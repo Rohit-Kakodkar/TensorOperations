@@ -7,7 +7,7 @@ namespace TensorOperations {
 
 template <TensorLike T>
 struct TensorHandle : T {
-    static constexpr int Rank = T::rank();
+    static constexpr int Rank = static_cast<int>(T::rank);
 
     std::array<int32_t, Rank> modes;
 
@@ -16,7 +16,7 @@ struct TensorHandle : T {
 };
 
 template <TensorLike T>
-TensorHandle<T> make_handle(T base, std::array<int32_t, T::rank()> modes) {
+TensorHandle<T> make_handle(T base, std::array<int32_t, static_cast<int>(T::rank)> modes) {
     return TensorHandle<T>(std::move(base), modes);
 }
 
