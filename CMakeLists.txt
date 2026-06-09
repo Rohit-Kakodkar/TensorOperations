@@ -37,3 +37,8 @@ gtest_discover_tests(test_concept)
 add_executable(test_nodehandle tests/test_nodehandle.cpp)
 target_link_libraries(test_nodehandle PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_nodehandle)
+
+# test_contraction_node — custom main() wraps Kokkos init/finalize
+add_executable(test_contraction_node tests/test_contraction_node.cpp)
+target_link_libraries(test_contraction_node PRIVATE tensor GTest::gtest)
+gtest_discover_tests(test_contraction_node)

@@ -19,7 +19,7 @@ static_assert(TensorLike<MyTensor>);
 
 TEST(NodeHandleTest, InputNode) {
     auto h   = make_handle(MyTensor{}, std::array<int32_t, 2>{'i', 'j'});
-    auto inp = make_node(h);
+    auto inp = make_input_node(h);
 
     auto s = inp.shape();
     EXPECT_EQ(s[0], 4);
@@ -34,7 +34,7 @@ TEST(NodeHandleTest, InputNode) {
 }
 
 TEST(NodeHandleTest, IntermediateNodeGlobalAlloc) {
-    auto interm = make_node<float, 2, Kokkos::Serial>(
+    auto interm = make_interm_node<float, 2, Kokkos::Serial>(
         0,
         std::array<int, 2>{4, 3},
         std::array<int32_t, 2>{'a', 'b'});

@@ -1,6 +1,7 @@
 #pragma once
 #include <TensorOperations/TensorHandle.hpp>
 #include <array>
+#include <cassert>
 #include <cstdint>
 #include <type_traits>
 
@@ -11,45 +12,16 @@ namespace TensorOperations {
 // Tags for NodeHandle specializations
 struct InputTag {};
 struct IntermTag {};
+struct ContractionTag {};
+
+// Sentinel for "no hook"
+struct NoHook {};
 
 // Primary template — undefined; must use a specialization
 template <typename Tag, typename... Args> struct NodeHandle;
 
 // ---------------------------------------------------------------------------
-// Input specialization — wraps an existing TensorHandle
-// ---------------------------------------------------------------------------
-template <TensorLike T, typename HookOp = void> struct NodeHandle<InputTag, T> {
-  TensorHandle<T> handle;
-  HookOp hook_op;
-
-  // Check that HookOp is invocable with indices with the same arity as the
-  // tensor rank
-  static_assert(
-      (std::invocable<HookOp::template operator(),
-                      std::make_index_sequence<TensorHandle<T>::Rank>>),
-      "HookOp must be invocable with indices matching the tensor rank");
-
-  static constexpr int Rank = TensorHandle<T>::Rank;
-
-  std::array<int, Rank> shape() const {
-    std::array<int, Rank> s;
-    for (int i = 0; i < Rank; ++i)
-      s[i] = handle.extent(i);
-    return s;
-  }
-  std::array<int32_t, Rank> modes() const { return handle.modes; }
-
-  const TensorHandle<T> &concretize() const { return handle; }
-
-  template <typename TeamMember>
-  auto concretize(const TeamMember &team,
-                  std::array<int, Rank> tile_shape) const {
-    // Deep copy the relevant subtile into scratch memory
-  }
-};
-
-// ---------------------------------------------------------------------------
-// Impl helpers for the intermediate specialization
+// Impl helpers
 // ---------------------------------------------------------------------------
 namespace Impl {
 
@@ -88,22 +60,44 @@ make_kokkos_view(const std::array<int, R> &shape) {
 } // namespace Impl
 
 // ---------------------------------------------------------------------------
+// Input specialization — wraps an existing TensorHandle
+// ---------------------------------------------------------------------------
+template <TensorLike T, typename HookOp>
+struct NodeHandle<InputTag, T, HookOp> {
+  TensorHandle<T> handle;
+  [[no_unique_address]] HookOp hook_op;
+
+  static constexpr int Rank = TensorHandle<T>::Rank;
+
+  std::array<int, Rank> shape() const {
+    std::array<int, Rank> s;
+    for (int i = 0; i < Rank; ++i)
+      s[i] = handle.extent(i);
+    return s;
+  }
+  std::array<int32_t, Rank> modes() const { return handle.modes; }
+
+  const TensorHandle<T> &concretize() const { return handle; }
+
+  template <typename TeamMember>
+  auto concretize(const TeamMember &team,
+                  std::array<int, Rank> tile_shape) const {
+    // Deep copy the relevant subtile into scratch memory
+  }
+};
+
+// ---------------------------------------------------------------------------
 // Intermediate specialization — deferred allocation
 // ---------------------------------------------------------------------------
 template <typename Scalar, typename IntRank, typename ExecSpace,
-          typename HookOp = void>
-struct NodeHandle<IntermTag, Scalar, IntRank, ExecSpace> {
+          typename HookOp>
+struct NodeHandle<IntermTag, Scalar, IntRank, ExecSpace, HookOp> {
   static constexpr int Rank = IntRank::value;
 
   uint32_t id;
   std::array<int, Rank> shape_;
   std::array<int32_t, Rank> modes_;
-  HookOp hook_op;
-
-  static_assert(
-      (std::invocable<HookOp::template operator(),
-                      std::make_index_sequence<Rank>>),
-      "HookOp must be invocable with indices matching the tensor rank");
+  [[no_unique_address]] HookOp hook_op;
 
   std::array<int, Rank> shape() const { return shape_; }
   std::array<int32_t, Rank> modes() const { return modes_; }
@@ -130,22 +124,101 @@ struct NodeHandle<IntermTag, Scalar, IntRank, ExecSpace> {
 };
 
 // ---------------------------------------------------------------------------
-// Factory functions — both overloads of make_node
+// Factory functions
 // ---------------------------------------------------------------------------
 
 // Input node — wraps an existing TensorHandle
-template <TensorLike T> NodeHandle<InputTag, T> make_node(TensorHandle<T> h) {
-  return {std::move(h)};
+template <TensorLike T, typename HookOp = NoHook>
+NodeHandle<InputTag, T, HookOp> make_input_node(TensorHandle<T> h,
+                                                HookOp hook = {}) {
+  return {std::move(h), std::move(hook)};
 }
 
 // Intermediate node — deferred allocation, ExecSpace determines both memory
 // spaces
 template <typename Scalar, int Rank,
-          typename ExecSpace = Kokkos::DefaultExecutionSpace>
-NodeHandle<IntermTag, Scalar, std::integral_constant<int, Rank>, ExecSpace>
-make_node(uint32_t id, std::array<int, Rank> shape,
-          std::array<int32_t, Rank> modes) {
-  return {id, shape, modes};
+          typename ExecSpace = Kokkos::DefaultExecutionSpace,
+          typename HookOp = NoHook>
+NodeHandle<IntermTag, Scalar, std::integral_constant<int, Rank>, ExecSpace,
+           HookOp>
+make_interm_node(uint32_t id, std::array<int, Rank> shape,
+                 std::array<int32_t, Rank> modes, HookOp hook = {}) {
+  return {id, shape, modes, std::move(hook)};
+}
+
+// ---------------------------------------------------------------------------
+// Contraction specialization — C{free modes} = sum{contracted} A × B
+// ---------------------------------------------------------------------------
+template <typename NodeA, typename NodeB, typename IntCRank, typename Scalar,
+          typename ExecSpace, typename HookOp>
+struct NodeHandle<ContractionTag, NodeA, NodeB, IntCRank, Scalar, ExecSpace,
+                  HookOp> {
+  static constexpr int Rank = IntCRank::value;
+  static constexpr int NumContracted = (NodeA::Rank + NodeB::Rank - Rank) / 2;
+  using hook_type = HookOp;
+
+  NodeA node_a;
+  NodeB node_b;
+  std::array<int32_t, Rank> modes_;
+  std::array<int, Rank> shape_;
+  [[no_unique_address]] HookOp hook_op;
+
+  std::array<int, Rank> shape() const { return shape_; }
+  std::array<int32_t, Rank> modes() const { return modes_; }
+};
+
+// ---------------------------------------------------------------------------
+// Contraction node factory
+// ---------------------------------------------------------------------------
+
+template <typename Scalar, typename ExecSpace = Kokkos::DefaultExecutionSpace,
+          typename NodeA, typename NodeB, std::size_t CRank,
+          typename HookOp = NoHook>
+auto make_contraction_node(NodeA a, NodeB b,
+                           std::array<int32_t, CRank> out_modes,
+                           HookOp hook = {}) {
+  constexpr int Rank = static_cast<int>(CRank);
+  static_assert((NodeA::Rank + NodeB::Rank - Rank) % 2 == 0,
+                "Output rank is inconsistent with input ranks");
+
+  const auto a_modes = a.modes();
+  const auto b_modes = b.modes();
+  const auto a_shape = a.shape();
+  const auto b_shape = b.shape();
+
+  auto in_array = [](auto val, const auto &arr, int n) {
+    for (int i = 0; i < n; ++i)
+      if (arr[i] == val)
+        return true;
+    return false;
+  };
+
+  // Each output mode must be a free mode (in exactly one input)
+  for (int i = 0; i < Rank; ++i) {
+    int32_t m = out_modes[i];
+    bool in_a = in_array(m, a_modes, NodeA::Rank);
+    bool in_b = in_array(m, b_modes, NodeB::Rank);
+    assert((in_a != in_b) &&
+           "each output mode must appear in exactly one input tensor");
+  }
+
+  // Derive C's shape from input extents
+  std::array<int, Rank> c_shape{};
+  for (int i = 0; i < Rank; ++i) {
+    int32_t m = out_modes[i];
+    if (in_array(m, a_modes, NodeA::Rank)) {
+      for (int j = 0; j < NodeA::Rank; ++j)
+        if (a_modes[j] == m) { c_shape[i] = a_shape[j]; break; }
+    } else {
+      for (int j = 0; j < NodeB::Rank; ++j)
+        if (b_modes[j] == m) { c_shape[i] = b_shape[j]; break; }
+    }
+  }
+
+  return NodeHandle<ContractionTag, NodeA, NodeB,
+                    std::integral_constant<int, Rank>, Scalar, ExecSpace,
+                    HookOp>{std::move(a), std::move(b), out_modes, c_shape,
+                            std::move(hook)};
 }
 
 } // namespace TensorOperations
