@@ -1,2 +1,5 @@
-plan
+plans
 build
+.claude/settings.json
+output.log
+.venv
