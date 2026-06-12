@@ -33,6 +33,11 @@ add_executable(test_concept tests/test_concept.cpp)
 target_link_libraries(test_concept PRIVATE tensor GTest::gtest_main)
 gtest_discover_tests(test_concept)
 
+# test_layout — no Kokkos runtime; GTest provides main()
+add_executable(test_layout tests/test_layout.cpp)
+target_link_libraries(test_layout PRIVATE tensor GTest::gtest_main)
+gtest_discover_tests(test_layout)
+
 # test_nodehandle — custom main() wraps Kokkos init/finalize
 add_executable(test_nodehandle tests/test_nodehandle.cpp)
 target_link_libraries(test_nodehandle PRIVATE tensor GTest::gtest)
@@ -42,3 +47,18 @@ gtest_discover_tests(test_nodehandle)
 add_executable(test_contraction_node tests/test_contraction_node.cpp)
 target_link_libraries(test_contraction_node PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_contraction_node)
+
+# test_graph — custom main() wraps Kokkos init/finalize
+add_executable(test_graph tests/test_graph.cpp)
+target_link_libraries(test_graph PRIVATE tensor GTest::gtest)
+gtest_discover_tests(test_graph)
+
+# test_register_array — custom main() wraps Kokkos init/finalize
+add_executable(test_register_array tests/test_register_array.cpp)
+target_link_libraries(test_register_array PRIVATE tensor GTest::gtest)
+gtest_discover_tests(test_register_array)
+
+# test_tiling — custom main() wraps Kokkos init/finalize
+add_executable(test_tiling tests/test_tiling.cpp)
+target_link_libraries(test_tiling PRIVATE tensor GTest::gtest)
+gtest_discover_tests(test_tiling)
