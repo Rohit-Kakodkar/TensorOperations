@@ -9,32 +9,50 @@ namespace Impl {
 
 template <typename T, std::size_t... Is>
 concept CallableWithNInts = requires(T t) {
-    { t((void(Is), 0)...) };
+  { t((void(Is), 0)...) };
 };
 
 template <typename T, std::size_t... Is>
-concept WritableWithNInts = requires(T t) {
-    t((void(Is), 0)...) = typename T::value_type{};
-};
+concept WritableWithNInts =
+    requires(T t) { t((void(Is), 0)...) = typename T::value_type{}; };
 
-} // namespace Impl
+// Helper traits expand the rank into an index sequence without using an
+// immediately-invoked lambda inside the concept. Lambdas embedded in concept
+// definitions are evaluated inconsistently by some compilers across
+// instantiation contexts, which made the surrounding concepts spuriously fail.
+template <typename T, typename Seq>
+struct CallableWithRankImpl : std::false_type {};
 
-template <typename T>
-concept TensorLike =
-    requires(T t) {
-        requires (static_cast<int>(T::rank) >= 0);
-        { t.extent(0) } -> std::convertible_to<int>;
-    }
-    && []<std::size_t... Is>(std::index_sequence<Is...>) {
-           return Impl::CallableWithNInts<T, Is...>;
-       }(std::make_index_sequence<static_cast<std::size_t>(T::rank)>{});
+template <typename T, std::size_t... Is>
+struct CallableWithRankImpl<T, std::index_sequence<Is...>>
+    : std::bool_constant<CallableWithNInts<T, Is...>> {};
 
 template <typename T>
-concept WritableTensorLike =
-    TensorLike<T> &&
-    requires { typename T::value_type; } &&
-    []<std::size_t... Is>(std::index_sequence<Is...>) {
-        return Impl::WritableWithNInts<T, Is...>;
-    }(std::make_index_sequence<static_cast<std::size_t>(T::rank)>{});
+concept CallableWithRank = CallableWithRankImpl<
+    T, std::make_index_sequence<static_cast<std::size_t>(T::rank)>>::value;
 
-} // namespace TensorOperations
+template <typename T, typename Seq>
+struct WritableWithRankImpl : std::false_type {};
+
+template <typename T, std::size_t... Is>
+struct WritableWithRankImpl<T, std::index_sequence<Is...>>
+    : std::bool_constant<WritableWithNInts<T, Is...>> {};
+
+template <typename T>
+concept WritableWithRank = WritableWithRankImpl<
+    T, std::make_index_sequence<static_cast<std::size_t>(T::rank)>>::value;
+
+}  // namespace Impl
+
+template <typename T>
+concept TensorLike = requires(T t) {
+  requires(static_cast<int>(T::rank) >= 0);
+  { t.extent(0) } -> std::convertible_to<int>;
+} && Impl::CallableWithRank<T>;
+
+template <typename T>
+concept WritableTensorLike = TensorLike<T> && requires {
+  typename T::value_type;
+} && Impl::WritableWithRank<T>;
+
+}  // namespace TensorOperations
