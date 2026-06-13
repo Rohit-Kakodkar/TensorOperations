@@ -45,6 +45,24 @@ KOKKOS_FORCEINLINE_FUNCTION V apply_hook(const NoHook&, V v) {
   return v;
 }
 
+// Project a tiling type onto a set of participating-mode positions, yielding a
+// StaticTile / RegisterArray whose extents are Tile::extent(Pos[i])... . `Pos`
+// is a constexpr std::array of positions (Option A: pure rank arithmetic, no
+// mode-label lookup). A single std::make_index_sequence drives the unpack.
+template <typename Tile, auto Pos, std::size_t... I>
+StaticTile<Tile::extent(static_cast<int>(Pos[I]))...> project_tile_fn(
+    std::index_sequence<I...>);
+template <typename Tile, auto Pos>
+using project_tile_t = decltype(project_tile_fn<Tile, Pos>(
+    std::make_index_sequence<Pos.size()>{}));
+
+template <typename V, typename Tile, auto Pos, std::size_t... I>
+RegisterArray<V, Tile::extent(static_cast<int>(Pos[I]))...> project_regs_fn(
+    std::index_sequence<I...>);
+template <typename V, typename Tile, auto Pos>
+using project_regs_t = decltype(project_regs_fn<V, Tile, Pos>(
+    std::make_index_sequence<Pos.size()>{}));
+
 }  // namespace Impl
 
 // ---------------------------------------------------------------------------
@@ -157,12 +175,18 @@ struct Evaluator<TeamPolicyTag, NodeHandle<InputTag, T, HookOp>, Tile_> {
 // Specialization 3: RangePolicyTag + ContractionTag + StaticTile<E...>
 // (register tier)
 // ---------------------------------------------------------------------------
-// Register-blocked: each thread holds a register working set (StaticTile
-// carries one extent per participating mode = Rank_C + NumContracted), runs an
-// outer- product update over the contracted modes, and writes its output
-// sub-tile back to the pre-allocated global result. The kernel projects the
-// accumulator sub-tile out of the full participating-mode tile. Body defined in
-// Eval.hpp.
+// Register-blocked, GEMM-structural convention (Option A): the participating
+// tile StaticTile<E...> carries one extent per participating mode
+// (Rank_C + NumContracted) ordered [freeA.., freeB.., contracted..], with each
+// operand stored [freeA.., contracted..] (A) and [contracted.., freeB..] (B).
+// Mirroring the input stager, operator() takes the A and B tile offsets and an
+// out-param C accumulator: it stages both operand tiles into registers (reusing
+// Specialization 1) and accumulates (+=) their contraction into `result`. The
+// caller zeroes the accumulator, computes the offsets, loops the contracted
+// blocks, and writes the finished accumulator into the interm node view.
+//
+// General (label-matched) projection for arbitrary operand mode orders is
+// tracked in issues/0001-general-mode-projection.md.
 template <typename NA, typename NB, typename IntCRank, typename S, typename ES,
           typename HookOp, int... E>
 struct Evaluator<RangePolicyTag,
@@ -171,21 +195,93 @@ struct Evaluator<RangePolicyTag,
   using node_type = NodeHandle<ContractionTag, NA, NB, IntCRank, S, ES, HookOp>;
   using tiling_type         = StaticTile<E...>;
   using policy_tag          = RangePolicyTag;
-  static constexpr int Rank = node_type::Rank;  // output rank
+  static constexpr int Rank = node_type::Rank;  // output (C) rank
   using value_type          = S;
   using exec_space          = ES;
-  using register_array_t =
-      RegisterArray<value_type, E...>;  // staging working set
-  using interm_type =
-      NodeHandle<IntermTag, value_type, std::integral_constant<int, Rank>,
-                 exec_space, NoHook>;
-  using result_type = interm_type;
+  // Kept for the existing EvaluatorSelection static_asserts (full set of E...).
+  using register_array_t = RegisterArray<value_type, E...>;
+
+ private:
+  // Structural (GEMM) convention counts — all compile-time from ranks.
+  static constexpr int RankC = node_type::Rank;
+  static constexpr int NumK  = node_type::NumContracted;
+  static constexpr int RankA = NA::Rank;
+  static constexpr int RankB = NB::Rank;
+  static constexpr int FreeA = RankA - NumK;
+  static constexpr int FreeB = RankB - NumK;
+
+  static_assert(tiling_type::rank == RankC + NumK,
+                "contraction tile must carry one extent per participating mode "
+                "(Rank_C + NumContracted)");
+  static_assert(FreeA + FreeB == RankC,
+                "free-mode counts must sum to the output rank");
+
+  // Participating-tile positions for each operand under the GEMM convention:
+  //   [0,FreeA)=freeA   [FreeA,RankC)=freeB   [RankC,RankC+NumK)=contracted
+  static constexpr std::array<int, RankA> a_pos = [] {
+    std::array<int, RankA> p{};
+    for (int i = 0; i < FreeA; ++i) p[i] = i;                 // freeA
+    for (int i = 0; i < NumK; ++i) p[FreeA + i] = RankC + i;  // contracted
+    return p;
+  }();
+  static constexpr std::array<int, RankB> b_pos = [] {
+    std::array<int, RankB> p{};
+    for (int i = 0; i < NumK; ++i) p[i] = RankC + i;          // contracted
+    for (int i = 0; i < FreeB; ++i) p[NumK + i] = FreeA + i;  // freeB
+    return p;
+  }();
+  static constexpr std::array<int, RankC> c_pos = [] {
+    std::array<int, RankC> p{};
+    for (int i = 0; i < RankC; ++i) p[i] = i;  // freeA ++ freeB
+    return p;
+  }();
+
+  // Compile-time projected tile/register types for the A and B operand tiles.
+  using a_tile_type = Impl::project_tile_t<tiling_type, a_pos>;
+  using b_tile_type = Impl::project_tile_t<tiling_type, b_pos>;
+  using a_array_t   = Impl::project_regs_t<value_type, tiling_type, a_pos>;
+  using b_array_t   = Impl::project_regs_t<value_type, tiling_type, b_pos>;
+
+  // Flat sizes of each mode group. Under the row-major register layout the
+  // contraction is a plain GEMM on flat storage: C[SA x SB] += A[SA x SK] *
+  // B[SK x SB].
+  static constexpr int prod_range(int lo, int count) {
+    int p = 1;
+    for (int i = 0; i < count; ++i) p *= tiling_type::extent(lo + i);
+    return p;
+  }
+  static constexpr int SA = prod_range(0, FreeA);      // free-A extent product
+  static constexpr int SB = prod_range(FreeA, FreeB);  // free-B extent product
+  static constexpr int SK = prod_range(RankC, NumK);   // contracted product
+
+ public:
+  // The C accumulator (free modes) — the operator's out-param type.
+  using accumulator_t = Impl::project_regs_t<value_type, tiling_type, c_pos>;
+  using result_type   = accumulator_t;
 
   node_type   node;
   tiling_type tiling;
-  result_type result;  // pre-allocated output node; view_ written by operator()
 
-  KOKKOS_FUNCTION void operator()(int flat_idx) const;
+  // Stage the A-tile at `a_tile_offset` and B-tile at `b_tile_offset` into
+  // registers, then accumulate their contraction into `result`.
+  KOKKOS_FUNCTION void operator()(std::array<int, RankA> a_tile_offset,
+                                  std::array<int, RankB> b_tile_offset,
+                                  accumulator_t&         result) const {
+    Evaluator<RangePolicyTag, NA, a_tile_type> stage_a{node.node_a};
+    Evaluator<RangePolicyTag, NB, b_tile_type> stage_b{node.node_b};
+    a_array_t                                  a_regs{};
+    b_array_t                                  b_regs{};
+    stage_a(a_tile_offset, a_regs);
+    stage_b(b_tile_offset, b_regs);
+
+    for (int fa = 0; fa < SA; ++fa)
+      for (int fb = 0; fb < SB; ++fb) {
+        value_type acc = result.data_[fa * SB + fb];
+        for (int kk = 0; kk < SK; ++kk)
+          acc += a_regs.data_[fa * SK + kk] * b_regs.data_[kk * SB + fb];
+        result.data_[fa * SB + fb] = acc;
+      }
+  }
 };
 
 // ---------------------------------------------------------------------------

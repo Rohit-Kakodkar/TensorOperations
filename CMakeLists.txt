@@ -62,3 +62,8 @@ gtest_discover_tests(test_register_array)
 add_executable(test_tiling tests/test_tiling.cpp)
 target_link_libraries(test_tiling PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_tiling)
+
+# test_contraction_eval — custom main() wraps Kokkos init/finalize
+add_executable(test_contraction_eval tests/test_contraction_eval.cpp)
+target_link_libraries(test_contraction_eval PRIVATE tensor GTest::gtest)
+gtest_discover_tests(test_contraction_eval)

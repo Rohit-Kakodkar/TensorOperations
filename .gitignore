@@ -3,3 +3,4 @@ build
 .claude/settings.json
 output.log
 .venv
+issues
