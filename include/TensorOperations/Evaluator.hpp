@@ -95,7 +95,12 @@ struct Evaluator<RangePolicyTag, NodeHandle<InputTag, T, HookOp>,
   using exec_space          = typename Impl::exec_space_of<T>::type;
   using register_array_t    = RegisterArray<value_type, E...>;
   using layout_type         = StridedLayout<Rank>;
-  using result_type         = register_array_t;
+  // Result is an IntermTag tile node backed by the staged RegisterArray. The
+  // input hook is applied at load, so the node carries NoHook.
+  using interm_type =
+      NodeHandle<IntermTag, register_array_t, std::integral_constant<int, Rank>,
+                 exec_space, NoHook>;
+  using result_type = interm_type;
 
   static_assert(node_type::Rank == Rank,
                 "input staging tile must carry one extent per input mode");
@@ -104,11 +109,16 @@ struct Evaluator<RangePolicyTag, NodeHandle<InputTag, T, HookOp>,
   tiling_type tiling;
   layout_type layout;  // default-constructed = contiguous (stride 1)
 
-  // Stage the tile whose global origin is `tile_offset` into `result`.
-  KOKKOS_FUNCTION void operator()(std::array<int, Rank> tile_offset,
-                                  register_array_t&     result) const {
-    fill_slots(tile_offset, result,
+  // Stage the tile whose global origin is `tile_offset` and return it as an
+  // IntermTag tile node.
+  KOKKOS_FUNCTION result_type
+  operator()(std::array<int, Rank> tile_offset) const {
+    result_type out{};
+    for (int d = 0; d < Rank; ++d) out.shape_[d] = tiling_type::extent(d);
+    out.modes_ = node.modes();
+    fill_slots(tile_offset, out.storage_,
                std::make_index_sequence<register_array_t::size>{});
+    return out;
   }
 
  private:
@@ -159,7 +169,7 @@ struct Evaluator<TeamPolicyTag, NodeHandle<InputTag, T, HookOp>, Tile_> {
   using scratch_view_t =
       typename Impl::KokkosViewN<value_type, Rank, scratch_space>::type;
   using interm_type =
-      NodeHandle<IntermTag, value_type, std::integral_constant<int, Rank>,
+      NodeHandle<IntermTag, scratch_view_t, std::integral_constant<int, Rank>,
                  exec_space, NoHook>;
   using result_type = interm_type;
 
@@ -254,25 +264,81 @@ struct Evaluator<RangePolicyTag,
   static constexpr int SB = prod_range(FreeA, FreeB);  // free-B extent product
   static constexpr int SK = prod_range(RankC, NumK);   // contracted product
 
+  static constexpr int P = RankC + NumK;  // participating-mode count
+
  public:
-  // The C accumulator (free modes) — the operator's out-param type.
+  // The C accumulator over the free (output) modes.
   using accumulator_t = Impl::project_regs_t<value_type, tiling_type, c_pos>;
-  using result_type   = accumulator_t;
+  // Result is the finished output tile as an IntermTag node, carrying the
+  // contraction's hook (applied later at store time).
+  using interm_type =
+      NodeHandle<IntermTag, accumulator_t, std::integral_constant<int, RankC>,
+                 exec_space, HookOp>;
+  using result_type = interm_type;
 
   node_type   node;
   tiling_type tiling;
 
-  // Stage the A-tile at `a_tile_offset` and B-tile at `b_tile_offset` into
-  // registers, then accumulate their contraction into `result`.
-  KOKKOS_FUNCTION void operator()(std::array<int, RankA> a_tile_offset,
-                                  std::array<int, RankB> b_tile_offset,
-                                  accumulator_t&         result) const {
+  // Compute the complete output tile whose free-mode origin is
+  // `c_tile_offset`: sum over the entire contracted extent K, then return the
+  // finished tile node (hook carried, applied at store).
+  KOKKOS_FUNCTION result_type
+  operator()(std::array<int, RankC> c_tile_offset) const {
+    accumulator_t acc{};
+    acc.fill(value_type{0});
+
+    std::array<int, NumK> kext{};
+    if constexpr (NumK > 0) {
+      const auto a_shape = node.node_a.shape();  // contracted extents (GEMM)
+      for (int i = 0; i < NumK; ++i) kext[i] = a_shape[FreeA + i];
+    }
+    std::array<int, NumK> k_off{};
+    reduce_contracted<0>(c_tile_offset, k_off, kext, acc);
+
+    result_type out{};
+    out.storage_ = acc;
+    for (int d = 0; d < RankC; ++d) out.shape_[d] = tiling_type::extent(d);
+    out.modes_  = node.modes();
+    out.hook_op = node.hook_op;  // carried; applied by the overwrite store
+    return out;
+  }
+
+ private:
+  // Nested loop over the contracted modes (compile-time depth NumK, runtime
+  // extents, compile-time tile step — no modulo/division). At the base case the
+  // assembled A/B offsets feed one local GEMM block.
+  template <int I>
+  KOKKOS_FUNCTION void reduce_contracted(std::array<int, RankC>       c_off,
+                                         std::array<int, NumK>&       k_off,
+                                         const std::array<int, NumK>& kext,
+                                         accumulator_t& acc) const {
+    if constexpr (I == NumK) {
+      std::array<int, P> part_off{};  // [free.., contracted..]
+      for (int d = 0; d < RankC; ++d) part_off[d] = c_off[d];
+      for (int i = 0; i < NumK; ++i) part_off[RankC + i] = k_off[i];
+      std::array<int, RankA> a_off{};
+      for (int j = 0; j < RankA; ++j) a_off[j] = part_off[a_pos[j]];
+      std::array<int, RankB> b_off{};
+      for (int j = 0; j < RankB; ++j) b_off[j] = part_off[b_pos[j]];
+      accumulate_block(a_off, b_off, acc);
+    } else {
+      constexpr int TileK = tiling_type::extent(RankC + I);
+      for (int off = 0; off < kext[I]; off += TileK) {
+        k_off[I] = off;
+        reduce_contracted<I + 1>(c_off, k_off, kext, acc);
+      }
+    }
+  }
+
+  // Stage the A-tile at `a_off` and B-tile at `b_off` into registers, then
+  // accumulate their contraction into `result` (one contracted block).
+  KOKKOS_FUNCTION void accumulate_block(std::array<int, RankA> a_off,
+                                        std::array<int, RankB> b_off,
+                                        accumulator_t&         result) const {
     Evaluator<RangePolicyTag, NA, a_tile_type> stage_a{node.node_a};
     Evaluator<RangePolicyTag, NB, b_tile_type> stage_b{node.node_b};
-    a_array_t                                  a_regs{};
-    b_array_t                                  b_regs{};
-    stage_a(a_tile_offset, a_regs);
-    stage_b(b_tile_offset, b_regs);
+    const auto                                 a_regs = stage_a(a_off).storage_;
+    const auto                                 b_regs = stage_b(b_off).storage_;
 
     for (int fa = 0; fa < SA; ++fa)
       for (int fb = 0; fb < SB; ++fb) {
@@ -305,7 +371,7 @@ struct Evaluator<TeamPolicyTag,
   using scratch_view_t =
       typename Impl::KokkosViewN<value_type, Rank, scratch_space>::type;
   using interm_type =
-      NodeHandle<IntermTag, value_type, std::integral_constant<int, Rank>,
+      NodeHandle<IntermTag, scratch_view_t, std::integral_constant<int, Rank>,
                  exec_space, NoHook>;
   using result_type = interm_type;
 
@@ -315,6 +381,73 @@ struct Evaluator<TeamPolicyTag,
   KOKKOS_FUNCTION result_type
   operator()(const typename Kokkos::TeamPolicy<exec_space>::member_type& team,
              std::array<int, Rank> tile_offset) const;
+};
+
+// ---------------------------------------------------------------------------
+// Specialization 5: RangePolicyTag + IntermTag(RegisterArray) — store-evaluator
+// ---------------------------------------------------------------------------
+// Overwrite-drains a finished register-tier output tile into a destination view
+// at a given global offset, applying the node's hook at store time. The Tiling
+// parameter is unused (the tile shape lives in the RegisterArray storage).
+// Assumes the destination extents are divisible by the tile extents; a boundary
+// guard skips slots that fall outside the view.
+template <typename V, int... E, typename IntRank, typename ES, typename HookOp,
+          typename Tiling>
+struct Evaluator<
+    RangePolicyTag,
+    NodeHandle<IntermTag, RegisterArray<V, E...>, IntRank, ES, HookOp>,
+    Tiling> {
+  using node_type =
+      NodeHandle<IntermTag, RegisterArray<V, E...>, IntRank, ES, HookOp>;
+  using storage_type        = RegisterArray<V, E...>;
+  using tiling_type         = Tiling;
+  using policy_tag          = RangePolicyTag;
+  static constexpr int Rank = node_type::Rank;
+  using value_type          = V;
+  using exec_space          = ES;
+
+  static_assert(storage_type::rank == Rank,
+                "interm storage rank must equal node rank");
+
+  node_type node;
+
+  // Write the tile into `view` at global origin `offset` (hook applied).
+  template <typename ViewT>
+  KOKKOS_FUNCTION void operator()(std::array<int, Rank> offset,
+                                  const ViewT&          view) const {
+    store_slots(offset, view, std::make_index_sequence<storage_type::size>{});
+  }
+
+ private:
+  // Compile-time local index of register slot S along mode D (row-major
+  // decode).
+  template <std::size_t S, std::size_t D>
+  static constexpr int local_index() {
+    return static_cast<int>((S / storage_type::strides_[D]) %
+                            storage_type::extents_[D]);
+  }
+
+  // Write one register slot S into the view (hook applied), with a per-mode
+  // bounds guard so partial boundary tiles do not write out of range.
+  template <typename ViewT, std::size_t S, std::size_t... D>
+  KOKKOS_FORCEINLINE_FUNCTION void store_slot(const std::array<int, Rank>& off,
+                                              const ViewT&                 view,
+                                              std::index_sequence<D...>) const {
+    const bool in =
+        ((off[D] + local_index<S, D>() < static_cast<int>(view.extent(D))) &&
+         ...);
+    if (in)
+      view((off[D] + local_index<S, D>())...) =
+          Impl::apply_hook(node.hook_op, node.storage_.data_[S]);
+  }
+
+  // Unroll over every register slot; the read index S stays compile-time.
+  template <typename ViewT, std::size_t... S>
+  KOKKOS_FORCEINLINE_FUNCTION void store_slots(
+      const std::array<int, Rank>& off, const ViewT& view,
+      std::index_sequence<S...>) const {
+    (store_slot<ViewT, S>(off, view, std::make_index_sequence<Rank>{}), ...);
+  }
 };
 
 }  // namespace TensorOperations

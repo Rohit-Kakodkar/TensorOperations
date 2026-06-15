@@ -4,6 +4,6 @@ repos:
       - id: clang-format
         name: clang-format
         entry: clang-format
-        language: system
+        language: python
         types: [c++]
         args: ["-i"]

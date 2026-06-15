@@ -107,8 +107,8 @@ TEST(TilingTest, InputStagerContiguous) {
   using Eval = Evaluator<RangePolicyTag, decltype(inp), StaticTile<2, 2>>;
   Eval ev{inp};  // tiling + layout default-constructed (stride 1 = contiguous)
 
-  Eval::register_array_t regs{};
-  ev({2, 1}, regs);  // tile origin (2,1)
+  auto        node = ev({2, 1});  // tile origin (2,1)
+  const auto& regs = node.storage_;
 
   // regs(a,b) == Grid4x4(2+a, 1+b) == (2+a)*4 + (1+b)
   EXPECT_FLOAT_EQ((regs(0, 0)), 9.f);   // (2,1)
@@ -124,8 +124,8 @@ TEST(TilingTest, InputStagerStaggered) {
   using Eval = Evaluator<RangePolicyTag, decltype(inp), StaticTile<2, 2>>;
   Eval ev{inp, {}, StridedLayout<2>{{1, 2}}};
 
-  Eval::register_array_t regs{};
-  ev({0, 0}, regs);
+  auto        node = ev({0, 0});
+  const auto& regs = node.storage_;
 
   // regs(a,b) == Grid4x4(0 + a*1, 0 + b*2) == a*4 + b*2
   EXPECT_FLOAT_EQ((regs(0, 0)), 0.f);  // (0,0)
@@ -141,8 +141,8 @@ TEST(TilingTest, InputStagerAppliesHook) {
   using Eval = Evaluator<RangePolicyTag, decltype(inp), StaticTile<2, 2>>;
   Eval ev{inp};
 
-  Eval::register_array_t regs{};
-  ev({0, 0}, regs);
+  auto        node = ev({0, 0});
+  const auto& regs = node.storage_;
 
   EXPECT_FLOAT_EQ((regs(1, 1)), 2.f * 5.f);  // 2 * Grid4x4(1,1)
 }

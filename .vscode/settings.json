@@ -2,7 +2,7 @@
   "C_Cpp.clang_format_style": "file",
   "C_Cpp.clang_format_fallbackStyle": "Google",
   "[cpp]": {
-    "editor.defaultFormatter": "ms-vscode.cpptools",
+    "editor.defaultFormatter": "xaver.clang-format",
     "editor.formatOnSave": true
   },
   "[c]": {

@@ -1,5 +1,7 @@
 #include <Kokkos_Core.hpp>
+#include <TensorOperations/Evaluator.hpp>
 #include <TensorOperations/Graph.hpp>
+#include <TensorOperations/Tiling.hpp>
 #include <gtest/gtest.h>
 
 using namespace TensorOperations;
@@ -24,6 +26,10 @@ TEST(GraphTest, SingleContractionNode) {
       g.ops(make_contraction_node(hA, hB, std::array<int32_t, 2>{'i', 'l'}));
   auto [T1] = out1;
 
+  // Compile-time index counts: C_{i,l} survives 2 free modes, contracts j,k.
+  static_assert(decltype(g1)::num_free_indices() == 2);
+  static_assert(decltype(g1)::num_contraction_indices() == 2);
+
   static_assert(decltype(T1)::Rank == 2);
   static_assert(decltype(T1)::NumContracted == 2);
   static_assert(std::is_same_v<decltype(T1)::value_type, float>);
@@ -35,6 +41,11 @@ TEST(GraphTest, SingleContractionNode) {
   auto m = T1.modes();
   EXPECT_EQ(m[0], 'i');
   EXPECT_EQ(m[1], 'l');
+
+  // Work items over participating modes [i=3, l=6, j=4, k=5] (ceil-div).
+  EXPECT_EQ((g1.execute<RangePolicyTag>(StaticTile<3, 6, 4, 5>{})), 1u);
+  EXPECT_EQ((g1.execute<RangePolicyTag>(StaticTile<1, 1, 1, 1>{})), 360u);
+  EXPECT_EQ((g1.execute<RangePolicyTag>(StaticTile<3, 3, 4, 5>{})), 2u);
 }
 
 TEST(GraphTest, MultiLevelChain) {
@@ -79,7 +90,16 @@ TEST(GraphTest, MultiLevelChain) {
   EXPECT_EQ(s[2], 2);
   EXPECT_EQ(s[3], 5);
 
-  g2.execute();
+  // Compile-time index counts over the whole graph: T3 keeps 4 free modes;
+  // the two leaf contractions each contract 2 modes (AB: k,m; CD: q,r) and the
+  // top-level outer product contracts 0 → 2 + 2 + 0 = 4.
+  static_assert(decltype(g2)::num_free_indices() == 4);
+  static_assert(decltype(g2)::num_contraction_indices() == 4);
+
+  // T3 is an outer product (NumContracted 0): participating modes == output
+  // modes [3, 6, 2, 5].
+  EXPECT_EQ((g2.execute<TeamPolicyTag>(StaticTile<1, 1, 1, 1>{})), 180u);
+  EXPECT_EQ((g2.execute<RangePolicyTag>(StaticTile<3, 6, 2, 5>{})), 1u);
 }
 
 TEST(GraphTest, ScalarInferredFromNode) {

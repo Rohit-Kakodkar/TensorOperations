@@ -99,19 +99,22 @@ struct NodeHandle<InputTag, T, HookOp> {
 };
 
 // ---------------------------------------------------------------------------
-// Intermediate specialization — deferred allocation
+// Intermediate specialization — a staged/computed tile, parameterized by its
+// storage. Storage is either a Kokkos::View (scratch / team tier) or a
+// RegisterArray (register / range tier); both expose value_type, extent(i) and
+// operator()(idx...), so the tile is read uniformly regardless of tier. Also
+// reused for deferred full-tensor intermediates (empty View storage).
 // ---------------------------------------------------------------------------
-template <typename Scalar, typename IntRank, typename ExecSpace,
+template <typename Storage, typename IntRank, typename ExecSpace,
           typename HookOp>
-struct NodeHandle<IntermTag, Scalar, IntRank, ExecSpace, HookOp> {
+struct NodeHandle<IntermTag, Storage, IntRank, ExecSpace, HookOp> {
   static constexpr int Rank = IntRank::value;
-  using value_type          = Scalar;
+  using storage_type        = Storage;
+  using value_type          = typename Storage::value_type;
   using exec_space          = ExecSpace;
-  using mem_space           = typename ExecSpace::memory_space;
-  using view_type = typename Impl::KokkosViewN<Scalar, Rank, mem_space>::type;
 
-  uint32_t  id;
-  view_type view_;  // empty (default-constructed) for deferred nodes
+  uint32_t id{};
+  Storage  storage_;  // Kokkos::View (scratch) OR RegisterArray (register tier)
   std::array<int, Rank>        shape_;
   std::array<int32_t, Rank>    modes_;
   [[no_unique_address]] HookOp hook_op;
@@ -132,19 +135,18 @@ NodeHandle<InputTag, T, HookOp> make_input_node(TensorHandle<T> h,
 }
 
 // Intermediate node — deferred allocation, ExecSpace determines both memory
-// spaces
+// spaces. Storage is the matching Kokkos::View (empty until allocated).
 template <typename Scalar, int Rank,
           typename ExecSpace = Kokkos::DefaultExecutionSpace,
           typename HookOp    = NoHook>
-NodeHandle<IntermTag, Scalar, std::integral_constant<int, Rank>, ExecSpace,
-           HookOp>
-make_interm_node(uint32_t id, std::array<int, Rank> shape,
-                 std::array<int32_t, Rank> modes, HookOp hook = {}) {
+auto make_interm_node(uint32_t id, std::array<int, Rank> shape,
+                      std::array<int32_t, Rank> modes, HookOp hook = {}) {
+  using mem_space = typename ExecSpace::memory_space;
+  using view_type = typename Impl::KokkosViewN<Scalar, Rank, mem_space>::type;
   using NodeType =
-      NodeHandle<IntermTag, Scalar, std::integral_constant<int, Rank>,
+      NodeHandle<IntermTag, view_type, std::integral_constant<int, Rank>,
                  ExecSpace, HookOp>;
-  return NodeType{id, typename NodeType::view_type{}, shape, modes,
-                  std::move(hook)};
+  return NodeType{id, view_type{}, shape, modes, std::move(hook)};
 }
 
 // ---------------------------------------------------------------------------

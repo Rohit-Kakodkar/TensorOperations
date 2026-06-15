@@ -47,30 +47,29 @@ static auto make_nc(HookOp hook = {}) {
 }
 
 // Drive the register-tier contraction Evaluator over the whole 4x4 output with
-// the participating tile TileT = StaticTile<Ti, Tk, Tj>. For each output tile:
-// zero the accumulator, loop the contracted blocks accumulating, then store the
-// hook-applied result — exactly the caller responsibilities the evaluator
-// omits.
+// the participating tile TileT = StaticTile<Ti, Tk, Tj>. Each evaluator call
+// computes one complete output tile (summing over all of K internally); the
+// store-evaluator writes it into the destination view, applying the hook at
+// store time. The contracted Tj drives Spec 3's internal K loop.
 template <typename TileT, typename NC>
 static std::array<std::array<float, 4>, 4> compute(const NC& nc) {
-  using Eval = Evaluator<RangePolicyTag, NC, TileT>;
-  Eval          ev{nc};
+  using CEval  = Evaluator<RangePolicyTag, NC, TileT>;
+  using Interm = typename CEval::result_type;
+  using SEval  = Evaluator<RangePolicyTag, Interm, TileT>;
+  CEval         cev{nc};
   constexpr int N  = 4;
-  constexpr int Ti = TileT::extent(0), Tk = TileT::extent(1),
-                Tj = TileT::extent(2);
-  std::array<std::array<float, 4>, 4> out{};
+  constexpr int Ti = TileT::extent(0), Tk = TileT::extent(1);
 
+  Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::HostSpace> v("C", N, N);
   for (int off_i = 0; off_i < N; off_i += Ti)
     for (int off_k = 0; off_k < N; off_k += Tk) {
-      typename Eval::accumulator_t acc{};
-      acc.fill(0.f);
-      for (int off_j = 0; off_j < N; off_j += Tj)
-        ev(std::array<int, 2>{off_i, off_j}, std::array<int, 2>{off_j, off_k},
-           acc);
-      for (int m = 0; m < Ti; ++m)
-        for (int n = 0; n < Tk; ++n)
-          out[off_i + m][off_k + n] = Impl::apply_hook(nc.hook_op, acc(m, n));
+      auto tile_node = cev(std::array<int, 2>{off_i, off_k});
+      SEval{tile_node}(std::array<int, 2>{off_i, off_k}, v);
     }
+
+  std::array<std::array<float, 4>, 4> out{};
+  for (int i = 0; i < N; ++i)
+    for (int j = 0; j < N; ++j) out[i][j] = v(i, j);
   return out;
 }
 

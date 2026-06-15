@@ -46,19 +46,19 @@ TEST(NodeHandleTest, IntermediateNodeGlobalAlloc) {
   EXPECT_EQ(m[0], 'a');
   EXPECT_EQ(m[1], 'b');
 
-  // Allocate the view directly (Evaluator::operator() will do this in
+  // Allocate the storage view directly (Evaluator::operator() will do this in
   // production)
-  using NodeT  = decltype(interm);
-  interm.view_ = NodeT::view_type("test_interm", 4, 3);
+  using NodeT     = decltype(interm);
+  interm.storage_ = NodeT::storage_type("test_interm", 4, 3);
 
-  EXPECT_EQ(interm.view_.extent(0), 4);
-  EXPECT_EQ(interm.view_.extent(1), 3);
+  EXPECT_EQ(interm.storage_.extent(0), 4);
+  EXPECT_EQ(interm.storage_.extent(1), 3);
   EXPECT_EQ(interm.modes_[0], 'a');
   EXPECT_EQ(interm.modes_[1], 'b');
 
-  interm.view_(1, 2) = 9.f;
-  EXPECT_FLOAT_EQ(interm.view_(1, 2), 9.f);
-  EXPECT_FLOAT_EQ(interm.view_(0, 0), 0.f);
+  interm.storage_(1, 2) = 9.f;
+  EXPECT_FLOAT_EQ(interm.storage_(1, 2), 9.f);
+  EXPECT_FLOAT_EQ(interm.storage_(0, 0), 0.f);
 }
 
 int main(int argc, char* argv[]) {
