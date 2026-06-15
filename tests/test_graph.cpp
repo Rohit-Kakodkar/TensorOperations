@@ -42,10 +42,10 @@ TEST(GraphTest, SingleContractionNode) {
   EXPECT_EQ(m[0], 'i');
   EXPECT_EQ(m[1], 'l');
 
-  // Work items over participating modes [i=3, l=6, j=4, k=5] (ceil-div).
-  EXPECT_EQ((g1.execute<RangePolicyTag>(StaticTile<3, 6, 4, 5>{})), 1u);
-  EXPECT_EQ((g1.execute<RangePolicyTag>(StaticTile<1, 1, 1, 1>{})), 360u);
-  EXPECT_EQ((g1.execute<RangePolicyTag>(StaticTile<3, 3, 4, 5>{})), 2u);
+  // Work items over free modes [i=3, l=6]; tile covers all modes [i,l,j,k].
+  EXPECT_EQ(g1.tile_count(StaticTile<3, 6, 4, 5>{}), 1u);
+  EXPECT_EQ(g1.tile_count(StaticTile<1, 1, 1, 1>{}), 18u);
+  EXPECT_EQ(g1.tile_count(StaticTile<3, 3, 4, 5>{}), 2u);
 }
 
 TEST(GraphTest, MultiLevelChain) {
@@ -96,10 +96,9 @@ TEST(GraphTest, MultiLevelChain) {
   static_assert(decltype(g2)::num_free_indices() == 4);
   static_assert(decltype(g2)::num_contraction_indices() == 4);
 
-  // T3 is an outer product (NumContracted 0): participating modes == output
-  // modes [3, 6, 2, 5].
-  EXPECT_EQ((g2.execute<TeamPolicyTag>(StaticTile<1, 1, 1, 1>{})), 180u);
-  EXPECT_EQ((g2.execute<RangePolicyTag>(StaticTile<3, 6, 2, 5>{})), 1u);
+  // T3 free modes [i=3, j=6, p=2, s=5]; no contracted modes (outer product).
+  EXPECT_EQ(g2.tile_count(StaticTile<1, 1, 1, 1>{}), 180u);
+  EXPECT_EQ(g2.tile_count(StaticTile<3, 6, 2, 5>{}), 1u);
 }
 
 TEST(GraphTest, ScalarInferredFromNode) {
@@ -138,6 +137,36 @@ TEST(GraphTest, HookPreservesType) {
   // Hook type is the lambda — no type erasure
   static_assert(!std::is_same_v<decltype(nc)::hook_type, NoHook>);
   static_assert(!std::is_same_v<decltype(nc)::hook_type, void>);
+}
+
+TEST(GraphTest, SingleContractionExecution) {
+  // C_{i,l} = sum_{j,k} A_{i,j,k} * B_{j,k,l}
+  // A(3,4,5) = 1, B(4,5,6) = 1  →  C[i,l] = 4*5 = 20 everywhere
+  using View2 = Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::HostSpace>;
+  using View3 = Kokkos::View<float***, Kokkos::LayoutRight, Kokkos::HostSpace>;
+  View3 A("A", 3, 4, 5);
+  View3 B("B", 4, 5, 6);
+  View2 C("C", 3, 6);
+
+  Kokkos::deep_copy(A, 1.0f);
+  Kokkos::deep_copy(B, 1.0f);
+  Kokkos::deep_copy(C, 0.0f);
+
+  auto hA =
+      make_input_node(make_handle(A, std::array<int32_t, 3>{'i', 'j', 'k'}));
+  auto hB =
+      make_input_node(make_handle(B, std::array<int32_t, 3>{'j', 'k', 'l'}));
+
+  auto g = make_graph();
+  auto [g1, o1] =
+      g.ops(make_contraction_node(hA, hB, std::array<int32_t, 2>{'i', 'l'}));
+  auto [T1] = o1;
+
+  // Single tile covers the full output [i=3,l=6] and contracted [j=4,k=5].
+  g1.execute(RangePolicyTag{}, StaticTile<3, 6, 4, 5>{}, C);
+
+  for (int i = 0; i < 3; ++i)
+    for (int l = 0; l < 6; ++l) EXPECT_FLOAT_EQ(C(i, l), 20.0f);
 }
 
 int main(int argc, char* argv[]) {

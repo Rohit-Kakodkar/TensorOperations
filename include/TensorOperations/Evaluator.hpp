@@ -71,6 +71,12 @@ using project_regs_t = decltype(project_regs_fn<V, Tile, Pos>(
 template <typename PolicyTag, typename NodeType, typename Tiling>
 struct Evaluator;
 
+template <typename PolicyTag, typename NodeType, typename Tile>
+KOKKOS_FUNCTION auto make_evaluator(NodeType node, Tile tile)
+    -> Evaluator<PolicyTag, NodeType, Tile> {
+  return {node, tile};
+}
+
 // ---------------------------------------------------------------------------
 // Specialization 1: RangePolicyTag + InputTag + StaticTile<E...>  (register
 // tier)
@@ -335,10 +341,10 @@ struct Evaluator<RangePolicyTag,
   KOKKOS_FUNCTION void accumulate_block(std::array<int, RankA> a_off,
                                         std::array<int, RankB> b_off,
                                         accumulator_t&         result) const {
-    Evaluator<RangePolicyTag, NA, a_tile_type> stage_a{node.node_a};
-    Evaluator<RangePolicyTag, NB, b_tile_type> stage_b{node.node_b};
-    const auto                                 a_regs = stage_a(a_off).storage_;
-    const auto                                 b_regs = stage_b(b_off).storage_;
+    auto stage_a = make_evaluator<RangePolicyTag>(node.node_a, a_tile_type{});
+    auto stage_b = make_evaluator<RangePolicyTag>(node.node_b, b_tile_type{});
+    const auto a_regs = stage_a(a_off).storage_;
+    const auto b_regs = stage_b(b_off).storage_;
 
     for (int fa = 0; fa < SA; ++fa)
       for (int fb = 0; fb < SB; ++fb) {
@@ -409,7 +415,8 @@ struct Evaluator<
   static_assert(storage_type::rank == Rank,
                 "interm storage rank must equal node rank");
 
-  node_type node;
+  node_type   node;
+  tiling_type tiling;
 
   // Write the tile into `view` at global origin `offset` (hook applied).
   template <typename ViewT>

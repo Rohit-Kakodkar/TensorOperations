@@ -1,4 +1,5 @@
 #pragma once
+#include <TensorOperations/Evaluator.hpp>
 #include <TensorOperations/NodeHandle.hpp>
 #include <array>
 #include <cstddef>
@@ -60,6 +61,21 @@ std::array<int, participating_rank<Node>()> participating_extents(
   return ext;
 }
 
+// Row-major decode of a linear work-item index into per-mode tile origins.
+// Uses only the first Rank extents of `tile` (the free modes).
+template <int Rank, typename Tile>
+KOKKOS_FUNCTION std::array<int, Rank> decode_tile_offset(
+    std::size_t idx, const std::array<int, Rank>& shape, const Tile& tile) {
+  std::array<int, Rank> off{};
+  for (int d = Rank - 1; d >= 0; --d) {
+    int n = (shape[d] + tile.extent(d) - 1) / tile.extent(d);
+    off[d] =
+        static_cast<int>(idx % static_cast<std::size_t>(n)) * tile.extent(d);
+    idx /= static_cast<std::size_t>(n);
+  }
+  return off;
+}
+
 }  // namespace Impl
 
 // Compile-time computational graph builder.
@@ -96,39 +112,69 @@ struct Graph {
     }(std::make_index_sequence<std::tuple_size_v<OutputTuple>>{});
   }
 
-  // Work items needed to produce one output node `n` with `tile`: the product
-  // over all participating modes (free ++ contracted) of the ceil-division of
-  // the mode extent by the tile extent. One work item == one evaluator
-  // tile-step (output tiles x contracted blocks).
   template <typename Node, typename Tile>
   static std::size_t work_items(const Node& n, const Tile& tile) {
-    constexpr int P = Impl::participating_rank<Node>();
-    static_assert(Tile::rank == P,
-                  "tile rank must equal the node's participating-mode count "
-                  "(output Rank + NumContracted)");
-    const auto  ext   = Impl::participating_extents(n);
+    constexpr int R = Node::Rank;
+    static_assert(
+        Tile::rank >= R,
+        "tile rank must cover at least the node's output (free) modes");
+    const auto  out   = n.shape();
     std::size_t total = 1;
-    for (int d = 0; d < P; ++d) {
+    for (int d = 0; d < R; ++d) {
       const int t = tile.extent(d);
-      total *= static_cast<std::size_t>((ext[d] + t - 1) / t);  // ceil-div
+      total *= static_cast<std::size_t>((out[d] + t - 1) / t);  // ceil-div
     }
     return total;
   }
 
-  // Total work items across all outputs for the given policy and tiling shape.
-  // PolicyTag is part of the interface and will drive evaluator selection
-  // later; it does not affect the count yet.
+  // Total work items across all outputs for the given tiling shape.
+  template <typename Tile>
+  std::size_t tile_count(const Tile& tile) const {
+    return [&]<std::size_t... I>(std::index_sequence<I...>) {
+      return (std::size_t{0} + ... + work_items(std::get<I>(outputs), tile));
+    }(std::make_index_sequence<std::tuple_size_v<OutputTuple>>{});
+  }
+
+  // Launch a Kokkos::RangePolicy kernel for a single output node, writing
+  // results into `view`. One kernel per output avoids tuple access on device.
+  template <typename NodeType, typename ViewT, typename Tile>
+  static void execute_one_output(const NodeType& node, const ViewT& view,
+                                 const Tile& tile) {
+    const std::size_t wk = work_items(node, tile);
+    Kokkos::parallel_for(
+        "TensorOperations::execute", Kokkos::RangePolicy<>(0, wk),
+        KOKKOS_LAMBDA(std::size_t local_idx) {
+          const auto shape = node.shape();
+          const auto c_off =
+              Impl::decode_tile_offset<NodeType::Rank>(local_idx, shape, tile);
+
+          auto eval   = make_evaluator<RangePolicyTag>(node, tile);
+          auto interm = eval(c_off);
+
+          auto seval = make_evaluator<RangePolicyTag>(interm, tile);
+          seval(c_off, view);
+        });
+  }
+
+  // Evaluate the graph and write each output into the corresponding view.
+  // Exactly one view must be provided per output node.
   template <typename PolicyTag, typename Tile, TensorLike... Ts>
   std::size_t execute(const PolicyTag&, const Tile& tile,
                       const Ts&... ts) const {
-    const auto wk_items = [&]<std::size_t... I>(std::index_sequence<I...>) {
-      return (std::size_t{0} + ... + work_items(std::get<I>(outputs), tile));
-    }(std::make_index_sequence<std::tuple_size_v<OutputTuple>>{});
+    static_assert(sizeof...(Ts) == std::tuple_size_v<OutputTuple>,
+                  "Number of runtime tensor arguments must match number of "
+                  "output nodes in the graph");
+    static_assert(std::is_same_v<PolicyTag, RangePolicyTag>,
+                  "Currently only RangePolicyTag is supported");
 
-    Kokkos::parallel_for("GraphExecution", Kokkos::RangePolicy<>(0, wk_items),
-                         KOKKOS_LAMBDA(std::size_t){
-                             // Placeholder for actual execution logic.
-                         });
+    const auto wk_items = tile_count(tile);
+
+    auto                  ts_tuple = std::tie(ts...);
+    constexpr std::size_t N        = std::tuple_size_v<OutputTuple>;
+    [&]<std::size_t... I>(std::index_sequence<I...>) {
+      (execute_one_output(std::get<I>(outputs), std::get<I>(ts_tuple), tile),
+       ...);
+    }(std::make_index_sequence<N>{});
 
     return wk_items;
   }
