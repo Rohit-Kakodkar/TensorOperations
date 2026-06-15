@@ -82,7 +82,7 @@ KOKKOS_FUNCTION std::array<int, Rank> decode_tile_offset(
 // OutputTuple tracks the nodes produced by the most recent ops() call.
 template <typename OutputTuple = std::tuple<>>
 struct Graph {
-  OutputTuple outputs;
+  Graph() = default;
 
   // Register any mix of node handles (InputNode, ContractionNode, etc.).
   // Returns a new Graph storing the outputs and the same tuple for structured
@@ -90,7 +90,7 @@ struct Graph {
   template <typename... Nodes>
   auto ops(Nodes&&... nodes) const {
     auto node_tuple = std::make_tuple(nodes...);
-    return std::pair{Graph<decltype(node_tuple)>{node_tuple},
+    return std::pair{Graph<decltype(node_tuple)>(node_tuple),
                      std::move(node_tuple)};
   }
 
@@ -112,48 +112,12 @@ struct Graph {
     }(std::make_index_sequence<std::tuple_size_v<OutputTuple>>{});
   }
 
-  template <typename Node, typename Tile>
-  static std::size_t work_items(const Node& n, const Tile& tile) {
-    constexpr int R = Node::Rank;
-    static_assert(
-        Tile::rank >= R,
-        "tile rank must cover at least the node's output (free) modes");
-    const auto  out   = n.shape();
-    std::size_t total = 1;
-    for (int d = 0; d < R; ++d) {
-      const int t = tile.extent(d);
-      total *= static_cast<std::size_t>((out[d] + t - 1) / t);  // ceil-div
-    }
-    return total;
-  }
-
   // Total work items across all outputs for the given tiling shape.
   template <typename Tile>
   std::size_t tile_count(const Tile& tile) const {
     return [&]<std::size_t... I>(std::index_sequence<I...>) {
       return (std::size_t{0} + ... + work_items(std::get<I>(outputs), tile));
     }(std::make_index_sequence<std::tuple_size_v<OutputTuple>>{});
-  }
-
-  // Launch a Kokkos::RangePolicy kernel for a single output node, writing
-  // results into `view`. One kernel per output avoids tuple access on device.
-  template <typename NodeType, typename ViewT, typename Tile>
-  static void execute_one_output(const NodeType& node, const ViewT& view,
-                                 const Tile& tile) {
-    const std::size_t wk = work_items(node, tile);
-    Kokkos::parallel_for(
-        "TensorOperations::execute", Kokkos::RangePolicy<>(0, wk),
-        KOKKOS_LAMBDA(std::size_t local_idx) {
-          const auto shape = node.shape();
-          const auto c_off =
-              Impl::decode_tile_offset<NodeType::Rank>(local_idx, shape, tile);
-
-          auto eval   = make_evaluator<RangePolicyTag>(node, tile);
-          auto interm = eval(c_off);
-
-          auto seval = make_evaluator<RangePolicyTag>(interm, tile);
-          seval(c_off, view);
-        });
   }
 
   // Evaluate the graph and write each output into the corresponding view.
@@ -177,6 +141,50 @@ struct Graph {
     }(std::make_index_sequence<N>{});
 
     return wk_items;
+  }
+
+ private:
+  template <typename>
+  friend struct Graph;
+
+  explicit Graph(OutputTuple o) : outputs(std::move(o)) {}
+
+  OutputTuple outputs;
+
+  template <typename Node, typename Tile>
+  static std::size_t work_items(const Node& n, const Tile& tile) {
+    constexpr int R = Node::Rank;
+    static_assert(
+        Tile::rank >= R,
+        "tile rank must cover at least the node's output (free) modes");
+    const auto  out   = n.shape();
+    std::size_t total = 1;
+    for (int d = 0; d < R; ++d) {
+      const int t = tile.extent(d);
+      total *= static_cast<std::size_t>((out[d] + t - 1) / t);  // ceil-div
+    }
+    return total;
+  }
+
+  // Launch a Kokkos::RangePolicy kernel for a single output node, writing
+  // results into `view`. One kernel per output avoids tuple access on device.
+  template <typename NodeType, typename ViewT, typename Tile>
+  static void execute_one_output(const NodeType& node, const ViewT& view,
+                                 const Tile& tile) {
+    const std::size_t wk = work_items(node, tile);
+    Kokkos::parallel_for(
+        "TensorOperations::execute", Kokkos::RangePolicy<>(0, wk),
+        KOKKOS_LAMBDA(std::size_t local_idx) {
+          const auto shape = node.shape();
+          const auto c_off =
+              Impl::decode_tile_offset<NodeType::Rank>(local_idx, shape, tile);
+
+          auto eval   = make_evaluator<RangePolicyTag>(node, tile);
+          auto interm = eval(c_off);
+
+          auto seval = make_evaluator<RangePolicyTag>(interm, tile);
+          seval(c_off, view);
+        });
   }
 };
 
