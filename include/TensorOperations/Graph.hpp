@@ -64,9 +64,9 @@ std::array<int, participating_rank<Node>()> participating_extents(
 // Row-major decode of a linear work-item index into per-mode tile origins.
 // Uses only the first Rank extents of `tile` (the free modes).
 template <int Rank, typename Tile>
-KOKKOS_FUNCTION std::array<int, Rank> decode_tile_offset(
-    std::size_t idx, const std::array<int, Rank>& shape, const Tile& tile) {
-  std::array<int, Rank> off{};
+KOKKOS_FUNCTION Kokkos::Array<int, Rank> decode_tile_offset(
+    std::size_t idx, const Kokkos::Array<int, Rank>& shape, const Tile& tile) {
+  Kokkos::Array<int, Rank> off{};
   for (int d = Rank - 1; d >= 0; --d) {
     int n = (shape[d] + tile.extent(d) - 1) / tile.extent(d);
     off[d] =
@@ -173,7 +173,8 @@ struct Graph {
                                  const Tile& tile) {
     const std::size_t wk = work_items(node, tile);
     Kokkos::parallel_for(
-        "TensorOperations::execute", Kokkos::RangePolicy<>(0, wk),
+        "TensorOperations::execute",
+        Kokkos::RangePolicy<typename NodeType::exec_space>(0, wk),
         KOKKOS_LAMBDA(std::size_t local_idx) {
           const auto shape = node.shape();
           const auto c_off =

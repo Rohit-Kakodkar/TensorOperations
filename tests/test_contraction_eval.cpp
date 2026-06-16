@@ -53,18 +53,16 @@ static auto make_nc(HookOp hook = {}) {
 // store time. The contracted Tj drives Spec 3's internal K loop.
 template <typename TileT, typename NC>
 static std::array<std::array<float, 4>, 4> compute(const NC& nc) {
-  using CEval  = Evaluator<RangePolicyTag, NC, TileT>;
-  using Interm = typename CEval::result_type;
-  using SEval  = Evaluator<RangePolicyTag, Interm, TileT>;
-  CEval         cev{nc};
-  constexpr int N  = 4;
+  auto          cev = make_evaluator<RangePolicyTag>(nc, TileT{});
+  constexpr int N   = 4;
   constexpr int Ti = TileT::extent(0), Tk = TileT::extent(1);
 
   Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::HostSpace> v("C", N, N);
   for (int off_i = 0; off_i < N; off_i += Ti)
     for (int off_k = 0; off_k < N; off_k += Tk) {
-      auto tile_node = cev(std::array<int, 2>{off_i, off_k});
-      SEval{tile_node}(std::array<int, 2>{off_i, off_k}, v);
+      auto tile_node = cev(Kokkos::Array<int, 2>{off_i, off_k});
+      auto store_ev  = make_evaluator<RangePolicyTag>(tile_node, TileT{});
+      store_ev({off_i, off_k}, v);
     }
 
   std::array<std::array<float, 4>, 4> out{};

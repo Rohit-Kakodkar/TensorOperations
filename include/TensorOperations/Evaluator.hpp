@@ -24,17 +24,6 @@ struct TeamPolicyTag {};
 // ---------------------------------------------------------------------------
 namespace Impl {
 
-// Extracts ExecSpace from a Kokkos View-like T (has ::execution_space).
-// Falls back to DefaultExecutionSpace for plain TensorLike types.
-template <typename T, typename = void>
-struct exec_space_of {
-  using type = Kokkos::DefaultExecutionSpace;
-};
-template <typename T>
-struct exec_space_of<T, std::void_t<typename T::execution_space>> {
-  using type = typename T::execution_space;
-};
-
 // Apply an input node's hook at load time. NoHook is the identity.
 template <typename Op, typename V>
 KOKKOS_FORCEINLINE_FUNCTION V apply_hook(const Op& op, V v) {
@@ -118,7 +107,7 @@ struct Evaluator<RangePolicyTag, NodeHandle<InputTag, T, HookOp>,
   // Stage the tile whose global origin is `tile_offset` and return it as an
   // IntermTag tile node.
   KOKKOS_FUNCTION result_type
-  operator()(std::array<int, Rank> tile_offset) const {
+  operator()(Kokkos::Array<int, Rank> tile_offset) const {
     result_type out{};
     for (int d = 0; d < Rank; ++d) out.shape_[d] = tiling_type::extent(d);
     out.modes_ = node.modes();
@@ -138,8 +127,8 @@ struct Evaluator<RangePolicyTag, NodeHandle<InputTag, T, HookOp>,
 
   // Load one register slot S: gather its global multi-index and read it.
   template <std::size_t S, std::size_t... D>
-  KOKKOS_FORCEINLINE_FUNCTION value_type
-  load_slot(const std::array<int, Rank>& off, std::index_sequence<D...>) const {
+  KOKKOS_FORCEINLINE_FUNCTION value_type load_slot(
+      const Kokkos::Array<int, Rank>& off, std::index_sequence<D...>) const {
     return Impl::apply_hook(
         node.hook_op,
         node.handle(
@@ -149,9 +138,9 @@ struct Evaluator<RangePolicyTag, NodeHandle<InputTag, T, HookOp>,
   // Unroll over every register slot; the write index S stays compile-time so
   // the RegisterArray remains register-resident.
   template <std::size_t... S>
-  KOKKOS_FORCEINLINE_FUNCTION void fill_slots(const std::array<int, Rank>& off,
-                                              register_array_t& result,
-                                              std::index_sequence<S...>) const {
+  KOKKOS_FORCEINLINE_FUNCTION void fill_slots(
+      const Kokkos::Array<int, Rank>& off, register_array_t& result,
+      std::index_sequence<S...>) const {
     ((result.data_[S] = load_slot<S>(off, std::make_index_sequence<Rank>{})),
      ...);
   }
@@ -184,7 +173,7 @@ struct Evaluator<TeamPolicyTag, NodeHandle<InputTag, T, HookOp>, Tile_> {
 
   KOKKOS_FUNCTION result_type
   operator()(const typename Kokkos::TeamPolicy<exec_space>::member_type& team,
-             std::array<int, Rank> tile_offset) const;
+             Kokkos::Array<int, Rank> tile_offset) const;
 };
 
 // ---------------------------------------------------------------------------
@@ -289,11 +278,11 @@ struct Evaluator<RangePolicyTag,
   // `c_tile_offset`: sum over the entire contracted extent K, then return the
   // finished tile node (hook carried, applied at store).
   KOKKOS_FUNCTION result_type
-  operator()(std::array<int, RankC> c_tile_offset) const {
+  operator()(Kokkos::Array<int, RankC> c_tile_offset) const {
     accumulator_t acc{};
     acc.fill(value_type{0});
 
-    std::array<int, NumK> kext{};
+    Kokkos::Array<int, NumK> kext{};
     if constexpr (NumK > 0) {
       const auto a_shape = node.node_a.shape();  // contracted extents (GEMM)
       for (int i = 0; i < NumK; ++i) kext[i] = a_shape[FreeA + i];
@@ -312,25 +301,25 @@ struct Evaluator<RangePolicyTag,
   // Nested loop over the contracted modes (compile-time depth NumK, runtime
   // extents, compile-time tile step — no modulo/division). At the base case the
   // assembled A/B offsets feed one local GEMM block.
-  KOKKOS_FUNCTION void reduce_contracted(std::array<int, RankC>       c_off,
-                                         const std::array<int, NumK>& kext,
+  KOKKOS_FUNCTION void reduce_contracted(Kokkos::Array<int, RankC>       c_off,
+                                         const Kokkos::Array<int, NumK>& kext,
                                          accumulator_t& acc) const {
-    std::array<int, NumK> k_off{};
+    Kokkos::Array<int, NumK> k_off{};
     reduce_contracted_impl(c_off, k_off, kext, acc,
                            std::make_index_sequence<NumK>{});
   }
 
   // Base case: all contracted modes stepped; assemble offsets and accumulate.
   KOKKOS_FUNCTION void reduce_contracted_impl(
-      const std::array<int, RankC>& c_off, std::array<int, NumK>& k_off,
-      const std::array<int, NumK>& /*kext*/, accumulator_t&       acc,
+      const Kokkos::Array<int, RankC>& c_off, Kokkos::Array<int, NumK>& k_off,
+      const Kokkos::Array<int, NumK>& /*kext*/, accumulator_t&          acc,
       std::index_sequence<>) const {
-    std::array<int, P> part_off{};  // [free.., contracted..]
+    Kokkos::Array<int, P> part_off{};  // [free.., contracted..]
     for (int d = 0; d < RankC; ++d) part_off[d] = c_off[d];
     for (int i = 0; i < NumK; ++i) part_off[RankC + i] = k_off[i];
-    std::array<int, RankA> a_off{};
+    Kokkos::Array<int, RankA> a_off{};
     for (int j = 0; j < RankA; ++j) a_off[j] = part_off[a_pos[j]];
-    std::array<int, RankB> b_off{};
+    Kokkos::Array<int, RankB> b_off{};
     for (int j = 0; j < RankB; ++j) b_off[j] = part_off[b_pos[j]];
     accumulate_block(a_off, b_off, acc);
   }
@@ -338,8 +327,8 @@ struct Evaluator<RangePolicyTag,
   // Recursive case: peel the head index I, loop over that contracted mode.
   template <std::size_t I, std::size_t... Rest>
   KOKKOS_FUNCTION void reduce_contracted_impl(
-      const std::array<int, RankC>& c_off, std::array<int, NumK>& k_off,
-      const std::array<int, NumK>& kext, accumulator_t& acc,
+      const Kokkos::Array<int, RankC>& c_off, Kokkos::Array<int, NumK>& k_off,
+      const Kokkos::Array<int, NumK>& kext, accumulator_t& acc,
       std::index_sequence<I, Rest...>) const {
     constexpr int TileK = tiling_type::extent(RankC + I);
     for (int off = 0; off < kext[I]; off += TileK) {
@@ -351,9 +340,9 @@ struct Evaluator<RangePolicyTag,
 
   // Stage the A-tile at `a_off` and B-tile at `b_off` into registers, then
   // accumulate their contraction into `result` (one contracted block).
-  KOKKOS_FUNCTION void accumulate_block(std::array<int, RankA> a_off,
-                                        std::array<int, RankB> b_off,
-                                        accumulator_t&         result) const {
+  KOKKOS_FUNCTION void accumulate_block(Kokkos::Array<int, RankA> a_off,
+                                        Kokkos::Array<int, RankB> b_off,
+                                        accumulator_t& result) const {
     auto stage_a = make_evaluator<RangePolicyTag>(node.node_a, a_tile_type{});
     auto stage_b = make_evaluator<RangePolicyTag>(node.node_b, b_tile_type{});
     const auto a_regs = stage_a(a_off).storage_;
@@ -400,7 +389,7 @@ struct Evaluator<TeamPolicyTag,
 
   KOKKOS_FUNCTION result_type
   operator()(const typename Kokkos::TeamPolicy<exec_space>::member_type& team,
-             std::array<int, Rank> tile_offset) const;
+             Kokkos::Array<int, Rank> tile_offset) const;
 };
 
 // ---------------------------------------------------------------------------
@@ -435,8 +424,8 @@ struct Evaluator<
 
   // Write the tile into `view` at global origin `offset` (hook applied).
   template <typename ViewT>
-  KOKKOS_FUNCTION void operator()(std::array<int, Rank> offset,
-                                  const ViewT&          view) const {
+  KOKKOS_FUNCTION void operator()(Kokkos::Array<int, Rank> offset,
+                                  const ViewT&             view) const {
     store_slots(offset, view, std::make_index_sequence<storage_type::size>{});
   }
 
@@ -452,9 +441,9 @@ struct Evaluator<
   // Write one register slot S into the view (hook applied), with a per-mode
   // bounds guard so partial boundary tiles do not write out of range.
   template <typename ViewT, std::size_t S, std::size_t... D>
-  KOKKOS_FORCEINLINE_FUNCTION void store_slot(const std::array<int, Rank>& off,
-                                              const ViewT&                 view,
-                                              std::index_sequence<D...>) const {
+  KOKKOS_FORCEINLINE_FUNCTION void store_slot(
+      const Kokkos::Array<int, Rank>& off, const ViewT& view,
+      std::index_sequence<D...>) const {
     const bool in =
         ((off[D] + local_index<S, D>() < static_cast<int>(view.extent(D))) &&
          ...);
@@ -466,7 +455,7 @@ struct Evaluator<
   // Unroll over every register slot; the read index S stays compile-time.
   template <typename ViewT, std::size_t... S>
   KOKKOS_FORCEINLINE_FUNCTION void store_slots(
-      const std::array<int, Rank>& off, const ViewT& view,
+      const Kokkos::Array<int, Rank>& off, const ViewT& view,
       std::index_sequence<S...>) const {
     (store_slot<ViewT, S>(off, view, std::make_index_sequence<Rank>{}), ...);
   }

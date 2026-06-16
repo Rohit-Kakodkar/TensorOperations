@@ -39,6 +39,17 @@ struct value_type_of<T, std::void_t<typename T::value_type>> {
   using type = typename T::value_type;
 };
 
+// Extracts ExecSpace from a Kokkos View-like T (has ::execution_space).
+// Falls back to DefaultExecutionSpace for plain TensorLike types.
+template <typename T, typename = void>
+struct exec_space_of {
+  using type = Kokkos::DefaultExecutionSpace;
+};
+template <typename T>
+struct exec_space_of<T, std::void_t<typename T::execution_space>> {
+  using type = typename T::execution_space;
+};
+
 // Map (Scalar, Rank, MemSpace) → the appropriate Kokkos::View type
 template <typename S, int R, typename MS>
 struct KokkosViewN;
@@ -65,14 +76,14 @@ struct KokkosViewN<S, 4, MS> {
 
 // Construct a KokkosViewN from a shape array via index_sequence unpacking
 template <typename ViewType, int R, std::size_t... Is>
-ViewType make_view_impl(const std::array<int, R>& shape,
+ViewType make_view_impl(const Kokkos::Array<int, R>& shape,
                         std::index_sequence<Is...>) {
   return ViewType("intermediate", static_cast<std::size_t>(shape[Is])...);
 }
 
 template <typename S, int R, typename MS>
 typename KokkosViewN<S, R, MS>::type make_kokkos_view(
-    const std::array<int, R>& shape) {
+    const Kokkos::Array<int, R>& shape) {
   using VT = typename KokkosViewN<S, R, MS>::type;
   return make_view_impl<VT, R>(shape, std::make_index_sequence<R>{});
 }
@@ -89,13 +100,16 @@ struct NodeHandle<InputTag, T, HookOp> {
 
   static constexpr int Rank = TensorHandle<T>::Rank;
   using value_type          = typename Impl::value_type_of<T>::type;
+  using exec_space          = typename Impl::exec_space_of<T>::type;
 
-  std::array<int, Rank> shape() const {
-    std::array<int, Rank> s;
-    for (int i = 0; i < Rank; ++i) s[i] = handle.extent(i);
+  KOKKOS_FUNCTION Kokkos::Array<int, Rank> shape() const {
+    Kokkos::Array<int, Rank> s{};
+    for (int i = 0; i < Rank; ++i) s[i] = static_cast<int>(handle.extent(i));
     return s;
   }
-  std::array<int32_t, Rank> modes() const { return handle.modes; }
+  KOKKOS_FUNCTION Kokkos::Array<int32_t, Rank> modes() const {
+    return handle.modes;
+  }
 };
 
 // ---------------------------------------------------------------------------
@@ -115,12 +129,12 @@ struct NodeHandle<IntermTag, Storage, IntRank, ExecSpace, HookOp> {
 
   uint32_t id{};
   Storage  storage_;  // Kokkos::View (scratch) OR RegisterArray (register tier)
-  std::array<int, Rank>        shape_;
-  std::array<int32_t, Rank>    modes_;
+  Kokkos::Array<int, Rank>     shape_;
+  Kokkos::Array<int32_t, Rank> modes_;
   [[no_unique_address]] HookOp hook_op;
 
-  std::array<int, Rank>     shape() const { return shape_; }
-  std::array<int32_t, Rank> modes() const { return modes_; }
+  KOKKOS_FUNCTION Kokkos::Array<int, Rank> shape() const { return shape_; }
+  KOKKOS_FUNCTION Kokkos::Array<int32_t, Rank> modes() const { return modes_; }
 };
 
 // ---------------------------------------------------------------------------
@@ -146,7 +160,13 @@ auto make_interm_node(uint32_t id, std::array<int, Rank> shape,
   using NodeType =
       NodeHandle<IntermTag, view_type, std::integral_constant<int, Rank>,
                  ExecSpace, HookOp>;
-  return NodeType{id, view_type{}, shape, modes, std::move(hook)};
+  Kokkos::Array<int, Rank>     kshape{};
+  Kokkos::Array<int32_t, Rank> kmodes{};
+  for (int i = 0; i < Rank; ++i) {
+    kshape[i] = shape[i];
+    kmodes[i] = modes[i];
+  }
+  return NodeType{id, view_type{}, kshape, kmodes, std::move(hook)};
 }
 
 // ---------------------------------------------------------------------------
@@ -166,12 +186,12 @@ struct NodeHandle<ContractionTag, NodeA, NodeB, IntCRank, Scalar, ExecSpace,
 
   NodeA                        node_a;
   NodeB                        node_b;
-  std::array<int32_t, Rank>    modes_;
-  std::array<int, Rank>        shape_;
+  Kokkos::Array<int32_t, Rank> modes_;
+  Kokkos::Array<int, Rank>     shape_;
   [[no_unique_address]] HookOp hook_op;
 
-  std::array<int, Rank>     shape() const { return shape_; }
-  std::array<int32_t, Rank> modes() const { return modes_; }
+  KOKKOS_FUNCTION Kokkos::Array<int, Rank> shape() const { return shape_; }
+  KOKKOS_FUNCTION Kokkos::Array<int32_t, Rank> modes() const { return modes_; }
 };
 
 // ---------------------------------------------------------------------------
@@ -211,7 +231,7 @@ auto make_contraction_node(NodeA a, NodeB b,
   }
 
   // Derive C's shape from input extents
-  std::array<int, Rank> c_shape{};
+  Kokkos::Array<int, Rank> c_shape{};
   for (int i = 0; i < Rank; ++i) {
     int32_t m = out_modes[i];
     if (in_array(m, a_modes, NodeA::Rank)) {
@@ -229,9 +249,12 @@ auto make_contraction_node(NodeA a, NodeB b,
     }
   }
 
+  Kokkos::Array<int32_t, Rank> k_out_modes{};
+  for (int i = 0; i < Rank; ++i) k_out_modes[i] = out_modes[i];
+
   return NodeHandle<ContractionTag, NodeA, NodeB,
                     std::integral_constant<int, Rank>, ActualScalar, ExecSpace,
-                    HookOp>{std::move(a), std::move(b), out_modes, c_shape,
+                    HookOp>{std::move(a), std::move(b), k_out_modes, c_shape,
                             std::move(hook)};
 }
 

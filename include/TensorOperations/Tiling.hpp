@@ -1,5 +1,5 @@
 #pragma once
-#include <array>
+#include <Kokkos_Core.hpp>
 
 namespace TensorOperations {
 
@@ -25,17 +25,17 @@ struct StaticTile {
   static constexpr int rank = sizeof...(Extents);
   static_assert(rank > 0 && ((Extents > 0) && ...),
                 "StaticTile requires at least one positive extent");
-  static constexpr std::array<int, rank> extents{Extents...};
-  static constexpr bool                  is_static = true;
-  static constexpr int extent(int i) { return extents[i]; }  // constexpr
+  static constexpr Kokkos::Array<int, rank> extents{Extents...};
+  static constexpr bool                     is_static = true;
+  KOKKOS_FUNCTION static constexpr int      extent(int i) { return extents[i]; }
 };
 
 template <int Rank>
 struct DynamicTile {
-  static constexpr int  rank      = Rank;
-  static constexpr bool is_static = false;
-  std::array<int, Rank> extents;
-  constexpr int         extent(int i) const { return extents[i]; }  // runtime
+  static constexpr int          rank      = Rank;
+  static constexpr bool         is_static = false;
+  Kokkos::Array<int, Rank>      extents;
+  KOKKOS_FUNCTION constexpr int extent(int i) const { return extents[i]; }
 };
 
 }  // namespace TensorOperations

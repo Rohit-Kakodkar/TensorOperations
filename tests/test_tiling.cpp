@@ -104,8 +104,7 @@ struct Doubler {
 TEST(TilingTest, InputStagerContiguous) {
   auto inp =
       make_input_node(make_handle(Grid4x4{}, std::array<int32_t, 2>{'i', 'j'}));
-  using Eval = Evaluator<RangePolicyTag, decltype(inp), StaticTile<2, 2>>;
-  Eval ev{inp};  // tiling + layout default-constructed (stride 1 = contiguous)
+  auto ev = make_evaluator<RangePolicyTag>(inp, StaticTile<2, 2>{});
 
   auto        node = ev({2, 1});  // tile origin (2,1)
   const auto& regs = node.storage_;
@@ -121,8 +120,8 @@ TEST(TilingTest, InputStagerContiguous) {
 TEST(TilingTest, InputStagerStaggered) {
   auto inp =
       make_input_node(make_handle(Grid4x4{}, std::array<int32_t, 2>{'i', 'j'}));
-  using Eval = Evaluator<RangePolicyTag, decltype(inp), StaticTile<2, 2>>;
-  Eval ev{inp, {}, StridedLayout<2>{{1, 2}}};
+  auto ev   = make_evaluator<RangePolicyTag>(inp, StaticTile<2, 2>{});
+  ev.layout = StridedLayout<2>{{1, 2}};
 
   auto        node = ev({0, 0});
   const auto& regs = node.storage_;
@@ -138,8 +137,7 @@ TEST(TilingTest, InputStagerStaggered) {
 TEST(TilingTest, InputStagerAppliesHook) {
   auto inp = make_input_node(
       make_handle(Grid4x4{}, std::array<int32_t, 2>{'i', 'j'}), Doubler{});
-  using Eval = Evaluator<RangePolicyTag, decltype(inp), StaticTile<2, 2>>;
-  Eval ev{inp};
+  auto ev = make_evaluator<RangePolicyTag>(inp, StaticTile<2, 2>{});
 
   auto        node = ev({0, 0});
   const auto& regs = node.storage_;

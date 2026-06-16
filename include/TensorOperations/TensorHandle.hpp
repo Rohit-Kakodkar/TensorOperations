@@ -1,5 +1,6 @@
 #pragma once
 #include <TensorOperations/Concept.hpp>
+#include <Kokkos_Core.hpp>
 #include <array>
 #include <cstdint>
 
@@ -9,10 +10,12 @@ template <TensorLike T>
 struct TensorHandle : T {
   static constexpr int Rank = static_cast<int>(T::rank);
 
-  std::array<int32_t, Rank> modes;
+  Kokkos::Array<int32_t, Rank> modes;
 
   explicit TensorHandle(T base, std::array<int32_t, Rank> modes_)
-      : T(std::move(base)), modes(modes_) {}
+      : T(std::move(base)) {
+    for (int i = 0; i < Rank; ++i) modes[i] = modes_[i];
+  }
 };
 
 template <TensorLike T>
