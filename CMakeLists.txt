@@ -24,6 +24,9 @@ FetchContent_MakeAvailable(googletest)
 add_library(tensor INTERFACE)
 target_include_directories(tensor INTERFACE include/)
 target_link_libraries(tensor INTERFACE Kokkos::kokkos)
+target_compile_features(tensor INTERFACE cxx_std_20)
+target_compile_options(tensor INTERFACE
+    $<$<OR:$<CXX_COMPILER_ID:Clang>,$<CXX_COMPILER_ID:AppleClang>>:-fbracket-depth=2048>)
 
 enable_testing()
 include(GoogleTest)
@@ -71,8 +74,3 @@ gtest_discover_tests(test_contraction_eval)
 # Benchmark: naive RangePolicy vs library tiled contraction
 add_executable(bench_contraction benchmarks/bench_contraction.cpp)
 target_link_libraries(bench_contraction PRIVATE tensor)
-# The library's fill_slots uses a fold expression over all register-array slots.
-# Clang's default bracket-nesting depth (256) is too shallow for tiles with
-# more than 256 elements; raise it for this target only.
-target_compile_options(bench_contraction PRIVATE
-    $<$<OR:$<CXX_COMPILER_ID:Clang>,$<CXX_COMPILER_ID:AppleClang>>:-fbracket-depth=2048>)
