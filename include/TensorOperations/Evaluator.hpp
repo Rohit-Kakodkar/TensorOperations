@@ -3,11 +3,11 @@
 #include <TensorOperations/NodeHandle.hpp>
 #include <TensorOperations/RegisterArray.hpp>
 #include <TensorOperations/Tiling.hpp>
+#include <TensorOperations/Macros.hpp>
 #include <array>
 #include <utility>
 
 #include <Kokkos_Core.hpp>
-
 namespace TensorOperations {
 
 // ---------------------------------------------------------------------------
@@ -298,8 +298,7 @@ struct Evaluator<RangePolicyTag,
       const auto a_shape = node.node_a.shape();  // contracted extents (GEMM)
       for (int i = 0; i < NumK; ++i) kext[i] = a_shape[FreeA + i];
     }
-    std::array<int, NumK> k_off{};
-    reduce_contracted<0>(c_tile_offset, k_off, kext, acc);
+    reduce_contracted(c_tile_offset, kext, acc);
 
     result_type out{};
     out.storage_ = acc;
@@ -313,26 +312,40 @@ struct Evaluator<RangePolicyTag,
   // Nested loop over the contracted modes (compile-time depth NumK, runtime
   // extents, compile-time tile step — no modulo/division). At the base case the
   // assembled A/B offsets feed one local GEMM block.
-  template <int I>
   KOKKOS_FUNCTION void reduce_contracted(std::array<int, RankC>       c_off,
-                                         std::array<int, NumK>&       k_off,
                                          const std::array<int, NumK>& kext,
                                          accumulator_t& acc) const {
-    if constexpr (I == NumK) {
-      std::array<int, P> part_off{};  // [free.., contracted..]
-      for (int d = 0; d < RankC; ++d) part_off[d] = c_off[d];
-      for (int i = 0; i < NumK; ++i) part_off[RankC + i] = k_off[i];
-      std::array<int, RankA> a_off{};
-      for (int j = 0; j < RankA; ++j) a_off[j] = part_off[a_pos[j]];
-      std::array<int, RankB> b_off{};
-      for (int j = 0; j < RankB; ++j) b_off[j] = part_off[b_pos[j]];
-      accumulate_block(a_off, b_off, acc);
-    } else {
-      constexpr int TileK = tiling_type::extent(RankC + I);
-      for (int off = 0; off < kext[I]; off += TileK) {
-        k_off[I] = off;
-        reduce_contracted<I + 1>(c_off, k_off, kext, acc);
-      }
+    std::array<int, NumK> k_off{};
+    reduce_contracted_impl(c_off, k_off, kext, acc,
+                           std::make_index_sequence<NumK>{});
+  }
+
+  // Base case: all contracted modes stepped; assemble offsets and accumulate.
+  KOKKOS_FUNCTION void reduce_contracted_impl(
+      const std::array<int, RankC>& c_off, std::array<int, NumK>& k_off,
+      const std::array<int, NumK>& /*kext*/, accumulator_t&       acc,
+      std::index_sequence<>) const {
+    std::array<int, P> part_off{};  // [free.., contracted..]
+    for (int d = 0; d < RankC; ++d) part_off[d] = c_off[d];
+    for (int i = 0; i < NumK; ++i) part_off[RankC + i] = k_off[i];
+    std::array<int, RankA> a_off{};
+    for (int j = 0; j < RankA; ++j) a_off[j] = part_off[a_pos[j]];
+    std::array<int, RankB> b_off{};
+    for (int j = 0; j < RankB; ++j) b_off[j] = part_off[b_pos[j]];
+    accumulate_block(a_off, b_off, acc);
+  }
+
+  // Recursive case: peel the head index I, loop over that contracted mode.
+  template <std::size_t I, std::size_t... Rest>
+  KOKKOS_FUNCTION void reduce_contracted_impl(
+      const std::array<int, RankC>& c_off, std::array<int, NumK>& k_off,
+      const std::array<int, NumK>& kext, accumulator_t& acc,
+      std::index_sequence<I, Rest...>) const {
+    constexpr int TileK = tiling_type::extent(RankC + I);
+    for (int off = 0; off < kext[I]; off += TileK) {
+      k_off[I] = off;
+      reduce_contracted_impl(c_off, k_off, kext, acc,
+                             std::index_sequence<Rest...>{});
     }
   }
 
@@ -346,13 +359,14 @@ struct Evaluator<RangePolicyTag,
     const auto a_regs = stage_a(a_off).storage_;
     const auto b_regs = stage_b(b_off).storage_;
 
-    for (int fa = 0; fa < SA; ++fa)
+    for (int fa = 0; fa < SA; ++fa) {
       for (int fb = 0; fb < SB; ++fb) {
         value_type acc = result.data_[fa * SB + fb];
         for (int kk = 0; kk < SK; ++kk)
           acc += a_regs.data_[fa * SK + kk] * b_regs.data_[kk * SB + fb];
         result.data_[fa * SB + fb] = acc;
       }
+    }
   }
 };
 
@@ -390,13 +404,14 @@ struct Evaluator<TeamPolicyTag,
 };
 
 // ---------------------------------------------------------------------------
-// Specialization 5: RangePolicyTag + IntermTag(RegisterArray) — store-evaluator
+// Specialization 5: RangePolicyTag + IntermTag(RegisterArray) —
+// store-evaluator
 // ---------------------------------------------------------------------------
-// Overwrite-drains a finished register-tier output tile into a destination view
-// at a given global offset, applying the node's hook at store time. The Tiling
-// parameter is unused (the tile shape lives in the RegisterArray storage).
-// Assumes the destination extents are divisible by the tile extents; a boundary
-// guard skips slots that fall outside the view.
+// Overwrite-drains a finished register-tier output tile into a destination
+// view at a given global offset, applying the node's hook at store time. The
+// Tiling parameter is unused (the tile shape lives in the RegisterArray
+// storage). Assumes the destination extents are divisible by the tile
+// extents; a boundary guard skips slots that fall outside the view.
 template <typename V, int... E, typename IntRank, typename ES, typename HookOp,
           typename Tiling>
 struct Evaluator<
