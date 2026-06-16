@@ -147,6 +147,28 @@ TEST(TilingTest, InputStagerAppliesHook) {
   EXPECT_FLOAT_EQ((regs(1, 1)), 2.f * 5.f);  // 2 * Grid4x4(1,1)
 }
 
+// A 512-element fake tensor to exercise fill_slots at the documented maximum.
+struct LargeGrid {
+  static constexpr int rank = 2;
+  using value_type          = float;
+  int   extent(int) const { return 512; }
+  float operator()(int i, int j) const { return 0.f; }
+};
+
+// ---------------------------------------------------------------------------
+// Regression: fill_slots must compile for a 512-element (16x32) RegisterArray.
+// Clang's bracket-depth limit was raised to 2048 in CMakeLists for exactly
+// this — instantiating the fold over 512 slots is the stress case.
+// ---------------------------------------------------------------------------
+TEST(TilingTest, LargeRegisterViewFillSlotsCompiles) {
+  auto inp = make_input_node(
+      make_handle(LargeGrid{}, std::array<int32_t, 2>{'i', 'j'}));
+  auto ev = make_evaluator<RangePolicyTag>(inp, StaticTile<16, 32>{});
+  static_assert(decltype(ev)::register_array_t::size == 512);
+  auto node = ev({0, 0});  // instantiates fill_slots over all 512 slots
+  SUCCEED();
+}
+
 int main(int argc, char* argv[]) {
   ::testing::InitGoogleTest(&argc, argv);
   Kokkos::initialize(argc, argv);
