@@ -261,6 +261,17 @@ struct Evaluator<RangePolicyTag,
 
   static constexpr int P = RankC + NumK;  // participating-mode count
 
+  // Register block (micro-kernel) dims, decoupled from the tile (SA x SB). The
+  // hot accumulator working set is one MR x NR block, kept register-resident
+  // even when the full SA x SB tile accumulator would spill. Tunable here.
+  static constexpr int MR0 = 4;  // preferred register-block rows
+  static constexpr int NR0 =
+      8;  // preferred register-block lanes (contiguous SB)
+  static constexpr int MR = SA < MR0 ? SA : MR0;
+  static constexpr int NR = SB < NR0 ? SB : NR0;
+  static_assert(SA % MR == 0 && SB % NR == 0,
+                "tile free extents must be divisible by the register block");
+
  public:
   // The C accumulator over the free (output) modes.
   using accumulator_t = Impl::project_regs_t<value_type, tiling_type, c_pos>;
@@ -339,7 +350,9 @@ struct Evaluator<RangePolicyTag,
   }
 
   // Stage the A-tile at `a_off` and B-tile at `b_off` into registers, then
-  // accumulate their contraction into `result` (one contracted block).
+  // accumulate their contraction into `result` (one contracted block). The
+  // SA x SB accumulator is walked as a grid of MR x NR register blocks; each
+  // block is computed by a register-resident, vectorized micro-kernel.
   KOKKOS_FUNCTION void accumulate_block(Kokkos::Array<int, RankA> a_off,
                                         Kokkos::Array<int, RankB> b_off,
                                         accumulator_t& result) const {
@@ -348,14 +361,69 @@ struct Evaluator<RangePolicyTag,
     const auto a_regs = stage_a(a_off).storage_;
     const auto b_regs = stage_b(b_off).storage_;
 
-    for (int fa = 0; fa < SA; ++fa) {
-      for (int fb = 0; fb < SB; ++fb) {
-        value_type acc = result.data_[fa * SB + fb];
-        for (int kk = 0; kk < SK; ++kk)
-          acc += a_regs.data_[fa * SK + kk] * b_regs.data_[kk * SB + fb];
-        result.data_[fa * SB + fb] = acc;
-      }
-    }
+    accumulate_blocks(a_regs, b_regs, result,
+                      std::make_index_sequence<(SA / MR) * (SB / NR)>{});
+  }
+
+  // Register block type: row-major MR x NR, flat data_[mr * NR + nr].
+  using block_t = RegisterArray<value_type, MR, NR>;
+
+  // Copy the MR x NR sub-block at (IA, IB) between `result` and a local block.
+  // All indices are compile-time constants, so the block stays
+  // register-resident.
+  template <int IA, int IB, std::size_t... Pos>
+  KOKKOS_FORCEINLINE_FUNCTION void mk_load(const accumulator_t& result,
+                                           block_t&             c,
+                                           std::index_sequence<Pos...>) const {
+    ((c.data_[Pos] =
+          result.data_[(IA + int(Pos) / NR) * SB + (IB + int(Pos) % NR)]),
+     ...);
+  }
+  template <int IA, int IB, std::size_t... Pos>
+  KOKKOS_FORCEINLINE_FUNCTION void mk_store(const block_t& c,
+                                            accumulator_t& result,
+                                            std::index_sequence<Pos...>) const {
+    ((result.data_[(IA + int(Pos) / NR) * SB + (IB + int(Pos) % NR)] =
+          c.data_[Pos]),
+     ...);
+  }
+
+  // One contracted-step rank-1 update of the whole MR x NR block: for every
+  // (mi, ni) in the block, c[mi,ni] += A[(IA+mi), kk] * B[kk, (IB+ni)]. mi/ni
+  // are compile-time (the fold over Pos); only kk is runtime. The ni lanes are
+  // contiguous in both b_regs and c, so this becomes a broadcast-A vector FMA.
+  template <int IA, int IB, std::size_t... Pos>
+  KOKKOS_FORCEINLINE_FUNCTION void mk_kstep(const a_array_t& a,
+                                            const b_array_t& b, int kk,
+                                            block_t& c,
+                                            std::index_sequence<Pos...>) const {
+    ((c.data_[Pos] += a.data_[(IA + int(Pos) / NR) * SK + kk] *
+                      b.data_[kk * SB + (IB + int(Pos) % NR)]),
+     ...);
+  }
+
+  // Compute the MR x NR register block whose origin in the tile is (IA, IB).
+  template <int IA, int IB>
+  KOKKOS_FORCEINLINE_FUNCTION void micro_kernel(const a_array_t& a,
+                                                const b_array_t& b,
+                                                accumulator_t&   result) const {
+    block_t c{};
+    mk_load<IA, IB>(result, c, std::make_index_sequence<MR * NR>{});
+    TENSOR_PRAGMA_UNROLL
+    for (int kk = 0; kk < SK; ++kk)
+      mk_kstep<IA, IB>(a, b, kk, c, std::make_index_sequence<MR * NR>{});
+    mk_store<IA, IB>(c, result, std::make_index_sequence<MR * NR>{});
+  }
+
+  // Unroll the MR x NR block grid over the SA x SB accumulator (compile-time
+  // origins). Q decodes to block-row (IA) and block-col (IB).
+  template <std::size_t... Q>
+  KOKKOS_FORCEINLINE_FUNCTION void accumulate_blocks(
+      const a_array_t& a, const b_array_t& b, accumulator_t& result,
+      std::index_sequence<Q...>) const {
+    constexpr int NBcol = SB / NR;
+    (micro_kernel<(int(Q) / NBcol) * MR, (int(Q) % NBcol) * NR>(a, b, result),
+     ...);
   }
 };
 
