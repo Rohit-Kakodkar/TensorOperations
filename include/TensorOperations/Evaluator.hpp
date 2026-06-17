@@ -4,10 +4,12 @@
 #include <TensorOperations/RegisterArray.hpp>
 #include <TensorOperations/Tiling.hpp>
 #include <TensorOperations/Macros.hpp>
+#include <TensorOperations/TimingInstrumentation.hpp>
 #include <array>
 #include <utility>
 
 #include <Kokkos_Core.hpp>
+#include <Kokkos_SIMD.hpp>
 namespace TensorOperations {
 
 // ---------------------------------------------------------------------------
@@ -51,6 +53,41 @@ RegisterArray<V, Tile::extent(static_cast<int>(Pos[I]))...> project_regs_fn(
 template <typename V, typename Tile, auto Pos>
 using project_regs_t = decltype(project_regs_fn<V, Tile, Pos>(
     std::make_index_sequence<Pos.size()>{}));
+
+// Outer slot decomposition shared by the gather (Spec 1) and store (Spec 5)
+// fast paths. ArrayType is RegisterArray<V,E...>; F is the compile-time
+// fast-varying dim (chosen to match the source/destination view's contiguous
+// dim). OuterFn computes gidx[d] for the outer (non-F) modes from (d, local);
+// InnerFn receives (slot, gidx) and performs the actual load or store.
+// NOTE: lambdas are fine on the Serial CPU backend. If a GPU backend is added,
+// replace the lambda arguments with KOKKOS_LAMBDA or explicit function objects.
+template <typename ArrayType, std::size_t F, int Rank,
+          typename OuterFn, typename InnerFn>
+KOKKOS_FORCEINLINE_FUNCTION void traverse_along(
+    const Kokkos::Array<int, Rank>& off, OuterFn outer_fn, InnerFn inner_fn) {
+  constexpr int Fi    = static_cast<int>(F);
+  constexpr int EF    = ArrayType::extent(Fi);
+  constexpr int RSF   = static_cast<int>(ArrayType::strides_[F]);
+  constexpr int Outer = static_cast<int>(ArrayType::size) / EF;
+  for (int o = 0; o < Outer; ++o) {
+    Kokkos::Array<int, Rank> gidx{};
+    int                      base_slot = 0;
+    int                      rem       = o;
+    for (int d = Rank - 1; d >= 0; --d) {
+      if (d == Fi) continue;
+      const int e     = ArrayType::extent(d);
+      const int local = rem % e;
+      rem /= e;
+      gidx[d]    = outer_fn(d, local);
+      base_slot += local * static_cast<int>(ArrayType::strides_[d]);
+    }
+    TENSOR_PRAGMA_UNROLL
+    for (int c = 0; c < EF; ++c) {
+      gidx[Fi] = off[Fi] + c;
+      inner_fn(base_slot + c * RSF, gidx);
+    }
+  }
+}
 
 }  // namespace Impl
 
@@ -108,15 +145,86 @@ struct Evaluator<RangePolicyTag, NodeHandle<InputTag, T, HookOp>,
   // IntermTag tile node.
   KOKKOS_FUNCTION result_type
   operator()(Kokkos::Array<int, Rank> tile_offset) const {
+    TIMING_SCOPE_ENTER(g_timing_stats.input_stage_load_time, g_timing_stats.input_stage_load_count);
     result_type out{};
     for (int d = 0; d < Rank; ++d) out.shape_[d] = tiling_type::extent(d);
     out.modes_ = node.modes();
-    fill_slots(tile_offset, out.storage_,
-               std::make_index_sequence<register_array_t::size>{});
+    fill(tile_offset, out.storage_);
+    TIMING_SCOPE_EXIT(g_timing_stats.input_stage_load_time, g_timing_stats.input_stage_load_count);
     return out;
   }
 
  private:
+  // ---- layout-aware staging -------------------------------------------------
+  // Pick the input view's contiguous mode F (compile-time for LayoutRight/Left,
+  // runtime argmin over the strides for LayoutStride) and gather slots in runs
+  // along F so the per-run reads are sequential in memory. The RegisterArray
+  // storage stays row-major: this only permutes the *visit order* of slots, so
+  // results are bit-identical to the per-element `fill_slots` fallback. The
+  // fast path assumes a unit slot->global step along F (`layout[F] == 1`, the
+  // default); a non-unit / staggered layout falls back to `fill_slots`.
+  KOKKOS_FORCEINLINE_FUNCTION void fill(const Kokkos::Array<int, Rank>& off,
+                                        register_array_t& result) const {
+    if constexpr (Impl::is_layout_stride_v<T>) {
+      // Runtime: make the smallest-stride dimension vary fastest.
+      int  f    = 0;
+      auto best = node.handle.stride(0);
+      for (int d = 1; d < Rank; ++d) {
+        const auto s = node.handle.stride(d);
+        if (s < best) { best = s; f = d; }
+      }
+      if (layout[f] == 1)
+        fill_dispatch(f, off, result, std::make_index_sequence<Rank>{});
+      else
+        fill_slots(off, result,
+                   std::make_index_sequence<register_array_t::size>{});
+    } else if constexpr (Impl::is_layout_left_v<T>) {
+      if (layout[0] == 1)
+        fill_along<0>(off, result);
+      else
+        fill_slots(off, result,
+                   std::make_index_sequence<register_array_t::size>{});
+    } else {  // LayoutRight or a plain grid type (defaults to row-major)
+      if (layout[Rank - 1] == 1)
+        fill_along<Rank - 1>(off, result);
+      else
+        fill_slots(off, result,
+                   std::make_index_sequence<register_array_t::size>{});
+    }
+  }
+
+  // Gather every slot with mode F varying in the (contiguous) inner run. The
+  // inner trip count and the register stride along F are compile-time, so with
+  // a unit memory step the compiler emits packed loads.
+  template <std::size_t F>
+  KOKKOS_FORCEINLINE_FUNCTION void fill_along(const Kokkos::Array<int, Rank>& off,
+                                              register_array_t& result) const {
+    Impl::traverse_along<register_array_t, F, Rank>(
+        off,
+        [&](int d, int local) { return off[d] + local * layout[d]; },
+        [&](int slot, const Kokkos::Array<int, Rank>& gidx) {
+          result.data_[slot] = Impl::apply_hook(
+              node.hook_op, read_handle(gidx, std::make_index_sequence<Rank>{}));
+        });
+  }
+
+  // Runtime F dispatch (LayoutStride): exactly one compile-time `fill_along`
+  // runs for the chosen fastest-varying dimension.
+  template <std::size_t... K>
+  KOKKOS_FORCEINLINE_FUNCTION void fill_dispatch(
+      int f, const Kokkos::Array<int, Rank>& off, register_array_t& result,
+      std::index_sequence<K...>) const {
+    ((f == static_cast<int>(K) ? fill_along<K>(off, result) : void()), ...);
+  }
+
+  template <std::size_t... D>
+  KOKKOS_FORCEINLINE_FUNCTION value_type
+  read_handle(const Kokkos::Array<int, Rank>& gidx,
+              std::index_sequence<D...>) const {
+    return node.handle(gidx[D]...);
+  }
+
+  // ---- per-element fallback (any layout) ------------------------------------
   // Compile-time local index of register slot S along mode D (row-major
   // decode).
   template <std::size_t S, std::size_t D>
@@ -279,6 +387,7 @@ struct Evaluator<RangePolicyTag,
   // finished tile node (hook carried, applied at store).
   KOKKOS_FUNCTION result_type
   operator()(Kokkos::Array<int, RankC> c_tile_offset) const {
+    TIMING_SCOPE_ENTER(g_timing_stats.contraction_accum_time, g_timing_stats.contraction_accum_count);
     accumulator_t acc{};
     acc.fill(value_type{0});
 
@@ -294,6 +403,7 @@ struct Evaluator<RangePolicyTag,
     for (int d = 0; d < RankC; ++d) out.shape_[d] = tiling_type::extent(d);
     out.modes_  = node.modes();
     out.hook_op = node.hook_op;  // carried; applied by the overwrite store
+    TIMING_SCOPE_EXIT(g_timing_stats.contraction_accum_time, g_timing_stats.contraction_accum_count);
     return out;
   }
 
@@ -343,18 +453,46 @@ struct Evaluator<RangePolicyTag,
   KOKKOS_FUNCTION void accumulate_block(Kokkos::Array<int, RankA> a_off,
                                         Kokkos::Array<int, RankB> b_off,
                                         accumulator_t& result) const {
+
+    TIMING_SCOPE_ENTER(g_timing_stats.contraction_block_load_time, g_timing_stats.contraction_block_load_count);
     auto stage_a = make_evaluator<RangePolicyTag>(node.node_a, a_tile_type{});
     auto stage_b = make_evaluator<RangePolicyTag>(node.node_b, b_tile_type{});
-    const auto a_regs = stage_a(a_off).storage_;
-    const auto b_regs = stage_b(b_off).storage_;
+    const auto &a_regs = stage_a(a_off).storage_;
+    const auto &b_regs = stage_b(b_off).storage_;
+    TIMING_SCOPE_EXIT(g_timing_stats.contraction_block_load_time, g_timing_stats.contraction_block_load_count);
+    
 
-    for (int fa = 0; fa < SA; ++fa) {
-      for (int fb = 0; fb < SB; ++fb) {
-        value_type acc = result.data_[fa * SB + fb];
-        for (int kk = 0; kk < SK; ++kk)
-          acc += a_regs.data_[fa * SK + kk] * b_regs.data_[kk * SB + fb];
-        result.data_[fa * SB + fb] = acc;
+    {
+      TIMING_SCOPE_ENTER(g_timing_stats.contraction_compute_time, g_timing_stats.contraction_compute_count);
+      namespace KE    = Kokkos::Experimental;
+      using simd_t    = KE::simd<value_type>;
+      using mask_t    = typename simd_t::mask_type;
+      constexpr int W = static_cast<int>(simd_t::size());
+      for (int fa = 0; fa < SA; ++fa) {
+        int fb0 = 0;
+        for (; fb0 + W <= SB; fb0 += W) {
+          simd_t acc(&result.data_[fa * SB + fb0], KE::simd_flag_default);
+          for (int kk = 0; kk < SK; ++kk) {
+            const simd_t bvec(&b_regs.data_[kk * SB + fb0], KE::simd_flag_default);
+            acc = simd_t(a_regs.data_[fa * SK + kk]) * bvec + acc;
+          }
+          KE::simd_unchecked_store(acc, &result.data_[fa * SB + fb0],
+                                   KE::simd_flag_default);
+        }
+        if (fb0 < SB) {
+          const mask_t mask([&](auto lane) { return fb0 + int(lane) < SB; });
+          simd_t       acc = KE::simd_partial_load(&result.data_[fa * SB + fb0],
+                                                   mask, KE::simd_flag_default);
+          for (int kk = 0; kk < SK; ++kk) {
+            const simd_t bvec = KE::simd_partial_load(
+                &b_regs.data_[kk * SB + fb0], mask, KE::simd_flag_default);
+            acc = simd_t(a_regs.data_[fa * SK + kk]) * bvec + acc;
+          }
+          KE::simd_partial_store(acc, &result.data_[fa * SB + fb0], mask,
+                                 KE::simd_flag_default);
+        }
       }
+      TIMING_SCOPE_EXIT(g_timing_stats.contraction_compute_time, g_timing_stats.contraction_compute_count);
     }
   }
 };
@@ -426,10 +564,73 @@ struct Evaluator<
   template <typename ViewT>
   KOKKOS_FUNCTION void operator()(Kokkos::Array<int, Rank> offset,
                                   const ViewT&             view) const {
-    store_slots(offset, view, std::make_index_sequence<storage_type::size>{});
+    TIMING_SCOPE_ENTER(g_timing_stats.store_write_time, g_timing_stats.store_write_count);
+    store(offset, view);
+    TIMING_SCOPE_EXIT(g_timing_stats.store_write_time, g_timing_stats.store_write_count);
   }
 
  private:
+  // ---- layout-aware draining ------------------------------------------------
+  // A fully-interior tile (no mode hangs off the view edge) needs no bounds
+  // guard, so drain it in contiguous runs along the view's fastest dimension F.
+  // Storage stays row-major (only the visit order is permuted), so results are
+  // bit-identical to the guarded `store_slots` fallback. Boundary tiles take
+  // the guarded path.
+  template <typename ViewT>
+  KOKKOS_FORCEINLINE_FUNCTION void store(const Kokkos::Array<int, Rank>& off,
+                                         const ViewT& view) const {
+    bool interior = true;
+    for (int d = 0; d < Rank; ++d)
+      if (off[d] + storage_type::extent(d) > static_cast<int>(view.extent(d)))
+        interior = false;
+    if (!interior) {
+      store_slots(off, view, std::make_index_sequence<storage_type::size>{});
+      return;
+    }
+    if constexpr (Impl::is_layout_stride_v<ViewT>) {
+      int  f    = 0;
+      auto best = view.stride(0);
+      for (int d = 1; d < Rank; ++d) {
+        const auto s = view.stride(d);
+        if (s < best) { best = s; f = d; }
+      }
+      store_dispatch(f, off, view, std::make_index_sequence<Rank>{});
+    } else if constexpr (Impl::is_layout_left_v<ViewT>) {
+      store_along<0>(off, view);
+    } else {  // LayoutRight or default
+      store_along<Rank - 1>(off, view);
+    }
+  }
+
+  // Drain every slot with mode F varying in the (contiguous) inner run.
+  template <std::size_t F, typename ViewT>
+  KOKKOS_FORCEINLINE_FUNCTION void store_along(const Kokkos::Array<int, Rank>& off,
+                                               const ViewT& view) const {
+    Impl::traverse_along<storage_type, F, Rank>(
+        off,
+        [&](int d, int local) { return off[d] + local; },
+        [&](int slot, const Kokkos::Array<int, Rank>& gidx) {
+          write_handle(view, gidx,
+                       Impl::apply_hook(node.hook_op, node.storage_.data_[slot]),
+                       std::make_index_sequence<Rank>{});
+        });
+  }
+
+  template <std::size_t... K, typename ViewT>
+  KOKKOS_FORCEINLINE_FUNCTION void store_dispatch(
+      int f, const Kokkos::Array<int, Rank>& off, const ViewT& view,
+      std::index_sequence<K...>) const {
+    ((f == static_cast<int>(K) ? store_along<K>(off, view) : void()), ...);
+  }
+
+  template <typename ViewT, std::size_t... D>
+  KOKKOS_FORCEINLINE_FUNCTION void write_handle(
+      const ViewT& view, const Kokkos::Array<int, Rank>& gidx, value_type v,
+      std::index_sequence<D...>) const {
+    view(gidx[D]...) = v;
+  }
+
+  // ---- per-element guarded fallback (boundary tiles) ------------------------
   // Compile-time local index of register slot S along mode D (row-major
   // decode).
   template <std::size_t S, std::size_t D>

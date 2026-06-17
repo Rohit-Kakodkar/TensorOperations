@@ -4,12 +4,17 @@ project(TensorKokkos CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+option(TENSOR_OPS_ENABLE_TIMING "Enable timing instrumentation for evaluator operations" OFF)
+
 include(FetchContent)
 
 FetchContent_Declare(
     kokkos
     GIT_REPOSITORY https://github.com/kokkos/kokkos.git
-    GIT_TAG        5.1.1
+    # develop (not a tagged release): needed for kokkos/kokkos#9184, which fixes
+    # an alignment bug in simd_partial_load/store used by the GEMM micro-kernel's
+    # masked-remainder path. The fix is merged but downstream of the 5.1.1 tag.
+    GIT_TAG        develop
 )
 FetchContent_MakeAvailable(kokkos)
 
@@ -27,6 +32,10 @@ target_link_libraries(tensor INTERFACE Kokkos::kokkos)
 target_compile_features(tensor INTERFACE cxx_std_20)
 target_compile_options(tensor INTERFACE
     $<$<OR:$<CXX_COMPILER_ID:Clang>,$<CXX_COMPILER_ID:AppleClang>>:-fbracket-depth=2048>)
+
+if(TENSOR_OPS_ENABLE_TIMING)
+  target_compile_definitions(tensor INTERFACE TENSOR_OPS_ENABLE_TIMING)
+endif()
 
 enable_testing()
 include(GoogleTest)
@@ -70,6 +79,11 @@ gtest_discover_tests(test_tiling)
 add_executable(test_contraction_eval tests/test_contraction_eval.cpp)
 target_link_libraries(test_contraction_eval PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_contraction_eval)
+
+# test_layout_staging — custom main() wraps Kokkos init/finalize
+add_executable(test_layout_staging tests/test_layout_staging.cpp)
+target_link_libraries(test_layout_staging PRIVATE tensor GTest::gtest)
+gtest_discover_tests(test_layout_staging)
 
 # Benchmark: naive RangePolicy vs library tiled contraction
 add_executable(bench_contraction benchmarks/bench_contraction.cpp)

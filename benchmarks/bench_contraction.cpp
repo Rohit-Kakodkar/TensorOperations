@@ -2,6 +2,8 @@
 #include <TensorOperations/Evaluator.hpp>
 #include <TensorOperations/Graph.hpp>
 #include <TensorOperations/Tiling.hpp>
+#include <TensorOperations/TimingInstrumentation.hpp>
+#include <TensorOperations/TimingAnalysis.hpp>
 
 #include <cmath>
 #include <cstdio>
@@ -18,8 +20,10 @@ using namespace TensorOperations;
 constexpr int J = 8;
 constexpr int K = 8;
 
-using View2 = Kokkos::View<float**, Kokkos::LayoutRight>;
-using View3 = Kokkos::View<float***, Kokkos::LayoutRight>;
+using View2  = Kokkos::View<float**, Kokkos::LayoutRight>;
+using View3  = Kokkos::View<float***, Kokkos::LayoutRight>;
+using View2L = Kokkos::View<float**, Kokkos::LayoutLeft>;
+using View3L = Kokkos::View<float***, Kokkos::LayoutLeft>;
 
 // ---------------------------------------------------------------------------
 // Naive: one output element per work item, no data reuse between work items.
@@ -31,10 +35,11 @@ using View3 = Kokkos::View<float***, Kokkos::LayoutRight>;
 // cache (large problem) every pass is paid in memory bandwidth — that is the
 // regime tiling is built to win.
 // ---------------------------------------------------------------------------
-struct NaiveFunctor {
-  View3 A, B;
-  View2 C;
-  int   L;
+template <typename Layout>
+struct NaiveFunctorT {
+  Kokkos::View<float***, Layout> A, B;
+  Kokkos::View<float**, Layout>  C;
+  int                            L;
 
   KOKKOS_FUNCTION void operator()(int flat) const {
     const int i   = flat / L;
@@ -46,20 +51,25 @@ struct NaiveFunctor {
   }
 };
 
-double bench_naive(const View3& A, const View3& B, const View2& C, int warmup,
-                   int iters) {
+// With LayoutLeft inputs the naive inner loop (k innermost) strides across
+// memory at step I*J for A and J for B — cache-hostile even in the small case.
+template <typename Layout = Kokkos::LayoutRight>
+double bench_naive(const Kokkos::View<float***, Layout>& A,
+                   const Kokkos::View<float***, Layout>& B,
+                   const Kokkos::View<float**, Layout>&  C,
+                   int warmup, int iters) {
   const int I = static_cast<int>(C.extent(0));
   const int L = static_cast<int>(C.extent(1));
   for (int w = 0; w < warmup; ++w) {
     Kokkos::parallel_for("naive_warmup", Kokkos::RangePolicy<>(0, I * L),
-                         NaiveFunctor{A, B, C, L});
+                         NaiveFunctorT<Layout>{A, B, C, L});
     Kokkos::fence();
   }
   Kokkos::fence();
   Kokkos::Timer timer;
   for (int r = 0; r < iters; ++r)
     Kokkos::parallel_for("naive", Kokkos::RangePolicy<>(0, I * L),
-                         NaiveFunctor{A, B, C, L});
+                         NaiveFunctorT<Layout>{A, B, C, L});
   Kokkos::fence();
   return timer.seconds() * 1000.0 / iters;
 }
@@ -75,9 +85,12 @@ double bench_naive(const View3& A, const View3& B, const View2& C, int warmup,
 // I/TileI times total (vs I naive). That reduction only turns into wall-clock
 // savings when those repeated reads would otherwise miss cache.
 // ---------------------------------------------------------------------------
-template <int TileI, int TileL, int TileJ = J, int TileK = K>
-double bench_library(const View3& A, const View3& B, const View2& C, int warmup,
+template <int TileI, int TileL, int TileJ = J, int TileK = K,
+          typename VA, typename VB, typename VC>
+double bench_library(const VA& A, const VB& B, const VC& C, int warmup,
                      int iters) {
+
+  g_timing_stats.reset();
   auto hA =
       make_input_node(make_handle(A, std::array<int32_t, 3>{'i', 'j', 'k'}));
   auto hB =
@@ -94,10 +107,20 @@ double bench_library(const View3& A, const View3& B, const View2& C, int warmup,
     Kokkos::fence();
   }
   Kokkos::fence();
+  // Reset counters AFTER warmup so the cycle counts cover exactly the timed
+  // iterations — matching the wall_ms anchor passed to the analyzer below.
+  g_timing_stats.reset();
   Kokkos::Timer timer;
   for (int r = 0; r < iters; ++r) g1.execute(RangePolicyTag{}, tile, C);
   Kokkos::fence();
-  return timer.seconds() * 1000.0 / iters;
+  double ms      = timer.seconds() * 1000.0 / iters;
+  double wall_ms = ms * iters;  // total wall time across the timed iterations
+
+#if defined(TENSOR_OPS_ENABLE_TIMING)
+  TensorOperations::TimingAnalyzer::print_detailed_analysis(g_timing_stats,
+                                                            wall_ms);
+#endif
+  return ms;
 }
 
 static void print_row(const char* name, long work_items, double macs_per_load,
@@ -114,7 +137,8 @@ static void print_header() {
               "---------", "---------");
 }
 
-static bool correct(const View2& C) {
+template <typename Layout = Kokkos::LayoutRight>
+static bool correct(const Kokkos::View<float**, Layout>& C) {
   auto C_host = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, C);
   for (std::size_t i = 0; i < C_host.extent(0); ++i)
     for (std::size_t l = 0; l < C_host.extent(1); ++l)
@@ -128,14 +152,23 @@ static bool correct(const View2& C) {
 // long without adding signal.
 static void run_suite(const char* title, int I, int L, int warmup, int iters,
                       bool include_small_tiles) {
+  // LayoutRight (row-major): last dim contiguous for A, B, and C.
   View3 A("A", I, J, K);
   View3 B("B", J, K, L);
   View2 C("C", I, L);
-
-  // A[i,j,k] = 1/(J*K), B[j,k,l] = 1  →  C[i,l] = 1.0 after contraction
   Kokkos::deep_copy(A, 1.0f / static_cast<float>(J * K));
   Kokkos::deep_copy(B, 1.0f);
   Kokkos::deep_copy(C, 0.0f);
+
+  // LayoutLeft (column-major): first dim contiguous. For A[I,J,K] this is I
+  // (stride 1), so the naive inner loop over k strides at I*J — cache-hostile.
+  // The library's layout-aware gather picks dim 0 and streams I-runs instead.
+  View3L AL("AL", I, J, K);
+  View3L BL("BL", J, K, L);
+  View2L CL("CL", I, L);
+  Kokkos::deep_copy(AL, 1.0f / static_cast<float>(J * K));
+  Kokkos::deep_copy(BL, 1.0f);
+  Kokkos::deep_copy(CL, 0.0f);
 
   const double flops = 2.0 * I * J * K * L;
   const double a_mb  = double(I) * J * K * 4 / (1 << 20);
@@ -149,8 +182,9 @@ static void run_suite(const char* title, int I, int L, int warmup, int iters,
               b_mb, c_mb);
   std::printf("FLOPs/run: %.3e   Warmup: %d   Timed iters: %d\n\n", flops,
               warmup, iters);
-  print_header();
 
+  std::printf("  -- LayoutRight (row-major, last dim contiguous) --\n");
+  print_header();
   print_row("Naive RangePolicy", long(I) * L, 0.5,
             bench_naive(A, B, C, warmup, iters), flops);
   if (include_small_tiles) {
@@ -165,8 +199,27 @@ static void run_suite(const char* title, int I, int L, int warmup, int iters,
             bench_library<16, 16>(A, B, C, warmup, iters), flops);
   print_row("Library tile 32x32 (k=8x8)", long(I / 32) * (L / 32), 16.0,
             bench_library<32, 32>(A, B, C, warmup, iters), flops);
+  std::printf("Correctness (LayoutRight): %s\n",
+              correct(C) ? "PASSED" : "FAILED");
 
-  std::printf("\nCorrectness check: %s\n", correct(C) ? "PASSED" : "FAILED");
+  std::printf("\n  -- LayoutLeft (column-major, first dim contiguous) --\n");
+  print_header();
+  print_row("Naive RangePolicy", long(I) * L, 0.5,
+            bench_naive(AL, BL, CL, warmup, iters), flops);
+  if (include_small_tiles) {
+    print_row("Library tile 2x2 (k=8x8)", long(I / 2) * (L / 2), 1.0,
+              bench_library<2, 2>(AL, BL, CL, warmup, iters), flops);
+    print_row("Library tile 4x4 (k=8x8)", long(I / 4) * (L / 4), 2.0,
+              bench_library<4, 4>(AL, BL, CL, warmup, iters), flops);
+  }
+  print_row("Library tile 8x8 (k=8x8)", long(I / 8) * (L / 8), 4.0,
+            bench_library<8, 8>(AL, BL, CL, warmup, iters), flops);
+  print_row("Library tile 16x16 (k=8x8)", long(I / 16) * (L / 16), 8.0,
+            bench_library<16, 16>(AL, BL, CL, warmup, iters), flops);
+  print_row("Library tile 32x32 (k=8x8)", long(I / 32) * (L / 32), 16.0,
+            bench_library<32, 32>(AL, BL, CL, warmup, iters), flops);
+  std::printf("Correctness (LayoutLeft):  %s\n",
+              correct(CL) ? "PASSED" : "FAILED");
 }
 
 int main(int argc, char* argv[]) {
