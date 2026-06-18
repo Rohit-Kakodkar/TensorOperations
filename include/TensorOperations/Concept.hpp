@@ -48,6 +48,8 @@ template <typename T>
 concept TensorLike = requires(T t) {
   requires(static_cast<int>(T::rank) >= 0);
   { t.extent(0) } -> std::convertible_to<int>;
+  t.data();
+  { t.stride(0) } -> std::convertible_to<std::ptrdiff_t>;
 } && Impl::CallableWithRank<T>;
 
 template <typename T>

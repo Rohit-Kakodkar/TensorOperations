@@ -9,7 +9,11 @@ using namespace TensorOperations;
 
 struct MyTensor {
   static constexpr int rank = 2;
+  float                buf_[12]{};
   int                  extent(int i) const { return (i == 0) ? 4 : 3; }
+  std::ptrdiff_t       stride(int k) const { return k == 0 ? 3 : 1; }
+  float*               data() { return buf_; }
+  const float*         data() const { return buf_; }
   float operator()(int i, int j) const { return static_cast<float>(i * 3 + j); }
 };
 

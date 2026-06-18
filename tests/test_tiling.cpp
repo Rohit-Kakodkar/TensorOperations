@@ -1,8 +1,10 @@
 #include <Kokkos_Core.hpp>
 #include <TensorOperations/Evaluator.hpp>
+#include <TensorOperations/NodeHandle.hpp>
 #include <TensorOperations/RegisterArray.hpp>
 #include <TensorOperations/TensorHandle.hpp>
 #include <TensorOperations/Tiling.hpp>
+#include <array>
 #include <gtest/gtest.h>
 
 using namespace TensorOperations;
@@ -37,60 +39,44 @@ TEST(TilingTest, DynamicTile) {
   EXPECT_EQ(t.extent(2), 6);
 }
 
-// Build a ContractionTag node type directly. Its NodeHandle specialization does
-// not constrain its operands with TensorLike, so this sidesteps the
-// pre-existing TensorLike/make_handle breakage and still exercises Evaluator
-// specialization selection for the tiling types. FakeNode mimics the node
-// interface the contraction reads (Rank, value_type). C_{ik} = sum_j A_{ij}
-// B_{jk}: output rank 2, NumContracted 1, so 3 participating modes.
-struct FakeNode {
-  static constexpr int Rank = 2;
-  using value_type          = float;
-};
-using FakeContraction = NodeHandle<ContractionTag, FakeNode, FakeNode,
-                                   std::integral_constant<int, 2>, float,
-                                   Kokkos::DefaultExecutionSpace, NoHook>;
+using View2D = Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::HostSpace>;
 
 // ---------------------------------------------------------------------------
 // Evaluator specialization selection — purely type-level; no kernels run.
+// C_{ik} = sum_j A_{ij} B_{jk}: output rank 2, NumContracted 1.
 // ---------------------------------------------------------------------------
 TEST(TilingTest, EvaluatorSelection) {
-  static_assert(FakeContraction::Rank == 2);
-  static_assert(FakeContraction::NumContracted == 1);
+  using NC = decltype(make_contraction_node<float>(
+      make_input_node(make_handle(std::declval<View2D>(), std::array<int32_t, 2>{'i', 'j'})),
+      make_input_node(make_handle(std::declval<View2D>(), std::array<int32_t, 2>{'j', 'k'})),
+      std::array<int32_t, 2>{'i', 'k'}));
+
+  static_assert(NC::Rank == 2);
+  static_assert(NC::NumContracted == 1);
 
   // -- Range + Contraction + StaticTile -> register-blocked (register tier) --
-  using REvalC =
-      Evaluator<RangePolicyTag, FakeContraction, StaticTile<2, 2, 2>>;
+  using REvalC = Evaluator<RangePolicyTag, NC, StaticTile<2, 2, 2>>;
   static_assert(std::is_same_v<REvalC::tiling_type, StaticTile<2, 2, 2>>);
   static_assert(REvalC::Rank == 2);  // output rank, not tile rank
   static_assert(
       std::is_same_v<REvalC::register_array_t, RegisterArray<float, 2, 2, 2>>);
 
   // -- Team + Contraction + DynamicTile -> scratch tier ----------------------
-  using TEvalC = Evaluator<TeamPolicyTag, FakeContraction, DynamicTile<2>>;
+  using TEvalC = Evaluator<TeamPolicyTag, NC, DynamicTile<2>>;
   static_assert(std::is_same_v<TEvalC::tiling_type, DynamicTile<2>>);
   static_assert(TEvalC::Rank == 2);
   static_assert(TEvalC::scratch_view_t::rank == 2);
 
   // -- Team also accepts StaticTile on the scratch tier ----------------------
-  using TEvalCS =
-      Evaluator<TeamPolicyTag, FakeContraction, StaticTile<2, 2, 2>>;
+  using TEvalCS = Evaluator<TeamPolicyTag, NC, StaticTile<2, 2, 2>>;
   static_assert(std::is_same_v<TEvalCS::tiling_type, StaticTile<2, 2, 2>>);
   static_assert(TEvalCS::scratch_view_t::rank == 2);
 
-  // NOTE: Evaluator<RangePolicyTag, FakeContraction, DynamicTile<2>> matches no
+  // NOTE: Evaluator<RangePolicyTag, NC, DynamicTile<2>> matches no
   // specialization (undefined primary template) — register tier is static-only.
 
   SUCCEED();
 }
-
-// A 4x4 readable TensorLike with element (i,j) = i*4 + j.
-struct Grid4x4 {
-  static constexpr int rank = 2;
-  using value_type          = float;
-  int   extent(int) const { return 4; }
-  float operator()(int i, int j) const { return static_cast<float>(i * 4 + j); }
-};
 
 // A doubling hook to verify hooks are applied at load.
 struct Doubler {
@@ -99,59 +85,43 @@ struct Doubler {
 
 // ---------------------------------------------------------------------------
 // Range + Input + StaticTile -> register-tier input stager. Functional test of
-// operator(): fill a 2x2 RegisterArray from a tile origin.
+// operator(): fill a 2x2 RegisterArray from tile index (1,0).
 // ---------------------------------------------------------------------------
 TEST(TilingTest, InputStagerContiguous) {
-  auto inp =
-      make_input_node(make_handle(Grid4x4{}, std::array<int32_t, 2>{'i', 'j'}));
-  auto ev = make_evaluator<RangePolicyTag>(inp, StaticTile<2, 2>{});
+  View2D v("g", 4, 4);
+  for (int i = 0; i < 4; ++i)
+    for (int j = 0; j < 4; ++j)
+      v(i, j) = static_cast<float>(i * 4 + j);
 
-  auto        node = ev({2, 1});  // tile origin (2,1)
+  auto inp = make_input_node(make_handle(v, std::array<int32_t, 2>{'i', 'j'}));
+  auto ev  = make_evaluator<RangePolicyTag>(inp, StaticTile<2, 2>{});
+
+  auto        node = ev({1, 0});  // tile index (1,0) -> element origin (2,0)
   const auto& regs = node.storage_;
 
-  // regs(a,b) == Grid4x4(2+a, 1+b) == (2+a)*4 + (1+b)
-  EXPECT_FLOAT_EQ((regs(0, 0)), 9.f);   // (2,1)
-  EXPECT_FLOAT_EQ((regs(0, 1)), 10.f);  // (2,2)
-  EXPECT_FLOAT_EQ((regs(1, 0)), 13.f);  // (3,1)
-  EXPECT_FLOAT_EQ((regs(1, 1)), 14.f);  // (3,2)
-}
-
-// Staggered read: stride 2 along the last mode (the coalescing pattern).
-TEST(TilingTest, InputStagerStaggered) {
-  auto inp =
-      make_input_node(make_handle(Grid4x4{}, std::array<int32_t, 2>{'i', 'j'}));
-  auto ev   = make_evaluator<RangePolicyTag>(inp, StaticTile<2, 2>{});
-  ev.layout = StridedLayout<2>{{1, 2}};
-
-  auto        node = ev({0, 0});
-  const auto& regs = node.storage_;
-
-  // regs(a,b) == Grid4x4(0 + a*1, 0 + b*2) == a*4 + b*2
-  EXPECT_FLOAT_EQ((regs(0, 0)), 0.f);  // (0,0)
-  EXPECT_FLOAT_EQ((regs(0, 1)), 2.f);  // (0,2)
-  EXPECT_FLOAT_EQ((regs(1, 0)), 4.f);  // (1,0)
-  EXPECT_FLOAT_EQ((regs(1, 1)), 6.f);  // (1,2)
+  // regs(a,b) == v(2+a, 0+b) == (2+a)*4 + b
+  EXPECT_FLOAT_EQ((regs(0, 0)), 8.f);   // (2,0)
+  EXPECT_FLOAT_EQ((regs(0, 1)), 9.f);   // (2,1)
+  EXPECT_FLOAT_EQ((regs(1, 0)), 12.f);  // (3,0)
+  EXPECT_FLOAT_EQ((regs(1, 1)), 13.f);  // (3,1)
 }
 
 // Hook is applied at load time.
 TEST(TilingTest, InputStagerAppliesHook) {
+  View2D v("g", 4, 4);
+  for (int i = 0; i < 4; ++i)
+    for (int j = 0; j < 4; ++j)
+      v(i, j) = static_cast<float>(i * 4 + j);
+
   auto inp = make_input_node(
-      make_handle(Grid4x4{}, std::array<int32_t, 2>{'i', 'j'}), Doubler{});
+      make_handle(v, std::array<int32_t, 2>{'i', 'j'}), Doubler{});
   auto ev = make_evaluator<RangePolicyTag>(inp, StaticTile<2, 2>{});
 
   auto        node = ev({0, 0});
   const auto& regs = node.storage_;
 
-  EXPECT_FLOAT_EQ((regs(1, 1)), 2.f * 5.f);  // 2 * Grid4x4(1,1)
+  EXPECT_FLOAT_EQ((regs(1, 1)), 2.f * 5.f);  // 2 * v(1,1)
 }
-
-// A 512-element fake tensor to exercise fill_slots at the documented maximum.
-struct LargeGrid {
-  static constexpr int rank = 2;
-  using value_type          = float;
-  int   extent(int) const { return 512; }
-  float operator()(int i, int j) const { return 0.f; }
-};
 
 // ---------------------------------------------------------------------------
 // Regression: fill_slots must compile for a 512-element (16x32) RegisterArray.
@@ -159,9 +129,9 @@ struct LargeGrid {
 // this — instantiating the fold over 512 slots is the stress case.
 // ---------------------------------------------------------------------------
 TEST(TilingTest, LargeRegisterViewFillSlotsCompiles) {
-  auto inp = make_input_node(
-      make_handle(LargeGrid{}, std::array<int32_t, 2>{'i', 'j'}));
-  auto ev = make_evaluator<RangePolicyTag>(inp, StaticTile<16, 32>{});
+  Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::HostSpace> lv("lg", 512, 512);
+  auto inp = make_input_node(make_handle(lv, std::array<int32_t, 2>{'i', 'j'}));
+  auto ev  = make_evaluator<RangePolicyTag>(inp, StaticTile<16, 32>{});
   static_assert(decltype(ev)::register_array_t::size == 512);
   auto node = ev({0, 0});  // instantiates fill_slots over all 512 slots
   SUCCEED();

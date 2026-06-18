@@ -13,35 +13,30 @@ using namespace TensorOperations;
 // A is stored [i,j] (= [freeA, contracted]), B is stored [j,k] (= [contracted,
 // freeB]), out_modes [i,k] (= [freeA, freeB]) — the Option A / GEMM convention.
 // ---------------------------------------------------------------------------
-struct AGrid {  // A(i,j)
-  static constexpr int rank = 2;
-  using value_type          = float;
-  int   extent(int) const { return 4; }
-  float operator()(int i, int j) const { return static_cast<float>(i * 4 + j); }
-};
-struct BGrid {  // B(j,k)
-  static constexpr int rank = 2;
-  using value_type          = float;
-  int   extent(int) const { return 4; }
-  float operator()(int j, int k) const { return static_cast<float>(j * 7 + k); }
-};
 struct Doubler {
   float operator()(float v) const { return 2.0f * v; }
 };
 
 static float reference(int i, int k) {
   float s = 0.f;
-  for (int j = 0; j < 4; ++j) s += AGrid{}(i, j) * BGrid{}(j, k);
+  for (int j = 0; j < 4; ++j)
+    s += static_cast<float>(i * 4 + j) * static_cast<float>(j * 7 + k);
   return s;
 }
 
-// Build a contraction node from A, B grids with the given output hook.
+// Build a contraction node from A, B views with the given output hook.
 template <typename HookOp = NoHook>
 static auto make_nc(HookOp hook = {}) {
-  auto na =
-      make_input_node(make_handle(AGrid{}, std::array<int32_t, 2>{'i', 'j'}));
-  auto nb =
-      make_input_node(make_handle(BGrid{}, std::array<int32_t, 2>{'j', 'k'}));
+  Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::HostSpace> a("A", 4, 4);
+  Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::HostSpace> b("B", 4, 4);
+  for (int i = 0; i < 4; ++i)
+    for (int j = 0; j < 4; ++j)
+      a(i, j) = static_cast<float>(i * 4 + j);
+  for (int j = 0; j < 4; ++j)
+    for (int k = 0; k < 4; ++k)
+      b(j, k) = static_cast<float>(j * 7 + k);
+  auto na = make_input_node(make_handle(a, std::array<int32_t, 2>{'i', 'j'}));
+  auto nb = make_input_node(make_handle(b, std::array<int32_t, 2>{'j', 'k'}));
   return make_contraction_node<float>(na, nb, std::array<int32_t, 2>{'i', 'k'},
                                       hook);
 }
@@ -58,11 +53,11 @@ static std::array<std::array<float, 4>, 4> compute(const NC& nc) {
   constexpr int Ti = TileT::extent(0), Tk = TileT::extent(1);
 
   Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::HostSpace> v("C", N, N);
-  for (int off_i = 0; off_i < N; off_i += Ti)
-    for (int off_k = 0; off_k < N; off_k += Tk) {
-      auto tile_node = cev(Kokkos::Array<int, 2>{off_i, off_k});
+  for (int ti = 0; ti < N / Ti; ++ti)
+    for (int tk = 0; tk < N / Tk; ++tk) {
+      auto tile_node = cev(Kokkos::Array<int, 2>{ti, tk});
       auto store_ev  = make_evaluator<RangePolicyTag>(tile_node, TileT{});
-      store_ev({off_i, off_k}, v);
+      store_ev({ti, tk}, v);
     }
 
   std::array<std::array<float, 4>, 4> out{};

@@ -8,23 +8,39 @@ using namespace TensorOperations;
 // A_{i,j,k}: shape (3, 4, 5)
 struct ATensor {
   static constexpr int rank = 3;
+  float                buf_[60]{};
   int                  extent(int i) const {
     if (i == 0) return 3;
     if (i == 1) return 4;
     return 5;
   }
-  float operator()(int, int, int) const { return 0.f; }
+  std::ptrdiff_t stride(int k) const {
+    if (k == 0) return 20;
+    if (k == 1) return 5;
+    return 1;
+  }
+  float*       data() { return buf_; }
+  const float* data() const { return buf_; }
+  float        operator()(int, int, int) const { return 0.f; }
 };
 
 // B_{j,k,l}: shape (4, 5, 6)
 struct BTensor {
   static constexpr int rank = 3;
+  float                buf_[120]{};
   int                  extent(int i) const {
     if (i == 0) return 4;
     if (i == 1) return 5;
     return 6;
   }
-  float operator()(int, int, int) const { return 0.f; }
+  std::ptrdiff_t stride(int k) const {
+    if (k == 0) return 30;
+    if (k == 1) return 6;
+    return 1;
+  }
+  float*       data() { return buf_; }
+  const float* data() const { return buf_; }
+  float        operator()(int, int, int) const { return 0.f; }
 };
 
 static_assert(TensorLike<ATensor>);

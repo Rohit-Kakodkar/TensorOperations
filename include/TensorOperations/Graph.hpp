@@ -61,19 +61,18 @@ std::array<int, participating_rank<Node>()> participating_extents(
   return ext;
 }
 
-// Row-major decode of a linear work-item index into per-mode tile origins.
-// Uses only the first Rank extents of `tile` (the free modes).
+// Row-major decode of a linear work-item index into per-mode tile indices.
+// Returns 0-based tile coordinates (not element offsets) along each free mode.
 template <int Rank, typename Tile>
-KOKKOS_FUNCTION Kokkos::Array<int, Rank> decode_tile_offset(
+KOKKOS_FUNCTION Kokkos::Array<int, Rank> decode_tile_index(
     std::size_t idx, const Kokkos::Array<int, Rank>& shape, const Tile& tile) {
-  Kokkos::Array<int, Rank> off{};
+  Kokkos::Array<int, Rank> tidx{};
   for (int d = Rank - 1; d >= 0; --d) {
-    int n = (shape[d] + tile.extent(d) - 1) / tile.extent(d);
-    off[d] =
-        static_cast<int>(idx % static_cast<std::size_t>(n)) * tile.extent(d);
-    idx /= static_cast<std::size_t>(n);
+    int n      = (shape[d] + tile.extent(d) - 1) / tile.extent(d);
+    tidx[d]    = static_cast<int>(idx % static_cast<std::size_t>(n));
+    idx       /= static_cast<std::size_t>(n);
   }
-  return off;
+  return tidx;
 }
 
 }  // namespace Impl
@@ -176,15 +175,15 @@ struct Graph {
         "TensorOperations::execute",
         Kokkos::RangePolicy<typename NodeType::exec_space>(0, wk),
         KOKKOS_LAMBDA(std::size_t local_idx) {
-          const auto shape = node.shape();
-          const auto c_off =
-              Impl::decode_tile_offset<NodeType::Rank>(local_idx, shape, tile);
+          const auto shape      = node.shape();
+          const auto c_tile_idx =
+              Impl::decode_tile_index<NodeType::Rank>(local_idx, shape, tile);
 
           auto eval   = make_evaluator<RangePolicyTag>(node, tile);
-          auto interm = eval(c_off);
+          auto interm = eval(c_tile_idx);
 
           auto seval = make_evaluator<RangePolicyTag>(interm, tile);
-          seval(c_off, view);
+          seval(c_tile_idx, view);
         });
   }
 };

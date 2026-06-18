@@ -81,6 +81,20 @@ struct RegisterArray {
     return data_[constexpr_offset<Idx...>()];
   }
 
+  // -- array-indexed accessors (coordinate as Kokkos::Array) ---------------
+  // Delegates to operator() — same register-residency caveats apply.
+  KOKKOS_FORCEINLINE_FUNCTION T& operator[](Kokkos::Array<int, rank> idx) {
+    return [&]<std::size_t... D>(std::index_sequence<D...>) -> T& {
+      return (*this)(idx[D]...);
+    }(std::make_index_sequence<rank>{});
+  }
+
+  KOKKOS_FORCEINLINE_FUNCTION const T& operator[](Kokkos::Array<int, rank> idx) const {
+    return [&]<std::size_t... D>(std::index_sequence<D...>) -> const T& {
+      return (*this)(idx[D]...);
+    }(std::make_index_sequence<rank>{});
+  }
+
   // -- helpers -------------------------------------------------------------
   KOKKOS_FORCEINLINE_FUNCTION void fill(T v) {
     for (std::size_t k = 0; k < size; ++k) data_[k] = v;

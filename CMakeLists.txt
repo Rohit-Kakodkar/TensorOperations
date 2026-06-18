@@ -85,6 +85,11 @@ add_executable(test_layout_staging tests/test_layout_staging.cpp)
 target_link_libraries(test_layout_staging PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_layout_staging)
 
+# test_tiled_layout — custom main() wraps Kokkos init/finalize
+add_executable(test_tiled_layout tests/test_tiled_layout.cpp)
+target_link_libraries(test_tiled_layout PRIVATE tensor GTest::gtest)
+gtest_discover_tests(test_tiled_layout)
+
 # Benchmark: naive RangePolicy vs library tiled contraction
 add_executable(bench_contraction benchmarks/bench_contraction.cpp)
 target_link_libraries(bench_contraction PRIVATE tensor)

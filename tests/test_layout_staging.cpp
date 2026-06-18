@@ -31,13 +31,13 @@ void fill_logical(const ViewT& v) {
     for (int j = 0; j < static_cast<int>(v.extent(1)); ++j) v(i, j) = D(i, j);
 }
 
-// Stage a 2x2 tile at origin (oi,oj) from `v` through the register-tier input
-// evaluator and return the staged RegisterArray.
+// Stage the 2x2 tile at tile index (ti,tj) from `v` through the register-tier
+// input evaluator and return the staged RegisterArray.
 template <typename ViewT>
-RegisterArray<float, 2, 2> stage(const ViewT& v, int oi, int oj) {
+RegisterArray<float, 2, 2> stage(const ViewT& v, int ti, int tj) {
   auto inp = make_input_node(make_handle(v, std::array<int32_t, 2>{'i', 'j'}));
   auto ev  = make_evaluator<RangePolicyTag>(inp, StaticTile<2, 2>{});
-  return ev({oi, oj}).storage_;
+  return ev({ti, tj}).storage_;
 }
 
 }  // namespace
@@ -82,19 +82,20 @@ TEST(LayoutStaging, GatherParity) {
   fill_logical(stride_col);
   fill_logical(stride_row);
 
-  for (int oi = 0; oi <= n0 - 2; ++oi)
-    for (int oj = 0; oj <= n1 - 2; ++oj) {
-      auto r  = stage(right, oi, oj);
-      auto l  = stage(left, oi, oj);
-      auto sc = stage(stride_col, oi, oj);
-      auto sr = stage(stride_row, oi, oj);
+  // Tile indices: 2 tiles per dimension (n=4, tile=2).
+  for (int ti = 0; ti < n0 / 2; ++ti)
+    for (int tj = 0; tj < n1 / 2; ++tj) {
+      auto r  = stage(right, ti, tj);
+      auto l  = stage(left, ti, tj);
+      auto sc = stage(stride_col, ti, tj);
+      auto sr = stage(stride_row, ti, tj);
       for (int a = 0; a < 2; ++a)
         for (int b = 0; b < 2; ++b) {
-          const float expect = D(oi + a, oj + b);
-          EXPECT_FLOAT_EQ((r(a, b)), expect) << "right " << oi << "," << oj;
-          EXPECT_FLOAT_EQ((l(a, b)), expect) << "left " << oi << "," << oj;
-          EXPECT_FLOAT_EQ((sc(a, b)), expect) << "stride_col " << oi << "," << oj;
-          EXPECT_FLOAT_EQ((sr(a, b)), expect) << "stride_row " << oi << "," << oj;
+          const float expect = D(ti * 2 + a, tj * 2 + b);
+          EXPECT_FLOAT_EQ((r(a, b)), expect) << "right ti=" << ti << ",tj=" << tj;
+          EXPECT_FLOAT_EQ((l(a, b)), expect) << "left ti=" << ti << ",tj=" << tj;
+          EXPECT_FLOAT_EQ((sc(a, b)), expect) << "stride_col ti=" << ti << ",tj=" << tj;
+          EXPECT_FLOAT_EQ((sr(a, b)), expect) << "stride_row ti=" << ti << ",tj=" << tj;
         }
     }
 }
@@ -110,11 +111,11 @@ TEST(LayoutStaging, StoreParity) {
   HostRight src("src", n0, n1);
   fill_logical(src);
 
-  auto stage_node = [&](int oi, int oj) {
+  auto stage_node = [&](int ti, int tj) {
     auto inp =
         make_input_node(make_handle(src, std::array<int32_t, 2>{'i', 'j'}));
     auto ev = make_evaluator<RangePolicyTag>(inp, StaticTile<2, 2>{});
-    return ev({oi, oj});
+    return ev({ti, tj});
   };
 
   HostRight  right("dr", n0, n1);
@@ -122,13 +123,14 @@ TEST(LayoutStaging, StoreParity) {
   HostStride scol("dsc", Kokkos::LayoutStride(n0, 1, n1, n0));
   HostStride srow("dsr", Kokkos::LayoutStride(n0, n1, n1, 1));
 
-  for (int oi = 0; oi <= n0 - 2; ++oi)
-    for (int oj = 0; oj <= n1 - 2; ++oj) {
-      auto node = stage_node(oi, oj);
-      make_evaluator<RangePolicyTag>(node, StaticTile<2, 2>{})({oi, oj}, right);
-      make_evaluator<RangePolicyTag>(node, StaticTile<2, 2>{})({oi, oj}, left);
-      make_evaluator<RangePolicyTag>(node, StaticTile<2, 2>{})({oi, oj}, scol);
-      make_evaluator<RangePolicyTag>(node, StaticTile<2, 2>{})({oi, oj}, srow);
+  // Tile indices: 2 tiles per dimension.
+  for (int ti = 0; ti < n0 / 2; ++ti)
+    for (int tj = 0; tj < n1 / 2; ++tj) {
+      auto node = stage_node(ti, tj);
+      make_evaluator<RangePolicyTag>(node, StaticTile<2, 2>{})({ti, tj}, right);
+      make_evaluator<RangePolicyTag>(node, StaticTile<2, 2>{})({ti, tj}, left);
+      make_evaluator<RangePolicyTag>(node, StaticTile<2, 2>{})({ti, tj}, scol);
+      make_evaluator<RangePolicyTag>(node, StaticTile<2, 2>{})({ti, tj}, srow);
     }
 
   for (int i = 0; i < n0; ++i)
@@ -150,7 +152,7 @@ TEST(LayoutStaging, StoreBoundaryGuard) {
   fill_logical(src);
   auto inp = make_input_node(make_handle(src, std::array<int32_t, 2>{'i', 'j'}));
   auto sev = make_evaluator<RangePolicyTag>(inp, StaticTile<2, 2>{});
-  auto node = sev({2, 2});  // staged tile holds D(2..3, 2..3)
+  auto node = sev({1, 1});  // tile index (1,1) -> element origin (2,2)
 
   // Destination is 3x3, sentinel-filled. Tile origin (2,2) with a 2x2 tile:
   // only (2,2) is in bounds; (2,3),(3,2),(3,3) are out of range.
@@ -160,8 +162,8 @@ TEST(LayoutStaging, StoreBoundaryGuard) {
   for (int i = 0; i < 3; ++i)
     for (int j = 0; j < 3; ++j) dst_s(i, j) = -1.f;
 
-  make_evaluator<RangePolicyTag>(node, StaticTile<2, 2>{})({2, 2}, dst_r);
-  make_evaluator<RangePolicyTag>(node, StaticTile<2, 2>{})({2, 2}, dst_s);
+  make_evaluator<RangePolicyTag>(node, StaticTile<2, 2>{})({1, 1}, dst_r);
+  make_evaluator<RangePolicyTag>(node, StaticTile<2, 2>{})({1, 1}, dst_s);
 
   for (int i = 0; i < 3; ++i)
     for (int j = 0; j < 3; ++j) {
