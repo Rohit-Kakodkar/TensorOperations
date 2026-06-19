@@ -68,9 +68,9 @@ KOKKOS_FUNCTION Kokkos::Array<int, Rank> decode_tile_index(
     std::size_t idx, const Kokkos::Array<int, Rank>& shape, const Tile& tile) {
   Kokkos::Array<int, Rank> tidx{};
   for (int d = Rank - 1; d >= 0; --d) {
-    int n      = (shape[d] + tile.extent(d) - 1) / tile.extent(d);
-    tidx[d]    = static_cast<int>(idx % static_cast<std::size_t>(n));
-    idx       /= static_cast<std::size_t>(n);
+    int n   = (shape[d] + tile.extent(d) - 1) / tile.extent(d);
+    tidx[d] = static_cast<int>(idx % static_cast<std::size_t>(n));
+    idx /= static_cast<std::size_t>(n);
   }
   return tidx;
 }
@@ -175,7 +175,7 @@ struct Graph {
         "TensorOperations::execute",
         Kokkos::RangePolicy<typename NodeType::exec_space>(0, wk),
         KOKKOS_LAMBDA(std::size_t local_idx) {
-          const auto shape      = node.shape();
+          const auto shape = node.shape();
           const auto c_tile_idx =
               Impl::decode_tile_index<NodeType::Rank>(local_idx, shape, tile);
 

@@ -1,4 +1,5 @@
 #pragma once
+#include <TensorOperations/TileLayout.hpp>
 #include <array>
 #include <cstddef>
 #include <utility>
@@ -23,33 +24,31 @@ namespace TensorOperations {
 // for exactly that and guarantees a constant offset. The runtime operator()
 // accessor is general and convenient but a non-constant index will spill the
 // array to local memory on GPU.
+//
+// Layout: encode/decode logic lives in StaticTileLayout<Extents...> (exposed
+// as layout_type). strides_ and extents_ are forwarded aliases so existing
+// callers continue to compile without change.
 // ---------------------------------------------------------------------------
 template <typename T, int... Extents>
 struct RegisterArray {
-  static constexpr int         rank = sizeof...(Extents);
-  static constexpr std::size_t size = (static_cast<std::size_t>(Extents) * ...);
-  using value_type                  = T;
+  using layout_type = StaticTileLayout<Extents...>;
+
+  static constexpr int         rank = layout_type::rank;
+  static constexpr std::size_t size = layout_type::size;
+
+  // Forwarded aliases — preserve existing call sites in Range.hpp.
+  static constexpr auto extents_ = layout_type::extents_;
+  static constexpr auto strides_ = layout_type::strides_;
+
+  using value_type = T;
 
   static_assert(rank > 0, "RegisterArray requires at least one extent");
-  static_assert(((Extents > 0) && ...), "all extents must be positive");
 
   Kokkos::Array<T, size> data_;
 
   // -- compile-time shape --------------------------------------------------
-  static constexpr std::array<std::size_t, rank> extents_{
-      static_cast<std::size_t>(Extents)...};
-
   KOKKOS_FORCEINLINE_FUNCTION
-  static constexpr int extent(int k) { return static_cast<int>(extents_[k]); }
-
-  // Row-major strides: stride[rank-1] = 1, stride[k] = stride[k+1]*extent(k+1).
-  static constexpr std::array<std::size_t, rank> strides_ = [] {
-    std::array<std::size_t, rank> e{static_cast<std::size_t>(Extents)...};
-    std::array<std::size_t, rank> s{};
-    s[rank - 1] = 1;
-    for (int k = rank - 2; k >= 0; --k) s[k] = s[k + 1] * e[k + 1];
-    return s;
-  }();
+  static constexpr int extent(int k) noexcept { return layout_type::extent(k); }
 
   // -- runtime-index accessor (general) ------------------------------------
   template <typename... I>
@@ -89,7 +88,8 @@ struct RegisterArray {
     }(std::make_index_sequence<rank>{});
   }
 
-  KOKKOS_FORCEINLINE_FUNCTION const T& operator[](Kokkos::Array<int, rank> idx) const {
+  KOKKOS_FORCEINLINE_FUNCTION const T& operator[](
+      Kokkos::Array<int, rank> idx) const {
     return [&]<std::size_t... D>(std::index_sequence<D...>) -> const T& {
       return (*this)(idx[D]...);
     }(std::make_index_sequence<rank>{});
@@ -101,20 +101,17 @@ struct RegisterArray {
   }
 
  private:
+  // Delegate multi-index → flat encode to the layout.
   template <typename... I>
   KOKKOS_FORCEINLINE_FUNCTION constexpr std::size_t offset_of(I... idx) const {
-    std::array<std::size_t, rank> ix{static_cast<std::size_t>(idx)...};
-    std::size_t                   flat = 0;
-    for (int k = 0; k < rank; ++k) flat += ix[k] * strides_[k];
-    return flat;
+    return layout_type{}.flat(static_cast<int>(idx)...);
   }
 
+  // Compile-time-index variant: all Idx are template ints so the compiler
+  // constant-folds layout_type{}.flat() to a single integer.
   template <int... Idx>
   KOKKOS_FORCEINLINE_FUNCTION static constexpr std::size_t constexpr_offset() {
-    std::array<std::size_t, rank> ix{static_cast<std::size_t>(Idx)...};
-    std::size_t                   flat = 0;
-    for (int k = 0; k < rank; ++k) flat += ix[k] * strides_[k];
-    return flat;
+    return layout_type{}.flat(Idx...);
   }
 };
 

@@ -47,8 +47,10 @@ using View2D = Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::HostSpace>;
 // ---------------------------------------------------------------------------
 TEST(TilingTest, EvaluatorSelection) {
   using NC = decltype(make_contraction_node<float>(
-      make_input_node(make_handle(std::declval<View2D>(), std::array<int32_t, 2>{'i', 'j'})),
-      make_input_node(make_handle(std::declval<View2D>(), std::array<int32_t, 2>{'j', 'k'})),
+      make_input_node(make_handle(std::declval<View2D>(),
+                                  std::array<int32_t, 2>{'i', 'j'})),
+      make_input_node(make_handle(std::declval<View2D>(),
+                                  std::array<int32_t, 2>{'j', 'k'})),
       std::array<int32_t, 2>{'i', 'k'}));
 
   static_assert(NC::Rank == 2);
@@ -90,8 +92,7 @@ struct Doubler {
 TEST(TilingTest, InputStagerContiguous) {
   View2D v("g", 4, 4);
   for (int i = 0; i < 4; ++i)
-    for (int j = 0; j < 4; ++j)
-      v(i, j) = static_cast<float>(i * 4 + j);
+    for (int j = 0; j < 4; ++j) v(i, j) = static_cast<float>(i * 4 + j);
 
   auto inp = make_input_node(make_handle(v, std::array<int32_t, 2>{'i', 'j'}));
   auto ev  = make_evaluator<RangePolicyTag>(inp, StaticTile<2, 2>{});
@@ -110,12 +111,11 @@ TEST(TilingTest, InputStagerContiguous) {
 TEST(TilingTest, InputStagerAppliesHook) {
   View2D v("g", 4, 4);
   for (int i = 0; i < 4; ++i)
-    for (int j = 0; j < 4; ++j)
-      v(i, j) = static_cast<float>(i * 4 + j);
+    for (int j = 0; j < 4; ++j) v(i, j) = static_cast<float>(i * 4 + j);
 
-  auto inp = make_input_node(
-      make_handle(v, std::array<int32_t, 2>{'i', 'j'}), Doubler{});
-  auto ev = make_evaluator<RangePolicyTag>(inp, StaticTile<2, 2>{});
+  auto inp = make_input_node(make_handle(v, std::array<int32_t, 2>{'i', 'j'}),
+                             Doubler{});
+  auto ev  = make_evaluator<RangePolicyTag>(inp, StaticTile<2, 2>{});
 
   auto        node = ev({0, 0});
   const auto& regs = node.storage_;
@@ -129,7 +129,8 @@ TEST(TilingTest, InputStagerAppliesHook) {
 // this — instantiating the fold over 512 slots is the stress case.
 // ---------------------------------------------------------------------------
 TEST(TilingTest, LargeRegisterViewFillSlotsCompiles) {
-  Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::HostSpace> lv("lg", 512, 512);
+  Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::HostSpace> lv("lg", 512,
+                                                                   512);
   auto inp = make_input_node(make_handle(lv, std::array<int32_t, 2>{'i', 'j'}));
   auto ev  = make_evaluator<RangePolicyTag>(inp, StaticTile<16, 32>{});
   static_assert(decltype(ev)::register_array_t::size == 512);

@@ -12,14 +12,16 @@ using namespace TensorOperations;
 
 namespace {
 
-using HostRight  = Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::HostSpace>;
-using HostLeft   = Kokkos::View<float**, Kokkos::LayoutLeft, Kokkos::HostSpace>;
-using HostStride = Kokkos::View<float**, Kokkos::LayoutStride, Kokkos::HostSpace>;
+using HostRight = Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::HostSpace>;
+using HostLeft  = Kokkos::View<float**, Kokkos::LayoutLeft, Kokkos::HostSpace>;
+using HostStride =
+    Kokkos::View<float**, Kokkos::LayoutStride, Kokkos::HostSpace>;
 
 // Logical data, independent of how it is laid out in memory.
 float D(int i, int j) { return static_cast<float>(i * 10 + j); }
 
-// A plain TensorLike grid: no array_layout -> layout_of defaults to LayoutRight.
+// A plain TensorLike grid: no array_layout -> layout_of defaults to
+// LayoutRight.
 struct PlainGrid {
   static constexpr int rank = 2;
   using value_type          = float;
@@ -68,14 +70,12 @@ TEST(LayoutStaging, Traits) {
 // ---------------------------------------------------------------------------
 TEST(LayoutStaging, GatherParity) {
   constexpr int n0 = 4, n1 = 4;
-  HostRight right("right", n0, n1);
-  HostLeft  left("left", n0, n1);
+  HostRight     right("right", n0, n1);
+  HostLeft      left("left", n0, n1);
   // Strided, contiguous along dim 0 (column-major-like): forces the f=0 branch.
-  HostStride stride_col("stride_col",
-                        Kokkos::LayoutStride(n0, 1, n1, n0));
+  HostStride stride_col("stride_col", Kokkos::LayoutStride(n0, 1, n1, n0));
   // Strided, contiguous along the last dim: forces the f=Rank-1 branch.
-  HostStride stride_row("stride_row",
-                        Kokkos::LayoutStride(n0, n1, n1, 1));
+  HostStride stride_row("stride_row", Kokkos::LayoutStride(n0, n1, n1, 1));
 
   fill_logical(right);
   fill_logical(left);
@@ -92,10 +92,14 @@ TEST(LayoutStaging, GatherParity) {
       for (int a = 0; a < 2; ++a)
         for (int b = 0; b < 2; ++b) {
           const float expect = D(ti * 2 + a, tj * 2 + b);
-          EXPECT_FLOAT_EQ((r(a, b)), expect) << "right ti=" << ti << ",tj=" << tj;
-          EXPECT_FLOAT_EQ((l(a, b)), expect) << "left ti=" << ti << ",tj=" << tj;
-          EXPECT_FLOAT_EQ((sc(a, b)), expect) << "stride_col ti=" << ti << ",tj=" << tj;
-          EXPECT_FLOAT_EQ((sr(a, b)), expect) << "stride_row ti=" << ti << ",tj=" << tj;
+          EXPECT_FLOAT_EQ((r(a, b)), expect)
+              << "right ti=" << ti << ",tj=" << tj;
+          EXPECT_FLOAT_EQ((l(a, b)), expect)
+              << "left ti=" << ti << ",tj=" << tj;
+          EXPECT_FLOAT_EQ((sc(a, b)), expect)
+              << "stride_col ti=" << ti << ",tj=" << tj;
+          EXPECT_FLOAT_EQ((sr(a, b)), expect)
+              << "stride_row ti=" << ti << ",tj=" << tj;
         }
     }
 }
@@ -148,10 +152,11 @@ TEST(LayoutStaging, StoreParity) {
 // ---------------------------------------------------------------------------
 TEST(LayoutStaging, StoreBoundaryGuard) {
   constexpr int n = 4;
-  HostRight src("src", n, n);
+  HostRight     src("src", n, n);
   fill_logical(src);
-  auto inp = make_input_node(make_handle(src, std::array<int32_t, 2>{'i', 'j'}));
-  auto sev = make_evaluator<RangePolicyTag>(inp, StaticTile<2, 2>{});
+  auto inp =
+      make_input_node(make_handle(src, std::array<int32_t, 2>{'i', 'j'}));
+  auto sev  = make_evaluator<RangePolicyTag>(inp, StaticTile<2, 2>{});
   auto node = sev({1, 1});  // tile index (1,1) -> element origin (2,2)
 
   // Destination is 3x3, sentinel-filled. Tile origin (2,2) with a 2x2 tile:

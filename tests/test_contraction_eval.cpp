@@ -30,11 +30,9 @@ static auto make_nc(HookOp hook = {}) {
   Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::HostSpace> a("A", 4, 4);
   Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::HostSpace> b("B", 4, 4);
   for (int i = 0; i < 4; ++i)
-    for (int j = 0; j < 4; ++j)
-      a(i, j) = static_cast<float>(i * 4 + j);
+    for (int j = 0; j < 4; ++j) a(i, j) = static_cast<float>(i * 4 + j);
   for (int j = 0; j < 4; ++j)
-    for (int k = 0; k < 4; ++k)
-      b(j, k) = static_cast<float>(j * 7 + k);
+    for (int k = 0; k < 4; ++k) b(j, k) = static_cast<float>(j * 7 + k);
   auto na = make_input_node(make_handle(a, std::array<int32_t, 2>{'i', 'j'}));
   auto nb = make_input_node(make_handle(b, std::array<int32_t, 2>{'j', 'k'}));
   return make_contraction_node<float>(na, nb, std::array<int32_t, 2>{'i', 'k'},

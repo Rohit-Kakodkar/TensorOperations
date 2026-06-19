@@ -26,27 +26,30 @@ struct Evaluator<RangePolicyTag, NodeHandle<InputTag, T, HookOp>,
                  exec_space, NoHook>;
   using result_type = interm_type;
 
-  node_type      node;
-  tiling_type    tiling;
-  tiled_input_t  tiled_input_;
+  node_type     node;
+  tiling_type   tiling;
+  tiled_input_t tiled_input_;
 
   KOKKOS_FUNCTION Evaluator(node_type n, tiling_type t)
       : node(n), tiling(t), tiled_input_(tile_view(n.handle, t)) {}
 
   KOKKOS_FUNCTION result_type
   operator()(Kokkos::Array<int, Rank> tile_idx) const {
-    TIMING_SCOPE_ENTER(g_timing_stats.input_stage_load_time, g_timing_stats.input_stage_load_count);
+    TIMING_SCOPE_ENTER(g_timing_stats.input_stage_load_time,
+                       g_timing_stats.input_stage_load_count);
     result_type out{};
     for (int d = 0; d < Rank; ++d) out.shape_[d] = tiling_type::extent(d);
     out.modes_ = node.modes();
     fill(tile_idx, out.storage_);
-    TIMING_SCOPE_EXIT(g_timing_stats.input_stage_load_time, g_timing_stats.input_stage_load_count);
+    TIMING_SCOPE_EXIT(g_timing_stats.input_stage_load_time,
+                      g_timing_stats.input_stage_load_count);
     return out;
   }
 
  private:
-  KOKKOS_FORCEINLINE_FUNCTION void fill(const Kokkos::Array<int, Rank>& tile_idx,
-                                        register_array_t& result) const {
+  KOKKOS_FORCEINLINE_FUNCTION void fill(
+      const Kokkos::Array<int, Rank>& tile_idx,
+      register_array_t&               result) const {
     auto sv = subview_tile(tiled_input_, tile_idx);
     if constexpr (Impl::is_layout_stride_v<T>) {
       const int f = sv.unit_stride_dim();
@@ -86,7 +89,7 @@ struct Evaluator<RangePolicyTag, NodeHandle<InputTag, T, HookOp>,
         const int local = rem % e;
         rem /= e;
         base_slot += local * static_cast<int>(register_array_t::strides_[d]);
-        src_base  += local * sv.stride(d);
+        src_base += local * sv.stride(d);
       }
       TENSOR_PRAGMA_UNROLL
       for (int c = 0; c < EF; ++c)
@@ -103,8 +106,8 @@ struct Evaluator<RangePolicyTag, NodeHandle<InputTag, T, HookOp>,
   }
 
   template <typename SV>
-  KOKKOS_FORCEINLINE_FUNCTION void fill_fallback(const SV&         sv,
-                                                 register_array_t& result) const {
+  KOKKOS_FORCEINLINE_FUNCTION void fill_fallback(
+      const SV& sv, register_array_t& result) const {
     TENSOR_PRAGMA_UNROLL
     for (int i = 0; i < static_cast<int>(register_array_t::size); ++i) {
       auto local    = sv.layout()[i];
@@ -138,8 +141,9 @@ struct Evaluator<RangePolicyTag,
   static constexpr int FreeA = RankA - NumK;
   static constexpr int FreeB = RankB - NumK;
 
-  static_assert(tiling_type::rank == RankC + NumK,
-                "contraction tile must carry one extent per participating mode");
+  static_assert(
+      tiling_type::rank == RankC + NumK,
+      "contraction tile must carry one extent per participating mode");
   static_assert(FreeA + FreeB == RankC,
                 "free-mode counts must sum to the output rank");
 
@@ -161,10 +165,10 @@ struct Evaluator<RangePolicyTag,
     return p;
   }();
 
-  using a_tile_type = Impl::project_tile_t<tiling_type, a_pos>;
-  using b_tile_type = Impl::project_tile_t<tiling_type, b_pos>;
-  using a_array_t   = Impl::project_regs_t<value_type, tiling_type, a_pos>;
-  using b_array_t   = Impl::project_regs_t<value_type, tiling_type, b_pos>;
+  using a_tile_type  = Impl::project_tile_t<tiling_type, a_pos>;
+  using b_tile_type  = Impl::project_tile_t<tiling_type, b_pos>;
+  using a_array_t    = Impl::project_regs_t<value_type, tiling_type, a_pos>;
+  using b_array_t    = Impl::project_regs_t<value_type, tiling_type, b_pos>;
   using stage_a_type = Evaluator<RangePolicyTag, NA, a_tile_type>;
   using stage_b_type = Evaluator<RangePolicyTag, NB, b_tile_type>;
 
@@ -185,17 +189,19 @@ struct Evaluator<RangePolicyTag,
                  exec_space, HookOp>;
   using result_type = interm_type;
 
-  node_type      node;
-  tiling_type    tiling;
+  node_type   node;
+  tiling_type tiling;
 
   KOKKOS_FUNCTION Evaluator(node_type n, tiling_type t)
-      : node(n), tiling(t),
+      : node(n),
+        tiling(t),
         stage_a_(make_stage_a(n.node_a)),
         stage_b_(make_stage_b(n.node_b)) {}
 
   KOKKOS_FUNCTION result_type
   operator()(Kokkos::Array<int, RankC> c_tile_idx) const {
-    TIMING_SCOPE_ENTER(g_timing_stats.contraction_accum_time, g_timing_stats.contraction_accum_count);
+    TIMING_SCOPE_ENTER(g_timing_stats.contraction_accum_time,
+                       g_timing_stats.contraction_accum_count);
     accumulator_t acc{};
     acc.fill(value_type{0});
 
@@ -211,7 +217,8 @@ struct Evaluator<RangePolicyTag,
     for (int d = 0; d < RankC; ++d) out.shape_[d] = tiling_type::extent(d);
     out.modes_  = node.modes();
     out.hook_op = node.hook_op;
-    TIMING_SCOPE_EXIT(g_timing_stats.contraction_accum_time, g_timing_stats.contraction_accum_count);
+    TIMING_SCOPE_EXIT(g_timing_stats.contraction_accum_time,
+                      g_timing_stats.contraction_accum_count);
     return out;
   }
 
@@ -226,9 +233,9 @@ struct Evaluator<RangePolicyTag,
     return make_evaluator<RangePolicyTag>(nb, b_tile_type{});
   }
 
-  KOKKOS_FUNCTION void reduce_contracted(
-      Kokkos::Array<int, RankC>       c_tile_idx,
-      const Kokkos::Array<int, NumK>& kext, accumulator_t& acc) const {
+  KOKKOS_FUNCTION void reduce_contracted(Kokkos::Array<int, RankC> c_tile_idx,
+                                         const Kokkos::Array<int, NumK>& kext,
+                                         accumulator_t& acc) const {
     Kokkos::Array<int, NumK> k_tile_idx{};
     reduce_contracted_impl(c_tile_idx, k_tile_idx, kext, acc,
                            std::make_index_sequence<NumK>{});
@@ -240,8 +247,8 @@ struct Evaluator<RangePolicyTag,
       const Kokkos::Array<int, NumK>& /*kext*/, accumulator_t& acc,
       std::index_sequence<>) const {
     Kokkos::Array<int, P> part_tile_idx{};
-    for (int d = 0; d < RankC; ++d) part_tile_idx[d]         = c_tile_idx[d];
-    for (int i = 0; i < NumK; ++i)  part_tile_idx[RankC + i] = k_tile_idx[i];
+    for (int d = 0; d < RankC; ++d) part_tile_idx[d] = c_tile_idx[d];
+    for (int i = 0; i < NumK; ++i) part_tile_idx[RankC + i] = k_tile_idx[i];
     Kokkos::Array<int, RankA> a_tile_idx{};
     for (int j = 0; j < RankA; ++j) a_tile_idx[j] = part_tile_idx[a_pos[j]];
     Kokkos::Array<int, RankB> b_tile_idx{};
@@ -253,7 +260,7 @@ struct Evaluator<RangePolicyTag,
   KOKKOS_FUNCTION void reduce_contracted_impl(
       const Kokkos::Array<int, RankC>& c_tile_idx,
       Kokkos::Array<int, NumK>&        k_tile_idx,
-      const Kokkos::Array<int, NumK>&  kext, accumulator_t& acc,
+      const Kokkos::Array<int, NumK>& kext, accumulator_t& acc,
       std::index_sequence<I, Rest...>) const {
     constexpr int TileK       = tiling_type::extent(RankC + I);
     const int     num_k_tiles = (kext[I] + TileK - 1) / TileK;
@@ -267,13 +274,16 @@ struct Evaluator<RangePolicyTag,
   KOKKOS_FUNCTION void accumulate_block(Kokkos::Array<int, RankA> a_tile_idx,
                                         Kokkos::Array<int, RankB> b_tile_idx,
                                         accumulator_t& result) const {
-    TIMING_SCOPE_ENTER(g_timing_stats.contraction_block_load_time, g_timing_stats.contraction_block_load_count);
+    TIMING_SCOPE_ENTER(g_timing_stats.contraction_block_load_time,
+                       g_timing_stats.contraction_block_load_count);
     const auto& a_regs = stage_a_(a_tile_idx).storage_;
     const auto& b_regs = stage_b_(b_tile_idx).storage_;
-    TIMING_SCOPE_EXIT(g_timing_stats.contraction_block_load_time, g_timing_stats.contraction_block_load_count);
+    TIMING_SCOPE_EXIT(g_timing_stats.contraction_block_load_time,
+                      g_timing_stats.contraction_block_load_count);
 
     {
-      TIMING_SCOPE_ENTER(g_timing_stats.contraction_compute_time, g_timing_stats.contraction_compute_count);
+      TIMING_SCOPE_ENTER(g_timing_stats.contraction_compute_time,
+                         g_timing_stats.contraction_compute_count);
       namespace KE    = Kokkos::Experimental;
       using simd_t    = KE::simd<value_type>;
       using mask_t    = typename simd_t::mask_type;
@@ -283,7 +293,8 @@ struct Evaluator<RangePolicyTag,
         for (; fb0 + W <= SB; fb0 += W) {
           simd_t acc(&result.data_[fa * SB + fb0], KE::simd_flag_default);
           for (int kk = 0; kk < SK; ++kk) {
-            const simd_t bvec(&b_regs.data_[kk * SB + fb0], KE::simd_flag_default);
+            const simd_t bvec(&b_regs.data_[kk * SB + fb0],
+                              KE::simd_flag_default);
             acc = simd_t(a_regs.data_[fa * SK + kk]) * bvec + acc;
           }
           KE::simd_unchecked_store(acc, &result.data_[fa * SB + fb0],
@@ -291,8 +302,8 @@ struct Evaluator<RangePolicyTag,
         }
         if (fb0 < SB) {
           const mask_t mask([&](auto lane) { return fb0 + int(lane) < SB; });
-          simd_t       acc = KE::simd_partial_load(&result.data_[fa * SB + fb0],
-                                                   mask, KE::simd_flag_default);
+          simd_t acc = KE::simd_partial_load(&result.data_[fa * SB + fb0], mask,
+                                             KE::simd_flag_default);
           for (int kk = 0; kk < SK; ++kk) {
             const simd_t bvec = KE::simd_partial_load(
                 &b_regs.data_[kk * SB + fb0], mask, KE::simd_flag_default);
@@ -302,7 +313,8 @@ struct Evaluator<RangePolicyTag,
                                  KE::simd_flag_default);
         }
       }
-      TIMING_SCOPE_EXIT(g_timing_stats.contraction_compute_time, g_timing_stats.contraction_compute_count);
+      TIMING_SCOPE_EXIT(g_timing_stats.contraction_compute_time,
+                        g_timing_stats.contraction_compute_count);
     }
   }
 };
@@ -337,16 +349,19 @@ struct Evaluator<
   template <typename ViewT>
   KOKKOS_FUNCTION void operator()(Kokkos::Array<int, Rank> tile_idx,
                                   const ViewT&             view) const {
-    TIMING_SCOPE_ENTER(g_timing_stats.store_write_time, g_timing_stats.store_write_count);
+    TIMING_SCOPE_ENTER(g_timing_stats.store_write_time,
+                       g_timing_stats.store_write_count);
     auto tv = tile_view(view, c_tile_type{});
     store(tile_idx, tv, view);
-    TIMING_SCOPE_EXIT(g_timing_stats.store_write_time, g_timing_stats.store_write_count);
+    TIMING_SCOPE_EXIT(g_timing_stats.store_write_time,
+                      g_timing_stats.store_write_count);
   }
 
  private:
   template <typename ViewT, typename TV>
-  KOKKOS_FORCEINLINE_FUNCTION void store(const Kokkos::Array<int, Rank>& tile_idx,
-                                         const TV& tv, const ViewT& view) const {
+  KOKKOS_FORCEINLINE_FUNCTION void store(
+      const Kokkos::Array<int, Rank>& tile_idx, const TV& tv,
+      const ViewT& view) const {
     auto sv = subview_tile(tv, tile_idx);
 
     bool interior = true;
@@ -376,9 +391,10 @@ struct Evaluator<
     } else {
       Kokkos::Array<int, Rank> avail{};
       for (int d = 0; d < Rank; ++d) {
-        int rem    = static_cast<int>(view.extent(d)) -
-                     tile_idx[d] * storage_type::extent(d);
-        avail[d] = rem < storage_type::extent(d) ? rem : storage_type::extent(d);
+        int rem = static_cast<int>(view.extent(d)) -
+                  tile_idx[d] * storage_type::extent(d);
+        avail[d] =
+            rem < storage_type::extent(d) ? rem : storage_type::extent(d);
       }
       Kokkos::Array<int, Rank> local{};
       store_boundary<0>(sv, local, avail);
@@ -403,12 +419,12 @@ struct Evaluator<
         const int local = rem % e;
         rem /= e;
         base_slot += local * static_cast<int>(storage_type::strides_[d]);
-        dst_base  += local * sv.stride(d);
+        dst_base += local * sv.stride(d);
       }
       TENSOR_PRAGMA_UNROLL
       for (int c = 0; c < EF; ++c)
-        dst[dst_base + c * sf] =
-            Impl::apply_hook(node.hook_op, node.storage_.data_[base_slot + c * RSF]);
+        dst[dst_base + c * sf] = Impl::apply_hook(
+            node.hook_op, node.storage_.data_[base_slot + c * RSF]);
     }
   }
 

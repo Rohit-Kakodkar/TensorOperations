@@ -45,10 +45,10 @@ TEST(TiledLayout, TileView1D_Exact) {
   auto tv = tile_view(v, StaticTile<4>{});
 
   ASSERT_EQ(tv.rank, 2);
-  EXPECT_EQ(tv.extent(0), 2);   // outer: 2 tiles
-  EXPECT_EQ(tv.extent(1), 4);   // inner: tile size 4
-  EXPECT_EQ(tv.stride(0), 4);   // outer stride = T*S = 4*1
-  EXPECT_EQ(tv.stride(1), 1);   // inner stride = S = 1
+  EXPECT_EQ(tv.extent(0), 2);  // outer: 2 tiles
+  EXPECT_EQ(tv.extent(1), 4);  // inner: tile size 4
+  EXPECT_EQ(tv.stride(0), 4);  // outer stride = T*S = 4*1
+  EXPECT_EQ(tv.stride(1), 1);  // inner stride = S = 1
 
   // Element access: tv(t, r) == v(t*4 + r)
   for (int t = 0; t < 2; ++t)
@@ -74,8 +74,7 @@ TEST(TiledLayout, TileView1D_Remainder) {
 
   // Valid (t, r) combinations
   for (int t = 0; t < 2; ++t)
-    for (int r = 0; r < 4; ++r)
-      EXPECT_FLOAT_EQ(tv(t, r), v(t * 4 + r));
+    for (int r = 0; r < 4; ++r) EXPECT_FLOAT_EQ(tv(t, r), v(t * 4 + r));
 }
 
 // ---------------------------------------------------------------------------
@@ -87,21 +86,20 @@ TEST(TiledLayout, TileView1D_Remainder) {
 TEST(TiledLayout, TileView2D_RowMajor) {
   Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::HostSpace> v("v", 10, 6);
   for (int i = 0; i < 10; ++i)
-    for (int j = 0; j < 6; ++j)
-      v(i, j) = static_cast<float>(i * 6 + j);
+    for (int j = 0; j < 6; ++j) v(i, j) = static_cast<float>(i * 6 + j);
 
   auto tv = tile_view(v, StaticTile<4, 4>{});
 
   ASSERT_EQ(tv.rank, 4);
   // Outer extents
-  EXPECT_EQ(tv.extent(0), 3);   // ceil(10/4) = 3
-  EXPECT_EQ(tv.extent(1), 2);   // ceil(6/4)  = 2
+  EXPECT_EQ(tv.extent(0), 3);  // ceil(10/4) = 3
+  EXPECT_EQ(tv.extent(1), 2);  // ceil(6/4)  = 2
   // Inner extents (tile sizes)
   EXPECT_EQ(tv.extent(2), 4);
   EXPECT_EQ(tv.extent(3), 4);
   // Outer strides = T[d]*S[d]
-  EXPECT_EQ(tv.stride(0), 4 * 6);   // 24
-  EXPECT_EQ(tv.stride(1), 4 * 1);   // 4
+  EXPECT_EQ(tv.stride(0), 4 * 6);  // 24
+  EXPECT_EQ(tv.stride(1), 4 * 1);  // 4
   // Inner strides = S[d]
   EXPECT_EQ(tv.stride(2), 6);
   EXPECT_EQ(tv.stride(3), 1);
@@ -122,8 +120,7 @@ TEST(TiledLayout, TileView2D_RowMajor) {
 TEST(TiledLayout, TileView2D_LayoutLeft) {
   Kokkos::View<float**, Kokkos::LayoutLeft, Kokkos::HostSpace> v("v", 6, 10);
   for (int i = 0; i < 6; ++i)
-    for (int j = 0; j < 10; ++j)
-      v(i, j) = static_cast<float>(i + j * 6);
+    for (int j = 0; j < 10; ++j) v(i, j) = static_cast<float>(i + j * 6);
 
   auto tv = tile_view(v, StaticTile<4, 4>{});
 
@@ -131,8 +128,8 @@ TEST(TiledLayout, TileView2D_LayoutLeft) {
   EXPECT_EQ(tv.stride(2), 1);  // inner stride dim 0 = S[0] = 1
   EXPECT_EQ(tv.stride(3), 6);  // inner stride dim 1 = S[1] = 6
 
-  EXPECT_EQ(tv.extent(0), 2);   // ceil(6/4) = 2
-  EXPECT_EQ(tv.extent(1), 3);   // ceil(10/4) = 3
+  EXPECT_EQ(tv.extent(0), 2);  // ceil(6/4) = 2
+  EXPECT_EQ(tv.extent(1), 3);  // ceil(10/4) = 3
 
   for (int t0 = 0; t0 < 1; ++t0)
     for (int t1 = 0; t1 < 2; ++t1)
@@ -147,11 +144,10 @@ TEST(TiledLayout, TileView2D_LayoutLeft) {
 
 TEST(TiledLayout, TileView2D_LayoutStride) {
   // Build a LayoutStride view with strides [3, 1] over a (4,4) shape.
-  Kokkos::LayoutStride ls{4, 3, 4, 1};
+  Kokkos::LayoutStride                                           ls{4, 3, 4, 1};
   Kokkos::View<float**, Kokkos::LayoutStride, Kokkos::HostSpace> v("v", ls);
   for (int i = 0; i < 4; ++i)
-    for (int j = 0; j < 4; ++j)
-      v(i, j) = static_cast<float>(i * 10 + j);
+    for (int j = 0; j < 4; ++j) v(i, j) = static_cast<float>(i * 10 + j);
 
   auto tv = tile_view(v, StaticTile<2, 2>{});
 
@@ -178,8 +174,7 @@ TEST(TiledLayout, TileViewClamp) {
   EXPECT_EQ(tv.extent(0), 1);  // outer: 1 tile
   EXPECT_EQ(tv.extent(1), 3);  // inner: clamped tile size = E = 3
 
-  for (int r = 0; r < 3; ++r)
-    EXPECT_FLOAT_EQ(tv(0, r), v(r));
+  for (int r = 0; r < 3; ++r) EXPECT_FLOAT_EQ(tv(0, r), v(r));
 }
 
 // ---------------------------------------------------------------------------
@@ -190,7 +185,7 @@ TEST(TiledLayout, TiledViewWritable) {
   Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::HostSpace> v("v", 8, 8);
   Kokkos::deep_copy(v, 0.f);
 
-  auto tv = tile_view(v, StaticTile<4, 4>{});
+  auto tv        = tile_view(v, StaticTile<4, 4>{});
   tv(1, 0, 3, 2) = 99.f;  // (t0=1,t1=0,r0=3,r1=2) -> v(1*4+3, 0*4+2) = v(7,2)
 
   EXPECT_FLOAT_EQ(v(7, 2), 99.f);
@@ -220,8 +215,7 @@ TEST(TiledLayout, TiledViewDynamic) {
 TEST(TiledLayout, SubviewFixOuterAndInnerDim0) {
   Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::HostSpace> v("v", 8, 8);
   for (int i = 0; i < 8; ++i)
-    for (int j = 0; j < 8; ++j)
-      v(i, j) = static_cast<float>(i * 8 + j);
+    for (int j = 0; j < 8; ++j) v(i, j) = static_cast<float>(i * 8 + j);
 
   // Tile: T=[4,4], shape becomes (2,2,4,4) with dims (t0,t1,r0,r1)
   auto tv = tile_view(v, StaticTile<4, 4>{});
@@ -236,7 +230,8 @@ TEST(TiledLayout, SubviewFixOuterAndInnerDim0) {
   // sv(t1, r1) == v(1*4+2, t1*4+r1) = v(6, t1*4+r1)
   for (int t1 = 0; t1 < 2; ++t1)
     for (int r1 = 0; r1 < 4; ++r1)
-      EXPECT_FLOAT_EQ(sv(t1, r1), v(6, t1 * 4 + r1)) << "t1=" << t1 << " r1=" << r1;
+      EXPECT_FLOAT_EQ(sv(t1, r1), v(6, t1 * 4 + r1))
+          << "t1=" << t1 << " r1=" << r1;
 }
 
 // ---------------------------------------------------------------------------
@@ -246,8 +241,7 @@ TEST(TiledLayout, SubviewFixOuterAndInnerDim0) {
 TEST(TiledLayout, SubviewFixInnerDims) {
   Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::HostSpace> v("v", 8, 8);
   for (int i = 0; i < 8; ++i)
-    for (int j = 0; j < 8; ++j)
-      v(i, j) = static_cast<float>(i * 8 + j);
+    for (int j = 0; j < 8; ++j) v(i, j) = static_cast<float>(i * 8 + j);
 
   auto tv = tile_view(v, StaticTile<4, 4>{});
 
@@ -271,16 +265,14 @@ TEST(TiledLayout, SubviewFixInnerDims) {
 TEST(TiledLayout, SubviewFullFree) {
   Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::HostSpace> v("v", 8, 8);
   for (int i = 0; i < 8; ++i)
-    for (int j = 0; j < 8; ++j)
-      v(i, j) = static_cast<float>(i * 8 + j);
+    for (int j = 0; j < 8; ++j) v(i, j) = static_cast<float>(i * 8 + j);
 
   auto tv = tile_view(v, StaticTile<4, 4>{});
   auto sv = subview(tv, Kokkos::ALL, Kokkos::ALL, Kokkos::ALL, Kokkos::ALL);
 
   static_assert(decltype(sv)::rank == 4);
 
-  for (int d = 0; d < 4; ++d)
-    EXPECT_EQ(sv.extent(d), tv.extent(d));
+  for (int d = 0; d < 4; ++d) EXPECT_EQ(sv.extent(d), tv.extent(d));
 
   for (int t0 = 0; t0 < 2; ++t0)
     for (int t1 = 0; t1 < 2; ++t1)

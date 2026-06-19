@@ -9,9 +9,7 @@ namespace TensorOperations {
 class TimingAnalyzer {
  public:
   // Convert nanoseconds to milliseconds
-  static double ns_to_ms(long long ns) {
-    return static_cast<double>(ns) / 1e6;
-  }
+  static double ns_to_ms(long long ns) { return static_cast<double>(ns) / 1e6; }
 
   // Convert nanoseconds to seconds
   static double ns_to_sec(long long ns) {
@@ -38,7 +36,8 @@ class TimingAnalyzer {
   //     stage_a/stage_b calls open Spec-1's own timing scope), so it is a
   //     sub-component of block load and must NOT be added to the denominator
   //     again — doing so was the old double-count bug.
-  static void print_detailed_analysis(const TimingStats& stats, double wall_ms) {
+  static void print_detailed_analysis(const TimingStats& stats,
+                                      double             wall_ms) {
     std::printf("\n=== Detailed Timing Analysis ===\n");
 
     const long long input_stage = stats.input_stage_load_time.load();
@@ -53,18 +52,18 @@ class TimingAnalyzer {
         block_load + compute + store + scratch_in + scratch_ct;
 
     if (denom == 0 || wall_ms <= 0.0) {
-      std::printf("No timing data collected. Ensure TENSOR_OPS_ENABLE_TIMING is defined.\n");
+      std::printf(
+          "No timing data collected. Ensure TENSOR_OPS_ENABLE_TIMING is "
+          "defined.\n");
       return;
     }
 
     std::printf("Total (wall) time: %.3f ms\n\n", wall_ms);
+    std::printf("%-40s %15s %15s %12s\n", "Operation", "Time (ms)", "Avg (ns)",
+                "Percent");
     std::printf("%-40s %15s %15s %12s\n",
-                "Operation", "Time (ms)", "Avg (ns)", "Percent");
-    std::printf("%-40s %15s %15s %12s\n",
-                "----------------------------------------",
-                "---------------",
-                "---------------",
-                "----------");
+                "----------------------------------------", "---------------",
+                "---------------", "----------");
 
     // A top-level stage: its wall-time share is its cycle fraction of `denom`.
     auto stage_line = [&](const char* name, long long cyc, long long count) {
@@ -85,15 +84,17 @@ class TimingAnalyzer {
       if (stats.input_stage_load_count > 0 && block_load > 0) {
         const double block_ms =
             wall_ms * static_cast<double>(block_load) / denom;
-        const long long gather = input_stage < block_load ? input_stage : block_load;
+        const long long gather =
+            input_stage < block_load ? input_stage : block_load;
         const double gather_ms =
             block_ms * static_cast<double>(gather) / block_load;
         std::printf("%-40s %15.3f %15s %11.1f%%\n",
                     "  \xe2\x94\x94 of which global gather", gather_ms, "",
                     100.0 * static_cast<double>(gather) / block_load);
-        std::printf("%-40s %15.3f %15s %11.1f%%\n",
-                    "  \xe2\x94\x94 staging copy/overhead", block_ms - gather_ms,
-                    "", 100.0 * static_cast<double>(block_load - gather) / block_load);
+        std::printf(
+            "%-40s %15.3f %15s %11.1f%%\n",
+            "  \xe2\x94\x94 staging copy/overhead", block_ms - gather_ms, "",
+            100.0 * static_cast<double>(block_load - gather) / block_load);
       }
     }
 
@@ -115,13 +116,19 @@ class TimingAnalyzer {
     if (compute_time > 0 && load_time > 0) {
       double ratio = static_cast<double>(compute_time) / load_time;
       std::printf("Compute-to-Load Ratio: %.2f\n", ratio);
-      std::printf("  (Ratio > 1.0 suggests compute-bound; < 1.0 suggests memory-bound)\n");
+      std::printf(
+          "  (Ratio > 1.0 suggests compute-bound; < 1.0 suggests "
+          "memory-bound)\n");
       if (ratio > 2.0) {
-        std::printf("  -> COMPUTE-BOUND: optimization should focus on arithmetic efficiency\n");
+        std::printf(
+            "  -> COMPUTE-BOUND: optimization should focus on arithmetic "
+            "efficiency\n");
       } else if (ratio > 1.0) {
         std::printf("  -> BALANCED: both memory and compute are significant\n");
       } else {
-        std::printf("  -> MEMORY-BOUND: optimization should focus on reducing memory traffic\n");
+        std::printf(
+            "  -> MEMORY-BOUND: optimization should focus on reducing memory "
+            "traffic\n");
       }
     }
   }

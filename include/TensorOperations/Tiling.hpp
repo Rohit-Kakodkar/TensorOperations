@@ -1,4 +1,6 @@
 #pragma once
+#include <TensorOperations/TileLayout.hpp>
+
 #include <Kokkos_Core.hpp>
 
 namespace TensorOperations {
@@ -37,5 +39,21 @@ struct DynamicTile {
   Kokkos::Array<int, Rank>      extents;
   KOKKOS_FUNCTION constexpr int extent(int i) const { return extents[i]; }
 };
+
+// ---------------------------------------------------------------------------
+// make_tile_layout — factories: Tile → TileLayout
+// ---------------------------------------------------------------------------
+
+template <int... E>
+KOKKOS_FUNCTION constexpr StaticTileLayout<E...> make_tile_layout(
+    StaticTile<E...>) noexcept {
+  return {};
+}
+
+template <int N>
+KOKKOS_FUNCTION DynamicTileLayout<N> make_tile_layout(
+    DynamicTile<N> t) noexcept {
+  return DynamicTileLayout<N>{t.extents};
+}
 
 }  // namespace TensorOperations

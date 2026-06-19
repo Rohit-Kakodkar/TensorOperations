@@ -56,8 +56,8 @@ struct NaiveFunctorT {
 template <typename Layout = Kokkos::LayoutRight>
 double bench_naive(const Kokkos::View<float***, Layout>& A,
                    const Kokkos::View<float***, Layout>& B,
-                   const Kokkos::View<float**, Layout>&  C,
-                   int warmup, int iters) {
+                   const Kokkos::View<float**, Layout>& C, int warmup,
+                   int iters) {
   const int I = static_cast<int>(C.extent(0));
   const int L = static_cast<int>(C.extent(1));
   for (int w = 0; w < warmup; ++w) {
@@ -85,11 +85,10 @@ double bench_naive(const Kokkos::View<float***, Layout>& A,
 // I/TileI times total (vs I naive). That reduction only turns into wall-clock
 // savings when those repeated reads would otherwise miss cache.
 // ---------------------------------------------------------------------------
-template <int TileI, int TileL, int TileJ = J, int TileK = K,
-          typename VA, typename VB, typename VC>
+template <int TileI, int TileL, int TileJ = J, int TileK = K, typename VA,
+          typename VB, typename VC>
 double bench_library(const VA& A, const VB& B, const VC& C, int warmup,
                      int iters) {
-
   g_timing_stats.reset();
   auto hA =
       make_input_node(make_handle(A, std::array<int32_t, 3>{'i', 'j', 'k'}));
