@@ -197,4 +197,27 @@ struct Tile {
   TileC c{};
 };
 
+// ---------------------------------------------------------------------------
+// output_tile — the free-mode (output C) tile of a tiling spec.
+//
+// A contraction tiling is a Tile<A,B,C> bundle whose output is the C tile; a
+// plain tile (register / input tier) is its own output tile. Lets a driver read
+// the free-mode tile uniformly from either form to size work items and decode
+// tile indices (Tile<A,B,C> itself has no extent()).
+// ---------------------------------------------------------------------------
+
+template <typename TileA, typename TileB, typename TileC>
+KOKKOS_FUNCTION TileC output_tile(const Tile<TileA, TileB, TileC>& t) noexcept {
+  return t.c;
+}
+template <int... E>
+KOKKOS_FUNCTION constexpr StaticTile<E...> output_tile(
+    StaticTile<E...> t) noexcept {
+  return t;
+}
+template <int R>
+KOKKOS_FUNCTION DynamicTile<R> output_tile(DynamicTile<R> t) noexcept {
+  return t;
+}
+
 }  // namespace TensorOperations

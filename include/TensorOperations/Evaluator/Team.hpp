@@ -249,3 +249,62 @@ struct Evaluator<TeamPolicyTag,
     team.team_barrier();
   }
 };
+
+// ---------------------------------------------------------------------------
+// Specialization 6: TeamPolicyTag + IntermTag(scratch View) — store-evaluator
+//
+// Writes a computed scratch tile (the result_ produced by Specialization 2 / 4)
+// back to the global output view, team-parallel. The exact reverse of
+// fill_team: same tile_view / subview_tile + TeamVectorRange structure, writing
+// instead of reading. Tile_ is the output (C) tile; Tiles are assumed to evenly
+// divide the view extents (no boundary guard), matching the rest of the team
+// tier.
+// ---------------------------------------------------------------------------
+template <typename BackingVT, typename Layout, typename IntRank, typename ES,
+          typename HookOp, typename Tile_>
+struct Evaluator<
+    TeamPolicyTag,
+    NodeHandle<IntermTag, View<BackingVT, Layout>, IntRank, ES, HookOp>,
+    Tile_> {
+  using node_type =
+      NodeHandle<IntermTag, View<BackingVT, Layout>, IntRank, ES, HookOp>;
+  using tiling_type         = Tile_;
+  using policy_tag          = TeamPolicyTag;
+  static constexpr int Rank = node_type::Rank;
+  using value_type          = typename node_type::value_type;
+  using exec_space          = ES;
+  using team_member_t = typename Kokkos::TeamPolicy<exec_space>::member_type;
+
+  static_assert(Layout::rank == Rank,
+                "scratch layout rank must equal node rank");
+  static_assert(tiling_type::rank == Rank,
+                "store tile must carry one extent per output mode");
+
+  node_type   node;
+  tiling_type tiling;  // the output (C) tile
+
+  // No scratch allocation: the scratch storage is already live in
+  // node.storage_.
+  KOKKOS_FUNCTION Evaluator(node_type n, tiling_type t) : node(n), tiling(t) {}
+
+  template <typename ViewT>
+  KOKKOS_FUNCTION void operator()(const team_member_t&     team,
+                                  Kokkos::Array<int, Rank> tile_idx,
+                                  const ViewT&             view) const {
+    TIMING_SCOPE_ENTER(g_timing_stats.store_write_time,
+                       g_timing_stats.store_write_count);
+    team.team_barrier();  // ensure the producer's scratch is fully visible
+    const auto tv        = tile_view(view, tiling);
+    const auto sv        = subview_tile(tv, tile_idx);
+    const auto sv_layout = sv.layout();
+    const auto scratch   = node.storage_;
+    const auto hook  = node.hook_op;  // local copy: lambda captures no `this`
+    const auto total = sv.size();
+    Kokkos::parallel_for(Kokkos::TeamVectorRange(team, total), [=](int i) {
+      const auto coord = sv_layout[i];
+      sv[coord]        = Impl::apply_hook(hook, scratch[coord]);
+    });
+    TIMING_SCOPE_EXIT(g_timing_stats.store_write_time,
+                      g_timing_stats.store_write_count);
+  }
+};
