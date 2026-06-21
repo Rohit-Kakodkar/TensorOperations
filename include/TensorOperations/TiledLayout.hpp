@@ -8,18 +8,48 @@
 
 namespace TensorOperations {
 
-// Forward declarations for friend declarations in layout structs.
-template <typename ViewType, typename Tile>
-struct TiledView;
-
-template <typename ViewType, int FreeRank>
-struct Subview;
+// Forward declaration — layouts hold no friend references; all offset methods
+// are public, so View needs no special access.
+template <typename ViewType, typename Layout>
+struct View;
 
 // ---------------------------------------------------------------------------
 // Impl helpers — pure arithmetic, unchanged.
 // ---------------------------------------------------------------------------
 
 namespace Impl {
+
+// Selection sort returning dimension indices ordered by ascending stride
+// (memory order): order[0] is the fastest-varying dim. Peeling dims in this
+// order during delinearize makes consecutive flat indices walk contiguous
+// memory. Shared by compute_tiled_layout and the subview factory.
+template <int N>
+KOKKOS_FUNCTION Kokkos::Array<int, N> argsort_by_stride(
+    Kokkos::Array<int, N> strides) noexcept {
+  Kokkos::Array<int, N> order{};
+  for (int i = 0; i < N; ++i) order[i] = i;
+  for (int i = 0; i < N; ++i) {
+    int m = i;
+    for (int j = i + 1; j < N; ++j)
+      if (strides[order[j]] < strides[order[m]]) m = j;
+    if (m != i) {
+      const int t = order[i];
+      order[i]    = order[m];
+      order[m]    = t;
+    }
+  }
+  return order;
+}
+
+// Per-dimension reciprocal 1/extent, for divide-free (reciprocal-multiply)
+// decode on device.
+template <int N>
+KOKKOS_FUNCTION Kokkos::Array<float, N> reciprocals(
+    Kokkos::Array<int, N> extents) noexcept {
+  Kokkos::Array<float, N> inv{};
+  for (int d = 0; d < N; ++d) inv[d] = 1.0f / static_cast<float>(extents[d]);
+  return inv;
+}
 
 template <int N>
 struct TiledLayoutResult {
@@ -28,100 +58,71 @@ struct TiledLayoutResult {
   Kokkos::Array<int, N>   outer_strides;
   Kokkos::Array<int, N>   inner_strides;
   Kokkos::Array<int, N>   inner_order;
-  Kokkos::Array<int, N>   outer_order;
   Kokkos::Array<float, N> inner_inv_extents;
-  Kokkos::Array<float, N> outer_inv_extents;
 };
 
 template <int N>
 KOKKOS_FUNCTION TiledLayoutResult<N> compute_tiled_layout(
     Kokkos::Array<int, N> extents, Kokkos::Array<int, N> strides,
     Kokkos::Array<int, N> tile_sizes) {
-  TiledLayoutResult<N> r{};
+  TiledLayoutResult<N>  r{};
+  Kokkos::Array<int, N> inner_extents{};  // tile size clamped to orig extent
   for (int d = 0; d < N; ++d) {
     const int T       = tile_sizes[d] < extents[d] ? tile_sizes[d] : extents[d];
+    inner_extents[d]  = T;
     r.orig_extents[d] = extents[d];
     r.outer_extents[d] = (extents[d] + T - 1) / T;
     r.outer_strides[d] = T * strides[d];
     r.inner_strides[d] = strides[d];
   }
-  for (int i = 0; i < N; ++i) r.inner_order[i] = i;
-  for (int i = 0; i < N; ++i) {
-    int m = i;
-    for (int j = i + 1; j < N; ++j)
-      if (r.inner_strides[r.inner_order[j]] < r.inner_strides[r.inner_order[m]])
-        m = j;
-    if (m != i) {
-      const int t      = r.inner_order[i];
-      r.inner_order[i] = r.inner_order[m];
-      r.inner_order[m] = t;
-    }
-  }
-  for (int i = 0; i < N; ++i) r.outer_order[i] = i;
-  for (int i = 0; i < N; ++i) {
-    int m = i;
-    for (int j = i + 1; j < N; ++j)
-      if (r.outer_strides[r.outer_order[j]] < r.outer_strides[r.outer_order[m]])
-        m = j;
-    if (m != i) {
-      const int t      = r.outer_order[i];
-      r.outer_order[i] = r.outer_order[m];
-      r.outer_order[m] = t;
-    }
-  }
-  for (int d = 0; d < N; ++d) {
-    const int T = tile_sizes[d] < extents[d] ? tile_sizes[d] : extents[d];
-    r.inner_inv_extents[d] = 1.0f / static_cast<float>(T);
-  }
-  for (int d = 0; d < N; ++d)
-    r.outer_inv_extents[d] = 1.0f / static_cast<float>(r.outer_extents[d]);
+  r.inner_order       = argsort_by_stride<N>(r.inner_strides);
+  r.inner_inv_extents = reciprocals<N>(inner_extents);
   return r;
 }
 
 }  // namespace Impl
 
 // ---------------------------------------------------------------------------
-// TiledLayout<N, InnerExtents>
+// TiledLayout<N, TileLayoutT>
 //
 // All layout parameters for an N-dimensional tiled view: outer tile counts,
-// outer and inner (element) strides, original extents, and inner tile extents.
+// outer and inner (element) strides, and original extents, plus the inner-tile
+// extents/decode delegated to a TileLayoutT (StaticTileLayoutRight /
+// DynamicTileLayoutRight from TileLayout.hpp). Mind the naming: *TileLayout*
+// encodes one tile's inner coordinates; *TiledLayout* (this) is the full
+// tiled-view layout that embeds one.
 //
 // Public interface:
 //   extent(d)      — outer tile count for d < N; clamped tile size for d >= N
 //   stride(d)      — outer stride for d < N; element stride for d >= N
 //   operator[](i)  — row-major delinearize: flat inner index → N-D tile coord
-//
-// All data members are private; TiledView is a friend to access the offset
-// and bounds-check helpers used inside operator().
+//                    (delegated to the embedded TileLayoutT)
+//   offset(index_sequence<Is...>, args) — full 2N-index flat offset
+//   base_offset()  — always 0 (tiled views start at the backing data pointer)
+//   size()         — product of all 2N extents
+//   check_bounds(args) — debug bounds check over all N outer/inner index pairs
 // ---------------------------------------------------------------------------
 
-template <int N, typename InnerExtents>
+template <int N, typename TileLayoutT>
 struct TiledLayout {
  public:
-  using inner_extents_t = InnerExtents;
+  static constexpr int rank = 2 * N;
+  using tile_layout_t       = TileLayoutT;
 
-  KOKKOS_FUNCTION TiledLayout(inner_extents_t inner, Kokkos::Array<int, N> orig,
-                              Kokkos::Array<int, N>   outer_ext,
-                              Kokkos::Array<int, N>   outer_str,
-                              Kokkos::Array<int, N>   inner_str,
-                              Kokkos::Array<int, N>   inner_ord,
-                              Kokkos::Array<int, N>   outer_ord,
-                              Kokkos::Array<float, N> inner_inv_ext,
-                              Kokkos::Array<float, N> outer_inv_ext) noexcept
-      : inner_extents_(inner),
-        orig_extents_(orig),
-        outer_extents_(outer_ext),
-        outer_strides_(outer_str),
-        inner_strides_(inner_str),
-        inner_order_(inner_ord),
-        outer_order_(outer_ord),
-        inner_inv_extents_(inner_inv_ext),
-        outer_inv_extents_(outer_inv_ext) {}
+  KOKKOS_FUNCTION TiledLayout(tile_layout_t                     tile_layout,
+                              const Impl::TiledLayoutResult<N>& r) noexcept
+      : tile_layout_(tile_layout),
+        orig_extents_(r.orig_extents),
+        outer_extents_(r.outer_extents),
+        outer_strides_(r.outer_strides),
+        inner_strides_(r.inner_strides),
+        inner_order_(r.inner_order),
+        inner_inv_extents_(r.inner_inv_extents) {}
 
   // extent(d): outer tile count for d < N; clamped tile size for d >= N.
   KOKKOS_FUNCTION int extent(int d) const noexcept {
     if (d < N) return outer_extents_[d];
-    const int T = static_cast<int>(inner_extents_.extent(d - N));
+    const int T = tile_layout_.extent(d - N);
     const int E = orig_extents_[d - N];
     return T < E ? T : E;
   }
@@ -132,41 +133,66 @@ struct TiledLayout {
   }
 
   // Delinearize: row-major flat inner index → N-D inner tile coordinate.
-  // Non-overlapping strides assumed.
   KOKKOS_FUNCTION Kokkos::Array<int, N> operator[](int linear) const noexcept {
-    Kokkos::Array<int, N> idx{};
-    for (int d = N - 1; d >= 0; --d) {
-      idx[d] = linear % static_cast<int>(inner_extents_.extent(d));
-      linear /= static_cast<int>(inner_extents_.extent(d));
-    }
-    return idx;
+    return tile_layout_[linear];
+  }
+
+  // Host-precomputed memory-order permutation and reciprocals, forwarded by
+  // subview_tile into a SubviewLayout (see SubviewLayout::operator[]).
+  KOKKOS_FUNCTION const Kokkos::Array<int, N>& inner_order() const noexcept {
+    return inner_order_;
+  }
+  KOKKOS_FUNCTION const Kokkos::Array<float, N>& inner_inv_extents()
+      const noexcept {
+    return inner_inv_extents_;
+  }
+
+  // Full 2N-index memory offset from backing_.data().
+  // Is spans {0, ..., 2N-1}: first N are outer coords, last N are inner
+  // offsets.
+  template <std::size_t... Is>
+  KOKKOS_FUNCTION int offset(std::index_sequence<Is...>, auto& args) const {
+    return (stride_for_<Is>(args) + ...);
+  }
+
+  KOKKOS_FUNCTION static constexpr int base_offset() noexcept { return 0; }
+
+  KOKKOS_FUNCTION int size() const noexcept {
+    int s = 1;
+    for (int d = 0; d < 2 * N; ++d) s *= extent(d);
+    return s;
+  }
+
+  // Bounds check over all N outer/inner index pairs; no-op without debug flag.
+  KOKKOS_FUNCTION void check_bounds(auto& args) const {
+    check_bounds_(std::make_index_sequence<N>{}, args);
   }
 
  private:
-  inner_extents_t       inner_extents_;
-  Kokkos::Array<int, N> orig_extents_;
-  Kokkos::Array<int, N> outer_extents_;
-  Kokkos::Array<int, N> outer_strides_;
-  Kokkos::Array<int, N> inner_strides_;
-
- public:
+  tile_layout_t           tile_layout_;
+  Kokkos::Array<int, N>   orig_extents_;
+  Kokkos::Array<int, N>   outer_extents_;
+  Kokkos::Array<int, N>   outer_strides_;
+  Kokkos::Array<int, N>   inner_strides_;
   Kokkos::Array<int, N>   inner_order_;
-  Kokkos::Array<int, N>   outer_order_;
   Kokkos::Array<float, N> inner_inv_extents_;
-  Kokkos::Array<float, N> outer_inv_extents_;
 
-  template <std::size_t... Is>
-  KOKKOS_FUNCTION int offset_(std::index_sequence<Is...>, auto& args) const {
-    return ((static_cast<int>(std::get<Is>(args)) * outer_strides_[Is] +
-             static_cast<int>(std::get<N + Is>(args)) * inner_strides_[Is]) +
-            ...);
+  // Helper: contribution of arg I to the flat offset.
+  // Is in [0, N): outer coordinate × outer stride.
+  // Is in [N, 2N): inner offset × inner stride.
+  template <std::size_t I>
+  KOKKOS_FUNCTION int stride_for_(auto& args) const {
+    if constexpr (I < static_cast<std::size_t>(N)) {
+      return static_cast<int>(std::get<I>(args)) * outer_strides_[I];
+    } else {
+      return static_cast<int>(std::get<I>(args)) * inner_strides_[I - N];
+    }
   }
 
   template <std::size_t I>
   KOKKOS_FUNCTION void check_one_(auto& args) const {
 #ifdef KOKKOS_ENABLE_DEBUG_BOUNDS_CHECK
-    if (static_cast<int>(std::get<I>(args)) *
-                static_cast<int>(inner_extents_.extent(I)) +
+    if (static_cast<int>(std::get<I>(args)) * tile_layout_.extent(I) +
             static_cast<int>(std::get<N + I>(args)) >=
         orig_extents_[I])
       Kokkos::abort("TiledView: out-of-bounds access");
@@ -180,87 +206,6 @@ struct TiledLayout {
                                      auto& args) const {
     (check_one_<Is>(args), ...);
   }
-
-  template <typename V, typename T>
-  friend struct TiledView;
-};
-
-// ---------------------------------------------------------------------------
-// Primary template — undefined; two specialisations below.
-// ---------------------------------------------------------------------------
-
-template <typename ViewType, typename Tile>
-struct TiledView;
-
-// ---------------------------------------------------------------------------
-// TiledView — StaticTile specialisation
-//
-// operator() accepts 2N arguments: (t0,…,tN-1, r0,…,rN-1).
-// All layout state lives in layout_; backing_ owns only the raw pointer.
-// ---------------------------------------------------------------------------
-
-template <typename ViewType, int... TileExtents>
-struct TiledView<ViewType, StaticTile<TileExtents...>> {
-  static constexpr int N = sizeof...(TileExtents);
-  static_assert(N == static_cast<int>(ViewType::rank),
-                "StaticTile rank must equal View rank");
-  static constexpr int rank = 2 * N;
-  using value_type          = typename ViewType::value_type;
-
-  using inner_extents_t =
-      Kokkos::extents<int, static_cast<std::size_t>(TileExtents)...>;
-  using layout_t = TiledLayout<N, inner_extents_t>;
-
-  ViewType backing_;
-  layout_t layout_;
-
-  KOKKOS_FUNCTION int extent(int d) const noexcept { return layout_.extent(d); }
-  KOKKOS_FUNCTION int stride(int d) const noexcept { return layout_.stride(d); }
-  KOKKOS_FUNCTION value_type* data() const noexcept { return backing_.data(); }
-
-  template <typename... Indices>
-    requires(sizeof...(Indices) == 2 * N)
-  KOKKOS_FUNCTION value_type& operator()(Indices... idx) const {
-    auto args = std::forward_as_tuple(idx...);
-#ifdef KOKKOS_ENABLE_DEBUG_BOUNDS_CHECK
-    layout_.check_bounds_(std::make_index_sequence<N>{}, args);
-#endif
-    return backing_
-        .data()[layout_.offset_(std::make_index_sequence<N>{}, args)];
-  }
-};
-
-// ---------------------------------------------------------------------------
-// TiledView — DynamicTile specialisation
-// ---------------------------------------------------------------------------
-
-template <typename ViewType, int N>
-struct TiledView<ViewType, DynamicTile<N>> {
-  static_assert(N == static_cast<int>(ViewType::rank),
-                "DynamicTile rank must equal View rank");
-  static constexpr int rank = 2 * N;
-  using value_type          = typename ViewType::value_type;
-
-  using inner_extents_t = Kokkos::dextents<int, N>;
-  using layout_t        = TiledLayout<N, inner_extents_t>;
-
-  ViewType backing_;
-  layout_t layout_;
-
-  KOKKOS_FUNCTION int extent(int d) const noexcept { return layout_.extent(d); }
-  KOKKOS_FUNCTION int stride(int d) const noexcept { return layout_.stride(d); }
-  KOKKOS_FUNCTION value_type* data() const noexcept { return backing_.data(); }
-
-  template <typename... Indices>
-    requires(sizeof...(Indices) == 2 * N)
-  KOKKOS_FUNCTION value_type& operator()(Indices... idx) const {
-    auto args = std::forward_as_tuple(idx...);
-#ifdef KOKKOS_ENABLE_DEBUG_BOUNDS_CHECK
-    layout_.check_bounds_(std::make_index_sequence<N>{}, args);
-#endif
-    return backing_
-        .data()[layout_.offset_(std::make_index_sequence<N>{}, args)];
-  }
 };
 
 // ---------------------------------------------------------------------------
@@ -270,13 +215,17 @@ struct TiledView<ViewType, DynamicTile<N>> {
 // backing storage, per-dimension extents, and per-dimension strides.
 //
 // Public interface:
-//   extent(d)              — extent of free dimension d
-//   stride(d)              — stride of free dimension d
-//   operator[](i)          — row-major delinearize: flat index → N-D coordinate
-//   delinearize_ordered(i) — memory-aligned delinearize: peels the smallest-
-//                            stride (fastest-varying) dimension first, so that
-//                            consecutive flat indices walk contiguous memory
-//                            (coalesced reads) regardless of input layout.
+//   extent(d)         — extent of free dimension d
+//   stride(d)         — stride of free dimension d
+//   size()            — product of all extents
+//   unit_stride_dim() — first free dim with unit stride, or -1
+//   base_offset()     — flat offset of element [0,...,0] from backing data
+//   offset(index_sequence<Is...>, args) — full flat offset from backing data
+//   operator[](i)     — memory-aligned delinearize: peels the smallest-stride
+//                       (fastest-varying) dimension first so consecutive flat
+//                       indices walk contiguous memory (coalesced reads),
+//                       regardless of input layout. Divide-free: uses the
+//                       precomputed reciprocals (see ctor).
 //
 // Non-overlapping strides assumed.
 // ---------------------------------------------------------------------------
@@ -284,6 +233,8 @@ struct TiledView<ViewType, DynamicTile<N>> {
 template <int N>
 struct SubviewLayout {
  public:
+  static constexpr int rank = N;
+
   KOKKOS_FUNCTION SubviewLayout(int base, Kokkos::Array<int, N> ext,
                                 Kokkos::Array<int, N>   str,
                                 Kokkos::Array<int, N>   order,
@@ -311,6 +262,15 @@ struct SubviewLayout {
       if (strides_[d] == 1) return d;
     return -1;
   }
+
+  // Full N-index offset from backing_.data() (includes base_offset_).
+  template <std::size_t... Is>
+  KOKKOS_FUNCTION int offset(std::index_sequence<Is...>, auto& args) const {
+    return base_offset_ +
+           ((static_cast<int>(std::get<Is>(args)) * strides_[Is]) + ...);
+  }
+
+  KOKKOS_FUNCTION int base_offset() const noexcept { return base_offset_; }
 
   // Memory-aligned delinearize: flat index → N-D coordinate, peeling the
   // smallest-stride dimension first so consecutive flat indices walk contiguous
@@ -343,60 +303,106 @@ struct SubviewLayout {
   Kokkos::Array<int, N> order_;  // dims by stride ascending (memory order)
   Kokkos::Array<float, N>
       inv_extents_;  // 1/extents_[d], for divide-free decode
-
-  template <std::size_t... Is>
-  KOKKOS_FUNCTION int offset_(std::index_sequence<Is...>, auto& args) const {
-    return ((static_cast<int>(std::get<Is>(args)) * strides_[Is]) + ...);
-  }
-
-  template <typename V, int FR>
-  friend struct Subview;
 };
 
 // ---------------------------------------------------------------------------
-// Subview — a non-owning slice of a TiledView
+// View<ViewType, Layout>
 //
-// Stores the backing ViewType by reference for zero-copy overhead. The
-// caller is responsible for keeping the source TiledView alive.
+// Generic view backed by a ViewType (any type exposing .data()) and indexed
+// by a Layout that provides:
+//   rank                                — static constexpr int
+//   extent(d)                           — logical extent of dimension d
+//   stride(d)                           — stride of dimension d
+//   base_offset()                       — flat offset of [0,...,0] from data()
+//   offset(index_sequence<Is...>, args) — full flat offset from data()
+//   size()                              — product of all extents
+//   operator[](int)                     — flat → multi-index delinearize
 //
-// FreeRank = number of Kokkos::ALL dimensions in the subview call.
+// TiledLayout<N,TL>  → rank = 2N  (outer tile coords then inner offsets)
+// SubviewLayout<N>   → rank = N   (free dimensions of a subview)
 // ---------------------------------------------------------------------------
 
-template <typename ViewType, int FreeRank>
-struct Subview {
-  static constexpr int rank = FreeRank;
+template <typename ViewType, typename Layout>
+struct View {
+  static constexpr int rank = Layout::rank;
   using value_type          = typename ViewType::value_type;
-  using layout_t            = SubviewLayout<FreeRank>;
+  using layout_t            = Layout;
 
-  const ViewType& backing_;
-  layout_t        layout_;
+  ViewType backing_;
+  Layout   layout_;
 
   KOKKOS_FUNCTION int extent(int d) const noexcept { return layout_.extent(d); }
   KOKKOS_FUNCTION int stride(int d) const noexcept { return layout_.stride(d); }
-  KOKKOS_FUNCTION int unit_stride_dim() const noexcept {
+  KOKKOS_FUNCTION value_type* data() const noexcept {
+    return backing_.data() + layout_.base_offset();
+  }
+  KOKKOS_FUNCTION const Layout& layout() const noexcept { return layout_; }
+  KOKKOS_FUNCTION int           size() const noexcept { return layout_.size(); }
+
+  // unit_stride_dim() forwarded to layout when available (SubviewLayout only).
+  KOKKOS_FUNCTION int unit_stride_dim() const noexcept
+    requires requires { layout_.unit_stride_dim(); }
+  {
     return layout_.unit_stride_dim();
   }
-  KOKKOS_FUNCTION value_type* data() const noexcept {
-    return backing_.data() + layout_.base_offset_;
-  }
-  KOKKOS_FUNCTION const layout_t& layout() const noexcept { return layout_; }
 
-  KOKKOS_FUNCTION value_type& operator[](
-      Kokkos::Array<int, FreeRank> idx) const {
+  template <typename... Idx>
+    requires(sizeof...(Idx) == rank)
+  KOKKOS_FUNCTION value_type& operator()(Idx... idx) const {
+    auto args = std::forward_as_tuple(idx...);
+#ifdef KOKKOS_ENABLE_DEBUG_BOUNDS_CHECK
+    if constexpr (requires { layout_.check_bounds(args); })
+      layout_.check_bounds(args);
+#endif
+    return backing_
+        .data()[layout_.offset(std::make_index_sequence<rank>{}, args)];
+  }
+
+  KOKKOS_FUNCTION value_type& operator[](Kokkos::Array<int, rank> idx) const {
     return [&]<std::size_t... D>(std::index_sequence<D...>) -> value_type& {
       return (*this)(idx[D]...);
-    }(std::make_index_sequence<FreeRank>{});
-  }
-
-  template <typename... Indices>
-    requires(sizeof...(Indices) == FreeRank)
-  KOKKOS_FUNCTION value_type& operator()(Indices... idx) const {
-    auto args = std::forward_as_tuple(idx...);
-    return backing_
-        .data()[layout_.base_offset_ +
-                layout_.offset_(std::make_index_sequence<FreeRank>{}, args)];
+    }(std::make_index_sequence<rank>{});
   }
 };
+
+// ---------------------------------------------------------------------------
+// TiledView<ViewType, Tile>
+//
+// Convenience alias: a View backed by TiledLayout<N, TileLayoutT>, where N and
+// TileLayoutT are derived from Tile (StaticTile<E...> or DynamicTile<N>).
+// operator() accepts 2N arguments: N outer tile coordinates then N inner
+// offsets.
+// ---------------------------------------------------------------------------
+
+template <typename ViewType, typename Tile>
+using TiledView =
+    View<ViewType, TiledLayout<Tile::rank, decltype(make_tile_layout(
+                                               std::declval<Tile>()))>>;
+
+// ---------------------------------------------------------------------------
+// Subview<ViewType, FreeRank>
+//
+// Convenience alias: a View backed by SubviewLayout<FreeRank>.
+// FreeRank = number of Kokkos::ALL dimensions in the subview call.
+// backing_ is stored by value (Kokkos::View has shallow-copy semantics).
+// ---------------------------------------------------------------------------
+
+template <typename ViewType, int FreeRank>
+using Subview = View<ViewType, SubviewLayout<FreeRank>>;
+
+// ---------------------------------------------------------------------------
+// ScratchView<ValueType, ExecSpace, Layout>
+//
+// Convenience alias: a View backed by a Layout and allocated in the scratch
+// memory space of an execution space. Used for tiled staging and reduction
+// accumulation.
+// ---------------------------------------------------------------------------
+
+template <typename ValueType, typename ExecSpace, typename Layout>
+using ScratchView =
+    View<Kokkos::View<ValueType*, typename ExecSpace::scratch_memory_space,
+                      Kokkos::MemoryTraits<Kokkos::Unmanaged>>,
+         Layout>;
 
 // ---------------------------------------------------------------------------
 // Impl helpers for subview
@@ -414,34 +420,17 @@ inline constexpr int free_rank_v = static_cast<int>((is_all_v<Slices> + ...));
 
 // ---------------------------------------------------------------------------
 // tile_view — factory: Kokkos::View × Tile → TiledView
+//
+// One overload for both tile kinds: the inner TileLayout is selected by
+// make_tile_layout(tile), and tile.extent(d) reads tile sizes uniformly
+// (StaticTile's extent is static constexpr, DynamicTile's a member).
 // ---------------------------------------------------------------------------
 
-template <typename ViewType, int... TileExtents>
-KOKKOS_FUNCTION auto tile_view(const ViewType& view, StaticTile<TileExtents...>)
-    -> TiledView<ViewType, StaticTile<TileExtents...>> {
-  constexpr int N = sizeof...(TileExtents);
-  using TV        = TiledView<ViewType, StaticTile<TileExtents...>>;
-  using LE        = typename TV::inner_extents_t;
-  using LT        = typename TV::layout_t;
-
-  Kokkos::Array<int, N> extents{}, strides{}, tsizes{};
-  for (int d = 0; d < N; ++d) {
-    extents[d] = static_cast<int>(view.extent(d));
-    strides[d] = static_cast<int>(view.stride(d));
-    tsizes[d]  = StaticTile<TileExtents...>::extent(d);
-  }
-
-  const auto r = Impl::compute_tiled_layout<N>(extents, strides, tsizes);
-  return {view, LT{LE{}, r.orig_extents, r.outer_extents, r.outer_strides,
-                   r.inner_strides, r.inner_order, r.outer_order,
-                   r.inner_inv_extents, r.outer_inv_extents}};
-}
-
-template <typename ViewType, int N>
-KOKKOS_FUNCTION auto tile_view(const ViewType& view, DynamicTile<N> tile)
-    -> TiledView<ViewType, DynamicTile<N>> {
-  using TV = TiledView<ViewType, DynamicTile<N>>;
-  using LT = typename TV::layout_t;
+template <typename ViewType, typename Tile>
+KOKKOS_FUNCTION auto tile_view(const ViewType& view, Tile tile)
+    -> TiledView<ViewType, Tile> {
+  constexpr int N = Tile::rank;
+  using LT        = typename TiledView<ViewType, Tile>::layout_t;
 
   Kokkos::Array<int, N> extents{}, strides{}, tsizes{};
   for (int d = 0; d < N; ++d) {
@@ -449,15 +438,9 @@ KOKKOS_FUNCTION auto tile_view(const ViewType& view, DynamicTile<N> tile)
     strides[d] = static_cast<int>(view.stride(d));
     tsizes[d]  = tile.extent(d);
   }
+
   const auto r = Impl::compute_tiled_layout<N>(extents, strides, tsizes);
-
-  auto inner_ext = [&]<std::size_t... Is>(std::index_sequence<Is...>) {
-    return Kokkos::dextents<int, N>{tsizes[Is]...};
-  }(std::make_index_sequence<N>{});
-
-  return {view, LT{inner_ext, r.orig_extents, r.outer_extents, r.outer_strides,
-                   r.inner_strides, r.inner_order, r.outer_order,
-                   r.inner_inv_extents, r.outer_inv_extents}};
+  return {view, LT{make_tile_layout(tile), r}};
 }
 
 // ---------------------------------------------------------------------------
@@ -468,10 +451,9 @@ KOKKOS_FUNCTION auto tile_view(const ViewType& view, DynamicTile<N> tile)
 // ALL  → keep that dimension free in the returned Subview.
 // ---------------------------------------------------------------------------
 
-template <typename ViewType, typename Tile, typename... Slices>
-auto subview(const TiledView<ViewType, Tile>& tv, Slices... slices) {
-  using TV           = TiledView<ViewType, Tile>;
-  constexpr int Full = TV::rank;
+template <typename ViewType, int N, typename TL, typename... Slices>
+auto subview(const View<ViewType, TiledLayout<N, TL>>& tv, Slices... slices) {
+  constexpr int Full = View<ViewType, TiledLayout<N, TL>>::rank;
   static_assert(sizeof...(Slices) == Full,
                 "subview: one slice argument per tiled dimension required");
   constexpr int Free = Impl::free_rank_v<Slices...>;
@@ -499,21 +481,8 @@ auto subview(const TiledView<ViewType, Tile>& tv, Slices... slices) {
         ...);
   }(std::make_index_sequence<Full>{});
 
-  Kokkos::Array<int, Free>   order{};
-  Kokkos::Array<float, Free> inv_extents{};
-  for (int i = 0; i < Free; ++i) order[i] = i;
-  for (int i = 0; i < Free; ++i) {
-    int m = i;
-    for (int j = i + 1; j < Free; ++j)
-      if (strides[order[j]] < strides[order[m]]) m = j;
-    if (m != i) {
-      const int t = order[i];
-      order[i]    = order[m];
-      order[m]    = t;
-    }
-  }
-  for (int d = 0; d < Free; ++d)
-    inv_extents[d] = 1.0f / static_cast<float>(extents[d]);
+  const auto order       = Impl::argsort_by_stride<Free>(strides);
+  const auto inv_extents = Impl::reciprocals<Free>(extents);
 
   return Subview<ViewType, Free>{
       tv.backing_,
@@ -529,12 +498,11 @@ auto subview(const TiledView<ViewType, Tile>& tv, Slices... slices) {
 // per-call sorting or reciprocal computation.
 // ---------------------------------------------------------------------------
 
-template <typename ViewType, typename Tile>
+template <typename ViewType, int N, typename TL>
 KOKKOS_FUNCTION auto subview_tile(
-    const TiledView<ViewType, Tile>&                        tv,
-    Kokkos::Array<int, TiledView<ViewType, Tile>::rank / 2> outer_idx) {
-  constexpr int N           = TiledView<ViewType, Tile>::rank / 2;
-  int           base_offset = 0;
+    const View<ViewType, TiledLayout<N, TL>>&       tv,
+    Kokkos::Array<int, static_cast<std::size_t>(N)> outer_idx) {
+  int base_offset = 0;
   for (int d = 0; d < N; ++d) base_offset += outer_idx[d] * tv.stride(d);
   Kokkos::Array<int, N> extents{}, strides{};
   for (int d = 0; d < N; ++d) {
@@ -543,8 +511,31 @@ KOKKOS_FUNCTION auto subview_tile(
   }
   return Subview<ViewType, N>{
       tv.backing_,
-      SubviewLayout<N>{base_offset, extents, strides, tv.layout_.inner_order_,
-                       tv.layout_.inner_inv_extents_}};
+      SubviewLayout<N>{base_offset, extents, strides, tv.layout_.inner_order(),
+                       tv.layout_.inner_inv_extents()}};
+}
+
+// ---------------------------------------------------------------------------
+// reshape — reinterpret a View under a new shape given by a Tile.
+//
+// Delegates to reshape(layout, tile) (defined in Tiling.hpp) to produce the
+// new layout, then wraps it with the same backing storage. The requires clause
+// constrains the overload to layout types that have a reshape overload,
+// producing a clear compile error for unsupported layouts (SubviewLayout,
+// TiledLayout) rather than a cryptic substitution failure.
+//
+//   reshape(View<VT, StaticTileLayoutRight<32>>{...}, StaticTile<4, 8>{})
+//       -> View<VT, StaticTileLayoutRight<4, 8>>
+//   reshape(View<VT, DynamicTileLayoutLeft<1>>{...},  DynamicTile<2>{{4,8}})
+//       -> View<VT, DynamicTileLayoutLeft<2>>
+// ---------------------------------------------------------------------------
+
+template <typename ViewType, typename Layout, typename Tile>
+  requires(requires(Layout l, Tile t) { reshape(l, t); })
+KOKKOS_FUNCTION auto reshape(const View<ViewType, Layout>& view,
+                             const Tile&                   tile)
+    -> View<ViewType, decltype(reshape(view.layout(), tile))> {
+  return {view.backing_, reshape(view.layout(), tile)};
 }
 
 }  // namespace TensorOperations

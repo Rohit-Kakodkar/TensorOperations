@@ -66,6 +66,16 @@ KOKKOS_FUNCTION auto make_evaluator(NodeType node, Tile tile)
   return Evaluator<PolicyTag, NodeType, Tile>(node, tile);
 }
 
+// Team-tier overload: evaluators that allocate from team scratch must be built
+// inside the kernel, so they take the team member at construction.
+template <typename PolicyTag, typename NodeType, typename Tile,
+          typename TeamMember>
+KOKKOS_FUNCTION auto make_evaluator(NodeType node, Tile tile,
+                                    const TeamMember& team)
+    -> Evaluator<PolicyTag, NodeType, Tile> {
+  return Evaluator<PolicyTag, NodeType, Tile>(node, tile, team);
+}
+
 #include <TensorOperations/Evaluator/Range.hpp>
 #include <TensorOperations/Evaluator/Team.hpp>
 

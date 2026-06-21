@@ -25,16 +25,16 @@ namespace TensorOperations {
 // accessor is general and convenient but a non-constant index will spill the
 // array to local memory on GPU.
 //
-// Layout: encode/decode logic lives in StaticTileLayout<Extents...> (exposed
-// as layout_type). strides_ and extents_ are forwarded aliases so existing
-// callers continue to compile without change.
+// Layout: encode/decode logic lives in StaticTileLayoutRight<Extents...>
+// (exposed as layout_type). strides_ and extents_ are forwarded aliases so
+// existing callers continue to compile without change.
 // ---------------------------------------------------------------------------
 template <typename T, int... Extents>
 struct RegisterArray {
-  using layout_type = StaticTileLayout<Extents...>;
+  using layout_type = StaticTileLayoutRight<Extents...>;
 
   static constexpr int         rank = layout_type::rank;
-  static constexpr std::size_t size = layout_type::size;
+  static constexpr std::size_t size = layout_type::num_elements;
 
   // Forwarded aliases — preserve existing call sites in Range.hpp.
   static constexpr auto extents_ = layout_type::extents_;
