@@ -127,24 +127,17 @@ struct Graph {
     static_assert(sizeof...(Ts) == std::tuple_size_v<OutputTuple>,
                   "Number of runtime tensor arguments must match number of "
                   "output nodes in the graph");
-    static_assert(std::is_same_v<PolicyTag, RangePolicyTag> ||
-                      std::is_same_v<PolicyTag, TeamPolicyTag>,
-                  "PolicyTag must be RangePolicyTag or TeamPolicyTag");
+    static_assert(std::is_same_v<PolicyTag, TeamPolicyTag>,
+                  "PolicyTag must be TeamPolicyTag");
 
     auto                  ts_tuple = std::tie(ts...);
     constexpr std::size_t N        = std::tuple_size_v<OutputTuple>;
     std::size_t           wk_items = 0;
     [&]<std::size_t... I>(std::index_sequence<I...>) {
-      if constexpr (std::is_same_v<PolicyTag, RangePolicyTag>) {
-        ((execute_one_output(std::get<I>(outputs), std::get<I>(ts_tuple), tile),
-          wk_items += work_items(std::get<I>(outputs), tile)),
-         ...);
-      } else {
-        ((execute_one_output_team(std::get<I>(outputs), std::get<I>(ts_tuple),
-                                  tile),
-          wk_items += work_items(std::get<I>(outputs), output_tile(tile))),
-         ...);
-      }
+      ((execute_one_output_team(std::get<I>(outputs), std::get<I>(ts_tuple),
+                                tile),
+        wk_items += work_items(std::get<I>(outputs), output_tile(tile))),
+       ...);
     }(std::make_index_sequence<N>{});
 
     return wk_items;
@@ -173,32 +166,9 @@ struct Graph {
     return total;
   }
 
-  // Launch a Kokkos::RangePolicy kernel for a single output node, writing
-  // results into `view`. One kernel per output avoids tuple access on device.
-  template <typename NodeType, typename ViewT, typename Tile>
-  static void execute_one_output(const NodeType& node, const ViewT& view,
-                                 const Tile& tile) {
-    const std::size_t wk = work_items(node, tile);
-    Kokkos::parallel_for(
-        "TensorOperations::execute",
-        Kokkos::RangePolicy<typename NodeType::exec_space>(0, wk),
-        KOKKOS_LAMBDA(std::size_t local_idx) {
-          const auto shape = node.shape();
-          const auto c_tile_idx =
-              Impl::decode_tile_index<NodeType::Rank>(local_idx, shape, tile);
-
-          auto eval   = make_evaluator<RangePolicyTag>(node, tile);
-          auto interm = eval(c_tile_idx);
-
-          auto seval = make_evaluator<RangePolicyTag>(interm, tile);
-          seval(c_tile_idx, view);
-        });
-  }
-
   // Launch a Kokkos::TeamPolicy kernel for a single output node: one team per
   // output tile stages/accumulates into team scratch (the node evaluator), then
   // writes the scratch tile back to `view` (the interm store evaluator).
-  // Mirrors execute_one_output for the scratch tier.
   template <typename NodeType, typename ViewT, typename Tile>
   static void execute_one_output_team(const NodeType& node, const ViewT& view,
                                       const Tile& tile) {

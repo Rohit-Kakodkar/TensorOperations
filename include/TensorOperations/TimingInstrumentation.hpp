@@ -9,46 +9,26 @@ namespace TensorOperations {
 // Global timing counters for each evaluator operator stage.
 // Thread-safe via atomics (though Kokkos may serialize on host).
 struct TimingStats {
-  // Input staging (RangePolicyTag + InputTag specialization)
-  std::atomic<long long> input_stage_load_count{0};
-  std::atomic<long long> input_stage_load_time{0};
-
-  // Contraction (RangePolicyTag + ContractionTag specialization)
-  std::atomic<long long> contraction_accum_count{0};
-  std::atomic<long long> contraction_accum_time{0};
-  std::atomic<long long> contraction_block_load_count{0};
-  std::atomic<long long> contraction_block_load_time{0};
-  std::atomic<long long> contraction_compute_count{0};
-  std::atomic<long long> contraction_compute_time{0};
-
-  // Store (RangePolicyTag + IntermTag + RegisterArray specialization)
-  std::atomic<long long> store_write_count{0};
-  std::atomic<long long> store_write_time{0};
-
   // Scratch tier (TeamPolicyTag) — input load
   std::atomic<long long> scratch_input_load_count{0};
   std::atomic<long long> scratch_input_load_time{0};
 
-  // Scratch tier (TeamPolicyTag) — contraction
-  std::atomic<long long> scratch_contraction_count{0};
-  std::atomic<long long> scratch_contraction_time{0};
+  // Contraction (TeamPolicyTag + ContractionTag specialization)
+  std::atomic<long long> contraction_accum_count{0};
+  std::atomic<long long> contraction_accum_time{0};
+
+  // Store (TeamPolicyTag + IntermTag specialization)
+  std::atomic<long long> store_write_count{0};
+  std::atomic<long long> store_write_time{0};
 
   // Reset all counters
   void reset() {
-    input_stage_load_count       = 0;
-    input_stage_load_time        = 0;
-    contraction_accum_count      = 0;
-    contraction_accum_time       = 0;
-    contraction_block_load_count = 0;
-    contraction_block_load_time  = 0;
-    contraction_compute_count    = 0;
-    contraction_compute_time     = 0;
-    store_write_count            = 0;
-    store_write_time             = 0;
-    scratch_input_load_count     = 0;
-    scratch_input_load_time      = 0;
-    scratch_contraction_count    = 0;
-    scratch_contraction_time     = 0;
+    scratch_input_load_count = 0;
+    scratch_input_load_time  = 0;
+    contraction_accum_count  = 0;
+    contraction_accum_time   = 0;
+    store_write_count        = 0;
+    store_write_time         = 0;
   }
 
   // Print a human-readable report to stdout
@@ -58,21 +38,10 @@ struct TimingStats {
     std::printf("%-40s %15s %15s\n", "----------------------------------------",
                 "---------------", "---------------");
 
-    if (input_stage_load_count > 0) {
-      std::printf("%-40s %15lld %15lld\n", "Input Stage Load",
-                  input_stage_load_count.load(), input_stage_load_time.load());
-    }
-
-    if (contraction_block_load_count > 0) {
-      std::printf("%-40s %15lld %15lld\n", "Contraction Block Load (A+B)",
-                  contraction_block_load_count.load(),
-                  contraction_block_load_time.load());
-    }
-
-    if (contraction_compute_count > 0) {
-      std::printf("%-40s %15lld %15lld\n", "Contraction Compute (GEMM)",
-                  contraction_compute_count.load(),
-                  contraction_compute_time.load());
+    if (scratch_input_load_count > 0) {
+      std::printf("%-40s %15lld %15lld\n", "Scratch Input Load",
+                  scratch_input_load_count.load(),
+                  scratch_input_load_time.load());
     }
 
     if (contraction_accum_count > 0) {
@@ -84,18 +53,6 @@ struct TimingStats {
     if (store_write_count > 0) {
       std::printf("%-40s %15lld %15lld\n", "Store Write",
                   store_write_count.load(), store_write_time.load());
-    }
-
-    if (scratch_input_load_count > 0) {
-      std::printf("%-40s %15lld %15lld\n", "Scratch Input Load",
-                  scratch_input_load_count.load(),
-                  scratch_input_load_time.load());
-    }
-
-    if (scratch_contraction_count > 0) {
-      std::printf("%-40s %15lld %15lld\n", "Scratch Contraction",
-                  scratch_contraction_count.load(),
-                  scratch_contraction_time.load());
     }
 
     std::printf("\n");

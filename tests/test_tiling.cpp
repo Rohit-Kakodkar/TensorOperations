@@ -1,7 +1,6 @@
 #include <Kokkos_Core.hpp>
 #include <TensorOperations/Evaluator.hpp>
 #include <TensorOperations/NodeHandle.hpp>
-#include <TensorOperations/RegisterArray.hpp>
 #include <TensorOperations/TensorHandle.hpp>
 #include <TensorOperations/Tiling.hpp>
 #include <array>
@@ -56,13 +55,6 @@ TEST(TilingTest, EvaluatorSelection) {
   static_assert(NC::Rank == 2);
   static_assert(NC::NumContracted == 1);
 
-  // -- Range + Contraction + StaticTile -> register-blocked (register tier) --
-  using REvalC = Evaluator<RangePolicyTag, NC, StaticTile<2, 2, 2>>;
-  static_assert(std::is_same_v<REvalC::tiling_type, StaticTile<2, 2, 2>>);
-  static_assert(REvalC::Rank == 2);  // output rank, not tile rank
-  static_assert(
-      std::is_same_v<REvalC::register_array_t, RegisterArray<float, 2, 2, 2>>);
-
   // -- Team + Contraction + Tile<TileA,TileB,TileC> -> scratch tier ----------
   // Each operand carries its own tile: A:(i,j), B:(j,k), C:(i,k), all rank 2.
   using TTile  = Tile<DynamicTile<2>, DynamicTile<2>, DynamicTile<2>>;
@@ -77,67 +69,6 @@ TEST(TilingTest, EvaluatorSelection) {
   static_assert(std::is_same_v<TEvalCS::tiling_type, TTileS>);
   static_assert(TEvalCS::scratch_view_t::rank == 2);
 
-  // NOTE: Evaluator<RangePolicyTag, NC, DynamicTile<2>> matches no
-  // specialization (undefined primary template) — register tier is static-only.
-
-  SUCCEED();
-}
-
-// A doubling hook to verify hooks are applied at load.
-struct Doubler {
-  float operator()(float v) const { return 2.0f * v; }
-};
-
-// ---------------------------------------------------------------------------
-// Range + Input + StaticTile -> register-tier input stager. Functional test of
-// operator(): fill a 2x2 RegisterArray from tile index (1,0).
-// ---------------------------------------------------------------------------
-TEST(TilingTest, InputStagerContiguous) {
-  View2D v("g", 4, 4);
-  for (int i = 0; i < 4; ++i)
-    for (int j = 0; j < 4; ++j) v(i, j) = static_cast<float>(i * 4 + j);
-
-  auto inp = make_input_node(make_handle(v, std::array<int32_t, 2>{'i', 'j'}));
-  auto ev  = make_evaluator<RangePolicyTag>(inp, StaticTile<2, 2>{});
-
-  auto        node = ev({1, 0});  // tile index (1,0) -> element origin (2,0)
-  const auto& regs = node.storage_;
-
-  // regs(a,b) == v(2+a, 0+b) == (2+a)*4 + b
-  EXPECT_FLOAT_EQ((regs(0, 0)), 8.f);   // (2,0)
-  EXPECT_FLOAT_EQ((regs(0, 1)), 9.f);   // (2,1)
-  EXPECT_FLOAT_EQ((regs(1, 0)), 12.f);  // (3,0)
-  EXPECT_FLOAT_EQ((regs(1, 1)), 13.f);  // (3,1)
-}
-
-// Hook is applied at load time.
-TEST(TilingTest, InputStagerAppliesHook) {
-  View2D v("g", 4, 4);
-  for (int i = 0; i < 4; ++i)
-    for (int j = 0; j < 4; ++j) v(i, j) = static_cast<float>(i * 4 + j);
-
-  auto inp = make_input_node(make_handle(v, std::array<int32_t, 2>{'i', 'j'}),
-                             Doubler{});
-  auto ev  = make_evaluator<RangePolicyTag>(inp, StaticTile<2, 2>{});
-
-  auto        node = ev({0, 0});
-  const auto& regs = node.storage_;
-
-  EXPECT_FLOAT_EQ((regs(1, 1)), 2.f * 5.f);  // 2 * v(1,1)
-}
-
-// ---------------------------------------------------------------------------
-// Regression: fill_slots must compile for a 512-element (16x32) RegisterArray.
-// Clang's bracket-depth limit was raised to 2048 in CMakeLists for exactly
-// this — instantiating the fold over 512 slots is the stress case.
-// ---------------------------------------------------------------------------
-TEST(TilingTest, LargeRegisterViewFillSlotsCompiles) {
-  Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::HostSpace> lv("lg", 512,
-                                                                   512);
-  auto inp = make_input_node(make_handle(lv, std::array<int32_t, 2>{'i', 'j'}));
-  auto ev  = make_evaluator<RangePolicyTag>(inp, StaticTile<16, 32>{});
-  static_assert(decltype(ev)::register_array_t::size == 512);
-  auto node = ev({0, 0});  // instantiates fill_slots over all 512 slots
   SUCCEED();
 }
 

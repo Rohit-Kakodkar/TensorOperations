@@ -139,36 +139,6 @@ TEST(GraphTest, HookPreservesType) {
   static_assert(!std::is_same_v<decltype(nc)::hook_type, void>);
 }
 
-TEST(GraphTest, SingleContractionExecution) {
-  // C_{i,l} = sum_{j,k} A_{i,j,k} * B_{j,k,l}
-  // A(3,4,5) = 1, B(4,5,6) = 1  →  C[i,l] = 4*5 = 20 everywhere
-  using View2 = Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::HostSpace>;
-  using View3 = Kokkos::View<float***, Kokkos::LayoutRight, Kokkos::HostSpace>;
-  View3 A("A", 3, 4, 5);
-  View3 B("B", 4, 5, 6);
-  View2 C("C", 3, 6);
-
-  Kokkos::deep_copy(A, 1.0f);
-  Kokkos::deep_copy(B, 1.0f);
-  Kokkos::deep_copy(C, 0.0f);
-
-  auto hA =
-      make_input_node(make_handle(A, std::array<int32_t, 3>{'i', 'j', 'k'}));
-  auto hB =
-      make_input_node(make_handle(B, std::array<int32_t, 3>{'j', 'k', 'l'}));
-
-  auto g = make_graph();
-  auto [g1, o1] =
-      g.ops(make_contraction_node(hA, hB, std::array<int32_t, 2>{'i', 'l'}));
-  auto [T1] = o1;
-
-  // Single tile covers the full output [i=3,l=6] and contracted [j=4,k=5].
-  g1.execute(RangePolicyTag{}, StaticTile<3, 6, 4, 5>{}, C);
-
-  for (int i = 0; i < 3; ++i)
-    for (int l = 0; l < 6; ++l) EXPECT_FLOAT_EQ(C(i, l), 20.0f);
-}
-
 TEST(GraphTest, SingleContractionExecutionTeam) {
   // Same contraction as SingleContractionExecution, run on the team/scratch
   // tier. C_{i,l} = sum_{j,k} A_{i,j,k} * B_{j,k,l}; A=B=1  →  C[i,l] = 4*5

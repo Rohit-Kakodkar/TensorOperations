@@ -114,10 +114,9 @@ struct NodeHandle<InputTag, T, HookOp> {
 
 // ---------------------------------------------------------------------------
 // Intermediate specialization — a staged/computed tile, parameterized by its
-// storage. Storage is either a Kokkos::View (scratch / team tier) or a
-// RegisterArray (register / range tier); both expose value_type, extent(i) and
-// operator()(idx...), so the tile is read uniformly regardless of tier. Also
-// reused for deferred full-tensor intermediates (empty View storage).
+// storage. Storage is a Kokkos::View (scratch / team tier) exposing value_type,
+// extent(i) and operator()(idx...), so the tile is read uniformly. Also reused
+// for deferred full-tensor intermediates (empty View storage).
 // ---------------------------------------------------------------------------
 template <typename Storage, typename IntRank, typename ExecSpace,
           typename HookOp>
@@ -127,8 +126,8 @@ struct NodeHandle<IntermTag, Storage, IntRank, ExecSpace, HookOp> {
   using value_type          = typename Storage::value_type;
   using exec_space          = ExecSpace;
 
-  uint32_t id{};
-  Storage  storage_;  // Kokkos::View (scratch) OR RegisterArray (register tier)
+  uint32_t                     id{};
+  Storage                      storage_;  // Kokkos::View (scratch tier)
   Kokkos::Array<int, Rank>     shape_;
   Kokkos::Array<int32_t, Rank> modes_;
   [[no_unique_address]] HookOp hook_op;
