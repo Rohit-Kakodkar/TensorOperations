@@ -51,81 +51,6 @@ KOKKOS_FUNCTION Kokkos::Array<float, N> reciprocals(
   return inv;
 }
 
-// ---------------------------------------------------------------------------
-// Static-tile staging fast path (no runtime-indexed per-thread arrays).
-//
-// The generic staging path (SubviewLayout::operator[] + View::flat_offset_)
-// builds Kokkos::Array coordinates and indexes them with *runtime* subscripts.
-// CUDA cannot keep a dynamically-indexed array in registers, so those arrays
-// spill to local memory (DRAM-backed), which dominated the team kernel's
-// runtime (long_scoreboard stalls, ~35% L1 hit). For static tiles every extent
-// and scratch stride is a compile-time constant, so the global+scratch offsets
-// can be folded into pure scalar arithmetic that stays in registers — the same
-// thing a hand-written tiled kernel does. These helpers implement that path.
-// ---------------------------------------------------------------------------
-
-// Inner dimension that varies fastest (unit stride) at memory-order position
-// `pos` (pos 0 == fastest), for a contiguous Kokkos layout. LayoutLeft: dim 0
-// is unit-stride; LayoutRight: dim N-1 is unit-stride.
-template <class L, int N>
-KOKKOS_FORCEINLINE_FUNCTION constexpr int mem_order_dim(int pos) noexcept {
-  if constexpr (std::is_same_v<L, Kokkos::LayoutLeft>)
-    return pos;
-  else
-    return N - 1 - pos;
-}
-
-// True when L is a contiguous Kokkos layout the static fast path can peel at
-// compile time. LayoutStride / unknown layouts fall back to the generic path.
-template <class L>
-inline constexpr bool fast_layout_v = std::is_same_v<L, Kokkos::LayoutLeft> ||
-                                      std::is_same_v<L, Kokkos::LayoutRight>;
-
-// Gather a view's per-dimension strides into an Array using only compile-time
-// indices (aggregate init), so the array is never written with a runtime
-// subscript and stays scalarizable in registers.
-template <typename V, std::size_t... D>
-KOKKOS_FORCEINLINE_FUNCTION Kokkos::Array<int, sizeof...(D)> stride_array_impl(
-    const V& v, std::index_sequence<D...>) noexcept {
-  return Kokkos::Array<int, sizeof...(D)>{v.stride(static_cast<int>(D))...};
-}
-template <int N, typename V>
-KOKKOS_FORCEINLINE_FUNCTION Kokkos::Array<int, N> stride_array(
-    const V& v) noexcept {
-  return stride_array_impl(v, std::make_index_sequence<N>{});
-}
-
-// {global_offset, scratch_offset} for element `i` of a static tile, enumerating
-// coordinates in global memory order (consecutive i walk contiguous global
-// memory -> coalesced). STL is a StaticTileLayout{Right,Left} (compile-time
-// extents/strides); gstride holds the runtime global element strides in logical
-// dim order. No array is indexed by a runtime value: `d` is a compile-time
-// constant for every dimension, so gstride[d] scalarizes.
-template <class GL, class STL, int N, std::size_t... P>
-KOKKOS_FORCEINLINE_FUNCTION Kokkos::pair<int, int> static_tile_addr_impl(
-    int i, const Kokkos::Array<int, N>& gstride,
-    std::index_sequence<P...>) noexcept {
-  int rem = i, goff = 0, soff = 0;
-  (
-      [&] {
-        constexpr int d    = mem_order_dim<GL, N>(static_cast<int>(P));
-        constexpr int e    = STL::extent(d);
-        constexpr int sstr = STL::stride(d);
-        const int     c    = rem % e;
-        rem /= e;
-        goff += c * gstride[d];
-        soff += c * sstr;
-      }(),
-      ...);
-  return {goff, soff};
-}
-template <class GL, class STL, int N>
-KOKKOS_FORCEINLINE_FUNCTION Kokkos::pair<int, int> static_tile_addr(
-    int i, const Kokkos::Array<int, N>& gstride) noexcept {
-  return static_tile_addr_impl<GL, STL, N>(i, gstride,
-                                           std::make_index_sequence<N>{});
-}
-
 template <int N>
 struct TiledLayoutResult {
   Kokkos::Array<int, N>   orig_extents;
@@ -230,12 +155,18 @@ struct TiledLayout {
     return s;
   }
 
+  KOKKOS_FUNCTION int flat_offset(
+      const Impl::Index<2 * N>& coord) const noexcept {
+    int off = base_offset();
+    for (int d = 0; d < 2 * N; ++d) off += coord[d] * stride(d);
+    return off;
+  }
+
   // Bounds check over all N outer/inner index pairs; no-op without debug flag.
   // Takes the 2N-index coordinate array directly (not a tuple): nvcc
   // miscompiles the std::get/fold tuple path on device (see
   // View::flat_offset_).
-  KOKKOS_FUNCTION void check_bounds(
-      const Kokkos::Array<int, 2 * N>& coord) const {
+  KOKKOS_FUNCTION void check_bounds(const Impl::Index<2 * N>& coord) const {
 #ifdef KOKKOS_ENABLE_DEBUG_BOUNDS_CHECK
     for (int i = 0; i < N; ++i)
       if (coord[i] * tile_layout_.extent(i) + coord[N + i] >= orig_extents_[i])
@@ -312,11 +243,17 @@ struct SubviewLayout {
 
   KOKKOS_FUNCTION int base_offset() const noexcept { return base_offset_; }
 
+  KOKKOS_FUNCTION int flat_offset(const Impl::Index<N>& coord) const noexcept {
+    int off = base_offset_;
+    for (int d = 0; d < N; ++d) off += coord[d] * strides_[d];
+    return off;
+  }
+
   // Memory-aligned delinearize: flat index → N-D coordinate, peeling the
   // smallest-stride dimension first so consecutive flat indices walk contiguous
   // memory. Divide/modulo are replaced by a reciprocal multiply (see ctor) for
   // fixed-cost, divergence-free decode on device.
-  KOKKOS_FUNCTION Kokkos::Array<int, N> operator[](int linear) const noexcept {
+  KOKKOS_FUNCTION Impl::Index<N> operator[](int linear) const noexcept {
     Kokkos::Array<int, N> idx{};
     for (int j = 0; j < N; ++j) {
       const int d = order_[j];
@@ -333,7 +270,7 @@ struct SubviewLayout {
       idx[d] = r;
       linear = q;
     }
-    return idx;
+    return Impl::Index<N>{idx};
   }
 
  private:
@@ -343,6 +280,105 @@ struct SubviewLayout {
   Kokkos::Array<int, N> order_;  // dims by stride ascending (memory order)
   Kokkos::Array<float, N>
       inv_extents_;  // 1/extents_[d], for divide-free decode
+};
+
+// ---------------------------------------------------------------------------
+// OrderedSubviewLayout<N, int... Order>
+//
+// Like SubviewLayout<N> but with the memory-order permutation baked in as
+// compile-time template parameters. When all array subscripts in operator[]
+// and flat_offset are compile-time constants, CUDA can keep every per-element
+// array in registers instead of spilling to per-thread local memory.
+//
+// Order[j] = the logical dimension at memory-order position j (fastest first).
+// For LayoutRight/C order: Order = {N-1, ..., 1, 0}
+// For LayoutLeft/Fortran:  Order = {0, 1, ..., N-1}
+// ---------------------------------------------------------------------------
+
+template <int N, int... Order>
+struct OrderedSubviewLayout {
+  static_assert(sizeof...(Order) == N, "Order must have exactly N elements");
+  static constexpr int rank = N;
+
+  KOKKOS_FUNCTION OrderedSubviewLayout(int base, Kokkos::Array<int, N> ext,
+                                       Kokkos::Array<int, N>   str,
+                                       Kokkos::Array<float, N> inv_ext) noexcept
+      : base_offset_(base),
+        extents_(ext),
+        strides_(str),
+        inv_extents_(inv_ext) {}
+
+  KOKKOS_FUNCTION int extent(int d) const noexcept { return extents_[d]; }
+  KOKKOS_FUNCTION int stride(int d) const noexcept { return strides_[d]; }
+
+  KOKKOS_FUNCTION int size() const noexcept {
+    int s = 1;
+    for (int d = 0; d < N; ++d) s *= extents_[d];
+    return s;
+  }
+
+  KOKKOS_FUNCTION int unit_stride_dim() const noexcept {
+    constexpr int arr[] = {Order...};
+    return arr[0];  // Order[0] is the fastest-varying dimension
+  }
+
+  KOKKOS_FUNCTION int base_offset() const noexcept { return base_offset_; }
+
+  KOKKOS_FUNCTION int flat_offset(const Impl::Index<N>& coord) const noexcept {
+    return flat_offset_impl_(coord, std::make_index_sequence<N>{});
+  }
+
+  // Memory-aligned delinearize: compile-time Order... ensures every array
+  // subscript is a compile-time constant → all per-element arrays stay in
+  // registers (no local memory spill).
+  KOKKOS_FUNCTION Impl::Index<N> operator[](int linear) const noexcept {
+    return decode_impl(linear, std::make_index_sequence<N>{});
+  }
+
+ private:
+  template <std::size_t... Ds>
+  KOKKOS_FORCEINLINE_FUNCTION int flat_offset_impl_(
+      const Impl::Index<N>& coord, std::index_sequence<Ds...>) const noexcept {
+    return (base_offset_ + ... +
+            (coord.template get<static_cast<int>(Ds)>() *
+             strides_[static_cast<int>(Ds)]));
+  }
+
+  template <std::size_t... J>
+  KOKKOS_FORCEINLINE_FUNCTION Impl::Index<N> decode_impl(
+      int linear, std::index_sequence<J...>) const noexcept {
+    Impl::Index<N> idx{};
+    // Non-template lambda + pack expansion: J is a compile-time constant at
+    // each expansion step, so constexpr d = arr[J] is also compile-time.
+    // Every array access in the lambda body therefore uses a compile-time
+    // index, allowing CUDA to keep idx.data and the extents/inv_extents in
+    // registers (same technique used in Impl::static_tile_addr_impl).
+    (
+        [&] {
+          constexpr int arr[] = {Order...};
+          constexpr int d     = arr[static_cast<int>(J)];
+          const int     e     = extents_[d];
+          int           q =
+              static_cast<int>(static_cast<float>(linear) * inv_extents_[d]);
+          int r = linear - q * e;
+          if (r < 0) {
+            r += e;
+            --q;
+          } else if (r >= e) {
+            r -= e;
+            ++q;
+          }
+          idx.data[d] = r;  // compile-time d → register write
+          linear      = q;
+        }(),
+        ...);
+    return idx;
+  }
+
+  int                     base_offset_;
+  Kokkos::Array<int, N>   extents_;
+  Kokkos::Array<int, N>   strides_;
+  Kokkos::Array<float, N> inv_extents_;
 };
 
 // ---------------------------------------------------------------------------
@@ -389,23 +425,17 @@ struct View {
     return layout_.unit_stride_dim();
   }
 
-  // Flat element offset from backing_.data() for a multi-index. Every layout's
-  // offset() equals base_offset() + Σ coord[d]·stride(d), so this stride loop
-  // is equivalent. It is used instead of the layout's variadic
-  // offset(index_sequence, tuple) helper because nvcc (CUDA 13.x) miscompiles
-  // that std::forward_as_tuple/std::get/fold path for these views on device,
-  // yielding a wrong offset (garbage reads, faulting or misplaced writes).
-  KOKKOS_FUNCTION int flat_offset_(
-      const Kokkos::Array<int, rank>& coord) const {
-    int off = layout_.base_offset();
-    for (int d = 0; d < rank; ++d) off += coord[d] * layout_.stride(d);
-    return off;
+  // Delegates to layout_.flat_offset(). Kept as a separate method rather than
+  // inlining a fold/variadic path because nvcc (CUDA 13.x) miscompiles
+  // std::forward_as_tuple/std::get folds on device, yielding wrong offsets.
+  KOKKOS_FUNCTION int flat_offset_(const Impl::Index<rank>& coord) const {
+    return layout_.flat_offset(coord);
   }
 
   template <typename... Idx>
     requires(sizeof...(Idx) == rank)
   KOKKOS_FUNCTION value_type& operator()(Idx... idx) const {
-    const Kokkos::Array<int, rank> coord{static_cast<int>(idx)...};
+    const Impl::Index<rank> coord{static_cast<int>(idx)...};
 #ifdef KOKKOS_ENABLE_DEBUG_BOUNDS_CHECK
     if constexpr (requires { layout_.check_bounds(coord); })
       layout_.check_bounds(coord);
@@ -413,7 +443,7 @@ struct View {
     return backing_.data()[flat_offset_(coord)];
   }
 
-  KOKKOS_FUNCTION value_type& operator[](Kokkos::Array<int, rank> idx) const {
+  KOKKOS_FUNCTION value_type& operator[](Impl::Index<rank> idx) const {
     return backing_.data()[flat_offset_(idx)];
   }
 };
@@ -468,6 +498,30 @@ inline constexpr bool is_all_v = std::is_same_v<std::decay_t<T>, Kokkos::ALL_t>;
 
 template <typename... Slices>
 inline constexpr int free_rank_v = static_cast<int>((is_all_v<Slices> + ...));
+
+// Unpack integer_sequence<int, Order...> into OrderedSubviewLayout template
+// args.  std::size_t M matches Kokkos::Array's size_t size param to avoid
+// template deduction failure (int vs size_t).
+template <typename VT, std::size_t M, int... Order>
+KOKKOS_FUNCTION auto make_ordered_subview(
+    VT backing, int base, Kokkos::Array<int, M> ext, Kokkos::Array<int, M> str,
+    Kokkos::Array<float, M> inv, std::integer_sequence<int, Order...>) {
+  static_assert(M == sizeof...(Order));
+  constexpr int N = static_cast<int>(M);
+  return View<VT, OrderedSubviewLayout<N, Order...>>{
+      backing, OrderedSubviewLayout<N, Order...>{base, ext, str, inv}};
+}
+
+// Compile-time order sequences for LayoutRight {N-1,...,0} and LayoutLeft
+// {0,...,N-1}.
+template <int N, std::size_t... J>
+constexpr auto right_order_seq(std::index_sequence<J...>) {
+  return std::integer_sequence<int, (N - 1 - static_cast<int>(J))...>{};
+}
+template <int N, std::size_t... J>
+constexpr auto left_order_seq(std::index_sequence<J...>) {
+  return std::integer_sequence<int, static_cast<int>(J)...>{};
+}
 
 }  // namespace Impl
 
@@ -552,9 +606,59 @@ KOKKOS_FUNCTION auto subview(const View<ViewType, TiledLayout<N, TL>>& tv,
 // per-call sorting or reciprocal computation.
 // ---------------------------------------------------------------------------
 
-template <typename ViewType, int N, typename TL>
+// ---------------------------------------------------------------------------
+// subview_tile — factory: TiledView × outer coordinate array → Subview
+//
+// Three overloads, resolved on ViewType::array_layout:
+//   LayoutRight  → OrderedSubviewLayout with compile-time order {N-1,...,0}
+//   LayoutLeft   → OrderedSubviewLayout with compile-time order {0,...,N-1}
+//   everything else → runtime SubviewLayout (LayoutStride or unknown)
+//
+// The two specialised overloads eliminate local memory spill: every array
+// subscript in OrderedSubviewLayout::operator[] is a compile-time constant, so
+// CUDA keeps idx.data and the extents/inv_extents in registers.
+// ---------------------------------------------------------------------------
+
+// LayoutRight specialization.
+template <typename VT, int N, typename TL>
+  requires std::is_same_v<typename VT::array_layout, Kokkos::LayoutRight>
 KOKKOS_FUNCTION auto subview_tile(
-    const View<ViewType, TiledLayout<N, TL>>&       tv,
+    const View<VT, TiledLayout<N, TL>>&             tv,
+    Kokkos::Array<int, static_cast<std::size_t>(N)> outer_idx) {
+  int base = 0;
+  for (int d = 0; d < N; ++d) base += outer_idx[d] * tv.stride(d);
+  Kokkos::Array<int, N> ext{}, str{};
+  for (int d = 0; d < N; ++d) {
+    ext[d] = tv.extent(N + d);
+    str[d] = tv.stride(N + d);
+  }
+  return Impl::make_ordered_subview(
+      tv.backing_, base, ext, str, Impl::reciprocals<N>(ext),
+      Impl::right_order_seq<N>(std::make_index_sequence<N>{}));
+}
+
+// LayoutLeft specialization.
+template <typename VT, int N, typename TL>
+  requires std::is_same_v<typename VT::array_layout, Kokkos::LayoutLeft>
+KOKKOS_FUNCTION auto subview_tile(
+    const View<VT, TiledLayout<N, TL>>&             tv,
+    Kokkos::Array<int, static_cast<std::size_t>(N)> outer_idx) {
+  int base = 0;
+  for (int d = 0; d < N; ++d) base += outer_idx[d] * tv.stride(d);
+  Kokkos::Array<int, N> ext{}, str{};
+  for (int d = 0; d < N; ++d) {
+    ext[d] = tv.extent(N + d);
+    str[d] = tv.stride(N + d);
+  }
+  return Impl::make_ordered_subview(
+      tv.backing_, base, ext, str, Impl::reciprocals<N>(ext),
+      Impl::left_order_seq<N>(std::make_index_sequence<N>{}));
+}
+
+// Generic fallback for LayoutStride / unknown layouts: runtime SubviewLayout.
+template <typename VT, int N, typename TL>
+KOKKOS_FUNCTION auto subview_tile(
+    const View<VT, TiledLayout<N, TL>>&             tv,
     Kokkos::Array<int, static_cast<std::size_t>(N)> outer_idx) {
   int base_offset = 0;
   for (int d = 0; d < N; ++d) base_offset += outer_idx[d] * tv.stride(d);
@@ -563,7 +667,7 @@ KOKKOS_FUNCTION auto subview_tile(
     extents[d] = tv.extent(N + d);
     strides[d] = tv.stride(N + d);
   }
-  return Subview<ViewType, N>{
+  return Subview<VT, N>{
       tv.backing_,
       SubviewLayout<N>{base_offset, extents, strides, tv.layout_.inner_order(),
                        tv.layout_.inner_inv_extents()}};

@@ -71,30 +71,13 @@ struct Evaluator<TeamPolicyTag<ES>, NodeHandle<InputTag, T, HookOp>, Tile_> {
   KOKKOS_FUNCTION void fill_team(const team_member_t&            team,
                                  const Kokkos::Array<int, Rank>& tile_idx,
                                  const scratch_view_t&           result) const {
-    const auto sv = subview_tile(tiled_input_, tile_idx);
-
-    if constexpr (tiling_type::is_static &&
-                  Impl::fast_layout_v<typename T::array_layout>) {
-      // Static fast path: fold global+scratch offsets into scalar arithmetic so
-      // no per-thread coordinate array spills to local memory. Capture only the
-      // scalar strides/pointers (not the runtime SubviewLayout object).
-      using GL                = typename T::array_layout;
-      value_type* const sptr  = sv.data();
-      value_type* const dptr  = result.data();
-      const auto        gs    = Impl::stride_array<Rank>(sv);
-      constexpr int     total = static_cast<int>(tile_layout_t::num_elements);
-      Kokkos::parallel_for(Kokkos::TeamVectorRange(team, total), [=](int i) {
-        const auto a   = Impl::static_tile_addr<GL, tile_layout_t, Rank>(i, gs);
-        dptr[a.second] = sptr[a.first];
-      });
-    } else {
-      const auto sv_layout = sv.layout();
-      const auto total     = sv.size();
-      Kokkos::parallel_for(Kokkos::TeamVectorRange(team, total), [=](int i) {
-        const auto coord = sv_layout[i];
-        result[coord]    = sv[coord];
-      });
-    }
+    const auto sv        = subview_tile(tiled_input_, tile_idx);
+    const auto sv_layout = sv.layout();
+    const auto total     = sv.size();
+    Kokkos::parallel_for(Kokkos::TeamVectorRange(team, total), [=](int i) {
+      const auto coord = sv_layout[i];
+      result[coord]    = sv[coord];
+    });
   }
 };
 
@@ -405,29 +388,12 @@ struct Evaluator<
     const auto scratch = node.storage_;
     const auto hook    = node.hook_op;  // local copy: lambda captures no `this`
 
-    if constexpr (tiling_type::is_static &&
-                  Impl::fast_layout_v<typename ViewT::array_layout>) {
-      // Static fast path (mirror of fill_team's): scalar global+scratch
-      // offsets, no per-thread coordinate array in local memory. `Layout` is
-      // the scratch tile's static row-major layout.
-      using GL                = typename ViewT::array_layout;
-      using STL               = Layout;
-      value_type* const sptr  = scratch.data();
-      value_type* const dptr  = sv.data();
-      const auto        gs    = Impl::stride_array<Rank>(sv);
-      constexpr int     total = static_cast<int>(STL::num_elements);
-      Kokkos::parallel_for(Kokkos::TeamVectorRange(team, total), [=](int i) {
-        const auto a  = Impl::static_tile_addr<GL, STL, Rank>(i, gs);
-        dptr[a.first] = Impl::apply_hook(hook, sptr[a.second]);
-      });
-    } else {
-      const auto sv_layout = sv.layout();
-      const auto total     = sv.size();
-      Kokkos::parallel_for(Kokkos::TeamVectorRange(team, total), [=](int i) {
-        const auto coord = sv_layout[i];
-        sv[coord]        = Impl::apply_hook(hook, scratch[coord]);
-      });
-    }
+    const auto sv_layout = sv.layout();
+    const auto total     = sv.size();
+    Kokkos::parallel_for(Kokkos::TeamVectorRange(team, total), [=](int i) {
+      const auto coord = sv_layout[i];
+      sv[coord]        = Impl::apply_hook(hook, scratch[coord]);
+    });
     TIMING_SCOPE_EXIT(g_timing_stats.store_write_time,
                       g_timing_stats.store_write_count);
   }

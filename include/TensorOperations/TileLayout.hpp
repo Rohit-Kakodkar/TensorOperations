@@ -9,6 +9,43 @@
 
 namespace TensorOperations {
 
+namespace Impl {
+
+template <int N>
+struct Index {
+  int data[N];
+
+  template <typename... I>
+  KOKKOS_FORCEINLINE_FUNCTION constexpr Index(I... idx) noexcept
+      : data{static_cast<int>(idx)...} {}
+
+  KOKKOS_FORCEINLINE_FUNCTION constexpr Index(
+      const Kokkos::Array<int, N>& idx) noexcept {
+    for (int d = 0; d < N; ++d) data[d] = idx[d];
+  }
+
+  KOKKOS_FORCEINLINE_FUNCTION constexpr int& operator[](int d) noexcept {
+    return data[d];
+  }
+
+  KOKKOS_FORCEINLINE_FUNCTION constexpr const int& operator[](
+      int d) const noexcept {
+    return data[d];
+  }
+
+  template <int D>
+  KOKKOS_FORCEINLINE_FUNCTION constexpr int get() const noexcept {
+    return data[D];
+  }
+
+  template <int D>
+  KOKKOS_FORCEINLINE_FUNCTION constexpr void set(int v) noexcept {
+    data[D] = v;
+  }
+};
+
+}  // namespace Impl
+
 // ---------------------------------------------------------------------------
 // TileLayout types — encode/decode between a flat index and an N-dimensional
 // tile coordinate, and satisfy the View<ViewType, Layout> interface.
@@ -50,6 +87,20 @@ struct StaticTileLayoutRight {
   static_assert(rank > 0 && ((Extents > 0) && ...),
                 "StaticTileLayoutRight requires at least one positive extent");
 
+  template <int I>
+  KOKKOS_FORCEINLINE_FUNCTION static consteval int extent() noexcept {
+    constexpr int e[] = {Extents...};
+    return e[I];
+  }
+
+  template <int I>
+  KOKKOS_FORCEINLINE_FUNCTION static consteval int stride() noexcept {
+    constexpr int e[] = {Extents...};
+    int           s   = 1;
+    for (int i = rank - 1; i > I; --i) s *= e[i];
+    return s;
+  }
+
   KOKKOS_FORCEINLINE_FUNCTION static constexpr int extent(int k) noexcept {
     constexpr int e[] = {Extents...};
     return e[k];
@@ -70,8 +121,7 @@ struct StaticTileLayoutRight {
 
   // flat → multi-index (decode): independent per-dim, exposes compile-time
   // divisors
-  KOKKOS_FORCEINLINE_FUNCTION Kokkos::Array<int, rank> operator[](
-      int linear) const noexcept {
+  KOKKOS_FORCEINLINE_FUNCTION auto operator[](int linear) const noexcept {
     return decode_impl(linear, std::make_index_sequence<rank>{});
   }
 
@@ -80,6 +130,11 @@ struct StaticTileLayoutRight {
   KOKKOS_FORCEINLINE_FUNCTION constexpr std::size_t flat(
       I... idx) const noexcept {
     return flat_impl(std::index_sequence_for<I...>{}, idx...);
+  }
+
+  KOKKOS_FORCEINLINE_FUNCTION static constexpr int flat_offset(
+      const Impl::Index<rank>& coord) noexcept {
+    return flat_offset_impl_(coord, std::make_index_sequence<rank>{});
   }
 
  private:
@@ -92,10 +147,18 @@ struct StaticTileLayoutRight {
   }
 
   template <std::size_t... Ds>
-  KOKKOS_FORCEINLINE_FUNCTION static Kokkos::Array<int, rank> decode_impl(
+  KOKKOS_FORCEINLINE_FUNCTION static auto decode_impl(
       int linear, std::index_sequence<Ds...>) noexcept {
-    return Kokkos::Array<int, rank>{
+    return Impl::Index<rank>{
         static_cast<int>((linear / stride(Ds)) % extent(Ds))...};
+  }
+
+  template <std::size_t... Ds>
+  KOKKOS_FORCEINLINE_FUNCTION static constexpr int flat_offset_impl_(
+      const Impl::Index<rank>& coord, std::index_sequence<Ds...>) noexcept {
+    return (base_offset() + ... +
+            (coord.template get<static_cast<int>(Ds)>() *
+             stride<static_cast<int>(Ds)>()));
   }
 };
 
@@ -111,6 +174,20 @@ struct StaticTileLayoutLeft {
   static_assert(rank > 0 && ((Extents > 0) && ...),
                 "StaticTileLayoutLeft requires at least one positive extent");
 
+  template <int I>
+  KOKKOS_FORCEINLINE_FUNCTION static consteval int extent() noexcept {
+    constexpr int e[] = {Extents...};
+    return e[I];
+  }
+
+  template <int I>
+  KOKKOS_FORCEINLINE_FUNCTION static consteval int stride() noexcept {
+    constexpr int e[] = {Extents...};
+    int           s   = 1;
+    for (int i = 0; i < I; ++i) s *= e[i];
+    return s;
+  }
+
   KOKKOS_FORCEINLINE_FUNCTION static constexpr int extent(int k) noexcept {
     constexpr int e[] = {Extents...};
     return e[k];
@@ -122,6 +199,7 @@ struct StaticTileLayoutLeft {
     for (int i = 0; i < k; ++i) s *= e[i];
     return s;
   }
+
   KOKKOS_FORCEINLINE_FUNCTION static constexpr int base_offset() noexcept {
     return 0;
   }
@@ -131,8 +209,7 @@ struct StaticTileLayoutLeft {
 
   // flat → multi-index (decode): same formula as Right, strides encode the
   // order
-  KOKKOS_FORCEINLINE_FUNCTION Kokkos::Array<int, rank> operator[](
-      int linear) const noexcept {
+  KOKKOS_FORCEINLINE_FUNCTION auto operator[](int linear) const noexcept {
     return decode_impl(linear, std::make_index_sequence<rank>{});
   }
 
@@ -141,6 +218,11 @@ struct StaticTileLayoutLeft {
   KOKKOS_FORCEINLINE_FUNCTION constexpr std::size_t flat(
       I... idx) const noexcept {
     return flat_impl(std::index_sequence_for<I...>{}, idx...);
+  }
+
+  KOKKOS_FORCEINLINE_FUNCTION static constexpr int flat_offset(
+      const Impl::Index<rank>& coord) noexcept {
+    return flat_offset_impl_(coord, std::make_index_sequence<rank>{});
   }
 
  private:
@@ -153,10 +235,18 @@ struct StaticTileLayoutLeft {
   }
 
   template <std::size_t... Ds>
-  KOKKOS_FORCEINLINE_FUNCTION static Kokkos::Array<int, rank> decode_impl(
+  KOKKOS_FORCEINLINE_FUNCTION static auto decode_impl(
       int linear, std::index_sequence<Ds...>) noexcept {
-    return Kokkos::Array<int, rank>{
+    return Impl::Index<rank>{
         static_cast<int>((linear / stride(Ds)) % extent(Ds))...};
+  }
+
+  template <std::size_t... Ds>
+  KOKKOS_FORCEINLINE_FUNCTION static constexpr int flat_offset_impl_(
+      const Impl::Index<rank>& coord, std::index_sequence<Ds...>) noexcept {
+    return (base_offset() + ... +
+            (coord.template get<static_cast<int>(Ds)>() *
+             stride<static_cast<int>(Ds)>()));
   }
 };
 
@@ -191,14 +281,13 @@ struct DynamicTileLayoutRight {
   }
 
   // flat → multi-index (decode): peel from rightmost (row-major)
-  KOKKOS_FUNCTION Kokkos::Array<int, Rank> operator[](
-      int linear) const noexcept {
+  KOKKOS_FUNCTION auto operator[](int linear) const noexcept {
     Kokkos::Array<int, Rank> idx{};
     for (int d = Rank - 1; d >= 0; --d) {
       idx[d] = linear % extents_[d];
       linear /= extents_[d];
     }
-    return idx;
+    return Impl::Index<Rank>{idx};
   }
 
   // multi-index → flat offset (encode)
@@ -208,6 +297,14 @@ struct DynamicTileLayoutRight {
     for (int k = 0; k < Rank; ++k)
       f += static_cast<std::size_t>(idx[k]) * strides_[k];
     return f;
+  }
+
+  KOKKOS_FUNCTION int flat_offset(
+      const Impl::Index<Rank>& coord) const noexcept {
+    int off = base_offset();
+    for (int d = 0; d < Rank; ++d)
+      off += coord[d] * static_cast<int>(strides_[d]);
+    return off;
   }
 };
 
@@ -243,14 +340,13 @@ struct DynamicTileLayoutLeft {
   }
 
   // flat → multi-index (decode): peel from leftmost (column-major)
-  KOKKOS_FUNCTION Kokkos::Array<int, Rank> operator[](
-      int linear) const noexcept {
+  KOKKOS_FUNCTION auto operator[](int linear) const noexcept {
     Kokkos::Array<int, Rank> idx{};
     for (int d = 0; d < Rank; ++d) {
       idx[d] = linear % extents_[d];
       linear /= extents_[d];
     }
-    return idx;
+    return Impl::Index<Rank>{idx};
   }
 
   // multi-index → flat offset (encode)
@@ -260,6 +356,14 @@ struct DynamicTileLayoutLeft {
     for (int k = 0; k < Rank; ++k)
       f += static_cast<std::size_t>(idx[k]) * strides_[k];
     return f;
+  }
+
+  KOKKOS_FUNCTION int flat_offset(
+      const Impl::Index<Rank>& coord) const noexcept {
+    int off = base_offset();
+    for (int d = 0; d < Rank; ++d)
+      off += coord[d] * static_cast<int>(strides_[d]);
+    return off;
   }
 };
 
