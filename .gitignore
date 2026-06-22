@@ -1,6 +1,8 @@
 plans
 build
+build_*
 .claude/settings.json
 output.log
 .venv
 issues
+profiles

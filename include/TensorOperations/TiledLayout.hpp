@@ -51,6 +51,81 @@ KOKKOS_FUNCTION Kokkos::Array<float, N> reciprocals(
   return inv;
 }
 
+// ---------------------------------------------------------------------------
+// Static-tile staging fast path (no runtime-indexed per-thread arrays).
+//
+// The generic staging path (SubviewLayout::operator[] + View::flat_offset_)
+// builds Kokkos::Array coordinates and indexes them with *runtime* subscripts.
+// CUDA cannot keep a dynamically-indexed array in registers, so those arrays
+// spill to local memory (DRAM-backed), which dominated the team kernel's
+// runtime (long_scoreboard stalls, ~35% L1 hit). For static tiles every extent
+// and scratch stride is a compile-time constant, so the global+scratch offsets
+// can be folded into pure scalar arithmetic that stays in registers — the same
+// thing a hand-written tiled kernel does. These helpers implement that path.
+// ---------------------------------------------------------------------------
+
+// Inner dimension that varies fastest (unit stride) at memory-order position
+// `pos` (pos 0 == fastest), for a contiguous Kokkos layout. LayoutLeft: dim 0
+// is unit-stride; LayoutRight: dim N-1 is unit-stride.
+template <class L, int N>
+KOKKOS_FORCEINLINE_FUNCTION constexpr int mem_order_dim(int pos) noexcept {
+  if constexpr (std::is_same_v<L, Kokkos::LayoutLeft>)
+    return pos;
+  else
+    return N - 1 - pos;
+}
+
+// True when L is a contiguous Kokkos layout the static fast path can peel at
+// compile time. LayoutStride / unknown layouts fall back to the generic path.
+template <class L>
+inline constexpr bool fast_layout_v = std::is_same_v<L, Kokkos::LayoutLeft> ||
+                                      std::is_same_v<L, Kokkos::LayoutRight>;
+
+// Gather a view's per-dimension strides into an Array using only compile-time
+// indices (aggregate init), so the array is never written with a runtime
+// subscript and stays scalarizable in registers.
+template <typename V, std::size_t... D>
+KOKKOS_FORCEINLINE_FUNCTION Kokkos::Array<int, sizeof...(D)> stride_array_impl(
+    const V& v, std::index_sequence<D...>) noexcept {
+  return Kokkos::Array<int, sizeof...(D)>{v.stride(static_cast<int>(D))...};
+}
+template <int N, typename V>
+KOKKOS_FORCEINLINE_FUNCTION Kokkos::Array<int, N> stride_array(
+    const V& v) noexcept {
+  return stride_array_impl(v, std::make_index_sequence<N>{});
+}
+
+// {global_offset, scratch_offset} for element `i` of a static tile, enumerating
+// coordinates in global memory order (consecutive i walk contiguous global
+// memory -> coalesced). STL is a StaticTileLayout{Right,Left} (compile-time
+// extents/strides); gstride holds the runtime global element strides in logical
+// dim order. No array is indexed by a runtime value: `d` is a compile-time
+// constant for every dimension, so gstride[d] scalarizes.
+template <class GL, class STL, int N, std::size_t... P>
+KOKKOS_FORCEINLINE_FUNCTION Kokkos::pair<int, int> static_tile_addr_impl(
+    int i, const Kokkos::Array<int, N>& gstride,
+    std::index_sequence<P...>) noexcept {
+  int rem = i, goff = 0, soff = 0;
+  (
+      [&] {
+        constexpr int d    = mem_order_dim<GL, N>(static_cast<int>(P));
+        constexpr int e    = STL::extent(d);
+        constexpr int sstr = STL::stride(d);
+        const int     c    = rem % e;
+        rem /= e;
+        goff += c * gstride[d];
+        soff += c * sstr;
+      }(),
+      ...);
+  return {goff, soff};
+}
+template <class GL, class STL, int N>
+KOKKOS_FORCEINLINE_FUNCTION Kokkos::pair<int, int> static_tile_addr(
+    int i, const Kokkos::Array<int, N>& gstride) noexcept {
+  return static_tile_addr_impl<GL, STL, N>(i, gstride,
+                                           std::make_index_sequence<N>{});
+}
+
 template <int N>
 struct TiledLayoutResult {
   Kokkos::Array<int, N>   orig_extents;

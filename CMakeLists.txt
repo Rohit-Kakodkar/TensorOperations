@@ -5,6 +5,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 option(TENSOR_OPS_ENABLE_TIMING "Enable timing instrumentation for evaluator operations" OFF)
+option(TENSOR_OPS_BUILD_BENCHMARKS "Build performance benchmarks" OFF)
 
 include(FetchContent)
 
@@ -74,3 +75,9 @@ gtest_discover_tests(test_tiling)
 add_executable(test_tiled_layout tests/test_tiled_layout.cpp)
 target_link_libraries(test_tiled_layout PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_tiled_layout)
+
+# Benchmarks (opt-in: -DTENSOR_OPS_BUILD_BENCHMARKS=ON). No gtest; own main().
+if(TENSOR_OPS_BUILD_BENCHMARKS)
+  add_executable(bench_team_contraction benchmarks/bench_team_contraction.cpp)
+  target_link_libraries(bench_team_contraction PRIVATE tensor)
+endif()

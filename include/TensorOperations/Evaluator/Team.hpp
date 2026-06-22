@@ -71,14 +71,30 @@ struct Evaluator<TeamPolicyTag<ES>, NodeHandle<InputTag, T, HookOp>, Tile_> {
   KOKKOS_FUNCTION void fill_team(const team_member_t&            team,
                                  const Kokkos::Array<int, Rank>& tile_idx,
                                  const scratch_view_t&           result) const {
-    const auto sv        = subview_tile(tiled_input_, tile_idx);
-    const auto sv_layout = sv.layout();
+    const auto sv = subview_tile(tiled_input_, tile_idx);
 
-    const auto total = sv.size();
-    Kokkos::parallel_for(Kokkos::TeamVectorRange(team, total), [=](int i) {
-      const auto coord = sv_layout[i];
-      result[coord]    = sv[coord];
-    });
+    if constexpr (tiling_type::is_static &&
+                  Impl::fast_layout_v<typename T::array_layout>) {
+      // Static fast path: fold global+scratch offsets into scalar arithmetic so
+      // no per-thread coordinate array spills to local memory. Capture only the
+      // scalar strides/pointers (not the runtime SubviewLayout object).
+      using GL                = typename T::array_layout;
+      value_type* const sptr  = sv.data();
+      value_type* const dptr  = result.data();
+      const auto        gs    = Impl::stride_array<Rank>(sv);
+      constexpr int     total = static_cast<int>(tile_layout_t::num_elements);
+      Kokkos::parallel_for(Kokkos::TeamVectorRange(team, total), [=](int i) {
+        const auto a   = Impl::static_tile_addr<GL, tile_layout_t, Rank>(i, gs);
+        dptr[a.second] = sptr[a.first];
+      });
+    } else {
+      const auto sv_layout = sv.layout();
+      const auto total     = sv.size();
+      Kokkos::parallel_for(Kokkos::TeamVectorRange(team, total), [=](int i) {
+        const auto coord = sv_layout[i];
+        result[coord]    = sv[coord];
+      });
+    }
   }
 };
 
@@ -222,19 +238,120 @@ struct Evaluator<TeamPolicyTag<ES>,
     team.team_barrier();
 
     // View each operand's scratch as a 2D GEMM matrix: A[SA,SK], B[SK,SB],
-    // C[SA,SB]. Static tiles fold these extents (and strides) at compile time.
+    // C[SA,SB] (all row-major). Static tiles fold these extents/strides at
+    // compile time. Index raw pointers with hoisted/strided offsets rather than
+    // View::operator() so the inner loop carries no per-access coordinate-array
+    // build or flat_offset_ stride loop — that addressing overhead, not the
+    // memory traffic, is what doubled the generic kernel's instruction count.
     auto a = reshape(stage_a_.scratch_, prefix_product(a_tile_, rank_c<FreeA>));
     auto b = reshape(stage_b_.scratch_, prefix_product(b_tile_, rank_c<NumK>));
     auto c = reshape(c_scratch_, prefix_product(c_tile_, rank_c<FreeA>));
-    const int SK = a.extent(1);
-    Kokkos::parallel_for(Kokkos::TeamVectorRange(team, c.size()), [=](int idx) {
-      const auto coord = c.layout()[idx];
-      const int  fa    = coord[0];
-      const int  fb    = coord[1];
-      value_type acc   = c(fa, fb);
-      for (int k = 0; k < SK; ++k) acc += a(fa, k) * b(k, fb);
-      c(fa, fb) = acc;
-    });
+    const value_type* KOKKOS_RESTRICT ap = a.data();
+    const value_type* KOKKOS_RESTRICT bp = b.data();
+    value_type* KOKKOS_RESTRICT       cp = c.data();
+    // c is row-major [SA,SB], so the linear work index idx == fa*SB + fb. For
+    // static tiles SK/SB are pulled from the layout *type* as constexpr, which
+    // lets nvcc fully unroll the contraction loop and strength-reduce the
+    // address math (k*SB) — a `const int` from extent() does not trip the
+    // unroller, leaving the loop rolled with per-iter ISETP/BRA/IMAD overhead.
+    if constexpr (TileA::is_static && TileB::is_static) {
+      constexpr int SA = decltype(a)::layout_t::extent(0);
+      constexpr int SK = decltype(a)::layout_t::extent(1);
+      constexpr int SB = decltype(b)::layout_t::extent(1);
+
+      // Register-blocked GEMM micro-kernel. Each work-item owns an MT x NT tile
+      // of C held in registers; per k it loads MT A-values + NT B-values once
+      // and issues MT*NT FMAs, cutting the shared-load:FMA ratio from 2 to
+      // (MT+NT)/(MT*NT) — the unblocked 1:2 ratio left the L1/LSU pipe
+      // saturated
+      // (~85%) while the FP pipe starved (~30%). Performance-portable via
+      // Kokkos simd: its ABI is chosen by execution space — scalar (width 1) on
+      // GPU, so this is 2D scalar register-blocking there; AVX/NEON on CPU, so
+      // the column dimension vectorizes. TeamThreadRange (the policy already
+      // runs vector_length=1) keeps all parallelism in the thread dim on GPU
+      // and avoids Kokkos vectorizing across work-items on top of our explicit
+      // simd.
+      namespace KE    = Kokkos::Experimental;
+      using simd_t    = KE::simd<value_type>;
+      constexpr int W = static_cast<int>(simd_t::size());
+      // GPU (scalar simd) block factors are the register-tile dims; override
+      // for tuning. 4x2 (8 accumulators) was the sweep winner on A100: a larger
+      // 4x4 tile cut the load:FMA ratio further but pushed registers to 62 and
+      // occupancy to 48%, leaving the kernel occupancy-bound; 4x2 drops to 48
+      // registers / ~60% occupancy and is faster. CPU uses one simd-wide column
+      // block (NT==W) by default — these macros only affect the scalar/GPU
+      // path.
+#ifndef TENSOR_OPS_GPU_MT
+#define TENSOR_OPS_GPU_MT 4
+#endif
+#ifndef TENSOR_OPS_GPU_NT
+#define TENSOR_OPS_GPU_NT 2
+#endif
+      constexpr int MT =
+          (W == 1) ? TENSOR_OPS_GPU_MT : 8;  // output rows / item
+      constexpr int NT =
+          (W == 1) ? TENSOR_OPS_GPU_NT : W;  // output cols / item
+      constexpr int NR = NT / W;  // simd vectors spanning the columns
+
+      if constexpr (SA % MT == 0 && SB % NT == 0) {
+        constexpr int CB = SB / NT;  // column-blocks across the C tile
+        Kokkos::parallel_for(
+            Kokkos::TeamThreadRange(team, (SA / MT) * CB), [=](int t) {
+              const int i0 = (t / CB) * MT;
+              const int j0 = (t % CB) * NT;
+              simd_t    acc[MT][NR];
+#pragma unroll
+              for (int i = 0; i < MT; ++i)
+#pragma unroll
+                for (int n = 0; n < NR; ++n)
+                  acc[i][n] = simd_t(cp + (i0 + i) * SB + j0 + n * W,
+                                     KE::simd_flag_default);
+              for (int k = 0; k < SK; ++k) {
+                simd_t br[NR];
+#pragma unroll
+                for (int n = 0; n < NR; ++n)
+                  br[n] =
+                      simd_t(bp + k * SB + j0 + n * W, KE::simd_flag_default);
+#pragma unroll
+                for (int i = 0; i < MT; ++i) {
+                  const simd_t a_i(ap[(i0 + i) * SK + k]);  // broadcast A
+#pragma unroll
+                  for (int n = 0; n < NR; ++n) acc[i][n] += a_i * br[n];
+                }
+              }
+#pragma unroll
+              for (int i = 0; i < MT; ++i)
+#pragma unroll
+                for (int n = 0; n < NR; ++n)
+                  KE::simd_unchecked_store(acc[i][n],
+                                           cp + (i0 + i) * SB + j0 + n * W,
+                                           KE::simd_flag_default);
+            });
+      } else {
+        // Tile extents not divisible by the block: one output per work-item.
+        Kokkos::parallel_for(
+            Kokkos::TeamVectorRange(team, c.size()), [=](int idx) {
+              const int         fb   = idx % SB;
+              const value_type* arow = ap + (idx / SB) * SK;  // fa*SK, hoisted
+              value_type        acc  = cp[idx];
+#pragma unroll
+              for (int k = 0; k < SK; ++k) acc += arow[k] * bp[k * SB + fb];
+              cp[idx] = acc;
+            });
+      }
+    } else {
+      const int SK = a.extent(1);
+      const int SB = b.extent(1);
+      Kokkos::parallel_for(Kokkos::TeamVectorRange(team, c.size()),
+                           [=](int idx) {
+                             const int         fb   = idx % SB;
+                             const value_type* arow = ap + (idx / SB) * SK;
+                             value_type        acc  = cp[idx];
+                             for (int k = 0; k < SK; ++k)
+                               acc += arow[k] * bp[k * SB + fb];
+                             cp[idx] = acc;
+                           });
+    }
     team.team_barrier();
   }
 };
@@ -283,16 +400,34 @@ struct Evaluator<
     TIMING_SCOPE_ENTER(g_timing_stats.store_write_time,
                        g_timing_stats.store_write_count);
     team.team_barrier();  // ensure the producer's scratch is fully visible
-    const auto tv        = tile_view(view, tiling);
-    const auto sv        = subview_tile(tv, tile_idx);
-    const auto sv_layout = sv.layout();
-    const auto scratch   = node.storage_;
-    const auto hook  = node.hook_op;  // local copy: lambda captures no `this`
-    const auto total = sv.size();
-    Kokkos::parallel_for(Kokkos::TeamVectorRange(team, total), [=](int i) {
-      const auto coord = sv_layout[i];
-      sv[coord]        = Impl::apply_hook(hook, scratch[coord]);
-    });
+    const auto tv      = tile_view(view, tiling);
+    const auto sv      = subview_tile(tv, tile_idx);
+    const auto scratch = node.storage_;
+    const auto hook    = node.hook_op;  // local copy: lambda captures no `this`
+
+    if constexpr (tiling_type::is_static &&
+                  Impl::fast_layout_v<typename ViewT::array_layout>) {
+      // Static fast path (mirror of fill_team's): scalar global+scratch
+      // offsets, no per-thread coordinate array in local memory. `Layout` is
+      // the scratch tile's static row-major layout.
+      using GL                = typename ViewT::array_layout;
+      using STL               = Layout;
+      value_type* const sptr  = scratch.data();
+      value_type* const dptr  = sv.data();
+      const auto        gs    = Impl::stride_array<Rank>(sv);
+      constexpr int     total = static_cast<int>(STL::num_elements);
+      Kokkos::parallel_for(Kokkos::TeamVectorRange(team, total), [=](int i) {
+        const auto a  = Impl::static_tile_addr<GL, STL, Rank>(i, gs);
+        dptr[a.first] = Impl::apply_hook(hook, sptr[a.second]);
+      });
+    } else {
+      const auto sv_layout = sv.layout();
+      const auto total     = sv.size();
+      Kokkos::parallel_for(Kokkos::TeamVectorRange(team, total), [=](int i) {
+        const auto coord = sv_layout[i];
+        sv[coord]        = Impl::apply_hook(hook, scratch[coord]);
+      });
+    }
     TIMING_SCOPE_EXIT(g_timing_stats.store_write_time,
                       g_timing_stats.store_write_count);
   }
