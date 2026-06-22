@@ -4,14 +4,14 @@
 // ---------------------------------------------------------------------------
 // Specialization 2: TeamPolicyTag + InputTag + Tile_  (scratch tier)
 // ---------------------------------------------------------------------------
-template <TensorLike T, typename HookOp, typename Tile_>
-struct Evaluator<TeamPolicyTag, NodeHandle<InputTag, T, HookOp>, Tile_> {
+template <typename ES, TensorLike T, typename HookOp, typename Tile_>
+struct Evaluator<TeamPolicyTag<ES>, NodeHandle<InputTag, T, HookOp>, Tile_> {
   using node_type           = NodeHandle<InputTag, T, HookOp>;
   using tiling_type         = Tile_;
-  using policy_tag          = TeamPolicyTag;
+  using policy_tag          = TeamPolicyTag<ES>;
   static constexpr int Rank = tiling_type::rank;
   using value_type          = typename node_type::value_type;
-  using exec_space          = typename Impl::exec_space_of<T>::type;
+  using exec_space          = ES;
   using scratch_space       = typename exec_space::scratch_memory_space;
   using tile_layout_t = decltype(make_tile_layout(std::declval<tiling_type>()));
   using backing_t     = Kokkos::View<value_type*, scratch_space,
@@ -87,12 +87,12 @@ struct Evaluator<TeamPolicyTag, NodeHandle<InputTag, T, HookOp>, Tile_> {
 // ---------------------------------------------------------------------------
 template <typename NA, typename NB, typename IntCRank, typename S, typename ES,
           typename HookOp, typename TileA, typename TileB, typename TileC>
-struct Evaluator<TeamPolicyTag,
+struct Evaluator<TeamPolicyTag<ES>,
                  NodeHandle<ContractionTag, NA, NB, IntCRank, S, ES, HookOp>,
                  TensorOperations::Tile<TileA, TileB, TileC>> {
   using node_type = NodeHandle<ContractionTag, NA, NB, IntCRank, S, ES, HookOp>;
   using tiling_type         = TensorOperations::Tile<TileA, TileB, TileC>;
-  using policy_tag          = TeamPolicyTag;
+  using policy_tag          = TeamPolicyTag<ES>;
   static constexpr int Rank = node_type::Rank;
   using value_type          = S;
   using exec_space          = ES;
@@ -115,22 +115,9 @@ struct Evaluator<TeamPolicyTag,
   static_assert(TileB::rank == RankB, "TileB rank must match node B");
   static_assert(TileC::rank == RankC, "TileC rank must match output rank");
 
-  static constexpr std::array<int, RankA> a_pos = [] {
-    std::array<int, RankA> p{};
-    for (int i = 0; i < FreeA; ++i) p[i] = i;
-    for (int i = 0; i < NumK; ++i) p[FreeA + i] = RankC + i;
-    return p;
-  }();
-  static constexpr std::array<int, RankB> b_pos = [] {
-    std::array<int, RankB> p{};
-    for (int i = 0; i < NumK; ++i) p[i] = RankC + i;
-    for (int i = 0; i < FreeB; ++i) p[NumK + i] = FreeA + i;
-    return p;
-  }();
-
   using c_layout_t   = decltype(make_tile_layout(TileC{}));
-  using stage_a_type = Evaluator<TeamPolicyTag, NA, TileA>;
-  using stage_b_type = Evaluator<TeamPolicyTag, NB, TileB>;
+  using stage_a_type = Evaluator<TeamPolicyTag<ES>, NA, TileA>;
+  using stage_b_type = Evaluator<TeamPolicyTag<ES>, NB, TileB>;
 
  public:
   using scratch_view_t = ScratchView<value_type, exec_space, c_layout_t>;
@@ -155,8 +142,8 @@ struct Evaluator<TeamPolicyTag,
         a_tile_(t.a),
         b_tile_(t.b),
         c_tile_(t.c),
-        stage_a_(make_evaluator<TeamPolicyTag>(n.node_a, a_tile_, team)),
-        stage_b_(make_evaluator<TeamPolicyTag>(n.node_b, b_tile_, team)),
+        stage_a_(make_evaluator<TeamPolicyTag<ES>>(n.node_a, a_tile_, team)),
+        stage_b_(make_evaluator<TeamPolicyTag<ES>>(n.node_b, b_tile_, team)),
         c_scratch_(alloc_c_scratch(team)) {
     auto c = c_scratch_;
     Kokkos::parallel_for(Kokkos::TeamVectorRange(team, c.size()),
@@ -224,9 +211,11 @@ struct Evaluator<TeamPolicyTag,
     for (int i = 0; i < NumK; ++i) part[RankC + i] = k_tile_idx[i];
 
     Kokkos::Array<int, RankA> a_tile_idx{};
-    for (int j = 0; j < RankA; ++j) a_tile_idx[j] = part[a_pos[j]];
+    for (int j = 0; j < RankA; ++j)
+      a_tile_idx[j] = part[j < FreeA ? j : RankC + (j - FreeA)];
     Kokkos::Array<int, RankB> b_tile_idx{};
-    for (int j = 0; j < RankB; ++j) b_tile_idx[j] = part[b_pos[j]];
+    for (int j = 0; j < RankB; ++j)
+      b_tile_idx[j] = part[j < NumK ? RankC + j : FreeA + (j - NumK)];
 
     stage_a_(team, a_tile_idx);
     stage_b_(team, b_tile_idx);
@@ -263,13 +252,13 @@ struct Evaluator<TeamPolicyTag,
 template <typename BackingVT, typename Layout, typename IntRank, typename ES,
           typename HookOp, typename Tile_>
 struct Evaluator<
-    TeamPolicyTag,
+    TeamPolicyTag<ES>,
     NodeHandle<IntermTag, View<BackingVT, Layout>, IntRank, ES, HookOp>,
     Tile_> {
   using node_type =
       NodeHandle<IntermTag, View<BackingVT, Layout>, IntRank, ES, HookOp>;
   using tiling_type         = Tile_;
-  using policy_tag          = TeamPolicyTag;
+  using policy_tag          = TeamPolicyTag<ES>;
   static constexpr int Rank = node_type::Rank;
   using value_type          = typename node_type::value_type;
   using exec_space          = ES;

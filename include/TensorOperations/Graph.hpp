@@ -65,14 +65,57 @@ std::array<int, participating_rank<Node>()> participating_extents(
 // Returns 0-based tile coordinates (not element offsets) along each free mode.
 template <int Rank, typename Tile>
 KOKKOS_FUNCTION Kokkos::Array<int, Rank> decode_tile_index(
-    std::size_t idx, const Kokkos::Array<int, Rank>& shape, const Tile& tile) {
+    int idx, const Kokkos::Array<int, Rank>& shape, const Tile& tile) {
   Kokkos::Array<int, Rank> tidx{};
   for (int d = Rank - 1; d >= 0; --d) {
     int n   = (shape[d] + tile.extent(d) - 1) / tile.extent(d);
-    tidx[d] = static_cast<int>(idx % static_cast<std::size_t>(n));
-    idx /= static_cast<std::size_t>(n);
+    tidx[d] = static_cast<int>(idx % static_cast<int>(n));
+    idx /= static_cast<int>(n);
   }
   return tidx;
+}
+
+template <typename Node, typename Tile>
+int work_items(const Node& n, const Tile& tile) {
+  constexpr int R = Node::Rank;
+  static_assert(Tile::rank >= R,
+                "tile rank must cover at least the node's output (free) modes");
+  const auto out   = n.shape();
+  int        total = 1;
+  for (int d = 0; d < R; ++d) {
+    const int t = tile.extent(d);
+    total *= static_cast<int>((out[d] + t - 1) / t);  // ceil-div
+  }
+  return total;
+}
+
+template <typename NodeType, typename ViewT, typename Tile>
+void execute_one_output_team(const NodeType& node, const ViewT& view,
+                             const Tile& tile) {
+  using exec_space = typename NodeType::exec_space;
+  using member_t   = typename Kokkos::TeamPolicy<exec_space>::member_type;
+  using eval_type  = Evaluator<TeamPolicyTag<exec_space>, NodeType, Tile>;
+
+  const auto c_tile = output_tile(tile);
+  const int  wk     = work_items(node, c_tile);
+  const int  bytes  = eval_type::scratch_size_per_team(tile);
+
+  Kokkos::TeamPolicy<exec_space> policy(static_cast<int>(wk), Kokkos::AUTO);
+  policy.set_scratch_size(0, Kokkos::PerTeam(bytes));
+
+  Kokkos::parallel_for(
+      "TensorOperations::execute_team", policy,
+      KOKKOS_LAMBDA(const member_t& team) {
+        const auto shape      = node.shape();
+        const auto c_tile_idx = decode_tile_index<NodeType::Rank>(
+            static_cast<int>(team.league_rank()), shape, c_tile);
+
+        auto eval = make_evaluator<TeamPolicyTag<exec_space>>(node, tile, team);
+        auto interm = eval(team, c_tile_idx);
+
+        auto seval = make_evaluator<TeamPolicyTag<exec_space>>(interm, c_tile);
+        seval(team, c_tile_idx, view);
+      });
 }
 
 }  // namespace Impl
@@ -113,30 +156,24 @@ struct Graph {
 
   // Total work items across all outputs for the given tiling shape.
   template <typename Tile>
-  std::size_t tile_count(const Tile& tile) const {
+  int tile_count(const Tile& tile) const {
     return [&]<std::size_t... I>(std::index_sequence<I...>) {
-      return (std::size_t{0} + ... + work_items(std::get<I>(outputs), tile));
+      return (int{0} + ... + Impl::work_items(std::get<I>(outputs), tile));
     }(std::make_index_sequence<std::tuple_size_v<OutputTuple>>{});
   }
 
   // Evaluate the graph and write each output into the corresponding view.
   // Exactly one view must be provided per output node.
-  template <typename PolicyTag, typename Tile, TensorLike... Ts>
-  std::size_t execute(const PolicyTag&, const Tile& tile,
-                      const Ts&... ts) const {
-    static_assert(sizeof...(Ts) == std::tuple_size_v<OutputTuple>,
-                  "Number of runtime tensor arguments must match number of "
-                  "output nodes in the graph");
-    static_assert(std::is_same_v<PolicyTag, TeamPolicyTag>,
-                  "PolicyTag must be TeamPolicyTag");
-
+  template <typename ES, typename Tile, TensorLike... Ts>
+  int execute(const TeamPolicyTag<ES>&, const Tile& tile,
+              const Ts&... ts) const {
     auto                  ts_tuple = std::tie(ts...);
     constexpr std::size_t N        = std::tuple_size_v<OutputTuple>;
-    std::size_t           wk_items = 0;
+    int                   wk_items = 0;
     [&]<std::size_t... I>(std::index_sequence<I...>) {
-      ((execute_one_output_team(std::get<I>(outputs), std::get<I>(ts_tuple),
-                                tile),
-        wk_items += work_items(std::get<I>(outputs), output_tile(tile))),
+      ((Impl::execute_one_output_team(std::get<I>(outputs),
+                                      std::get<I>(ts_tuple), tile),
+        wk_items += Impl::work_items(std::get<I>(outputs), output_tile(tile))),
        ...);
     }(std::make_index_sequence<N>{});
 
@@ -150,53 +187,6 @@ struct Graph {
   explicit Graph(OutputTuple o) : outputs(std::move(o)) {}
 
   OutputTuple outputs;
-
-  template <typename Node, typename Tile>
-  static std::size_t work_items(const Node& n, const Tile& tile) {
-    constexpr int R = Node::Rank;
-    static_assert(
-        Tile::rank >= R,
-        "tile rank must cover at least the node's output (free) modes");
-    const auto  out   = n.shape();
-    std::size_t total = 1;
-    for (int d = 0; d < R; ++d) {
-      const int t = tile.extent(d);
-      total *= static_cast<std::size_t>((out[d] + t - 1) / t);  // ceil-div
-    }
-    return total;
-  }
-
-  // Launch a Kokkos::TeamPolicy kernel for a single output node: one team per
-  // output tile stages/accumulates into team scratch (the node evaluator), then
-  // writes the scratch tile back to `view` (the interm store evaluator).
-  template <typename NodeType, typename ViewT, typename Tile>
-  static void execute_one_output_team(const NodeType& node, const ViewT& view,
-                                      const Tile& tile) {
-    using exec_space = typename NodeType::exec_space;
-    using member_t   = typename Kokkos::TeamPolicy<exec_space>::member_type;
-    using eval_type  = Evaluator<TeamPolicyTag, NodeType, Tile>;
-
-    const auto        c_tile = output_tile(tile);  // free-mode (output) tile
-    const std::size_t wk     = work_items(node, c_tile);
-    const std::size_t bytes  = eval_type::scratch_size_per_team(tile);
-
-    Kokkos::TeamPolicy<exec_space> policy(static_cast<int>(wk), Kokkos::AUTO);
-    policy.set_scratch_size(0, Kokkos::PerTeam(bytes));
-
-    Kokkos::parallel_for(
-        "TensorOperations::execute_team", policy,
-        KOKKOS_LAMBDA(const member_t& team) {
-          const auto shape      = node.shape();
-          const auto c_tile_idx = Impl::decode_tile_index<NodeType::Rank>(
-              static_cast<std::size_t>(team.league_rank()), shape, c_tile);
-
-          auto eval   = make_evaluator<TeamPolicyTag>(node, tile, team);
-          auto interm = eval(team, c_tile_idx);
-
-          auto seval = make_evaluator<TeamPolicyTag>(interm, c_tile);
-          seval(team, c_tile_idx, view);
-        });
-  }
 };
 
 inline Graph<> make_graph() { return {}; }

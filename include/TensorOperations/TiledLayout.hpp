@@ -147,14 +147,6 @@ struct TiledLayout {
     return inner_inv_extents_;
   }
 
-  // Full 2N-index memory offset from backing_.data().
-  // Is spans {0, ..., 2N-1}: first N are outer coords, last N are inner
-  // offsets.
-  template <std::size_t... Is>
-  KOKKOS_FUNCTION int offset(std::index_sequence<Is...>, auto& args) const {
-    return (stride_for_<Is>(args) + ...);
-  }
-
   KOKKOS_FUNCTION static constexpr int base_offset() noexcept { return 0; }
 
   KOKKOS_FUNCTION int size() const noexcept {
@@ -164,8 +156,18 @@ struct TiledLayout {
   }
 
   // Bounds check over all N outer/inner index pairs; no-op without debug flag.
-  KOKKOS_FUNCTION void check_bounds(auto& args) const {
-    check_bounds_(std::make_index_sequence<N>{}, args);
+  // Takes the 2N-index coordinate array directly (not a tuple): nvcc
+  // miscompiles the std::get/fold tuple path on device (see
+  // View::flat_offset_).
+  KOKKOS_FUNCTION void check_bounds(
+      const Kokkos::Array<int, 2 * N>& coord) const {
+#ifdef KOKKOS_ENABLE_DEBUG_BOUNDS_CHECK
+    for (int i = 0; i < N; ++i)
+      if (coord[i] * tile_layout_.extent(i) + coord[N + i] >= orig_extents_[i])
+        Kokkos::abort("TiledView: out-of-bounds access");
+#else
+    (void)coord;
+#endif
   }
 
  private:
@@ -176,36 +178,6 @@ struct TiledLayout {
   Kokkos::Array<int, N>   inner_strides_;
   Kokkos::Array<int, N>   inner_order_;
   Kokkos::Array<float, N> inner_inv_extents_;
-
-  // Helper: contribution of arg I to the flat offset.
-  // Is in [0, N): outer coordinate × outer stride.
-  // Is in [N, 2N): inner offset × inner stride.
-  template <std::size_t I>
-  KOKKOS_FUNCTION int stride_for_(auto& args) const {
-    if constexpr (I < static_cast<std::size_t>(N)) {
-      return static_cast<int>(std::get<I>(args)) * outer_strides_[I];
-    } else {
-      return static_cast<int>(std::get<I>(args)) * inner_strides_[I - N];
-    }
-  }
-
-  template <std::size_t I>
-  KOKKOS_FUNCTION void check_one_(auto& args) const {
-#ifdef KOKKOS_ENABLE_DEBUG_BOUNDS_CHECK
-    if (static_cast<int>(std::get<I>(args)) * tile_layout_.extent(I) +
-            static_cast<int>(std::get<N + I>(args)) >=
-        orig_extents_[I])
-      Kokkos::abort("TiledView: out-of-bounds access");
-#else
-    (void)args;
-#endif
-  }
-
-  template <std::size_t... Is>
-  KOKKOS_FUNCTION void check_bounds_(std::index_sequence<Is...>,
-                                     auto& args) const {
-    (check_one_<Is>(args), ...);
-  }
 };
 
 // ---------------------------------------------------------------------------
@@ -263,13 +235,6 @@ struct SubviewLayout {
     return -1;
   }
 
-  // Full N-index offset from backing_.data() (includes base_offset_).
-  template <std::size_t... Is>
-  KOKKOS_FUNCTION int offset(std::index_sequence<Is...>, auto& args) const {
-    return base_offset_ +
-           ((static_cast<int>(std::get<Is>(args)) * strides_[Is]) + ...);
-  }
-
   KOKKOS_FUNCTION int base_offset() const noexcept { return base_offset_; }
 
   // Memory-aligned delinearize: flat index → N-D coordinate, peeling the
@@ -314,9 +279,12 @@ struct SubviewLayout {
 //   extent(d)                           — logical extent of dimension d
 //   stride(d)                           — stride of dimension d
 //   base_offset()                       — flat offset of [0,...,0] from data()
-//   offset(index_sequence<Is...>, args) — full flat offset from data()
 //   size()                              — product of all extents
 //   operator[](int)                     — flat → multi-index delinearize
+//
+// The element offset for a multi-index is computed by View as
+// base_offset() + Σ coord[d]·stride(d) (see View::flat_offset_), so a layout
+// only needs base_offset()/stride(d), not a variadic offset() helper.
 //
 // TiledLayout<N,TL>  → rank = 2N  (outer tile coords then inner offsets)
 // SubviewLayout<N>   → rank = N   (free dimensions of a subview)
@@ -346,22 +314,32 @@ struct View {
     return layout_.unit_stride_dim();
   }
 
+  // Flat element offset from backing_.data() for a multi-index. Every layout's
+  // offset() equals base_offset() + Σ coord[d]·stride(d), so this stride loop
+  // is equivalent. It is used instead of the layout's variadic
+  // offset(index_sequence, tuple) helper because nvcc (CUDA 13.x) miscompiles
+  // that std::forward_as_tuple/std::get/fold path for these views on device,
+  // yielding a wrong offset (garbage reads, faulting or misplaced writes).
+  KOKKOS_FUNCTION int flat_offset_(
+      const Kokkos::Array<int, rank>& coord) const {
+    int off = layout_.base_offset();
+    for (int d = 0; d < rank; ++d) off += coord[d] * layout_.stride(d);
+    return off;
+  }
+
   template <typename... Idx>
     requires(sizeof...(Idx) == rank)
   KOKKOS_FUNCTION value_type& operator()(Idx... idx) const {
-    auto args = std::forward_as_tuple(idx...);
+    const Kokkos::Array<int, rank> coord{static_cast<int>(idx)...};
 #ifdef KOKKOS_ENABLE_DEBUG_BOUNDS_CHECK
-    if constexpr (requires { layout_.check_bounds(args); })
-      layout_.check_bounds(args);
+    if constexpr (requires { layout_.check_bounds(coord); })
+      layout_.check_bounds(coord);
 #endif
-    return backing_
-        .data()[layout_.offset(std::make_index_sequence<rank>{}, args)];
+    return backing_.data()[flat_offset_(coord)];
   }
 
   KOKKOS_FUNCTION value_type& operator[](Kokkos::Array<int, rank> idx) const {
-    return [&]<std::size_t... D>(std::index_sequence<D...>) -> value_type& {
-      return (*this)(idx[D]...);
-    }(std::make_index_sequence<rank>{});
+    return backing_.data()[flat_offset_(idx)];
   }
 };
 
@@ -452,7 +430,8 @@ KOKKOS_FUNCTION auto tile_view(const ViewType& view, Tile tile)
 // ---------------------------------------------------------------------------
 
 template <typename ViewType, int N, typename TL, typename... Slices>
-auto subview(const View<ViewType, TiledLayout<N, TL>>& tv, Slices... slices) {
+KOKKOS_FUNCTION auto subview(const View<ViewType, TiledLayout<N, TL>>& tv,
+                             Slices... slices) {
   constexpr int Full = View<ViewType, TiledLayout<N, TL>>::rank;
   static_assert(sizeof...(Slices) == Full,
                 "subview: one slice argument per tiled dimension required");

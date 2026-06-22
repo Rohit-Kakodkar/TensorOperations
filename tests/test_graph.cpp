@@ -143,8 +143,10 @@ TEST(GraphTest, SingleContractionExecutionTeam) {
   // Same contraction as SingleContractionExecution, run on the team/scratch
   // tier. C_{i,l} = sum_{j,k} A_{i,j,k} * B_{j,k,l}; A=B=1  →  C[i,l] = 4*5
   // = 20.
-  using View2 = Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::HostSpace>;
-  using View3 = Kokkos::View<float***, Kokkos::LayoutRight, Kokkos::HostSpace>;
+  // Views use DefaultMemorySpace (CudaSpace when CUDA is enabled) so the
+  // kernel can access them from the GPU.
+  using View2 = Kokkos::View<float**, Kokkos::LayoutRight>;
+  using View3 = Kokkos::View<float***, Kokkos::LayoutRight>;
   View3 A("A", 3, 4, 5);
   View3 B("B", 4, 5, 6);
   View2 C("C", 3, 6);
@@ -164,12 +166,13 @@ TEST(GraphTest, SingleContractionExecutionTeam) {
   auto [T1] = o1;
 
   // One team, one tile: A[i,j,k], B[j,k,l], C[i,l] each cover the full extent.
-  g1.execute(TeamPolicyTag{},
+  g1.execute(TeamPolicyTag<>{},
              Tile<StaticTile<3, 4, 5>, StaticTile<4, 5, 6>, StaticTile<3, 6>>{},
              C);
 
+  auto C_host = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, C);
   for (int i = 0; i < 3; ++i)
-    for (int l = 0; l < 6; ++l) EXPECT_FLOAT_EQ(C(i, l), 20.0f);
+    for (int l = 0; l < 6; ++l) EXPECT_FLOAT_EQ(C_host(i, l), 20.0f);
 }
 
 TEST(GraphTest, MultiTileExecutionTeam) {
@@ -177,8 +180,8 @@ TEST(GraphTest, MultiTileExecutionTeam) {
   // output tiles (3 teams) and the contracted j mode splits into 2 accumulation
   // blocks, exercising multiple teams plus the k-tile reduction loop. Result is
   // still 20.
-  using View2 = Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::HostSpace>;
-  using View3 = Kokkos::View<float***, Kokkos::LayoutRight, Kokkos::HostSpace>;
+  using View2 = Kokkos::View<float**, Kokkos::LayoutRight>;
+  using View3 = Kokkos::View<float***, Kokkos::LayoutRight>;
   View3 A("A", 3, 4, 5);
   View3 B("B", 4, 5, 6);
   View2 C("C", 3, 6);
@@ -200,12 +203,13 @@ TEST(GraphTest, MultiTileExecutionTeam) {
   // A[i=1,j=2,k=5], B[j=2,k=5,l=6], C[i=1,l=6]: i → 3 tiles, j → 2 tiles (all
   // divide their extents). 3 output tiles, 2 contracted-tile blocks per output.
   const std::size_t wk = g1.execute(
-      TeamPolicyTag{},
+      TeamPolicyTag<>{},
       Tile<StaticTile<1, 2, 5>, StaticTile<2, 5, 6>, StaticTile<1, 6>>{}, C);
   EXPECT_EQ(wk, 3u);  // one team per output tile of C[i,l] = [3,1]
 
+  auto C_host = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, C);
   for (int i = 0; i < 3; ++i)
-    for (int l = 0; l < 6; ++l) EXPECT_FLOAT_EQ(C(i, l), 20.0f);
+    for (int l = 0; l < 6; ++l) EXPECT_FLOAT_EQ(C_host(i, l), 20.0f);
 }
 
 int main(int argc, char* argv[]) {

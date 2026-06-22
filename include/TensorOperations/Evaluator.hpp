@@ -15,7 +15,10 @@ namespace TensorOperations {
 // ---------------------------------------------------------------------------
 // Policy tags
 // ---------------------------------------------------------------------------
-struct TeamPolicyTag {};
+template <typename ES = Kokkos::DefaultExecutionSpace>
+struct TeamPolicyTag {
+  using execution_space = ES;
+};
 
 // Tiling specs (StaticTile / DynamicTile) live in Tiling.hpp.
 

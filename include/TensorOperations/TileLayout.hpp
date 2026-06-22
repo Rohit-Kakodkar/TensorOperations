@@ -50,38 +50,22 @@ struct StaticTileLayoutRight {
   static_assert(rank > 0 && ((Extents > 0) && ...),
                 "StaticTileLayoutRight requires at least one positive extent");
 
-  static constexpr std::array<int, rank> extents_{Extents...};
-
-  // Row-major strides: strides_[rank-1]=1,
-  // strides_[k]=strides_[k+1]*extents_[k+1]
-  static constexpr std::array<std::size_t, rank> strides_ = [] {
-    std::array<std::size_t, rank> s{};
-    s[rank - 1] = 1;
-    for (int k = rank - 2; k >= 0; --k)
-      s[k] = s[k + 1] * static_cast<std::size_t>(extents_[k + 1]);
-    return s;
-  }();
-
   KOKKOS_FORCEINLINE_FUNCTION static constexpr int extent(int k) noexcept {
-    return extents_[k];
+    constexpr int e[] = {Extents...};
+    return e[k];
   }
+  // Row-major stride: product of extents to the right of k
   KOKKOS_FORCEINLINE_FUNCTION static constexpr int stride(int k) noexcept {
-    return static_cast<int>(strides_[k]);
+    constexpr int e[] = {Extents...};
+    int           s   = 1;
+    for (int i = rank - 1; i > k; --i) s *= e[i];
+    return s;
   }
   KOKKOS_FORCEINLINE_FUNCTION static constexpr int base_offset() noexcept {
     return 0;
   }
   KOKKOS_FORCEINLINE_FUNCTION static constexpr int size() noexcept {
     return static_cast<int>(num_elements);
-  }
-
-  // View Layout: flat offset from a tuple of rank indices
-  template <std::size_t... Is>
-  KOKKOS_FORCEINLINE_FUNCTION int offset(std::index_sequence<Is...>,
-                                         auto& args) const noexcept {
-    return ((static_cast<int>(std::get<Is>(args)) *
-             static_cast<int>(strides_[Is])) +
-            ...);
   }
 
   // flat → multi-index (decode): independent per-dim, exposes compile-time
@@ -102,14 +86,16 @@ struct StaticTileLayoutRight {
   template <std::size_t... Ds, typename... I>
   KOKKOS_FORCEINLINE_FUNCTION static constexpr std::size_t flat_impl(
       std::index_sequence<Ds...>, I... idx) noexcept {
-    return ((static_cast<std::size_t>(idx) * strides_[Ds]) + ...);
+    return (
+        (static_cast<std::size_t>(idx) * static_cast<std::size_t>(stride(Ds))) +
+        ...);
   }
 
   template <std::size_t... Ds>
   KOKKOS_FORCEINLINE_FUNCTION static Kokkos::Array<int, rank> decode_impl(
       int linear, std::index_sequence<Ds...>) noexcept {
-    return Kokkos::Array<int, rank>{static_cast<int>(
-        (linear / static_cast<int>(strides_[Ds])) % extents_[Ds])...};
+    return Kokkos::Array<int, rank>{
+        static_cast<int>((linear / stride(Ds)) % extent(Ds))...};
   }
 };
 
@@ -125,38 +111,22 @@ struct StaticTileLayoutLeft {
   static_assert(rank > 0 && ((Extents > 0) && ...),
                 "StaticTileLayoutLeft requires at least one positive extent");
 
-  static constexpr std::array<int, rank> extents_{Extents...};
-
-  // Column-major strides: strides_[0]=1,
-  // strides_[k]=strides_[k-1]*extents_[k-1]
-  static constexpr std::array<std::size_t, rank> strides_ = [] {
-    std::array<std::size_t, rank> s{};
-    s[0] = 1;
-    for (int k = 1; k < rank; ++k)
-      s[k] = s[k - 1] * static_cast<std::size_t>(extents_[k - 1]);
-    return s;
-  }();
-
   KOKKOS_FORCEINLINE_FUNCTION static constexpr int extent(int k) noexcept {
-    return extents_[k];
+    constexpr int e[] = {Extents...};
+    return e[k];
   }
+  // Column-major stride: product of extents to the left of k
   KOKKOS_FORCEINLINE_FUNCTION static constexpr int stride(int k) noexcept {
-    return static_cast<int>(strides_[k]);
+    constexpr int e[] = {Extents...};
+    int           s   = 1;
+    for (int i = 0; i < k; ++i) s *= e[i];
+    return s;
   }
   KOKKOS_FORCEINLINE_FUNCTION static constexpr int base_offset() noexcept {
     return 0;
   }
   KOKKOS_FORCEINLINE_FUNCTION static constexpr int size() noexcept {
     return static_cast<int>(num_elements);
-  }
-
-  // View Layout: flat offset from a tuple of rank indices
-  template <std::size_t... Is>
-  KOKKOS_FORCEINLINE_FUNCTION int offset(std::index_sequence<Is...>,
-                                         auto& args) const noexcept {
-    return ((static_cast<int>(std::get<Is>(args)) *
-             static_cast<int>(strides_[Is])) +
-            ...);
   }
 
   // flat → multi-index (decode): same formula as Right, strides encode the
@@ -177,14 +147,16 @@ struct StaticTileLayoutLeft {
   template <std::size_t... Ds, typename... I>
   KOKKOS_FORCEINLINE_FUNCTION static constexpr std::size_t flat_impl(
       std::index_sequence<Ds...>, I... idx) noexcept {
-    return ((static_cast<std::size_t>(idx) * strides_[Ds]) + ...);
+    return (
+        (static_cast<std::size_t>(idx) * static_cast<std::size_t>(stride(Ds))) +
+        ...);
   }
 
   template <std::size_t... Ds>
   KOKKOS_FORCEINLINE_FUNCTION static Kokkos::Array<int, rank> decode_impl(
       int linear, std::index_sequence<Ds...>) noexcept {
-    return Kokkos::Array<int, rank>{static_cast<int>(
-        (linear / static_cast<int>(strides_[Ds])) % extents_[Ds])...};
+    return Kokkos::Array<int, rank>{
+        static_cast<int>((linear / stride(Ds)) % extent(Ds))...};
   }
 };
 
@@ -216,15 +188,6 @@ struct DynamicTileLayoutRight {
     int s = 1;
     for (int k = 0; k < Rank; ++k) s *= extents_[k];
     return s;
-  }
-
-  // View Layout: flat offset from a tuple of rank indices
-  template <std::size_t... Is>
-  KOKKOS_FUNCTION int offset(std::index_sequence<Is...>,
-                             auto& args) const noexcept {
-    return ((static_cast<int>(std::get<Is>(args)) *
-             static_cast<int>(strides_[Is])) +
-            ...);
   }
 
   // flat → multi-index (decode): peel from rightmost (row-major)
@@ -277,15 +240,6 @@ struct DynamicTileLayoutLeft {
     int s = 1;
     for (int k = 0; k < Rank; ++k) s *= extents_[k];
     return s;
-  }
-
-  // View Layout: flat offset from a tuple of rank indices
-  template <std::size_t... Is>
-  KOKKOS_FUNCTION int offset(std::index_sequence<Is...>,
-                             auto& args) const noexcept {
-    return ((static_cast<int>(std::get<Is>(args)) *
-             static_cast<int>(strides_[Is])) +
-            ...);
   }
 
   // flat → multi-index (decode): peel from leftmost (column-major)

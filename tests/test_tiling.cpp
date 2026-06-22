@@ -58,14 +58,14 @@ TEST(TilingTest, EvaluatorSelection) {
   // -- Team + Contraction + Tile<TileA,TileB,TileC> -> scratch tier ----------
   // Each operand carries its own tile: A:(i,j), B:(j,k), C:(i,k), all rank 2.
   using TTile  = Tile<DynamicTile<2>, DynamicTile<2>, DynamicTile<2>>;
-  using TEvalC = Evaluator<TeamPolicyTag, NC, TTile>;
+  using TEvalC = Evaluator<TeamPolicyTag<>, NC, TTile>;
   static_assert(std::is_same_v<TEvalC::tiling_type, TTile>);
   static_assert(TEvalC::Rank == 2);  // output rank, not tile rank
   static_assert(TEvalC::scratch_view_t::rank == 2);
 
   // -- Team also accepts StaticTile operands on the scratch tier -------------
   using TTileS  = Tile<StaticTile<2, 2>, StaticTile<2, 2>, StaticTile<2, 2>>;
-  using TEvalCS = Evaluator<TeamPolicyTag, NC, TTileS>;
+  using TEvalCS = Evaluator<TeamPolicyTag<>, NC, TTileS>;
   static_assert(std::is_same_v<TEvalCS::tiling_type, TTileS>);
   static_assert(TEvalCS::scratch_view_t::rank == 2);
 

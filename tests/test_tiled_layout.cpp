@@ -105,10 +105,11 @@ TEST(TiledLayout, TileView2D_RowMajor) {
   EXPECT_EQ(tv.stride(3), 1);
 
   // Element access: tv(t0, t1, r0, r1) == v(t0*4+r0, t1*4+r1)
+  // Clamp inner loops to the view's actual extents (last tile may be partial).
   for (int t0 = 0; t0 < 2; ++t0)
     for (int t1 = 0; t1 < 2; ++t1)
-      for (int r0 = 0; r0 < 4; ++r0)
-        for (int r1 = 0; r1 < 4; ++r1)
+      for (int r0 = 0; r0 < std::min(4, 10 - t0 * 4); ++r0)
+        for (int r1 = 0; r1 < std::min(4, 6 - t1 * 4); ++r1)
           EXPECT_FLOAT_EQ(tv(t0, t1, r0, r1), v(t0 * 4 + r0, t1 * 4 + r1));
 }
 

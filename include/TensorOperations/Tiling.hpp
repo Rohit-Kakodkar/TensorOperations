@@ -33,9 +33,11 @@ struct StaticTile {
   static constexpr int rank = sizeof...(Extents);
   static_assert(rank > 0 && ((Extents > 0) && ...),
                 "StaticTile requires at least one positive extent");
-  static constexpr Kokkos::Array<int, rank> extents{Extents...};
-  static constexpr bool                     is_static = true;
-  KOKKOS_FUNCTION static constexpr int      extent(int i) { return extents[i]; }
+  static constexpr bool                is_static = true;
+  KOKKOS_FUNCTION static constexpr int extent(int i) noexcept {
+    constexpr int e[] = {Extents...};
+    return e[i];
+  }
 };
 
 template <int Rank>
