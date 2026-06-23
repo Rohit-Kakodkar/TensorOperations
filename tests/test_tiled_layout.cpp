@@ -283,6 +283,130 @@ TEST(TiledLayout, SubviewFullFree) {
 }
 
 // ---------------------------------------------------------------------------
+// tile_view for View<ViewType, TileLayout> — same backing, 2N-dimensional
+// flat tiled layout.  Uses StaticTileLayoutRight/Left as the source layout
+// (stand-in for ScratchView which uses the same layout types in practice).
+// ---------------------------------------------------------------------------
+
+using Buf1D = Kokkos::View<float*, Kokkos::LayoutRight, Kokkos::HostSpace>;
+
+TEST(TiledLayout, TileViewScratchStaticRight) {
+  Buf1D buf("buf", 96);  // 8*12 elements
+  for (int k = 0; k < 96; ++k) buf(k) = static_cast<float>(k);
+
+  View<Buf1D, StaticTileLayoutRight<8, 12>> src{buf, {}};
+  auto tv = tile_view(src, StaticTile<2, 4>{});
+
+  // Fully compile-time result type
+  static_assert(std::is_same_v<decltype(tv),
+                               View<Buf1D, StaticTileLayoutRight<4, 3, 2, 4>>>);
+
+  EXPECT_EQ(tv.data(), src.data());  // same backing
+  EXPECT_EQ(tv.rank, 4);
+  EXPECT_EQ(tv.extent(0), 4);  // outer: 8/2
+  EXPECT_EQ(tv.extent(1), 3);  // outer: 12/4
+  EXPECT_EQ(tv.extent(2), 2);  // inner tile size
+  EXPECT_EQ(tv.extent(3), 4);
+  // Right: fastest dim last
+  EXPECT_EQ(tv.stride(3), 1);
+  EXPECT_EQ(tv.stride(2), 4);
+  EXPECT_EQ(tv.stride(1), 8);
+  EXPECT_EQ(tv.stride(0), 24);
+
+  // tv(ti,tj,ri,rj) = buf[ti*24 + tj*8 + ri*4 + rj]
+  for (int ti = 0; ti < 4; ++ti)
+    for (int tj = 0; tj < 3; ++tj)
+      for (int ri = 0; ri < 2; ++ri)
+        for (int rj = 0; rj < 4; ++rj)
+          EXPECT_FLOAT_EQ(tv(ti, tj, ri, rj),
+                          static_cast<float>(ti * 24 + tj * 8 + ri * 4 + rj));
+}
+
+TEST(TiledLayout, TileViewScratchStaticLeft) {
+  Buf1D buf("buf", 96);
+  for (int k = 0; k < 96; ++k) buf(k) = static_cast<float>(k);
+
+  View<Buf1D, StaticTileLayoutLeft<8, 12>> src{buf, {}};
+  auto tv = tile_view(src, StaticTile<2, 4>{});
+
+  static_assert(std::is_same_v<decltype(tv),
+                               View<Buf1D, StaticTileLayoutLeft<4, 3, 2, 4>>>);
+
+  EXPECT_EQ(tv.data(), src.data());
+  EXPECT_EQ(tv.extent(0), 4);
+  EXPECT_EQ(tv.extent(1), 3);
+  EXPECT_EQ(tv.extent(2), 2);
+  EXPECT_EQ(tv.extent(3), 4);
+  // Left: fastest dim first
+  EXPECT_EQ(tv.stride(0), 1);
+  EXPECT_EQ(tv.stride(1), 4);
+  EXPECT_EQ(tv.stride(2), 12);
+  EXPECT_EQ(tv.stride(3), 24);
+
+  // tv(ti,tj,ri,rj) = buf[ti + tj*4 + ri*12 + rj*24]
+  for (int ti = 0; ti < 4; ++ti)
+    for (int tj = 0; tj < 3; ++tj)
+      for (int ri = 0; ri < 2; ++ri)
+        for (int rj = 0; rj < 4; ++rj)
+          EXPECT_FLOAT_EQ(tv(ti, tj, ri, rj),
+                          static_cast<float>(ti + tj * 4 + ri * 12 + rj * 24));
+}
+
+TEST(TiledLayout, TileViewScratchDynamicRight) {
+  Buf1D buf("buf", 96);
+  for (int k = 0; k < 96; ++k) buf(k) = static_cast<float>(k);
+
+  View<Buf1D, DynamicTileLayoutRight<2>> src{
+      buf, DynamicTileLayoutRight<2>{Kokkos::Array<int, 2>{8, 12}}};
+  auto tv = tile_view(src, DynamicTile<2>{{2, 4}});
+
+  static_assert(
+      std::is_same_v<decltype(tv), View<Buf1D, DynamicTileLayoutRight<4>>>);
+
+  EXPECT_EQ(tv.data(), src.data());
+  EXPECT_EQ(tv.extent(0), 4);
+  EXPECT_EQ(tv.extent(1), 3);
+  EXPECT_EQ(tv.extent(2), 2);
+  EXPECT_EQ(tv.extent(3), 4);
+  EXPECT_EQ(tv.stride(3), 1);
+  EXPECT_EQ(tv.stride(0), 24);
+
+  for (int ti = 0; ti < 4; ++ti)
+    for (int tj = 0; tj < 3; ++tj)
+      for (int ri = 0; ri < 2; ++ri)
+        for (int rj = 0; rj < 4; ++rj)
+          EXPECT_FLOAT_EQ(tv(ti, tj, ri, rj),
+                          static_cast<float>(ti * 24 + tj * 8 + ri * 4 + rj));
+}
+
+TEST(TiledLayout, TileViewScratchDynamicLeft) {
+  Buf1D buf("buf", 96);
+  for (int k = 0; k < 96; ++k) buf(k) = static_cast<float>(k);
+
+  View<Buf1D, DynamicTileLayoutLeft<2>> src{
+      buf, DynamicTileLayoutLeft<2>{Kokkos::Array<int, 2>{8, 12}}};
+  auto tv = tile_view(src, DynamicTile<2>{{2, 4}});
+
+  static_assert(
+      std::is_same_v<decltype(tv), View<Buf1D, DynamicTileLayoutLeft<4>>>);
+
+  EXPECT_EQ(tv.data(), src.data());
+  EXPECT_EQ(tv.extent(0), 4);
+  EXPECT_EQ(tv.extent(1), 3);
+  EXPECT_EQ(tv.extent(2), 2);
+  EXPECT_EQ(tv.extent(3), 4);
+  EXPECT_EQ(tv.stride(0), 1);
+  EXPECT_EQ(tv.stride(3), 24);
+
+  for (int ti = 0; ti < 4; ++ti)
+    for (int tj = 0; tj < 3; ++tj)
+      for (int ri = 0; ri < 2; ++ri)
+        for (int rj = 0; rj < 4; ++rj)
+          EXPECT_FLOAT_EQ(tv(ti, tj, ri, rj),
+                          static_cast<float>(ti + tj * 4 + ri * 12 + rj * 24));
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 

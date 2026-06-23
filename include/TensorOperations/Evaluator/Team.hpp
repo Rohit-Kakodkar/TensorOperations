@@ -13,7 +13,8 @@ struct Evaluator<TeamPolicyTag<ES>, NodeHandle<InputTag, T, HookOp>, Tile_> {
   using value_type          = typename node_type::value_type;
   using exec_space          = ES;
   using scratch_space       = typename exec_space::scratch_memory_space;
-  using tile_layout_t = decltype(make_tile_layout(std::declval<tiling_type>()));
+  using tile_layout_t = decltype(make_tile_layout(std::declval<tiling_type>(),
+                                                  std::declval<LayoutRight>()));
   using backing_t     = Kokkos::View<value_type*, scratch_space,
                                      Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
   using scratch_view_t = ScratchView<value_type, exec_space, tile_layout_t>;
@@ -55,14 +56,14 @@ struct Evaluator<TeamPolicyTag<ES>, NodeHandle<InputTag, T, HookOp>, Tile_> {
   }
 
   static std::size_t scratch_size_per_team(const tiling_type& t) {
-    const auto layout = make_tile_layout(t);
+    const auto layout = make_tile_layout(t, LayoutRight{});
     return backing_t::shmem_size(static_cast<std::size_t>(layout.size()));
   }
 
  private:
   KOKKOS_FUNCTION scratch_view_t
   alloc_scratch(const team_member_t& team) const {
-    const auto layout = make_tile_layout(tiling);
+    const auto layout = make_tile_layout(tiling, LayoutRight{});
     backing_t  backing(team.team_scratch(0),
                        static_cast<std::size_t>(layout.size()));
     return {backing, layout};
@@ -114,7 +115,7 @@ struct Evaluator<TeamPolicyTag<ES>,
   static_assert(TileB::rank == RankB, "TileB rank must match node B");
   static_assert(TileC::rank == RankC, "TileC rank must match output rank");
 
-  using c_layout_t   = decltype(make_tile_layout(TileC{}));
+  using c_layout_t   = decltype(make_tile_layout(TileC{}, LayoutRight{}));
   using stage_a_type = Evaluator<TeamPolicyTag<ES>, NA, TileA>;
   using stage_b_type = Evaluator<TeamPolicyTag<ES>, NB, TileB>;
 
@@ -184,7 +185,7 @@ struct Evaluator<TeamPolicyTag<ES>,
 
   static std::size_t scratch_size_per_team(const tiling_type& t) {
     const std::size_t c_sz = c_backing_t::shmem_size(
-        static_cast<std::size_t>(make_tile_layout(t.c).size()));
+        static_cast<std::size_t>(make_tile_layout(t.c, LayoutRight{}).size()));
     return c_sz + stage_a_type::scratch_size_per_team(t.a) +
            stage_b_type::scratch_size_per_team(t.b);
   }
@@ -192,7 +193,7 @@ struct Evaluator<TeamPolicyTag<ES>,
  private:
   KOKKOS_FUNCTION scratch_view_t
   alloc_c_scratch(const team_member_t& team) const {
-    const auto  layout = make_tile_layout(c_tile_);
+    const auto  layout = make_tile_layout(c_tile_, LayoutRight{});
     c_backing_t backing(team.team_scratch(0),
                         static_cast<std::size_t>(layout.size()));
     return {backing, layout};
@@ -226,115 +227,89 @@ struct Evaluator<TeamPolicyTag<ES>,
     // View::operator() so the inner loop carries no per-access coordinate-array
     // build or flat_offset_ stride loop — that addressing overhead, not the
     // memory traffic, is what doubled the generic kernel's instruction count.
-    auto a = reshape(stage_a_.scratch_, prefix_product(a_tile_, rank_c<FreeA>));
-    auto b = reshape(stage_b_.scratch_, prefix_product(b_tile_, rank_c<NumK>));
-    auto c = reshape(c_scratch_, prefix_product(c_tile_, rank_c<FreeA>));
-    const value_type* KOKKOS_RESTRICT ap = a.data();
-    const value_type* KOKKOS_RESTRICT bp = b.data();
-    value_type* KOKKOS_RESTRICT       cp = c.data();
-    // c is row-major [SA,SB], so the linear work index idx == fa*SB + fb. For
-    // static tiles SK/SB are pulled from the layout *type* as constexpr, which
-    // lets nvcc fully unroll the contraction loop and strength-reduce the
-    // address math (k*SB) — a `const int` from extent() does not trip the
-    // unroller, leaving the loop rolled with per-iter ISETP/BRA/IMAD overhead.
-    if constexpr (TileA::is_static && TileB::is_static) {
-      constexpr int SA = decltype(a)::layout_t::extent(0);
-      constexpr int SK = decltype(a)::layout_t::extent(1);
-      constexpr int SB = decltype(b)::layout_t::extent(1);
+    auto a = reshape(stage_a_.scratch_,
+                     prefix_product(a_tile_, rank_c<FreeA>));  // [SA,SK]
+    auto b = reshape(stage_b_.scratch_,
+                     prefix_product(b_tile_, rank_c<NumK>));  // [SK,SB]
+    auto c =
+        reshape(c_scratch_, prefix_product(c_tile_, rank_c<FreeA>));  // [SA,SB]
 
-      // Register-blocked GEMM micro-kernel. Each work-item owns an MT x NT tile
-      // of C held in registers; per k it loads MT A-values + NT B-values once
-      // and issues MT*NT FMAs, cutting the shared-load:FMA ratio from 2 to
-      // (MT+NT)/(MT*NT) — the unblocked 1:2 ratio left the L1/LSU pipe
-      // saturated
-      // (~85%) while the FP pipe starved (~30%). Performance-portable via
-      // Kokkos simd: its ABI is chosen by execution space — scalar (width 1) on
-      // GPU, so this is 2D scalar register-blocking there; AVX/NEON on CPU, so
-      // the column dimension vectorizes. TeamThreadRange (the policy already
-      // runs vector_length=1) keeps all parallelism in the thread dim on GPU
-      // and avoids Kokkos vectorizing across work-items on top of our explicit
-      // simd.
-      namespace KE    = Kokkos::Experimental;
-      using simd_t    = KE::simd<value_type>;
-      constexpr int W = static_cast<int>(simd_t::size());
-      // GPU (scalar simd) block factors are the register-tile dims; override
-      // for tuning. 4x2 (8 accumulators) was the sweep winner on A100: a larger
-      // 4x4 tile cut the load:FMA ratio further but pushed registers to 62 and
-      // occupancy to 48%, leaving the kernel occupancy-bound; 4x2 drops to 48
-      // registers / ~60% occupancy and is faster. CPU uses one simd-wide column
-      // block (NT==W) by default — these macros only affect the scalar/GPU
-      // path.
-#ifndef TENSOR_OPS_GPU_MT
-#define TENSOR_OPS_GPU_MT 4
-#endif
-#ifndef TENSOR_OPS_GPU_NT
-#define TENSOR_OPS_GPU_NT 2
-#endif
-      constexpr int MT =
-          (W == 1) ? TENSOR_OPS_GPU_MT : 8;  // output rows / item
-      constexpr int NT =
-          (W == 1) ? TENSOR_OPS_GPU_NT : W;  // output cols / item
-      constexpr int NR = NT / W;  // simd vectors spanning the columns
+    int SA = [&]() {
+      if constexpr (TileA::is_static)
+        return decltype(a)::layout_t::extent(0);
+      else
+        return a.extent(0);
+    }();
+    int SK = [&]() {
+      if constexpr (TileA::is_static)
+        return decltype(a)::layout_t::extent(1);
+      else
+        return a.extent(1);
+    }();
+    int SB = [&]() {
+      if constexpr (TileB::is_static)
+        return decltype(b)::layout_t::extent(1);
+      else
+        return b.extent(1);
+    }();
 
-      if constexpr (SA % MT == 0 && SB % NT == 0) {
-        constexpr int CB = SB / NT;  // column-blocks across the C tile
-        Kokkos::parallel_for(
-            Kokkos::TeamThreadRange(team, (SA / MT) * CB), [=](int t) {
-              const int i0 = (t / CB) * MT;
-              const int j0 = (t % CB) * NT;
-              simd_t    acc[MT][NR];
+    namespace KE    = Kokkos::Experimental;
+    using simd_t    = KE::simd<value_type>;
+    constexpr int W = static_cast<int>(simd_t::size());
+
+#if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
+    constexpr int MT = 4;  // output rows / item
+    constexpr int NT = 2;  // output cols / item
+    constexpr int NR = 4;  // C columns
+#else
+    constexpr int MT = 8;  // output rows / item
+    constexpr int NT = 8;  // output cols / item
+    constexpr int NR = W;  // simd vectors spanning the columns
+#endif
+
+    using RegA = StaticTile<MT, NT>;
+    using RegB = StaticTile<NT, NR>;
+    using RegC = StaticTile<MT, NR>;
+
+    const auto a_reg = tile_view(a, RegA{});  // [SA/MT, SK/NT, MT, NT]
+    const auto b_reg = tile_view(b, RegB{});  // [SK/NT, SB/NR, NT, NR]
+    auto       c_reg = tile_view(c, RegC{});  // [SA/MT, SB/NR, MT, NR]
+
+    Kokkos::parallel_for(
+        Kokkos::TeamThreadRange(team, (SA / MT) * (SB / NR)), [=](int t) {
+          const int bi = t / (SB / NR);  // C tile-block row
+          const int bj = t % (SB / NR);  // C tile-block column
+          simd_t    acc[MT][NR / W];
 #pragma unroll
-              for (int i = 0; i < MT; ++i)
+          for (int i = 0; i < MT; ++i)
 #pragma unroll
-                for (int n = 0; n < NR; ++n)
-                  acc[i][n] = simd_t(cp + (i0 + i) * SB + j0 + n * W,
-                                     KE::simd_flag_default);
-              for (int k = 0; k < SK; ++k) {
-                simd_t br[NR];
+            for (int n = 0; n < NR; n += W)
+              acc[i][n / W] =
+                  simd_t(&c_reg(bi, bj, i, n), KE::simd_flag_default);
+
 #pragma unroll
-                for (int n = 0; n < NR; ++n)
-                  br[n] =
-                      simd_t(bp + k * SB + j0 + n * W, KE::simd_flag_default);
+          for (int k0 = 0; k0 < SK / NT; ++k0) {
+            for (int k = 0; k < NT; ++k) {
+              simd_t br[NR / W];
 #pragma unroll
-                for (int i = 0; i < MT; ++i) {
-                  const simd_t a_i(ap[(i0 + i) * SK + k]);  // broadcast A
+              for (int n = 0; n < NR; n += W)
+                br[n / W] = simd_t(&b_reg(k0, bj, k, n), KE::simd_flag_default);
 #pragma unroll
-                  for (int n = 0; n < NR; ++n) acc[i][n] += a_i * br[n];
-                }
+              for (int i = 0; i < MT; ++i) {
+                const simd_t a_i(a_reg(bi, k0, i, k));  // broadcast A
+#pragma unroll
+                for (int n = 0; n < NR; n += W)
+                  acc[i][n / W] += a_i * br[n / W];
               }
+            }
+          }
 #pragma unroll
-              for (int i = 0; i < MT; ++i)
+          for (int i = 0; i < MT; ++i)
 #pragma unroll
-                for (int n = 0; n < NR; ++n)
-                  KE::simd_unchecked_store(acc[i][n],
-                                           cp + (i0 + i) * SB + j0 + n * W,
-                                           KE::simd_flag_default);
-            });
-      } else {
-        // Tile extents not divisible by the block: one output per work-item.
-        Kokkos::parallel_for(
-            Kokkos::TeamVectorRange(team, c.size()), [=](int idx) {
-              const int         fb   = idx % SB;
-              const value_type* arow = ap + (idx / SB) * SK;  // fa*SK, hoisted
-              value_type        acc  = cp[idx];
-#pragma unroll
-              for (int k = 0; k < SK; ++k) acc += arow[k] * bp[k * SB + fb];
-              cp[idx] = acc;
-            });
-      }
-    } else {
-      const int SK = a.extent(1);
-      const int SB = b.extent(1);
-      Kokkos::parallel_for(Kokkos::TeamVectorRange(team, c.size()),
-                           [=](int idx) {
-                             const int         fb   = idx % SB;
-                             const value_type* arow = ap + (idx / SB) * SK;
-                             value_type        acc  = cp[idx];
-                             for (int k = 0; k < SK; ++k)
-                               acc += arow[k] * bp[k * SB + fb];
-                             cp[idx] = acc;
-                           });
-    }
+            for (int n = 0; n < NR; n += W)
+              KE::simd_unchecked_store(acc[i][n / W], &c_reg(bi, bj, i, n),
+                                       KE::simd_flag_default);
+        });
     team.team_barrier();
   }
 };

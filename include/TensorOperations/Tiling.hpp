@@ -54,14 +54,140 @@ struct DynamicTile {
 
 template <int... E>
 KOKKOS_FUNCTION constexpr StaticTileLayoutRight<E...> make_tile_layout(
-    StaticTile<E...>) noexcept {
+    StaticTile<E...>, LayoutRight) noexcept {
   return {};
 }
 
 template <int N>
 KOKKOS_FUNCTION DynamicTileLayoutRight<N> make_tile_layout(
-    DynamicTile<N> t) noexcept {
+    DynamicTile<N> t, LayoutRight) noexcept {
   return DynamicTileLayoutRight<N>{t.extents};
+}
+
+template <int... E>
+KOKKOS_FUNCTION constexpr StaticTileLayoutLeft<E...> make_tile_layout(
+    StaticTile<E...>, LayoutLeft) noexcept {
+  return {};
+}
+
+template <int N>
+KOKKOS_FUNCTION DynamicTileLayoutLeft<N> make_tile_layout(DynamicTile<N> t,
+                                                          LayoutLeft) noexcept {
+  return DynamicTileLayoutLeft<N>{t.extents};
+}
+
+// ---------------------------------------------------------------------------
+// tile_layout — factory: TileLayout × Tile → 2N-dimensional TileLayout
+//
+// Produces a flat TileLayout whose first N dims are the outer tile counts and
+// last N dims are the inner tile extents. Memory order (Right/Left) is
+// inherited from the source layout.
+//
+// Static src + static tile  → fully constexpr StaticTileLayout (all info
+//                             compile-time, pack expansion (E/T)... at zero
+//                             runtime cost).
+// Dynamic src + static tile → DynamicTileLayout (outer counts are runtime).
+// Any src    + dynamic tile → DynamicTileLayout with runtime extents.
+// ---------------------------------------------------------------------------
+
+template <int... Extents, int... TileE>
+KOKKOS_FUNCTION constexpr auto tile_layout(StaticTileLayoutRight<Extents...>,
+                                           StaticTile<TileE...>) noexcept
+    -> StaticTileLayoutRight<(Extents / TileE)..., TileE...> {
+  static_assert(sizeof...(Extents) == sizeof...(TileE),
+                "tile_layout: source rank must match tile rank");
+  return {};
+}
+
+template <int... Extents, int... TileE>
+KOKKOS_FUNCTION constexpr auto tile_layout(StaticTileLayoutLeft<Extents...>,
+                                           StaticTile<TileE...>) noexcept
+    -> StaticTileLayoutLeft<(Extents / TileE)..., TileE...> {
+  static_assert(sizeof...(Extents) == sizeof...(TileE),
+                "tile_layout: source rank must match tile rank");
+  return {};
+}
+
+template <int N, int... TileE>
+KOKKOS_FUNCTION auto tile_layout(DynamicTileLayoutRight<N> src,
+                                 StaticTile<TileE...>      tile) noexcept
+    -> DynamicTileLayoutRight<2 * N> {
+  static_assert(N == static_cast<int>(sizeof...(TileE)),
+                "tile_layout: source rank must match tile rank");
+  Kokkos::Array<int, 2 * N> exts{};
+  for (int d = 0; d < N; ++d) {
+    exts[d]     = src.extent(d) / tile.extent(d);
+    exts[N + d] = tile.extent(d);
+  }
+  return DynamicTileLayoutRight<2 * N>{exts};
+}
+
+template <int N, int... TileE>
+KOKKOS_FUNCTION auto tile_layout(DynamicTileLayoutLeft<N> src,
+                                 StaticTile<TileE...>     tile) noexcept
+    -> DynamicTileLayoutLeft<2 * N> {
+  static_assert(N == static_cast<int>(sizeof...(TileE)),
+                "tile_layout: source rank must match tile rank");
+  Kokkos::Array<int, 2 * N> exts{};
+  for (int d = 0; d < N; ++d) {
+    exts[d]     = src.extent(d) / tile.extent(d);
+    exts[N + d] = tile.extent(d);
+  }
+  return DynamicTileLayoutLeft<2 * N>{exts};
+}
+
+template <int... Extents, int N>
+KOKKOS_FUNCTION auto tile_layout(StaticTileLayoutRight<Extents...>,
+                                 DynamicTile<N> tile) noexcept
+    -> DynamicTileLayoutRight<2 * N> {
+  static_assert(static_cast<int>(sizeof...(Extents)) == N,
+                "tile_layout: source rank must match tile rank");
+  constexpr int             src_e[] = {Extents...};
+  Kokkos::Array<int, 2 * N> exts{};
+  for (int d = 0; d < N; ++d) {
+    exts[d]     = src_e[d] / tile.extent(d);
+    exts[N + d] = tile.extent(d);
+  }
+  return DynamicTileLayoutRight<2 * N>{exts};
+}
+
+template <int... Extents, int N>
+KOKKOS_FUNCTION auto tile_layout(StaticTileLayoutLeft<Extents...>,
+                                 DynamicTile<N> tile) noexcept
+    -> DynamicTileLayoutLeft<2 * N> {
+  static_assert(static_cast<int>(sizeof...(Extents)) == N,
+                "tile_layout: source rank must match tile rank");
+  constexpr int             src_e[] = {Extents...};
+  Kokkos::Array<int, 2 * N> exts{};
+  for (int d = 0; d < N; ++d) {
+    exts[d]     = src_e[d] / tile.extent(d);
+    exts[N + d] = tile.extent(d);
+  }
+  return DynamicTileLayoutLeft<2 * N>{exts};
+}
+
+template <int N>
+KOKKOS_FUNCTION auto tile_layout(DynamicTileLayoutRight<N> src,
+                                 DynamicTile<N>            tile) noexcept
+    -> DynamicTileLayoutRight<2 * N> {
+  Kokkos::Array<int, 2 * N> exts{};
+  for (int d = 0; d < N; ++d) {
+    exts[d]     = src.extent(d) / tile.extent(d);
+    exts[N + d] = tile.extent(d);
+  }
+  return DynamicTileLayoutRight<2 * N>{exts};
+}
+
+template <int N>
+KOKKOS_FUNCTION auto tile_layout(DynamicTileLayoutLeft<N> src,
+                                 DynamicTile<N>           tile) noexcept
+    -> DynamicTileLayoutLeft<2 * N> {
+  Kokkos::Array<int, 2 * N> exts{};
+  for (int d = 0; d < N; ++d) {
+    exts[d]     = src.extent(d) / tile.extent(d);
+    exts[N + d] = tile.extent(d);
+  }
+  return DynamicTileLayoutLeft<2 * N>{exts};
 }
 
 // ---------------------------------------------------------------------------

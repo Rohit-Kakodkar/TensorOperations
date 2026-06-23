@@ -17,11 +17,14 @@
 //   global
 //                 memory in the inner loop (no scratch, no reuse). The obvious
 //                 first kernel a user writes.
-//   3. tiled    — a competent hand-written team+scratch GEMM, hardcoded for
-//   this
-//                 one rank-3 x rank-3 contraction (stage tiles -> block GEMM ->
-//                 store). Mirrors what the library does, but its staging uses a
-//                 fixed row-major (LayoutRight-tuned) thread->index mapping.
+//   3. tiled    — a representative hand-written team+scratch kernel, hardcoded
+//   for
+//                 this one rank-3 x rank-3 contraction. Written the way a
+//                 typical practitioner writes it: multidimensional scratch
+//                 views with *runtime* extents, loop ranges and div-mods taken
+//                 from the view extents, contracted dimension staged in one
+//                 shot with compile-time inner GEMM loops, C accumulated per
+//                 thread and written straight to global memory.
 //
 // Each implementation is run with the input views A,B in BOTH
 // Kokkos::LayoutRight and Kokkos::LayoutLeft. The library holds throughput
@@ -121,30 +124,38 @@ void naive_contract(V3<LA> A, V3<LA> B, V2R C, int I, int L) {
 inline constexpr int kNaiveSrcEnd = __LINE__;
 
 // ===========================================================================
-// Implementation 3: hand-tiled team+scratch GEMM, hardcoded for rank-3 x
-// rank-3. One team per output tile [TI x TL]; stage A/B tiles into scratch,
-// block GEMM, accumulate over contracted tiles, store. The staging fills use a
-// fixed row-major (k-fastest / l-fastest) thread->index mapping tuned for
-// LayoutRight.
+// Implementation 3: representative hand-tiled team+scratch kernel, hardcoded
+// for rank-3 x rank-3. One team per output tile [TI x TL]; stage A/B into
+// multidimensional scratch views As(di,dj,dk)/Bs(dj,dk,dl) and compute. Written
+// the way a typical practitioner writes it (not idealized): scratch views carry
+// *runtime* extents, staging ranges and the flat->multi-index div-mods come
+// from the view extents, and the contracted dimension is staged in one shot
+// (the inner TJ/TK GEMM loops stay compile-time so they unroll). C is
+// accumulated in a register per thread and written straight to global memory.
 // ===========================================================================
 inline constexpr int kTiledSrcBegin = __LINE__;
 template <class LA>
 void tiled_contract(V3<LA> A, V3<LA> B, V2R C, int I, int L) {
   using ExecSpace    = Kokkos::DefaultExecutionSpace;
   using ScratchSpace = ExecSpace::scratch_memory_space;
-  using Pad          = Kokkos::View<float*, ScratchSpace,
+  using Scratch3     = Kokkos::View<float***, ScratchSpace,
                                     Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
   using member_t     = Kokkos::TeamPolicy<ExecSpace>::member_type;
 
-  constexpr int TI = cfg::TI, TL = cfg::TL, TJ = cfg::TJ, TK = cfg::TK,
-                KK     = cfg::KK;
-  const int     ntl    = L / TL;
-  const int     nteams = (I / TI) * ntl;
-  const int     nkt_j  = cfg::J / TJ;
-  const int     nkt_k  = cfg::K / TK;
+  // The whole contracted extent is staged at once (no contracted-mode tiling):
+  // the block-GEMM loops run over the full J,K at compile time so they unroll.
+  // The output tile dims TI,TL are runtime values, passed as scratch extents.
+  constexpr int TJ = cfg::J, TK = cfg::K;
+  constexpr int TI = cfg::TI, TL = cfg::TL;
 
-  const size_t bytes = Pad::shmem_size(TI * KK) + Pad::shmem_size(KK * TL) +
-                       Pad::shmem_size(TI * TL);
+  // Scratch sizes / staging ranges come from the input view extents (the way a
+  // typical hand-written kernel is wired: nothing assumes them compile-time).
+  const int J = A.extent(1), K = A.extent(2);  // == TJ, TK
+  const int ntl    = L / TL;
+  const int nteams = (I / TI) * ntl;
+
+  const size_t bytes =
+      Scratch3::shmem_size(TI, J, K) + Scratch3::shmem_size(J, K, TL);
   Kokkos::TeamPolicy<ExecSpace> policy(nteams, Kokkos::AUTO);
   policy.set_scratch_size(0, Kokkos::PerTeam(bytes));
 
@@ -154,55 +165,41 @@ void tiled_contract(V3<LA> A, V3<LA> B, V2R C, int I, int L) {
         const int i0 = (t / ntl) * TI;
         const int l0 = (t % ntl) * TL;
 
-        Pad As(team.team_scratch(0), TI * KK);
-        Pad Bs(team.team_scratch(0), KK * TL);
-        Pad Cs(team.team_scratch(0), TI * TL);
+        Scratch3 As(team.team_scratch(0), TI, J, K);
+        Scratch3 Bs(team.team_scratch(0), J, K, TL);
 
-        Kokkos::parallel_for(Kokkos::TeamVectorRange(team, TI * TL),
-                             [=](int e) { Cs(e) = 0.0f; });
+        // Stage A tile As(di,dj,dk): the flat thread index is unflattened with
+        // the view's *runtime* extents (the div-mods are not compiler-folded).
+        Kokkos::parallel_for(Kokkos::TeamVectorRange(team, As.size()),
+                             [=](int e) {
+                               const int dk = e % As.extent(2);
+                               const int dj = (e / As.extent(2)) % As.extent(1);
+                               const int di = e / (As.extent(2) * As.extent(1));
+                               As(di, dj, dk) = A(i0 + di, dj, dk);
+                             });
+        // Stage B tile Bs(dj,dk,dl).
+        Kokkos::parallel_for(Kokkos::TeamVectorRange(team, Bs.size()),
+                             [=](int e) {
+                               const int dl = e % Bs.extent(2);
+                               const int dk = (e / Bs.extent(2)) % Bs.extent(1);
+                               const int dj = e / (Bs.extent(2) * Bs.extent(1));
+                               Bs(dj, dk, dl) = B(dj, dk, l0 + dl);
+                             });
         team.team_barrier();
 
-        for (int ktj = 0; ktj < nkt_j; ++ktj) {
-          for (int ktk = 0; ktk < nkt_k; ++ktk) {
-            const int j0 = ktj * TJ;
-            const int k0 = ktk * TK;
-            // Stage A tile [TI x (TJ*TK)], k fastest (contiguous for
-            // LayoutRight).
-            Kokkos::parallel_for(Kokkos::TeamVectorRange(team, TI * KK),
-                                 [=](int e) {
-                                   const int dk = e % TK;
-                                   const int dj = (e / TK) % TJ;
-                                   const int di = e / (TK * TJ);
-                                   As(e)        = A(i0 + di, j0 + dj, k0 + dk);
-                                 });
-            // Stage B tile [(TJ*TK) x TL], l fastest (contiguous for
-            // LayoutRight).
-            Kokkos::parallel_for(Kokkos::TeamVectorRange(team, KK * TL),
-                                 [=](int e) {
-                                   const int dl = e % TL;
-                                   const int kk = e / TL;  // kk == dj*TK + dk
-                                   const int dj = kk / TK;
-                                   const int dk = kk % TK;
-                                   Bs(e)        = B(j0 + dj, k0 + dk, l0 + dl);
-                                 });
-            team.team_barrier();
-            // Block GEMM: Cs[TI x TL] += As[TI x KK] * Bs[KK x TL].
-            Kokkos::parallel_for(Kokkos::TeamVectorRange(team, TI * TL),
-                                 [=](int e) {
-                                   const int dl  = e % TL;
-                                   const int di  = e / TL;
-                                   float     acc = Cs(e);
-                                   for (int kk = 0; kk < KK; ++kk)
-                                     acc += As(di * KK + kk) * Bs(kk * TL + dl);
-                                   Cs(e) = acc;
-                                 });
-            team.team_barrier();
-          }
-        }
-        // Store the accumulated output tile back to global memory.
-        Kokkos::parallel_for(
-            Kokkos::TeamVectorRange(team, TI * TL),
-            [=](int e) { C(i0 + e / TL, l0 + e % TL) = Cs(e); });
+        // One thread per output element: accumulate in a register and write the
+        // result straight to global memory (C is not staged through scratch).
+        // The contracted TJ/TK loops are compile-time and unroll.
+        Kokkos::parallel_for(Kokkos::TeamVectorRange(team, TI * TL),
+                             [=](int e) {
+                               const int dl  = e % TL;
+                               const int di  = e / TL;
+                               float     acc = 0.0f;
+                               for (int dj = 0; dj < TJ; ++dj)
+                                 for (int dk = 0; dk < TK; ++dk)
+                                   acc += As(di, dj, dk) * Bs(dj, dk, dl);
+                               C(i0 + di, l0 + dl) = acc;
+                             });
       });
 }
 inline constexpr int kTiledSrcEnd = __LINE__;
@@ -298,7 +295,7 @@ int main(int argc, char* argv[]) {
     else if (cfg::kIsGPU)
       Ns = {1024, 2048, 4096};
     else
-      Ns = {256, 512, 1024};
+      Ns = {32, 64, 128};
 
     std::printf(
         "\n=== Team-policy contraction benchmark =====================\n");

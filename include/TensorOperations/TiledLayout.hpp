@@ -459,8 +459,9 @@ struct View {
 
 template <typename ViewType, typename Tile>
 using TiledView =
-    View<ViewType, TiledLayout<Tile::rank, decltype(make_tile_layout(
-                                               std::declval<Tile>()))>>;
+    View<ViewType,
+         TiledLayout<Tile::rank, decltype(make_tile_layout(std::declval<Tile>(),
+                                                           LayoutRight{}))>>;
 
 // ---------------------------------------------------------------------------
 // Subview<ViewType, FreeRank>
@@ -547,7 +548,27 @@ KOKKOS_FUNCTION auto tile_view(const ViewType& view, Tile tile)
   }
 
   const auto r = Impl::compute_tiled_layout<N>(extents, strides, tsizes);
-  return {view, LT{make_tile_layout(tile), r}};
+  return {view, LT{make_tile_layout(tile, LayoutRight{}), r}};
+}
+
+// ---------------------------------------------------------------------------
+// tile_view overload for View<ViewType, TileLayout> — same backing data,
+// 2N-dimensional tiled layout via tile_layout(src_layout, tile).
+//
+// Distinct from the Kokkos::View overload above: that one creates a
+// TiledLayout (complex outer/inner structure). This one produces a flat
+// StaticTileLayout or DynamicTileLayout from tile_layout(), preserving all
+// compile-time information when both the source layout and tile are static.
+//
+// Enabled only when tile_layout(Layout, Tile) is valid, i.e. Layout is one
+// of the four TileLayout types (not TiledLayout, SubviewLayout, etc.).
+// ---------------------------------------------------------------------------
+
+template <typename ViewType, typename Layout, typename Tile>
+  requires(requires(Layout l, Tile t) { tile_layout(l, t); })
+KOKKOS_FUNCTION auto tile_view(const View<ViewType, Layout>& view, Tile tile)
+    -> View<ViewType, decltype(tile_layout(view.layout(), tile))> {
+  return {view.backing_, tile_layout(view.layout(), tile)};
 }
 
 // ---------------------------------------------------------------------------

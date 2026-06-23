@@ -244,6 +244,191 @@ TEST(TilingTest, ReshapeDynamicLeft) {
 }
 
 // ---------------------------------------------------------------------------
+// tile_layout — factory: TileLayout × Tile → 2N-dimensional TileLayout.
+//
+// First N extents: outer tile counts (src.extent(d) / tile.extent(d)).
+// Last  N extents: inner tile sizes.
+// Memory order (Right/Left) is preserved from the source layout.
+// ---------------------------------------------------------------------------
+
+TEST(TilingTest, TileLayoutStaticRight) {
+  // Static src + static tile → fully compile-time
+  // StaticTileLayoutRight<4,3,2,4>
+  using Src  = StaticTileLayoutRight<8, 12>;
+  using Tile = StaticTile<2, 4>;
+  using R    = decltype(tile_layout(Src{}, Tile{}));
+  static_assert(std::is_same_v<R, StaticTileLayoutRight<4, 3, 2, 4>>);
+
+  constexpr R layout{};
+  static_assert(layout.rank == 4);
+  // outer counts
+  static_assert(layout.extent(0) == 4);
+  static_assert(layout.extent(1) == 3);
+  // inner tile sizes
+  static_assert(layout.extent(2) == 2);
+  static_assert(layout.extent(3) == 4);
+  // Right strides: fastest dim last
+  static_assert(layout.stride(3) == 1);
+  static_assert(layout.stride(2) == 4);
+  static_assert(layout.stride(1) == 8);
+  static_assert(layout.stride(0) == 24);
+
+  // round-trip: flat(i,j,k,l) → operator[] → {i,j,k,l}
+  for (int i = 0; i < 4; ++i)
+    for (int j = 0; j < 3; ++j)
+      for (int k = 0; k < 2; ++k)
+        for (int l = 0; l < 4; ++l) {
+          auto idx = layout[static_cast<int>(layout.flat(i, j, k, l))];
+          EXPECT_EQ(idx[0], i);
+          EXPECT_EQ(idx[1], j);
+          EXPECT_EQ(idx[2], k);
+          EXPECT_EQ(idx[3], l);
+        }
+}
+
+TEST(TilingTest, TileLayoutStaticLeft) {
+  // Static src + static tile → fully compile-time StaticTileLayoutLeft<4,3,2,4>
+  using Src  = StaticTileLayoutLeft<8, 12>;
+  using Tile = StaticTile<2, 4>;
+  using R    = decltype(tile_layout(Src{}, Tile{}));
+  static_assert(std::is_same_v<R, StaticTileLayoutLeft<4, 3, 2, 4>>);
+
+  constexpr R layout{};
+  static_assert(layout.rank == 4);
+  static_assert(layout.extent(0) == 4);
+  static_assert(layout.extent(1) == 3);
+  static_assert(layout.extent(2) == 2);
+  static_assert(layout.extent(3) == 4);
+  // Left strides: fastest dim first
+  static_assert(layout.stride(0) == 1);
+  static_assert(layout.stride(1) == 4);
+  static_assert(layout.stride(2) == 12);
+  static_assert(layout.stride(3) == 24);
+
+  for (int i = 0; i < 4; ++i)
+    for (int j = 0; j < 3; ++j)
+      for (int k = 0; k < 2; ++k)
+        for (int l = 0; l < 4; ++l) {
+          auto idx = layout[static_cast<int>(layout.flat(i, j, k, l))];
+          EXPECT_EQ(idx[0], i);
+          EXPECT_EQ(idx[1], j);
+          EXPECT_EQ(idx[2], k);
+          EXPECT_EQ(idx[3], l);
+        }
+}
+
+TEST(TilingTest, TileLayoutDynamicSrcStaticTileRight) {
+  // Dynamic src + static tile → DynamicTileLayoutRight<4>
+  auto src = DynamicTileLayoutRight<2>{Kokkos::Array<int, 2>{8, 12}};
+  auto tl  = tile_layout(src, StaticTile<2, 4>{});
+  static_assert(std::is_same_v<decltype(tl), DynamicTileLayoutRight<4>>);
+
+  EXPECT_EQ(tl.rank, 4);
+  EXPECT_EQ(tl.extent(0), 4);  // outer: 8/2
+  EXPECT_EQ(tl.extent(1), 3);  // outer: 12/4
+  EXPECT_EQ(tl.extent(2), 2);  // inner tile size
+  EXPECT_EQ(tl.extent(3), 4);
+  EXPECT_EQ(tl.stride(3), 1);
+  EXPECT_EQ(tl.stride(2), 4);
+  EXPECT_EQ(tl.stride(1), 8);
+  EXPECT_EQ(tl.stride(0), 24);
+
+  for (int i = 0; i < 4; ++i)
+    for (int j = 0; j < 3; ++j)
+      for (int k = 0; k < 2; ++k)
+        for (int l = 0; l < 4; ++l) {
+          auto idx =
+              tl[static_cast<int>(tl.flat(Kokkos::Array<int, 4>{i, j, k, l}))];
+          EXPECT_EQ(idx[0], i);
+          EXPECT_EQ(idx[1], j);
+          EXPECT_EQ(idx[2], k);
+          EXPECT_EQ(idx[3], l);
+        }
+}
+
+TEST(TilingTest, TileLayoutDynamicSrcStaticTileLeft) {
+  // Dynamic src + static tile → DynamicTileLayoutLeft<4>
+  auto src = DynamicTileLayoutLeft<2>{Kokkos::Array<int, 2>{8, 12}};
+  auto tl  = tile_layout(src, StaticTile<2, 4>{});
+  static_assert(std::is_same_v<decltype(tl), DynamicTileLayoutLeft<4>>);
+
+  EXPECT_EQ(tl.extent(0), 4);
+  EXPECT_EQ(tl.extent(1), 3);
+  EXPECT_EQ(tl.extent(2), 2);
+  EXPECT_EQ(tl.extent(3), 4);
+  EXPECT_EQ(tl.stride(0), 1);
+  EXPECT_EQ(tl.stride(1), 4);
+  EXPECT_EQ(tl.stride(2), 12);
+  EXPECT_EQ(tl.stride(3), 24);
+
+  for (int i = 0; i < 4; ++i)
+    for (int j = 0; j < 3; ++j)
+      for (int k = 0; k < 2; ++k)
+        for (int l = 0; l < 4; ++l) {
+          auto idx =
+              tl[static_cast<int>(tl.flat(Kokkos::Array<int, 4>{i, j, k, l}))];
+          EXPECT_EQ(idx[0], i);
+          EXPECT_EQ(idx[1], j);
+          EXPECT_EQ(idx[2], k);
+          EXPECT_EQ(idx[3], l);
+        }
+}
+
+TEST(TilingTest, TileLayoutStaticSrcDynamicTileRight) {
+  // Static src + dynamic tile → DynamicTileLayoutRight<4>
+  auto tl = tile_layout(StaticTileLayoutRight<8, 12>{}, DynamicTile<2>{{2, 4}});
+  static_assert(std::is_same_v<decltype(tl), DynamicTileLayoutRight<4>>);
+
+  EXPECT_EQ(tl.extent(0), 4);
+  EXPECT_EQ(tl.extent(1), 3);
+  EXPECT_EQ(tl.extent(2), 2);
+  EXPECT_EQ(tl.extent(3), 4);
+  EXPECT_EQ(tl.stride(3), 1);
+  EXPECT_EQ(tl.stride(0), 24);
+}
+
+TEST(TilingTest, TileLayoutStaticSrcDynamicTileLeft) {
+  // Static src + dynamic tile → DynamicTileLayoutLeft<4>
+  auto tl = tile_layout(StaticTileLayoutLeft<8, 12>{}, DynamicTile<2>{{2, 4}});
+  static_assert(std::is_same_v<decltype(tl), DynamicTileLayoutLeft<4>>);
+
+  EXPECT_EQ(tl.extent(0), 4);
+  EXPECT_EQ(tl.extent(1), 3);
+  EXPECT_EQ(tl.extent(2), 2);
+  EXPECT_EQ(tl.extent(3), 4);
+  EXPECT_EQ(tl.stride(0), 1);
+  EXPECT_EQ(tl.stride(3), 24);
+}
+
+TEST(TilingTest, TileLayoutDynamicRight) {
+  // Dynamic src + dynamic tile → DynamicTileLayoutRight<4>
+  auto src = DynamicTileLayoutRight<2>{Kokkos::Array<int, 2>{8, 12}};
+  auto tl  = tile_layout(src, DynamicTile<2>{{2, 4}});
+  static_assert(std::is_same_v<decltype(tl), DynamicTileLayoutRight<4>>);
+
+  EXPECT_EQ(tl.extent(0), 4);
+  EXPECT_EQ(tl.extent(1), 3);
+  EXPECT_EQ(tl.extent(2), 2);
+  EXPECT_EQ(tl.extent(3), 4);
+  EXPECT_EQ(tl.stride(3), 1);
+  EXPECT_EQ(tl.stride(0), 24);
+}
+
+TEST(TilingTest, TileLayoutDynamicLeft) {
+  // Dynamic src + dynamic tile → DynamicTileLayoutLeft<4>
+  auto src = DynamicTileLayoutLeft<2>{Kokkos::Array<int, 2>{8, 12}};
+  auto tl  = tile_layout(src, DynamicTile<2>{{2, 4}});
+  static_assert(std::is_same_v<decltype(tl), DynamicTileLayoutLeft<4>>);
+
+  EXPECT_EQ(tl.extent(0), 4);
+  EXPECT_EQ(tl.extent(1), 3);
+  EXPECT_EQ(tl.extent(2), 2);
+  EXPECT_EQ(tl.extent(3), 4);
+  EXPECT_EQ(tl.stride(0), 1);
+  EXPECT_EQ(tl.stride(3), 24);
+}
+
+// ---------------------------------------------------------------------------
 // prefix_product — collapse a tile to a 2D [before, after] shape at a split.
 // ---------------------------------------------------------------------------
 TEST(TilingTest, PrefixProductStaticMidSplit) {

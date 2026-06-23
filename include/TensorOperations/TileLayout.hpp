@@ -9,6 +9,9 @@
 
 namespace TensorOperations {
 
+struct LayoutRight {};
+struct LayoutLeft {};
+
 namespace Impl {
 
 template <int N>
