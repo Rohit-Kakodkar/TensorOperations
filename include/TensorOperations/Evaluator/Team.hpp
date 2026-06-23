@@ -304,7 +304,7 @@ struct Evaluator<TeamPolicyTag<ES>,
                   acc[i][n / W] += a_i * br[n / W];
               }
             }
-          };
+          }
 
 #pragma unroll
           for (int i = 0; i < MT; ++i)
