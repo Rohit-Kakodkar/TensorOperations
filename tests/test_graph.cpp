@@ -219,6 +219,60 @@ TEST(GraphTest, MultiTileExecutionTeam) {
     for (int l = 0; l < 16; ++l) EXPECT_FLOAT_EQ(C_host(i, l), 16.0f);
 }
 
+TEST(GraphTest, NonSquareNonSymmetricTeam) {
+  // Guards the class of bug that uniform (all-ones) inputs cannot detect:
+  // a transposed or free-mode-swapped output is invisible when every element
+  // is identical. Uses a *non-symmetric* deterministic fill AND a *non-square*
+  // output tile (TI=32, TL=16) over a non-square problem (I=64, L=16), checked
+  // against an independent host reference.
+  using View2     = Kokkos::View<float**, Kokkos::LayoutRight>;
+  using View3     = Kokkos::View<float***, Kokkos::LayoutRight>;
+  constexpr int I = 64, J = 4, K = 4, L = 16;
+  View3         A("A", I, J, K);
+  View3         B("B", J, K, L);
+  View2         C("C", I, L);
+
+  // Fill on host (deterministic, non-symmetric) then copy to device — avoids a
+  // device lambda inside GoogleTest's private TestBody.
+  auto Ah = Kokkos::create_mirror_view(A);
+  auto Bh = Kokkos::create_mirror_view(B);
+  for (int i = 0; i < I; ++i)
+    for (int j = 0; j < J; ++j)
+      for (int k = 0; k < K; ++k)
+        Ah(i, j, k) = static_cast<float>((i + 2 * j + 3 * k) % 5 + 1) * 0.5f;
+  for (int j = 0; j < J; ++j)
+    for (int k = 0; k < K; ++k)
+      for (int l = 0; l < L; ++l)
+        Bh(j, k, l) = static_cast<float>((3 * j + k + 2 * l) % 4 + 1) * 0.25f;
+  Kokkos::deep_copy(A, Ah);
+  Kokkos::deep_copy(B, Bh);
+
+  auto hA =
+      make_input_node(make_handle(A, std::array<int32_t, 3>{'i', 'j', 'k'}));
+  auto hB =
+      make_input_node(make_handle(B, std::array<int32_t, 3>{'j', 'k', 'l'}));
+  auto g = make_graph();
+  auto [g1, o1] =
+      g.ops(make_contraction_node(hA, hB, std::array<int32_t, 2>{'i', 'l'}));
+  auto [T1] = o1;
+
+  g1.execute(
+      TeamPolicyTag<>{},
+      Tile<StaticTile<32, 4, 4>, StaticTile<4, 4, 16>, StaticTile<32, 16>>{},
+      C);
+
+  auto Ch = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, C);
+  for (int i = 0; i < I; ++i)
+    for (int l = 0; l < L; ++l) {
+      double acc = 0.0;
+      for (int j = 0; j < J; ++j)
+        for (int k = 0; k < K; ++k)
+          acc += static_cast<double>(Ah(i, j, k)) * Bh(j, k, l);
+      EXPECT_NEAR(Ch(i, l), static_cast<float>(acc), 1e-3f)
+          << "i=" << i << " l=" << l;
+    }
+}
+
 int main(int argc, char* argv[]) {
   ::testing::InitGoogleTest(&argc, argv);
   Kokkos::initialize(argc, argv);

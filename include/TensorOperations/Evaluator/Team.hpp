@@ -222,11 +222,8 @@ struct Evaluator<TeamPolicyTag<ES>,
     team.team_barrier();
 
     // View each operand's scratch as a 2D GEMM matrix: A[SA,SK], B[SK,SB],
-    // C[SA,SB] (all row-major). Static tiles fold these extents/strides at
-    // compile time. Index raw pointers with hoisted/strided offsets rather than
-    // View::operator() so the inner loop carries no per-access coordinate-array
-    // build or flat_offset_ stride loop — that addressing overhead, not the
-    // memory traffic, is what doubled the generic kernel's instruction count.
+    // C[SA,SB] (all row-major). For static tiles these carry compile-time
+    // extents, and the register-tiled views below carry compile-time strides.
     auto a = reshape(stage_a_.scratch_,
                      prefix_product(a_tile_, rank_c<FreeA>));  // [SA,SK]
     auto b = reshape(stage_b_.scratch_,
@@ -271,9 +268,14 @@ struct Evaluator<TeamPolicyTag<ES>,
     using RegB = StaticTile<NT, NR>;
     using RegC = StaticTile<MT, NR>;
 
-    const auto a_reg = tile_view(a, RegA{});  // [SA/MT, SK/NT, MT, NT]
-    const auto b_reg = tile_view(b, RegB{});  // [SK/NT, SB/NR, NT, NR]
-    auto       c_reg = tile_view(c, RegC{});  // [SA/MT, SB/NR, MT, NR]
+    // Position-preserving, compile-time-strided tiled views over the row-major
+    // scratch. The index order is interleaved (outer_d, inner_d) per dim:
+    //   a_reg(bi, i, k0, k)   b_reg(k0, k, bj, n)   c_reg(bi, i, bj, n)
+    // The W-wide inner column is the last dim (stride 1), so the simd
+    // loads/stores below are unit-stride.
+    const auto a_reg = tile_view(a, RegA{});  // [SA/MT, MT, SK/NT, NT]
+    const auto b_reg = tile_view(b, RegB{});  // [SK/NT, NT, SB/NR, NR]
+    auto       c_reg = tile_view(c, RegC{});  // [SA/MT, MT, SB/NR, NR]
 
     Kokkos::parallel_for(
         Kokkos::TeamThreadRange(team, (SA / MT) * (SB / NR)), [=](int t) {
@@ -285,29 +287,30 @@ struct Evaluator<TeamPolicyTag<ES>,
 #pragma unroll
             for (int n = 0; n < NR; n += W)
               acc[i][n / W] =
-                  simd_t(&c_reg(bi, bj, i, n), KE::simd_flag_default);
+                  simd_t(&c_reg(bi, i, bj, n), KE::simd_flag_default);
 
-#pragma unroll
+          // One contracted register-block (NT-deep rank-1 updates).
           for (int k0 = 0; k0 < SK / NT; ++k0) {
             for (int k = 0; k < NT; ++k) {
               simd_t br[NR / W];
 #pragma unroll
               for (int n = 0; n < NR; n += W)
-                br[n / W] = simd_t(&b_reg(k0, bj, k, n), KE::simd_flag_default);
+                br[n / W] = simd_t(&b_reg(k0, k, bj, n), KE::simd_flag_default);
 #pragma unroll
               for (int i = 0; i < MT; ++i) {
-                const simd_t a_i(a_reg(bi, k0, i, k));  // broadcast A
+                const simd_t a_i(a_reg(bi, i, k0, k));  // broadcast A
 #pragma unroll
                 for (int n = 0; n < NR; n += W)
                   acc[i][n / W] += a_i * br[n / W];
               }
             }
-          }
+          };
+
 #pragma unroll
           for (int i = 0; i < MT; ++i)
 #pragma unroll
             for (int n = 0; n < NR; n += W)
-              KE::simd_unchecked_store(acc[i][n / W], &c_reg(bi, bj, i, n),
+              KE::simd_unchecked_store(acc[i][n / W], &c_reg(bi, i, bj, n),
                                        KE::simd_flag_default);
         });
     team.team_barrier();
