@@ -78,6 +78,11 @@ gtest_discover_tests(test_tiled_layout)
 
 # Benchmarks (opt-in: -DTENSOR_OPS_BUILD_BENCHMARKS=ON). No gtest; own main().
 if(TENSOR_OPS_BUILD_BENCHMARKS)
-  add_executable(bench_team_contraction benchmarks/bench_team_contraction.cpp)
+  add_executable(bench_team_contraction
+    benchmarks/team_contraction/bench_team_contraction.cpp)
   target_link_libraries(bench_team_contraction PRIVATE tensor)
+
+  add_executable(bench_matrix_multiply
+    benchmarks/matrix_multiply/bench_matrix_multiply.cpp)
+  target_link_libraries(bench_matrix_multiply PRIVATE tensor)
 endif()
