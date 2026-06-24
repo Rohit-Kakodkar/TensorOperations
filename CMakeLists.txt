@@ -78,11 +78,28 @@ gtest_discover_tests(test_tiled_layout)
 
 # Benchmarks (opt-in: -DTENSOR_OPS_BUILD_BENCHMARKS=ON). No gtest; own main().
 if(TENSOR_OPS_BUILD_BENCHMARKS)
+  # KokkosKernels — needed for bench_matrix_multiply's BLAS3 GEMM path.
+  # KokkosKernels calls find_package(Kokkos) internally; point it at the
+  # build-tree KokkosConfig.cmake rather than a system install.
+  set(Kokkos_DIR "${kokkos_BINARY_DIR}" CACHE PATH "" FORCE)
+  set(KokkosKernels_ENABLE_TESTS     OFF CACHE BOOL "" FORCE)
+  set(KokkosKernels_ENABLE_EXAMPLES  OFF CACHE BOOL "" FORCE)
+  set(KokkosKernels_ENABLE_PERFTESTS OFF CACHE BOOL "" FORCE)
+  set(KokkosKernels_ENABLE_DOCS      OFF CACHE BOOL "" FORCE)
+  set(KokkosKernels_ENABLE_TPL_CUBLAS   OFF CACHE BOOL "" FORCE)
+  set(KokkosKernels_ENABLE_TPL_CUSOLVER OFF CACHE BOOL "" FORCE)
+  FetchContent_Declare(
+      kokkoskernels
+      GIT_REPOSITORY https://github.com/kokkos/kokkos-kernels.git
+      GIT_TAG        develop
+  )
+  FetchContent_MakeAvailable(kokkoskernels)
+
   add_executable(bench_team_contraction
     benchmarks/team_contraction/bench_team_contraction.cpp)
   target_link_libraries(bench_team_contraction PRIVATE tensor)
 
   add_executable(bench_matrix_multiply
     benchmarks/matrix_multiply/bench_matrix_multiply.cpp)
-  target_link_libraries(bench_matrix_multiply PRIVATE tensor)
+  target_link_libraries(bench_matrix_multiply PRIVATE tensor Kokkos::kokkoskernels)
 endif()

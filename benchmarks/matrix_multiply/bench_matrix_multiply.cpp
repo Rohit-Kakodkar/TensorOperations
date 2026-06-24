@@ -7,16 +7,17 @@
 //     C[i,j] = sum_{k} A[i,k] * B[k,j]                  (a dense GEMM I x K x
 //     J)
 //
-// Two implementations of the SAME product are compared:
+// Three implementations of the SAME product are compared:
 //
 //   1. library  — Graph::execute(TeamPolicyTag, Tile<...>, C). Generic: driven
 //                 by einsum-style mode labels and StaticTile extents; stages
 //                 tiles into team scratch with a *memory-order* (coalesced)
 //                 access pattern regardless of the input view's layout.
 //   2. naive    — a plain Kokkos team kernel that reads A/B straight from
-//   global
-//                 memory in the inner loop (no scratch, no reuse). The obvious
-//                 first kernel a user writes.
+//                 global memory in the inner loop (no scratch, no reuse). The
+//                 obvious first kernel a user writes.
+//   3. kkblas   — KokkosKernels::gemm (BLAS3). Routes to cuBLAS on GPU and
+//                 CPU BLAS (MKL/OpenBLAS) on CPU. Vendor-optimized reference.
 //
 // Each implementation is run with the input views A,B in BOTH
 // Kokkos::LayoutRight and Kokkos::LayoutLeft. The library holds throughput
@@ -32,6 +33,7 @@
 #include <TensorOperations/Evaluator.hpp>
 #include <TensorOperations/Graph.hpp>
 #include <TensorOperations/Tiling.hpp>
+#include <KokkosBlas3_gemm.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -54,9 +56,9 @@ inline constexpr bool kIsGPU =
     !Kokkos::SpaceAccessibility<Kokkos::DefaultExecutionSpace,
                                 Kokkos::HostSpace>::accessible;
 
-inline constexpr int TI = 32;  // output tile along i
-inline constexpr int TJ = 32;  // output tile along j
-inline constexpr int TK = 8;   // contracted tile along k
+inline constexpr int TI = 64;  // output tile along i
+inline constexpr int TJ = 64;  // output tile along j
+inline constexpr int TK = 16;  // contracted tile along k
 }  // namespace cfg
 
 // Convenience view aliases. Inputs are templated on layout; output is
@@ -103,6 +105,16 @@ void naive_matmul(V2<LA> A, V2<LA> B, V2R C, int I, int J, int K) {
       });
 }
 inline constexpr int kNaiveSrcEnd = __LINE__;
+
+// ===========================================================================
+// Implementation 3: KokkosKernels BLAS3 GEMM — cuBLAS on GPU, CPU BLAS on CPU.
+// ===========================================================================
+inline constexpr int kKKSrcBegin = __LINE__;
+template <class LA>
+void kkblas_matmul(V2<LA> A, V2<LA> B, V2R C) {
+  KokkosBlas::gemm("N", "N", 1.0f, A, B, 0.0f, C);
+}
+inline constexpr int kKKSrcEnd = __LINE__;
 
 // ---------------------------------------------------------------------------
 // Input fill — deterministic, bounded pattern (not all-ones, so an indexing or
@@ -153,7 +165,7 @@ double gflops_of(Fn&& fn, int warmup, int reps, double flops) {
 struct Row {
   int         N;
   const char* layout;
-  double      lib, naive, reldiff;
+  double      lib, naive, kkblas, reldiff, reldiff_kk;
 };
 
 template <class LA>
@@ -165,15 +177,18 @@ Row run_case(int N, const char* layout_name, int warmup, int reps) {
   V2<LA> B("B", K, J);
   fill_inputs<LA>(A, B, I, J, K);
 
-  V2R Clib("Clib", I, J), Cnai("Cnai", I, J);
+  V2R Clib("Clib", I, J), Cnai("Cnai", I, J), Ckk("Ckk", I, J);
 
   const double g_lib =
       gflops_of([&] { library_matmul<LA>(A, B, Clib); }, warmup, reps, flops);
   const double g_nai = gflops_of([&] { naive_matmul<LA>(A, B, Cnai, I, J, K); },
                                  warmup, reps, flops);
+  const double g_kk =
+      gflops_of([&] { kkblas_matmul<LA>(A, B, Ckk); }, warmup, reps, flops);
 
-  const double d = max_rel_diff(Clib, Cnai, I, J);
-  return Row{N, layout_name, g_lib, g_nai, d};
+  const double d    = max_rel_diff(Clib, Cnai, I, J);
+  const double d_kk = max_rel_diff(Clib, Ckk, I, J);
+  return Row{N, layout_name, g_lib, g_nai, g_kk, d, d_kk};
 }
 
 int main(int argc, char* argv[]) {
@@ -203,10 +218,12 @@ int main(int argc, char* argv[]) {
     std::printf("reps=%d warmup=%d  (GFLOP/s from min wall-clock)\n\n", reps,
                 warmup);
 
-    std::printf("%6s %7s %11s %11s %10s %14s\n", "N", "layout", "lib G/s",
-                "naive G/s", "sx/naive", "check");
+    std::printf("%6s %7s %11s %11s %11s %10s %10s %14s\n", "N", "layout",
+                "lib G/s", "naive G/s", "kk G/s", "sx/naive", "lib/kk",
+                "check");
     std::printf(
-        "------ ------- ----------- ----------- ---------- --------------\n");
+        "------ ------- ----------- ----------- ----------- ---------- "
+        "---------- --------------\n");
 
     std::vector<Row> rows;
     for (int N : Ns) {
@@ -220,9 +237,13 @@ int main(int argc, char* argv[]) {
     }
 
     for (const Row& r : rows) {
-      std::printf("%6d %7s %11.3f %11.3f %9.2fx   %s(%.1e)\n", r.N, r.layout,
-                  r.lib, r.naive, r.lib / r.naive,
-                  r.reldiff < 1e-2 ? "PASS" : "FAIL", r.reldiff);
+      char chk[24];
+      std::snprintf(chk, sizeof(chk), "%s(%.0e)/%s(%.0e)",
+                    r.reldiff < 1e-2 ? "P" : "F", r.reldiff,
+                    r.reldiff_kk < 1e-2 ? "P" : "F", r.reldiff_kk);
+      std::printf("%6d %7s %11.3f %11.3f %11.3f %9.2fx %9.2fx   %-14s\n", r.N,
+                  r.layout, r.lib, r.naive, r.kkblas, r.lib / r.naive,
+                  r.lib / r.kkblas, chk);
     }
 
     // Layout-robustness summary: average GFLOP/s per impl per layout, and the
@@ -241,7 +262,9 @@ int main(int argc, char* argv[]) {
       const char* name;
       double Row::* field;
     };
-    const Imp imps[] = {{"library", &Row::lib}, {"naive", &Row::naive}};
+    const Imp imps[] = {{"library", &Row::lib},
+                        {"naive", &Row::naive},
+                        {"kkblas", &Row::kkblas}};
     std::printf("\nLayout robustness (avg GFLOP/s; ratio = Left/Right):\n");
     std::printf("%10s %12s %12s %10s\n", "impl", "Right", "Left", "L/R");
     for (const Imp& im : imps) {
@@ -259,6 +282,8 @@ int main(int argc, char* argv[]) {
                 "generic: any rank / pattern via einsum modes + StaticTile");
     std::printf("%10s %8d   %s\n", "naive", kNaiveSrcEnd - kNaiveSrcBegin - 1,
                 "hardcoded for this rank-2 x rank-2 product");
+    std::printf("%10s %8d   %s\n", "kkblas", kKKSrcEnd - kKKSrcBegin - 1,
+                "generic: KokkosKernels BLAS3 (Internal backend)");
     std::printf("\n");
   }
   Kokkos::finalize();
