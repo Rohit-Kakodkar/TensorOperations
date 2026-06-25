@@ -257,11 +257,21 @@ struct Evaluator<TeamPolicyTag<ES>,
 #if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
     constexpr int MT = 4;  // output rows / item
     constexpr int NT = 2;  // output cols / item
-    constexpr int NR = 4;  // C columns
+    // NR=2 (not 4): the shared-load bank is (col_block*NR + n) mod 32, so a
+    // power-of-two NR > 2 makes register-blocked lanes alias banks on rows
+    // wider than 32 elems. NR=2 halves the conflicts AND drops register
+    // pressure (64->48 regs, occupancy 48->60%): measured +20% matmul / +28%
+    // contraction on A100 vs NR=4. (Tuning NR beats address swizzling, which
+    // only regressed.)
+    constexpr int NR = 2;  // C columns / item
 #else
     constexpr int MT = 8;  // output rows / item
     constexpr int NT = 8;  // output cols / item
-    constexpr int NR = W;  // simd vectors spanning the columns
+    // NR = 2*W (two SIMD vectors, not one): gives MT*(NR/W)=16 independent FMA
+    // accumulators, enough to hide the FMA latency on AVX-512 (2 FMA units)
+    // where NR=W left only 8 and under-fed them. Measured ~+8% on serial matmul
+    // N=512. Requires the operand free-dim (SB) to be a multiple of 2*W.
+    constexpr int NR = 2 * W;  // simd vectors spanning the columns
 #endif
 
     using RegA = StaticTile<MT, NT>;

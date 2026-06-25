@@ -205,7 +205,7 @@ int main(int argc, char* argv[]) {
     else if (cfg::kIsGPU)
       Ns = {1024, 2048, 4096};
     else
-      Ns = {32, 64, 128};
+      Ns = {256, 512, 1024};  // steady-state sizes; <=128 is overhead-bound
 
     std::printf(
         "\n=== Matrix-matrix multiply benchmark ======================\n");
