@@ -13,53 +13,7 @@ namespace Impl {
 // Detect a ContractionTag node (the only node type with operands to recurse
 // into); all other node types are leaves.
 template <typename Node>
-struct is_contraction : std::false_type {};
-template <typename NA, typename NB, typename R, typename S, typename ES,
-          typename H>
-struct is_contraction<NodeHandle<ContractionTag, NA, NB, R, S, ES, H>>
-    : std::true_type {};
-
-// Total contracted modes in a node subtree, summed over every contraction node.
-// Leaves (InputTag / IntermTag) contribute 0.
-template <typename Node, bool = is_contraction<Node>::value>
-struct contracted_count : std::integral_constant<int, 0> {};  // leaf
-template <typename Node>
-struct contracted_count<Node, true>
-    : std::integral_constant<
-          int, Node::NumContracted +
-                   contracted_count<typename Node::node_a_type>::value +
-                   contracted_count<typename Node::node_b_type>::value> {};
-
-// Number of participating modes of a node's own op: free (output) modes plus
-// contracted modes. Leaves (input/interm) have no contracted modes.
-template <typename Node>
-constexpr int participating_rank() {
-  if constexpr (is_contraction<Node>::value)
-    return Node::Rank + Node::NumContracted;
-  else
-    return Node::Rank;
-}
-
-// Build the participating-mode extents [free.., contracted..] for a node.
-// Free-mode extents come from the node's own shape(). Contracted-mode extents
-// are recovered from operand A under the GEMM/Option-A convention (A is stored
-// [freeA.., contracted..], so the contracted extents are the last NumContracted
-// entries of node_a.shape()). Extents are runtime (Kokkos View extents).
-template <typename Node>
-std::array<int, participating_rank<Node>()> participating_extents(
-    const Node& n) {
-  constexpr int      P = participating_rank<Node>();
-  std::array<int, P> ext{};
-  const auto         out = n.shape();
-  for (int d = 0; d < Node::Rank; ++d) ext[d] = out[d];
-  if constexpr (is_contraction<Node>::value) {
-    constexpr int NumK  = Node::NumContracted;
-    constexpr int FreeA = Node::node_a_type::Rank - NumK;
-    const auto    a     = n.node_a.shape();
-    for (int i = 0; i < NumK; ++i) ext[Node::Rank + i] = a[FreeA + i];
-  }
-  return ext;
-}
+using is_contraction = has_node_tag<ContractionTag, Node>;
 
 // Row-major decode of a linear work-item index into per-mode tile indices.
 // Returns 0-based tile coordinates (not element offsets) along each free mode.
@@ -89,14 +43,44 @@ int work_items(const Node& n, const Tile& tile) {
   return total;
 }
 
+// The output permutation (permC) as a full-rank sequence: maps canonical output
+// mode i -> its position in the user output order. The store evaluator subviews
+// the native output on the ordered path and reorders it into canonical order
+// via this sequence. Identity seq for canonical contractions and
+// non-contraction outputs (so the store's scatter + reorder collapse to
+// no-ops).
+template <typename NodeType>
+KOKKOS_FUNCTION auto output_perm_seq() {
+  if constexpr (is_contraction<NodeType>::value)
+    return typename NodeType::permC_seq{};
+  else
+    return std::make_integer_sequence<int, NodeType::Rank>{};
+}
+
+// The output (C) tile in the node's canonical (freeA ++ freeB) mode order:
+// the user-order output tile gathered by permC. Identity permC (canonical
+// contractions, non-contraction outputs) passes the tile through unchanged.
+template <typename NodeType, typename Tile>
+KOKKOS_FUNCTION auto canonical_c_tile(const Tile& tile) {
+  return reorder_tile_value(output_tile(tile), output_perm_seq<NodeType>());
+}
+
+// Launches one team-policy kernel for one output node and returns the number
+// of work items (output tiles) it covered.
 template <typename NodeType, typename ViewT, typename Tile>
-void execute_one_output_team(const NodeType& node, const ViewT& view,
-                             const Tile& tile) {
+int execute_one_output_team(const NodeType& node, const ViewT& view,
+                            const Tile& tile) {
   using exec_space = typename NodeType::exec_space;
   using member_t   = typename Kokkos::TeamPolicy<exec_space>::member_type;
   using eval_type  = Evaluator<TeamPolicyTag<exec_space>, NodeType, Tile>;
 
-  const auto c_tile = output_tile(tile);
+  // node.shape() is canonical, so the output tile is presented canonically for
+  // the contraction evaluator (which canonicalizes A/B/C internally from the
+  // same user-order tile bundle). The store, however, tiles the NATIVE user
+  // output (u_tile) so subview_tile stays on the compile-time-ordered path,
+  // then reorders that ordered subview into canonical order before writing.
+  const auto c_tile = canonical_c_tile<NodeType>(tile);
+  const auto u_tile = output_tile(tile);
   const int  wk     = work_items(node, c_tile);
   const int  bytes  = eval_type::scratch_size_per_team(tile);
 
@@ -113,9 +97,10 @@ void execute_one_output_team(const NodeType& node, const ViewT& view,
         auto eval = make_evaluator<TeamPolicyTag<exec_space>>(node, tile, team);
         auto interm = eval(team, c_tile_idx);
 
-        auto seval = make_evaluator<TeamPolicyTag<exec_space>>(interm, c_tile);
-        seval(team, c_tile_idx, view);
+        auto seval = make_evaluator<TeamPolicyTag<exec_space>>(interm, u_tile);
+        seval(team, c_tile_idx, view, output_perm_seq<NodeType>());
       });
+  return wk;
 }
 
 }  // namespace Impl
@@ -136,32 +121,6 @@ struct Graph {
                      std::move(node_tuple)};
   }
 
-  // Number of free indices: the modes that survive to the result, i.e. the sum
-  // of each output node's Rank. Pure compile-time arithmetic.
-  static constexpr int num_free_indices() {
-    return []<std::size_t... I>(std::index_sequence<I...>) {
-      return (0 + ... + std::tuple_element_t<I, OutputTuple>::Rank);
-    }(std::make_index_sequence<std::tuple_size_v<OutputTuple>>{});
-  }
-
-  // Number of contraction indices: the modes summed over across every
-  // contraction node reachable from the outputs, summed across all outputs.
-  static constexpr int num_contraction_indices() {
-    return []<std::size_t... I>(std::index_sequence<I...>) {
-      return (
-          0 + ... +
-          Impl::contracted_count<std::tuple_element_t<I, OutputTuple>>::value);
-    }(std::make_index_sequence<std::tuple_size_v<OutputTuple>>{});
-  }
-
-  // Total work items across all outputs for the given tiling shape.
-  template <typename Tile>
-  int tile_count(const Tile& tile) const {
-    return [&]<std::size_t... I>(std::index_sequence<I...>) {
-      return (int{0} + ... + Impl::work_items(std::get<I>(outputs), tile));
-    }(std::make_index_sequence<std::tuple_size_v<OutputTuple>>{});
-  }
-
   // Evaluate the graph and write each output into the corresponding view.
   // Exactly one view must be provided per output node.
   template <typename ES, typename Tile, TensorLike... Ts>
@@ -171,9 +130,8 @@ struct Graph {
     constexpr std::size_t N        = std::tuple_size_v<OutputTuple>;
     int                   wk_items = 0;
     [&]<std::size_t... I>(std::index_sequence<I...>) {
-      ((Impl::execute_one_output_team(std::get<I>(outputs),
-                                      std::get<I>(ts_tuple), tile),
-        wk_items += Impl::work_items(std::get<I>(outputs), output_tile(tile))),
+      ((wk_items += Impl::execute_one_output_team(std::get<I>(outputs),
+                                                  std::get<I>(ts_tuple), tile)),
        ...);
     }(std::make_index_sequence<N>{});
 

@@ -45,12 +45,9 @@ using View2D = Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::HostSpace>;
 // C_{ik} = sum_j A_{ij} B_{jk}: output rank 2, NumContracted 1.
 // ---------------------------------------------------------------------------
 TEST(TilingTest, EvaluatorSelection) {
-  using NC = decltype(make_contraction_node<float>(
-      make_input_node(make_handle(std::declval<View2D>(),
-                                  std::array<int32_t, 2>{'i', 'j'})),
-      make_input_node(make_handle(std::declval<View2D>(),
-                                  std::array<int32_t, 2>{'j', 'k'})),
-      std::array<int32_t, 2>{'i', 'k'}));
+  using NC = decltype(make_contraction_node<'i', 'k'>(
+      make_input_node(make_handle<'i', 'j'>(std::declval<View2D>())),
+      make_input_node(make_handle<'j', 'k'>(std::declval<View2D>()))));
 
   static_assert(NC::Rank == 2);
   static_assert(NC::NumContracted == 1);

@@ -1,12 +1,40 @@
 #pragma once
 // Included from within TensorOperations namespace by Evaluator.hpp
 
+namespace Impl {
+// --- staging operand canonicalization (native subview -> reorder) ----------
+//
+// A permuted input operand is presented to the contraction as a PermutedView
+// (canonical labels, strided). Rather than tile that strided view (runtime
+// SubviewLayout, local-memory spill), the input stage evaluator tiles the
+// PermutedView's *native* inner view (ordered subview) and reorders the taken
+// subview into canonical order. This trait destructures the operand's handle
+// type T to recover that native view (`view_t` / `get()`) and the gather
+// permutation (`perm_seq`, native -> canonical); it degrades to identity /
+// passthrough when the operand isn't permuted. Handle = TensorHandle<T,
+// ModesSeq>.
+template <typename Handle, typename T, int Rank, bool = is_permuted_view_v<T>>
+struct staging_operand {
+  using perm_seq = std::make_integer_sequence<int, Rank>;  // identity
+  using view_t   = Handle;
+  KOKKOS_FUNCTION static const Handle& get(const Handle& h) { return h; }
+};
+template <typename Handle, typename T, int Rank>
+struct staging_operand<Handle, T, Rank, true> {
+  using perm_seq = typename T::perm_seq;
+  using view_t   = typename T::inner_view_t;
+  KOKKOS_FUNCTION static const view_t& get(const Handle& h) { return h.v; }
+};
+}  // namespace Impl
+
 // ---------------------------------------------------------------------------
 // Specialization 2: TeamPolicyTag + InputTag + Tile_  (scratch tier)
 // ---------------------------------------------------------------------------
-template <typename ES, TensorLike T, typename HookOp, typename Tile_>
-struct Evaluator<TeamPolicyTag<ES>, NodeHandle<InputTag, T, HookOp>, Tile_> {
-  using node_type           = NodeHandle<InputTag, T, HookOp>;
+template <typename ES, TensorLike T, typename ModesSeq, typename HookOp,
+          typename Tile_>
+struct Evaluator<TeamPolicyTag<ES>, NodeHandle<InputTag, T, ModesSeq, HookOp>,
+                 Tile_> {
+  using node_type           = NodeHandle<InputTag, T, ModesSeq, HookOp>;
   using tiling_type         = Tile_;
   using policy_tag          = TeamPolicyTag<ES>;
   static constexpr int Rank = tiling_type::rank;
@@ -23,7 +51,20 @@ struct Evaluator<TeamPolicyTag<ES>, NodeHandle<InputTag, T, HookOp>, Tile_> {
                  exec_space, NoHook>;
   using result_type   = interm_type;
   using team_member_t = typename Kokkos::TeamPolicy<exec_space>::member_type;
-  using tiled_input_t = TiledView<TensorHandle<T>, tiling_type>;
+
+  // Staging keeps its scratch/result canonical (tiling_type is the canonical
+  // tile). For a permuted operand it tiles the PermutedView's *native* inner
+  // view so subview_tile stays on the compile-time-ordered path; the taken
+  // subview is reordered into canonical order via perm_seq. All of this
+  // collapses to the previous behavior for non-permuted operands (perm_seq =
+  // identity).
+  using stg      = Impl::staging_operand<TensorHandle<T, ModesSeq>, T, Rank>;
+  using perm_seq = typename stg::perm_seq;
+  using inv_perm_seq  = Impl::inverse_perm_seq_t<perm_seq>;
+  using native_view_t = typename stg::view_t;
+  using native_tile_t =
+      decltype(reorder_tile_value(std::declval<tiling_type>(), inv_perm_seq{}));
+  using tiled_input_t = TiledView<native_view_t, native_tile_t>;
 
   static_assert(node_type::Rank == Rank,
                 "input staging tile must carry one extent per input mode");
@@ -38,10 +79,9 @@ struct Evaluator<TeamPolicyTag<ES>, NodeHandle<InputTag, T, HookOp>, Tile_> {
                             const team_member_t& team)
       : node(n),
         tiling(t),
-        tiled_input_(tile_view(n.handle, t)),
+        tiled_input_(tile_view(stg::get(n.handle),
+                               reorder_tile_value(t, inv_perm_seq{}))),
         scratch_(alloc_scratch(team)) {
-    for (int d = 0; d < Rank; ++d) result_.shape_[d] = tiling.extent(d);
-    result_.modes_   = node.modes();
     result_.storage_ = scratch_;
   }
 
@@ -49,10 +89,19 @@ struct Evaluator<TeamPolicyTag<ES>, NodeHandle<InputTag, T, HookOp>, Tile_> {
       const team_member_t& team, Kokkos::Array<int, Rank> tile_idx) const {
     TIMING_SCOPE_ENTER(g_timing_stats.scratch_input_load_time,
                        g_timing_stats.scratch_input_load_count);
-    fill_team(team, tile_idx, scratch_);
+    // Canonical tile index -> native (operand-order) tile index; identity
+    // scatter for non-permuted operands.
+    fill_team(team, Impl::scatter_index(tile_idx, perm_seq{}), scratch_);
     TIMING_SCOPE_EXIT(g_timing_stats.scratch_input_load_time,
                       g_timing_stats.scratch_input_load_count);
     return result_;
+  }
+
+  // Outer tile count along canonical dimension d, read through the permutation
+  // (tiled_input_ is stored in the operand's native axis order).
+  KOKKOS_FUNCTION int outer_extent_canon(int d) const noexcept {
+    const auto p = Impl::seq_to_karray(perm_seq{});
+    return tiled_input_.extent(p[d]);
   }
 
   static std::size_t scratch_size_per_team(const tiling_type& t) {
@@ -70,14 +119,16 @@ struct Evaluator<TeamPolicyTag<ES>, NodeHandle<InputTag, T, HookOp>, Tile_> {
   }
 
   KOKKOS_FUNCTION void fill_team(const team_member_t&            team,
-                                 const Kokkos::Array<int, Rank>& tile_idx,
+                                 const Kokkos::Array<int, Rank>& native_idx,
                                  const scratch_view_t&           result) const {
-    const auto sv        = subview_tile(tiled_input_, tile_idx);
+    const auto sv0       = subview_tile(tiled_input_, native_idx);  // ordered
+    const auto sv        = reorder_view(sv0, perm_seq{});           // canonical
     const auto sv_layout = sv.layout();
     const auto total     = sv.size();
+    const auto hook = node.hook_op;  // local copy: lambda captures no `this`
     Kokkos::parallel_for(Kokkos::TeamVectorRange(team, total), [=](int i) {
       const auto coord = sv_layout[i];
-      result[coord]    = sv[coord];
+      result[coord]    = Impl::apply_hook(hook, sv[coord]);
     });
   }
 };
@@ -86,11 +137,14 @@ struct Evaluator<TeamPolicyTag<ES>, NodeHandle<InputTag, T, HookOp>, Tile_> {
 // Specialization 4: TeamPolicyTag + ContractionTag + Tile_  (scratch tier)
 // ---------------------------------------------------------------------------
 template <typename NA, typename NB, typename IntCRank, typename S, typename ES,
-          typename HookOp, typename TileA, typename TileB, typename TileC>
+          typename HookOp, typename CModesSeq, typename PermCSeq,
+          typename TileA, typename TileB, typename TileC>
 struct Evaluator<TeamPolicyTag<ES>,
-                 NodeHandle<ContractionTag, NA, NB, IntCRank, S, ES, HookOp>,
+                 NodeHandle<ContractionTag, NA, NB, IntCRank, S, ES, HookOp,
+                            CModesSeq, PermCSeq>,
                  TensorOperations::Tile<TileA, TileB, TileC>> {
-  using node_type = NodeHandle<ContractionTag, NA, NB, IntCRank, S, ES, HookOp>;
+  using node_type = NodeHandle<ContractionTag, NA, NB, IntCRank, S, ES, HookOp,
+                               CModesSeq, PermCSeq>;
   using tiling_type         = TensorOperations::Tile<TileA, TileB, TileC>;
   using policy_tag          = TeamPolicyTag<ES>;
   static constexpr int Rank = node_type::Rank;
@@ -115,9 +169,32 @@ struct Evaluator<TeamPolicyTag<ES>,
   static_assert(TileB::rank == RankB, "TileB rank must match node B");
   static_assert(TileC::rank == RankC, "TileC rank must match output rank");
 
-  using c_layout_t   = decltype(make_tile_layout(TileC{}, LayoutRight{}));
-  using stage_a_type = Evaluator<TeamPolicyTag<ES>, NA, TileA>;
-  using stage_b_type = Evaluator<TeamPolicyTag<ES>, NB, TileB>;
+  // Per-operand permutations from user axis order into the GEMM's canonical
+  // order (freeA ++ contracted for A, contracted ++ freeB for B). permC maps
+  // the canonical output back to the user order. Identity for canonical
+  // contractions (in which case every canonicalization below is a no-op
+  // passthrough).
+  using permA_seq =
+      Impl::permA_seq_t<typename NA::modes_seq, typename NB::modes_seq>;
+  using permB_seq =
+      Impl::permB_seq_t<typename NA::modes_seq, typename NB::modes_seq>;
+  using permC_seq = PermCSeq;
+
+  using na_canon_t =
+      decltype(Impl::canonicalize_input(std::declval<NA>(), permA_seq{}));
+  using nb_canon_t =
+      decltype(Impl::canonicalize_input(std::declval<NB>(), permB_seq{}));
+  using tile_a_canon_t =
+      decltype(reorder_tile_value(std::declval<TileA>(), permA_seq{}));
+  using tile_b_canon_t =
+      decltype(reorder_tile_value(std::declval<TileB>(), permB_seq{}));
+  using tile_c_canon_t =
+      decltype(reorder_tile_value(std::declval<TileC>(), permC_seq{}));
+
+  using c_layout_t =
+      decltype(make_tile_layout(tile_c_canon_t{}, LayoutRight{}));
+  using stage_a_type = Evaluator<TeamPolicyTag<ES>, na_canon_t, tile_a_canon_t>;
+  using stage_b_type = Evaluator<TeamPolicyTag<ES>, nb_canon_t, tile_b_canon_t>;
 
  public:
   using scratch_view_t = ScratchView<value_type, exec_space, c_layout_t>;
@@ -128,9 +205,9 @@ struct Evaluator<TeamPolicyTag<ES>,
   using team_member_t = typename Kokkos::TeamPolicy<exec_space>::member_type;
 
   node_type      node;
-  TileA          a_tile_;
-  TileB          b_tile_;
-  TileC          c_tile_;
+  tile_a_canon_t a_tile_;
+  tile_b_canon_t b_tile_;
+  tile_c_canon_t c_tile_;
   stage_a_type   stage_a_;
   stage_b_type   stage_b_;
   scratch_view_t c_scratch_;
@@ -139,18 +216,18 @@ struct Evaluator<TeamPolicyTag<ES>,
   KOKKOS_FUNCTION Evaluator(node_type n, tiling_type t,
                             const team_member_t& team)
       : node(n),
-        a_tile_(t.a),
-        b_tile_(t.b),
-        c_tile_(t.c),
-        stage_a_(make_evaluator<TeamPolicyTag<ES>>(n.node_a, a_tile_, team)),
-        stage_b_(make_evaluator<TeamPolicyTag<ES>>(n.node_b, b_tile_, team)),
+        a_tile_(reorder_tile_value(t.a, permA_seq{})),
+        b_tile_(reorder_tile_value(t.b, permB_seq{})),
+        c_tile_(reorder_tile_value(t.c, permC_seq{})),
+        stage_a_(make_evaluator<TeamPolicyTag<ES>>(
+            Impl::canonicalize_input(n.node_a, permA_seq{}), a_tile_, team)),
+        stage_b_(make_evaluator<TeamPolicyTag<ES>>(
+            Impl::canonicalize_input(n.node_b, permB_seq{}), b_tile_, team)),
         c_scratch_(alloc_c_scratch(team)) {
     auto c = c_scratch_;
     Kokkos::parallel_for(Kokkos::TeamVectorRange(team, c.size()),
                          [c](int i) { c.data()[i] = S{0}; });
     team.team_barrier();
-    for (int d = 0; d < Rank; ++d) result_.shape_[d] = c_tile_.extent(d);
-    result_.modes_   = node.modes();
     result_.hook_op  = node.hook_op;
     result_.storage_ = c_scratch_;
   }
@@ -165,7 +242,7 @@ struct Evaluator<TeamPolicyTag<ES>,
     Kokkos::Array<int, NumK> n_k_tiles{};
     int                      total_k_tiles = 1;
     for (int i = 0; i < NumK; ++i) {
-      n_k_tiles[i] = stage_a_.tiled_input_.extent(FreeA + i);
+      n_k_tiles[i] = stage_a_.outer_extent_canon(FreeA + i);
       total_k_tiles *= n_k_tiles[i];
     }
     // Mixed-radix counter (LSB fastest); carry-increment avoids per-step
@@ -184,10 +261,14 @@ struct Evaluator<TeamPolicyTag<ES>,
   }
 
   static std::size_t scratch_size_per_team(const tiling_type& t) {
-    const std::size_t c_sz = c_backing_t::shmem_size(
-        static_cast<std::size_t>(make_tile_layout(t.c, LayoutRight{}).size()));
-    return c_sz + stage_a_type::scratch_size_per_team(t.a) +
-           stage_b_type::scratch_size_per_team(t.b);
+    const auto        c_canon = reorder_tile_value(t.c, permC_seq{});
+    const std::size_t c_sz = c_backing_t::shmem_size(static_cast<std::size_t>(
+        make_tile_layout(c_canon, LayoutRight{}).size()));
+    return c_sz +
+           stage_a_type::scratch_size_per_team(
+               reorder_tile_value(t.a, permA_seq{})) +
+           stage_b_type::scratch_size_per_team(
+               reorder_tile_value(t.b, permB_seq{}));
   }
 
  private:
@@ -270,9 +351,45 @@ struct Evaluator<TeamPolicyTag<ES>,
     // NR = 2*W (two SIMD vectors, not one): gives MT*(NR/W)=16 independent FMA
     // accumulators, enough to hide the FMA latency on AVX-512 (2 FMA units)
     // where NR=W left only 8 and under-fed them. Measured ~+8% on serial matmul
-    // N=512. Requires the operand free-dim (SB) to be a multiple of 2*W.
+    // N=512. Requires the operand free-dim SB to be a multiple of 2*W; static
+    // tiles narrower than that are rejected below rather than silently
+    // mis-tiled.
     constexpr int NR = 2 * W;  // simd vectors spanning the columns
 #endif
+
+    // The register kernel has no remainder path: each staged GEMM dim must be a
+    // multiple of its block factor (SA%MT, SK%NT, SB%NR), else tile_view either
+    // yields a zero outer extent (a hard error) or silently drops the remainder
+    // (wrong results). Static tiles are rejected at compile time with clear
+    // messages; dynamic tiles get the same guard at runtime in debug builds.
+    if constexpr (TileA::is_static) {
+      constexpr int SAs = decltype(a)::layout_t::extent(0);
+      constexpr int SKs = decltype(a)::layout_t::extent(1);
+      static_assert(
+          SAs >= MT && SAs % MT == 0,
+          "team GEMM: operand row dim (SA) must be a multiple of the register "
+          "row block MT; enlarge the output C tile's free extent");
+      static_assert(
+          SKs >= NT && SKs % NT == 0,
+          "team GEMM: operand contracted dim (SK) must be a multiple of the "
+          "register depth NT; enlarge the contracted tile extents");
+    } else {
+      assert(SA >= MT && SA % MT == 0 &&
+             "team GEMM: SA must be a multiple of the register row block MT");
+      assert(SK >= NT && SK % NT == 0 &&
+             "team GEMM: SK must be a multiple of the register depth NT");
+    }
+    if constexpr (TileB::is_static) {
+      constexpr int SBs = decltype(b)::layout_t::extent(1);
+      static_assert(
+          SBs >= NR && SBs % NR == 0,
+          "team GEMM: operand free dim (SB) must be a multiple of the register "
+          "column block (2*W on CPU); enlarge the output C tile's free extent");
+    } else {
+      assert(
+          SB >= NR && SB % NR == 0 &&
+          "team GEMM: SB must be a multiple of the register column block NR");
+    }
 
     using RegA = StaticTile<MT, NT>;
     using RegB = StaticTile<NT, NR>;
@@ -292,36 +409,33 @@ struct Evaluator<TeamPolicyTag<ES>,
           const int bi = t / (SB / NR);  // C tile-block row
           const int bj = t % (SB / NR);  // C tile-block column
           simd_t    acc[MT][NR / W];
-#pragma unroll
-          for (int i = 0; i < MT; ++i)
-#pragma unroll
-            for (int n = 0; n < NR; n += W)
-              acc[i][n / W] =
-                  simd_t(&c_reg(bi, i, bj, n), KE::simd_flag_default);
+          TENSOR_PRAGMA_UNROLL
+          for (int i = 0; i < MT; ++i) TENSOR_PRAGMA_UNROLL
+          for (int n = 0; n < NR; n += W)
+            acc[i][n / W] = simd_t(&c_reg(bi, i, bj, n), KE::simd_flag_default);
 
           // One contracted register-block (NT-deep rank-1 updates).
           for (int k0 = 0; k0 < SK / NT; ++k0) {
             for (int k = 0; k < NT; ++k) {
               simd_t br[NR / W];
-#pragma unroll
+              TENSOR_PRAGMA_UNROLL
               for (int n = 0; n < NR; n += W)
                 br[n / W] = simd_t(&b_reg(k0, k, bj, n), KE::simd_flag_default);
-#pragma unroll
+              TENSOR_PRAGMA_UNROLL
               for (int i = 0; i < MT; ++i) {
                 const simd_t a_i(a_reg(bi, i, k0, k));  // broadcast A
-#pragma unroll
+                TENSOR_PRAGMA_UNROLL
                 for (int n = 0; n < NR; n += W)
                   acc[i][n / W] += a_i * br[n / W];
               }
             }
           }
 
-#pragma unroll
-          for (int i = 0; i < MT; ++i)
-#pragma unroll
-            for (int n = 0; n < NR; n += W)
-              KE::simd_unchecked_store(acc[i][n / W], &c_reg(bi, i, bj, n),
-                                       KE::simd_flag_default);
+          TENSOR_PRAGMA_UNROLL
+          for (int i = 0; i < MT; ++i) TENSOR_PRAGMA_UNROLL
+          for (int n = 0; n < NR; n += W)
+            KE::simd_unchecked_store(acc[i][n / W], &c_reg(bi, i, bj, n),
+                                     KE::simd_flag_default);
         });
     team.team_barrier();
   }
@@ -364,15 +478,31 @@ struct Evaluator<
   // node.storage_.
   KOKKOS_FUNCTION Evaluator(node_type n, tiling_type t) : node(n), tiling(t) {}
 
-  template <typename ViewT>
-  KOKKOS_FUNCTION void operator()(const team_member_t&     team,
-                                  Kokkos::Array<int, Rank> tile_idx,
-                                  const ViewT&             view) const {
+  // `view` is the NATIVE (user-order) global output and `tiling` its native
+  // tile, so subview_tile hits the compile-time-ordered OrderedSubviewLayout
+  // path (registers, no local-memory spill). The canonical result is written by
+  // reordering the ordered subview into canonical order via reorder_view
+  // instead of presenting the output as a strided PermutedView. `perm` is permC
+  // (maps canonical output mode i -> user position perm[i]); a full-rank
+  // identity seq for canonical / non-permuted outputs makes every step below a
+  // no-op.
+  template <typename ViewT, int... Perm>
+  KOKKOS_FUNCTION void operator()(
+      const team_member_t& team, Kokkos::Array<int, Rank> tile_idx,
+      const ViewT& view, std::integer_sequence<int, Perm...> perm) const {
+    static_assert(sizeof...(Perm) == Rank,
+                  "store permutation must have one entry per output mode");
     TIMING_SCOPE_ENTER(g_timing_stats.store_write_time,
                        g_timing_stats.store_write_count);
     team.team_barrier();  // ensure the producer's scratch is fully visible
-    const auto tv      = tile_view(view, tiling);
-    const auto sv      = subview_tile(tv, tile_idx);
+
+    // Canonical tile index -> native (user-order) tile index: scatter by perm,
+    // since perm[i] = user position of canonical mode i.
+    const auto u_idx = Impl::scatter_index(tile_idx, perm);
+
+    const auto tv  = tile_view(view, tiling);  // native -> ordered backing
+    const auto sv0 = subview_tile(tv, u_idx);  // OrderedSubviewLayout (fast)
+    const auto sv  = reorder_view(sv0, perm);  // canonical order, still ordered
     const auto scratch = node.storage_;
     const auto hook    = node.hook_op;  // local copy: lambda captures no `this`
 

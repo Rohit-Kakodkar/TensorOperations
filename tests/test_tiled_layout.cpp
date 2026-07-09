@@ -7,7 +7,7 @@
 using namespace TensorOperations;
 
 // ---------------------------------------------------------------------------
-// TensorLike / WritableTensorLike concept checks — compile-time.
+// TensorLike concept checks — compile-time.
 // ---------------------------------------------------------------------------
 
 TEST(TiledLayout, TiledViewSatisfiesConcepts) {
@@ -15,20 +15,13 @@ TEST(TiledLayout, TiledViewSatisfiesConcepts) {
 
   using TV = TiledView<View2D, StaticTile<4, 4>>;
   static_assert(TensorLike<TV>);
-  static_assert(WritableTensorLike<TV>);
 
   using TVD = TiledView<View2D, DynamicTile<2>>;
   static_assert(TensorLike<TVD>);
-  static_assert(WritableTensorLike<TVD>);
 
-  SUCCEED();
-}
-
-TEST(TiledLayout, SubviewSatisfiesConcepts) {
-  using View2D = Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::HostSpace>;
-  using SV     = Subview<View2D, 2>;
+  using SV = Subview<View2D, 2>;
   static_assert(TensorLike<SV>);
-  static_assert(WritableTensorLike<SV>);
+
   SUCCEED();
 }
 
@@ -209,80 +202,6 @@ TEST(TiledLayout, TiledViewDynamic) {
 }
 
 // ---------------------------------------------------------------------------
-// Subview: fix outer dim 0 and inner dim 0; keep outer/inner dim 1 free.
-// subview(tv, t0_fixed, ALL, r0_fixed, ALL) → rank-2 Subview
-// ---------------------------------------------------------------------------
-
-TEST(TiledLayout, SubviewFixOuterAndInnerDim0) {
-  Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::HostSpace> v("v", 8, 8);
-  for (int i = 0; i < 8; ++i)
-    for (int j = 0; j < 8; ++j) v(i, j) = static_cast<float>(i * 8 + j);
-
-  // Tile: T=[4,4], shape becomes (2,2,4,4) with dims (t0,t1,r0,r1)
-  auto tv = tile_view(v, StaticTile<4, 4>{});
-
-  // Fix t0=1, r0=2; keep t1 and r1 free.
-  auto sv = subview(tv, 1, Kokkos::ALL, 2, Kokkos::ALL);
-
-  static_assert(decltype(sv)::rank == 2);
-  EXPECT_EQ(sv.extent(0), tv.extent(1));  // free dim t1: outer_extent[1]
-  EXPECT_EQ(sv.extent(1), tv.extent(3));  // free dim r1: inner_extent[1]
-
-  // sv(t1, r1) == v(1*4+2, t1*4+r1) = v(6, t1*4+r1)
-  for (int t1 = 0; t1 < 2; ++t1)
-    for (int r1 = 0; r1 < 4; ++r1)
-      EXPECT_FLOAT_EQ(sv(t1, r1), v(6, t1 * 4 + r1))
-          << "t1=" << t1 << " r1=" << r1;
-}
-
-// ---------------------------------------------------------------------------
-// Subview: fix all inner dims → rank-2 tile-index-only subview.
-// ---------------------------------------------------------------------------
-
-TEST(TiledLayout, SubviewFixInnerDims) {
-  Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::HostSpace> v("v", 8, 8);
-  for (int i = 0; i < 8; ++i)
-    for (int j = 0; j < 8; ++j) v(i, j) = static_cast<float>(i * 8 + j);
-
-  auto tv = tile_view(v, StaticTile<4, 4>{});
-
-  // Keep t0, t1 free; fix r0=0, r1=0 → access first element of each tile.
-  auto sv = subview(tv, Kokkos::ALL, Kokkos::ALL, 0, 0);
-
-  static_assert(decltype(sv)::rank == 2);
-  EXPECT_EQ(sv.extent(0), 2);  // outer dim 0: 2 tiles
-  EXPECT_EQ(sv.extent(1), 2);  // outer dim 1: 2 tiles
-
-  // sv(t0, t1) == v(t0*4+0, t1*4+0) = v(t0*4, t1*4)
-  for (int t0 = 0; t0 < 2; ++t0)
-    for (int t1 = 0; t1 < 2; ++t1)
-      EXPECT_FLOAT_EQ(sv(t0, t1), v(t0 * 4, t1 * 4));
-}
-
-// ---------------------------------------------------------------------------
-// Subview: all ALL → rank-4 subview acts identically to original TiledView.
-// ---------------------------------------------------------------------------
-
-TEST(TiledLayout, SubviewFullFree) {
-  Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::HostSpace> v("v", 8, 8);
-  for (int i = 0; i < 8; ++i)
-    for (int j = 0; j < 8; ++j) v(i, j) = static_cast<float>(i * 8 + j);
-
-  auto tv = tile_view(v, StaticTile<4, 4>{});
-  auto sv = subview(tv, Kokkos::ALL, Kokkos::ALL, Kokkos::ALL, Kokkos::ALL);
-
-  static_assert(decltype(sv)::rank == 4);
-
-  for (int d = 0; d < 4; ++d) EXPECT_EQ(sv.extent(d), tv.extent(d));
-
-  for (int t0 = 0; t0 < 2; ++t0)
-    for (int t1 = 0; t1 < 2; ++t1)
-      for (int r0 = 0; r0 < 4; ++r0)
-        for (int r1 = 0; r1 < 4; ++r1)
-          EXPECT_FLOAT_EQ(sv(t0, t1, r0, r1), tv(t0, t1, r0, r1));
-}
-
-// ---------------------------------------------------------------------------
 // tile_view for View<ViewType, TileLayout> — same backing, 2N-dimensional
 // *position-preserving* tiled layout. The (outer,inner) extent pair is
 // interleaved per dimension (Right: outer,inner; Left: inner,outer) so the
@@ -410,6 +329,120 @@ TEST(TiledLayout, TileViewScratchDynamicLeft) {
           EXPECT_FLOAT_EQ(
               tv(ri, ti, rj, tj),
               static_cast<float>((ti * 2 + ri) + (tj * 4 + rj) * 8));
+}
+
+// ---------------------------------------------------------------------------
+// reorder_view — logical axis permutation (transpose) of a subview.
+//
+// Gather convention: Perm[i] is the source dim that becomes new dim i, so
+// r.extent(i) == sv.extent(Perm[i]) and r(new coords) == sv(old coords).
+// Non-square, non-symmetric extents/data so a transpose bug can't hide.
+// ---------------------------------------------------------------------------
+
+TEST(TiledLayout, ReorderSubviewLayout2D) {
+  Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::HostSpace> v("v", 4, 6);
+  for (int i = 0; i < 4; ++i)
+    for (int j = 0; j < 6; ++j) v(i, j) = static_cast<float>(i * 6 + j);
+
+  // Runtime SubviewLayout over the full view (as the DynamicTile staging path
+  // would produce), built directly from the view's extents/strides.
+  const Kokkos::Array<int, 2> ext{4, 6}, str{6, 1};
+  auto                        sv = Subview<decltype(v), 2>{
+      v, SubviewLayout<2>{0, ext, str, Impl::argsort_by_stride<2>(str),
+                          Impl::reciprocals<2>(ext)}};
+  static_assert(std::is_same_v<decltype(sv)::layout_t, SubviewLayout<2>>);
+
+  auto r = reorder_view(sv, std::integer_sequence<int, 1, 0>{});
+  // Type-preserving: SubviewLayout stays a SubviewLayout.
+  static_assert(std::is_same_v<decltype(r)::layout_t, SubviewLayout<2>>);
+
+  constexpr int perm[] = {1, 0};
+  for (int i = 0; i < 2; ++i) {
+    EXPECT_EQ(r.extent(i), sv.extent(perm[i]));
+    EXPECT_EQ(r.stride(i), sv.stride(perm[i]));
+  }
+  EXPECT_EQ(r.layout().base_offset(), sv.layout().base_offset());
+
+  for (int a = 0; a < r.extent(0); ++a)
+    for (int b = 0; b < r.extent(1); ++b)
+      EXPECT_FLOAT_EQ(r(a, b), sv(b, a)) << "a=" << a << " b=" << b;
+}
+
+TEST(TiledLayout, ReorderSubviewLayout3D) {
+  Kokkos::View<float***, Kokkos::LayoutRight, Kokkos::HostSpace> v("v", 2, 3,
+                                                                   4);
+  for (int i = 0; i < 2; ++i)
+    for (int j = 0; j < 3; ++j)
+      for (int k = 0; k < 4; ++k)
+        v(i, j, k) = static_cast<float>((i * 3 + j) * 4 + k);
+
+  const Kokkos::Array<int, 3> ext{2, 3, 4}, str{12, 4, 1};
+  auto                        sv = Subview<decltype(v), 3>{
+      v, SubviewLayout<3>{0, ext, str, Impl::argsort_by_stride<3>(str),
+                          Impl::reciprocals<3>(ext)}};
+  static_assert(std::is_same_v<decltype(sv)::layout_t, SubviewLayout<3>>);
+
+  // Perm {2,0,1}: new dim0<-old2, new dim1<-old0, new dim2<-old1.
+  auto r = reorder_view(sv, std::integer_sequence<int, 2, 0, 1>{});
+  static_assert(std::is_same_v<decltype(r)::layout_t, SubviewLayout<3>>);
+
+  constexpr int perm[] = {2, 0, 1};
+  for (int i = 0; i < 3; ++i) {
+    EXPECT_EQ(r.extent(i), sv.extent(perm[i]));
+    EXPECT_EQ(r.stride(i), sv.stride(perm[i]));
+  }
+
+  for (int a = 0; a < r.extent(0); ++a)
+    for (int b = 0; b < r.extent(1); ++b)
+      for (int c = 0; c < r.extent(2); ++c)
+        EXPECT_FLOAT_EQ(r(a, b, c), sv(b, c, a))
+            << "a=" << a << " b=" << b << " c=" << c;
+}
+
+// Compile-time check: reorder_layout on an OrderedSubviewLayout is constexpr
+// and produces the correct type/extents/strides in a constant expression.
+namespace {
+constexpr OrderedSubviewLayout<2, 1, 0> kOrdered2D{
+    /*base=*/0, /*ext=*/{4, 6}, /*str=*/{6, 1}, /*inv=*/{0.25f, 1.0f / 6.0f}};
+constexpr auto kReordered2D =
+    reorder_layout(kOrdered2D, std::integer_sequence<int, 1, 0>{});
+static_assert(
+    std::is_same_v<std::decay_t<decltype(kReordered2D)>,
+                   OrderedSubviewLayout<2, 0, 1>>,
+    "reorder_layout must preserve the OrderedSubviewLayout family at compile "
+    "time");
+static_assert(kReordered2D.extent(0) == 6 && kReordered2D.extent(1) == 4);
+static_assert(kReordered2D.stride(0) == 1 && kReordered2D.stride(1) == 6);
+static_assert(kReordered2D.base_offset() == 0);
+}  // namespace
+
+TEST(TiledLayout, ReorderOrderedSubviewLayout2D) {
+  Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::HostSpace> v("v", 4, 6);
+  for (int i = 0; i < 4; ++i)
+    for (int j = 0; j < 6; ++j) v(i, j) = static_cast<float>(i * 6 + j);
+
+  auto tv = tile_view(v, StaticTile<4, 6>{});  // shape (1,1,4,6)
+  // subview_tile on a LayoutRight source yields an OrderedSubviewLayout with
+  // compile-time order {N-1,...,0} = {1,0}.
+  auto sv = subview_tile(tv, Kokkos::Array<int, 2>{0, 0});
+  static_assert(
+      std::is_same_v<decltype(sv)::layout_t, OrderedSubviewLayout<2, 1, 0>>);
+
+  auto r = reorder_view(sv, std::integer_sequence<int, 1, 0>{});
+  // Order {1,0} transposed by Perm {1,0} -> new memory order {0,1}.
+  static_assert(
+      std::is_same_v<decltype(r)::layout_t, OrderedSubviewLayout<2, 0, 1>>);
+
+  constexpr int perm[] = {1, 0};
+  for (int i = 0; i < 2; ++i) {
+    EXPECT_EQ(r.extent(i), sv.extent(perm[i]));
+    EXPECT_EQ(r.stride(i), sv.stride(perm[i]));
+  }
+  EXPECT_EQ(r.layout().base_offset(), sv.layout().base_offset());
+
+  for (int a = 0; a < r.extent(0); ++a)
+    for (int b = 0; b < r.extent(1); ++b)
+      EXPECT_FLOAT_EQ(r(a, b), sv(b, a)) << "a=" << a << " b=" << b;
 }
 
 // ---------------------------------------------------------------------------

@@ -19,50 +19,20 @@ struct MyTensor {
 
 static_assert(
     TensorLike<Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::HostSpace>>);
-static_assert(WritableTensorLike<
-              Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::HostSpace>>);
 static_assert(TensorLike<MyTensor>);
 
 TEST(NodeHandleTest, InputNode) {
-  auto h   = make_handle(MyTensor{}, std::array<int32_t, 2>{'i', 'j'});
+  auto h   = make_handle<'i', 'j'>(MyTensor{});
   auto inp = make_input_node(h);
+
+  static_assert(std::is_same_v<decltype(inp)::modes_seq,
+                               std::integer_sequence<int32_t, 'i', 'j'>>);
 
   auto s = inp.shape();
   EXPECT_EQ(s[0], 4);
   EXPECT_EQ(s[1], 3);
 
-  auto m = inp.modes();
-  EXPECT_EQ(m[0], 'i');
-  EXPECT_EQ(m[1], 'j');
-
   EXPECT_FLOAT_EQ(inp.handle(1, 2), 5.f);  // MyTensor: 1*3+2 = 5
-}
-
-TEST(NodeHandleTest, IntermediateNodeGlobalAlloc) {
-  auto interm = make_interm_node<float, 2, Kokkos::Serial>(
-      0, std::array<int, 2>{4, 3}, std::array<int32_t, 2>{'a', 'b'});
-
-  auto s = interm.shape();
-  EXPECT_EQ(s[0], 4);
-  EXPECT_EQ(s[1], 3);
-
-  auto m = interm.modes();
-  EXPECT_EQ(m[0], 'a');
-  EXPECT_EQ(m[1], 'b');
-
-  // Allocate the storage view directly (Evaluator::operator() will do this in
-  // production)
-  using NodeT     = decltype(interm);
-  interm.storage_ = NodeT::storage_type("test_interm", 4, 3);
-
-  EXPECT_EQ(interm.storage_.extent(0), 4);
-  EXPECT_EQ(interm.storage_.extent(1), 3);
-  EXPECT_EQ(interm.modes_[0], 'a');
-  EXPECT_EQ(interm.modes_[1], 'b');
-
-  interm.storage_(1, 2) = 9.f;
-  EXPECT_FLOAT_EQ(interm.storage_(1, 2), 9.f);
-  EXPECT_FLOAT_EQ(interm.storage_(0, 0), 0.f);
 }
 
 int main(int argc, char* argv[]) {

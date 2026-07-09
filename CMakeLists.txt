@@ -46,11 +46,6 @@ add_executable(test_concept tests/test_concept.cpp)
 target_link_libraries(test_concept PRIVATE tensor GTest::gtest_main)
 gtest_discover_tests(test_concept)
 
-# test_layout — no Kokkos runtime; GTest provides main()
-add_executable(test_layout tests/test_layout.cpp)
-target_link_libraries(test_layout PRIVATE tensor GTest::gtest_main)
-gtest_discover_tests(test_layout)
-
 # test_nodehandle — custom main() wraps Kokkos init/finalize
 add_executable(test_nodehandle tests/test_nodehandle.cpp)
 target_link_libraries(test_nodehandle PRIVATE tensor GTest::gtest)
@@ -98,6 +93,10 @@ if(TENSOR_OPS_BUILD_BENCHMARKS)
   add_executable(bench_team_contraction
     benchmarks/team_contraction/bench_team_contraction.cpp)
   target_link_libraries(bench_team_contraction PRIVATE tensor)
+
+  add_executable(bench_permuted_contraction
+    benchmarks/permuted_contraction/bench_permuted_contraction.cpp)
+  target_link_libraries(bench_permuted_contraction PRIVATE tensor)
 
   add_executable(bench_matrix_multiply
     benchmarks/matrix_multiply/bench_matrix_multiply.cpp)

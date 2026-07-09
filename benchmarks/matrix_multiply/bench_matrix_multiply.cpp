@@ -73,11 +73,10 @@ using V2R = Kokkos::View<float**, Kokkos::LayoutRight>;
 inline constexpr int kLibSrcBegin = __LINE__;
 template <class LA>
 void library_matmul(V2<LA> A, V2<LA> B, V2R C) {
-  auto hA = make_input_node(make_handle(A, std::array<int32_t, 2>{'i', 'k'}));
-  auto hB = make_input_node(make_handle(B, std::array<int32_t, 2>{'k', 'j'}));
-  auto g  = make_graph();
-  auto [g1, o1] =
-      g.ops(make_contraction_node(hA, hB, std::array<int32_t, 2>{'i', 'j'}));
+  auto hA       = make_input_node(make_handle<'i', 'k'>(A));
+  auto hB       = make_input_node(make_handle<'k', 'j'>(B));
+  auto g        = make_graph();
+  auto [g1, o1] = g.ops(make_contraction_node<'i', 'j'>(hA, hB));
   g1.execute(TeamPolicyTag<>{},
              Tile<StaticTile<cfg::TI, cfg::TK>, StaticTile<cfg::TK, cfg::TJ>,
                   StaticTile<cfg::TI, cfg::TJ>>{},

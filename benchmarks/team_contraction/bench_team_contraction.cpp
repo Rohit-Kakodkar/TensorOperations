@@ -86,13 +86,10 @@ using V2R = Kokkos::View<float**, Kokkos::LayoutRight>;
 inline constexpr int kLibSrcBegin = __LINE__;
 template <class LA>
 void library_contract(V3<LA> A, V3<LA> B, V2R C) {
-  auto hA =
-      make_input_node(make_handle(A, std::array<int32_t, 3>{'i', 'j', 'k'}));
-  auto hB =
-      make_input_node(make_handle(B, std::array<int32_t, 3>{'j', 'k', 'l'}));
-  auto g = make_graph();
-  auto [g1, o1] =
-      g.ops(make_contraction_node(hA, hB, std::array<int32_t, 2>{'i', 'l'}));
+  auto hA       = make_input_node(make_handle<'i', 'j', 'k'>(A));
+  auto hB       = make_input_node(make_handle<'j', 'k', 'l'>(B));
+  auto g        = make_graph();
+  auto [g1, o1] = g.ops(make_contraction_node<'i', 'l'>(hA, hB));
   g1.execute(TeamPolicyTag<>{},
              Tile<StaticTile<cfg::TI, cfg::TJ, cfg::TK>,
                   StaticTile<cfg::TJ, cfg::TK, cfg::TL>,

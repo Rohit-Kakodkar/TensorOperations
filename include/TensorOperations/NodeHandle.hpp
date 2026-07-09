@@ -17,9 +17,6 @@ struct ContractionTag {};
 // Sentinel for "no hook"
 struct NoHook {};
 
-// Sentinel for "infer Scalar from NodeA::value_type" in make_contraction_node
-struct InferScalar {};
-
 // Primary template — undefined; must use a specialization
 template <typename Tag, typename... Args>
 struct NodeHandle;
@@ -28,6 +25,15 @@ struct NodeHandle;
 // Impl helpers
 // ---------------------------------------------------------------------------
 namespace Impl {
+
+// Does Node instantiate NodeHandle with this tag? One trait covers all tags
+// (InputTag, ContractionTag, ...).
+template <typename Tag, typename Node>
+struct has_node_tag : std::false_type {};
+template <typename Tag, typename... Args>
+struct has_node_tag<Tag, NodeHandle<Tag, Args...>> : std::true_type {};
+template <typename Tag, typename Node>
+inline constexpr bool has_node_tag_v = has_node_tag<Tag, Node>::value;
 
 // Safely extracts T::value_type when it exists; falls back to void.
 template <typename T, typename = void>
@@ -50,65 +56,25 @@ struct exec_space_of<T, std::void_t<typename T::execution_space>> {
   using type = typename T::execution_space;
 };
 
-// Map (Scalar, Rank, MemSpace) → the appropriate Kokkos::View type
-template <typename S, int R, typename MS>
-struct KokkosViewN;
-template <typename S, typename MS>
-struct KokkosViewN<S, 0, MS> {
-  using type = Kokkos::View<S, Kokkos::LayoutRight, MS>;
-};
-template <typename S, typename MS>
-struct KokkosViewN<S, 1, MS> {
-  using type = Kokkos::View<S*, Kokkos::LayoutRight, MS>;
-};
-template <typename S, typename MS>
-struct KokkosViewN<S, 2, MS> {
-  using type = Kokkos::View<S**, Kokkos::LayoutRight, MS>;
-};
-template <typename S, typename MS>
-struct KokkosViewN<S, 3, MS> {
-  using type = Kokkos::View<S***, Kokkos::LayoutRight, MS>;
-};
-template <typename S, typename MS>
-struct KokkosViewN<S, 4, MS> {
-  using type = Kokkos::View<S****, Kokkos::LayoutRight, MS>;
-};
-
-// Construct a KokkosViewN from a shape array via index_sequence unpacking
-template <typename ViewType, int R, std::size_t... Is>
-ViewType make_view_impl(const Kokkos::Array<int, R>& shape,
-                        std::index_sequence<Is...>) {
-  return ViewType("intermediate", static_cast<std::size_t>(shape[Is])...);
-}
-
-template <typename S, int R, typename MS>
-typename KokkosViewN<S, R, MS>::type make_kokkos_view(
-    const Kokkos::Array<int, R>& shape) {
-  using VT = typename KokkosViewN<S, R, MS>::type;
-  return make_view_impl<VT, R>(shape, std::make_index_sequence<R>{});
-}
-
 }  // namespace Impl
 
 // ---------------------------------------------------------------------------
 // Input specialization — wraps an existing TensorHandle
 // ---------------------------------------------------------------------------
-template <TensorLike T, typename HookOp>
-struct NodeHandle<InputTag, T, HookOp> {
-  TensorHandle<T>              handle;
+template <TensorLike T, typename ModesSeq, typename HookOp>
+struct NodeHandle<InputTag, T, ModesSeq, HookOp> {
+  TensorHandle<T, ModesSeq>    handle;
   [[no_unique_address]] HookOp hook_op;
 
-  static constexpr int Rank = TensorHandle<T>::Rank;
+  static constexpr int Rank = TensorHandle<T, ModesSeq>::Rank;
   using value_type          = typename Impl::value_type_of<T>::type;
   using exec_space          = typename Impl::exec_space_of<T>::type;
+  using modes_seq           = ModesSeq;
 
   KOKKOS_FUNCTION Kokkos::Array<int, Rank> shape() const {
     Kokkos::Array<int, Rank> s{};
     for (int i = 0; i < Rank; ++i) s[i] = static_cast<int>(handle.extent(i));
     return s;
-  }
-  KOKKOS_FUNCTION Kokkos::Array<int32_t, Rank> modes() const {
-    return handle.modes;
   }
 };
 
@@ -126,14 +92,8 @@ struct NodeHandle<IntermTag, Storage, IntRank, ExecSpace, HookOp> {
   using value_type          = typename Storage::value_type;
   using exec_space          = ExecSpace;
 
-  uint32_t                     id{};
   Storage                      storage_;  // Kokkos::View (scratch tier)
-  Kokkos::Array<int, Rank>     shape_;
-  Kokkos::Array<int32_t, Rank> modes_;
   [[no_unique_address]] HookOp hook_op;
-
-  KOKKOS_FUNCTION Kokkos::Array<int, Rank> shape() const { return shape_; }
-  KOKKOS_FUNCTION Kokkos::Array<int32_t, Rank> modes() const { return modes_; }
 };
 
 // ---------------------------------------------------------------------------
@@ -141,40 +101,24 @@ struct NodeHandle<IntermTag, Storage, IntRank, ExecSpace, HookOp> {
 // ---------------------------------------------------------------------------
 
 // Input node — wraps an existing TensorHandle
-template <TensorLike T, typename HookOp = NoHook>
-NodeHandle<InputTag, T, HookOp> make_input_node(TensorHandle<T> h,
-                                                HookOp          hook = {}) {
+template <TensorLike T, typename ModesSeq, typename HookOp = NoHook>
+KOKKOS_FUNCTION NodeHandle<InputTag, T, ModesSeq, HookOp> make_input_node(
+    TensorHandle<T, ModesSeq> h, HookOp hook = {}) {
   return {std::move(h), std::move(hook)};
-}
-
-// Intermediate node — deferred allocation, ExecSpace determines both memory
-// spaces. Storage is the matching Kokkos::View (empty until allocated).
-template <typename Scalar, int Rank,
-          typename ExecSpace = Kokkos::DefaultExecutionSpace,
-          typename HookOp    = NoHook>
-auto make_interm_node(uint32_t id, std::array<int, Rank> shape,
-                      std::array<int32_t, Rank> modes, HookOp hook = {}) {
-  using mem_space = typename ExecSpace::memory_space;
-  using view_type = typename Impl::KokkosViewN<Scalar, Rank, mem_space>::type;
-  using NodeType =
-      NodeHandle<IntermTag, view_type, std::integral_constant<int, Rank>,
-                 ExecSpace, HookOp>;
-  Kokkos::Array<int, Rank>     kshape{};
-  Kokkos::Array<int32_t, Rank> kmodes{};
-  for (int i = 0; i < Rank; ++i) {
-    kshape[i] = shape[i];
-    kmodes[i] = modes[i];
-  }
-  return NodeType{id, view_type{}, kshape, kmodes, std::move(hook)};
 }
 
 // ---------------------------------------------------------------------------
 // Contraction specialization — C{free modes} = sum{contracted} A × B
 // ---------------------------------------------------------------------------
+// ModesSeq holds the output labels in *canonical* (freeA ++ freeB) order; the
+// stored shape_ is in that order too. PermCSeq maps canonical output axes back
+// to the user-requested output order (canonical -> user), so the driver can
+// present the user's output view/tile canonically.
 template <typename NodeA, typename NodeB, typename IntCRank, typename Scalar,
-          typename ExecSpace, typename HookOp>
+          typename ExecSpace, typename HookOp, typename ModesSeq,
+          typename PermCSeq>
 struct NodeHandle<ContractionTag, NodeA, NodeB, IntCRank, Scalar, ExecSpace,
-                  HookOp> {
+                  HookOp, ModesSeq, PermCSeq> {
   static constexpr int Rank          = IntCRank::value;
   static constexpr int NumContracted = (NodeA::Rank + NodeB::Rank - Rank) / 2;
   using hook_type                    = HookOp;
@@ -182,79 +126,124 @@ struct NodeHandle<ContractionTag, NodeA, NodeB, IntCRank, Scalar, ExecSpace,
   using exec_space                   = ExecSpace;
   using node_a_type                  = NodeA;
   using node_b_type                  = NodeB;
+  using modes_seq                    = ModesSeq;  // canonical output labels
+  using permC_seq                    = PermCSeq;  // canonical -> user output
 
   NodeA                        node_a;
   NodeB                        node_b;
-  Kokkos::Array<int32_t, Rank> modes_;
-  Kokkos::Array<int, Rank>     shape_;
+  Kokkos::Array<int, Rank>     shape_;  // canonical output extents
   [[no_unique_address]] HookOp hook_op;
 
   KOKKOS_FUNCTION Kokkos::Array<int, Rank> shape() const { return shape_; }
-  KOKKOS_FUNCTION Kokkos::Array<int32_t, Rank> modes() const { return modes_; }
 };
 
 // ---------------------------------------------------------------------------
 // Contraction node factory
+//
+// C{out modes} = sum{contracted} A x B, with the output modes given as
+// compile-time labels. Contracted modes are inferred as the labels shared by A
+// and B; free modes are those in exactly one input. The output is stored in
+// canonical (freeA ++ freeB) order; the user's requested order is recorded as a
+// canonical->user permutation so the driver can write the result back
+// correctly.
 // ---------------------------------------------------------------------------
 
-template <typename Scalar    = InferScalar,
-          typename ExecSpace = Kokkos::DefaultExecutionSpace, typename NodeA,
-          typename NodeB, std::size_t CRank, typename HookOp = NoHook>
-auto make_contraction_node(NodeA a, NodeB b,
-                           std::array<int32_t, CRank> out_modes,
-                           HookOp                     hook = {}) {
-  using ActualScalar = std::conditional_t<std::is_same_v<Scalar, InferScalar>,
-                                          typename NodeA::value_type, Scalar>;
-  constexpr int Rank = static_cast<int>(CRank);
+namespace Impl {
+
+template <typename ActualScalar, typename ExecSpace, int32_t... OutModes,
+          typename NodeA, typename NodeB, typename HookOp>
+auto make_contraction_node_impl(NodeA a, NodeB b, HookOp hook) {
+  constexpr int Rank = static_cast<int>(sizeof...(OutModes));
   static_assert((NodeA::Rank + NodeB::Rank - Rank) % 2 == 0,
                 "Output rank is inconsistent with input ranks");
 
-  const auto a_modes = a.modes();
-  const auto b_modes = b.modes();
+  using AModes = typename NodeA::modes_seq;
+  using BModes = typename NodeB::modes_seq;
+  using OutSeq = std::integer_sequence<int32_t, OutModes...>;
+  static_assert(
+      Impl::valid_contraction<Rank, AModes, BModes, OutSeq>(),
+      "each output mode must appear in exactly one input tensor, output modes "
+      "must be pairwise distinct, and the output rank must equal the number "
+      "of free modes");
+
+  // Canonical output labels (freeA ++ freeB) and the canonical->user map.
+  using CanonModes = Impl::canonC_modes_seq_t<Rank, AModes, BModes>;
+  using PermC      = Impl::permC_seq_t<Rank, AModes, BModes, OutSeq>;
+
+  // Canonical C is freeA ++ freeB, and permA/permB already locate those axes
+  // in each operand: canonical output axis i draws its extent from A axis
+  // pA[i] (i < FreeA) or from B axis pB[NC + (i - FreeA)].
+  constexpr auto pA    = Impl::permA_v<AModes, BModes>;
+  constexpr auto pB    = Impl::permB_v<AModes, BModes>;
+  constexpr int  NC    = Impl::num_contracted<AModes, BModes>();
+  constexpr int  FreeA = NodeA::Rank - NC;
+
   const auto a_shape = a.shape();
   const auto b_shape = b.shape();
 
-  auto in_array = [](auto val, const auto& arr, int n) {
-    for (int i = 0; i < n; ++i)
-      if (arr[i] == val) return true;
-    return false;
-  };
+  // Contracted extents must agree between A and B (A axis pA[FreeA + i] pairs
+  // with B axis pB[i] on the same label).
+  for (int i = 0; i < NC; ++i)
+    assert(a_shape[pA[FreeA + i]] == b_shape[pB[i]] &&
+           "contracted mode extents must match between A and B");
 
-  // Each output mode must be a free mode (in exactly one input)
-  for (int i = 0; i < Rank; ++i) {
-    int32_t m    = out_modes[i];
-    bool    in_a = in_array(m, a_modes, NodeA::Rank);
-    bool    in_b = in_array(m, b_modes, NodeB::Rank);
-    assert((in_a != in_b) &&
-           "each output mode must appear in exactly one input tensor");
-  }
-
-  // Derive C's shape from input extents
   Kokkos::Array<int, Rank> c_shape{};
-  for (int i = 0; i < Rank; ++i) {
-    int32_t m = out_modes[i];
-    if (in_array(m, a_modes, NodeA::Rank)) {
-      for (int j = 0; j < NodeA::Rank; ++j)
-        if (a_modes[j] == m) {
-          c_shape[i] = a_shape[j];
-          break;
-        }
-    } else {
-      for (int j = 0; j < NodeB::Rank; ++j)
-        if (b_modes[j] == m) {
-          c_shape[i] = b_shape[j];
-          break;
-        }
-    }
-  }
-
-  Kokkos::Array<int32_t, Rank> k_out_modes{};
-  for (int i = 0; i < Rank; ++i) k_out_modes[i] = out_modes[i];
+  for (int i = 0; i < Rank; ++i)
+    c_shape[i] = i < FreeA ? a_shape[pA[i]] : b_shape[pB[NC + (i - FreeA)]];
 
   return NodeHandle<ContractionTag, NodeA, NodeB,
                     std::integral_constant<int, Rank>, ActualScalar, ExecSpace,
-                    HookOp>{std::move(a), std::move(b), k_out_modes, c_shape,
-                            std::move(hook)};
+                    HookOp, CanonModes, PermC>{std::move(a), std::move(b),
+                                               c_shape, std::move(hook)};
 }
+
+}  // namespace Impl
+
+// Primary form: infer the output scalar from NodeA, default execution space.
+//   make_contraction_node<'l','i'>(a, b)
+template <int32_t... OutModes, typename NodeA, typename NodeB,
+          typename HookOp = NoHook>
+auto make_contraction_node(NodeA a, NodeB b, HookOp hook = {}) {
+  return Impl::make_contraction_node_impl<
+      typename NodeA::value_type, Kokkos::DefaultExecutionSpace, OutModes...>(
+      std::move(a), std::move(b), std::move(hook));
+}
+
+// Explicit scalar (and execution-space) override:
+//   make_contraction_node<double, Kokkos::DefaultExecutionSpace, 'i','k'>(a, b)
+template <typename Scalar, typename ExecSpace = Kokkos::DefaultExecutionSpace,
+          int32_t... OutModes, typename NodeA, typename NodeB,
+          typename HookOp = NoHook>
+auto make_contraction_node(NodeA a, NodeB b, HookOp hook = {}) {
+  return Impl::make_contraction_node_impl<Scalar, ExecSpace, OutModes...>(
+      std::move(a), std::move(b), std::move(hook));
+}
+
+// ---------------------------------------------------------------------------
+// canonicalize_input — present an operand in the GEMM's canonical axis order.
+//
+// Identity permutation returns the node unchanged (native layout, fast staging
+// path); otherwise the operand's data is wrapped in a zero-copy PermutedView
+// carrying canonical labels. Only input operands may be permuted (permuted
+// nested/intermediate operands are a follow-up).
+// ---------------------------------------------------------------------------
+namespace Impl {
+
+template <typename Node, int... Perm>
+KOKKOS_FUNCTION auto canonicalize_input(
+    const Node& node, std::integer_sequence<int, Perm...> perm) {
+  if constexpr (is_identity_seq(perm)) {
+    return node;
+  } else {
+    static_assert(has_node_tag_v<InputTag, Node>,
+                  "permuted non-input operands are not supported yet");
+    using PermSeq    = std::integer_sequence<int, Perm...>;
+    using CanonModes = gather_modes_seq_t<typename Node::modes_seq, PermSeq>;
+    auto pv          = permuted_alias(node.handle, perm);
+    return make_input_node(make_handle_seq(pv, CanonModes{}), node.hook_op);
+  }
+}
+
+}  // namespace Impl
 
 }  // namespace TensorOperations

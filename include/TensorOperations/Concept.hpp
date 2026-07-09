@@ -12,10 +12,6 @@ concept CallableWithNInts = requires(T t) {
   { t((void(Is), 0)...) };
 };
 
-template <typename T, std::size_t... Is>
-concept WritableWithNInts =
-    requires(T t) { t((void(Is), 0)...) = typename T::value_type{}; };
-
 // Helper traits expand the rank into an index sequence without using an
 // immediately-invoked lambda inside the concept. Lambdas embedded in concept
 // definitions are evaluated inconsistently by some compilers across
@@ -31,17 +27,6 @@ template <typename T>
 concept CallableWithRank = CallableWithRankImpl<
     T, std::make_index_sequence<static_cast<std::size_t>(T::rank)>>::value;
 
-template <typename T, typename Seq>
-struct WritableWithRankImpl : std::false_type {};
-
-template <typename T, std::size_t... Is>
-struct WritableWithRankImpl<T, std::index_sequence<Is...>>
-    : std::bool_constant<WritableWithNInts<T, Is...>> {};
-
-template <typename T>
-concept WritableWithRank = WritableWithRankImpl<
-    T, std::make_index_sequence<static_cast<std::size_t>(T::rank)>>::value;
-
 }  // namespace Impl
 
 template <typename T>
@@ -51,10 +36,5 @@ concept TensorLike = requires(T t) {
   t.data();
   { t.stride(0) } -> std::convertible_to<std::ptrdiff_t>;
 } && Impl::CallableWithRank<T>;
-
-template <typename T>
-concept WritableTensorLike = TensorLike<T> && requires {
-  typename T::value_type;
-} && Impl::WritableWithRank<T>;
 
 }  // namespace TensorOperations

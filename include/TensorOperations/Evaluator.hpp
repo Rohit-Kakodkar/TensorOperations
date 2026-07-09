@@ -1,5 +1,4 @@
 #pragma once
-#include <TensorOperations/Layout.hpp>
 #include <TensorOperations/NodeHandle.hpp>
 #include <TensorOperations/TiledLayout.hpp>
 #include <TensorOperations/Tiling.hpp>

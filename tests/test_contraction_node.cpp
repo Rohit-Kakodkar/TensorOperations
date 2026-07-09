@@ -47,38 +47,38 @@ static_assert(TensorLike<ATensor>);
 static_assert(TensorLike<BTensor>);
 
 TEST(ContractionNodeTest, ShapeAndModes) {
-  auto ha = make_handle(ATensor{}, std::array<int32_t, 3>{'i', 'j', 'k'});
-  auto hb = make_handle(BTensor{}, std::array<int32_t, 3>{'j', 'k', 'l'});
+  auto ha = make_handle<'i', 'j', 'k'>(ATensor{});
+  auto hb = make_handle<'j', 'k', 'l'>(BTensor{});
   auto na = make_input_node(ha);
   auto nb = make_input_node(hb);
 
   // Contract over {j, k} → C_{i,l} with shape (3, 6)
   auto nc =
-      make_contraction_node<float>(na, nb, std::array<int32_t, 2>{'i', 'l'});
+      make_contraction_node<float, Kokkos::DefaultExecutionSpace, 'i', 'l'>(na,
+                                                                            nb);
 
   static_assert(decltype(nc)::Rank == 2);
   static_assert(decltype(nc)::NumContracted == 2);
+  static_assert(std::is_same_v<decltype(nc)::modes_seq,
+                               std::integer_sequence<int32_t, 'i', 'l'>>);
 
   auto s = nc.shape();
   EXPECT_EQ(s[0], 3);
   EXPECT_EQ(s[1], 6);
-
-  auto m = nc.modes();
-  EXPECT_EQ(m[0], 'i');
-  EXPECT_EQ(m[1], 'l');
 }
 
 TEST(ContractionNodeTest, HookIsStored) {
-  auto ha = make_handle(ATensor{}, std::array<int32_t, 3>{'i', 'j', 'k'});
-  auto hb = make_handle(BTensor{}, std::array<int32_t, 3>{'j', 'k', 'l'});
+  auto ha = make_handle<'i', 'j', 'k'>(ATensor{});
+  auto hb = make_handle<'j', 'k', 'l'>(BTensor{});
   auto na = make_input_node(ha);
   auto nb = make_input_node(hb);
 
   [[maybe_unused]] bool hook_constructed = false;
   auto                  hook = [&](int, int) { hook_constructed = true; };
 
-  auto nc = make_contraction_node<float>(
-      na, nb, std::array<int32_t, 2>{'i', 'l'}, hook);
+  auto nc =
+      make_contraction_node<float, Kokkos::DefaultExecutionSpace, 'i', 'l'>(
+          na, nb, hook);
 
   static_assert(!std::is_same_v<decltype(nc)::hook_type, void>);
 }

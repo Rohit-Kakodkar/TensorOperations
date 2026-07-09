@@ -30,9 +30,9 @@ static_assert(!TensorLike<BadNoRank>);
 static_assert(!TensorLike<BadWrongArity>);
 
 TEST(ConceptTest, TensorHandleBasicOps) {
-  auto h = make_handle(Good2D{}, std::array<int32_t, 2>{'i', 'j'});
+  auto h = make_handle<'i', 'j'>(Good2D{});
+  static_assert(std::is_same_v<decltype(h)::modes_seq,
+                               std::integer_sequence<int32_t, 'i', 'j'>>);
   EXPECT_EQ(h.extent(0), 4);
   EXPECT_FLOAT_EQ(h(0, 0), 1.f);
-  EXPECT_EQ(h.modes[0], 'i');
-  EXPECT_EQ(h.modes[1], 'j');
 }

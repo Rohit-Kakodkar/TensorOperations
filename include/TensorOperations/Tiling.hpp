@@ -1,4 +1,5 @@
 #pragma once
+#include <TensorOperations/Permute.hpp>
 #include <TensorOperations/TileLayout.hpp>
 
 #include <Kokkos_Core.hpp>
@@ -129,6 +130,38 @@ auto build_static_tiled(std::index_sequence<P...>) -> std::conditional_t<
     StaticTileLayoutRight<TiledExtentAt<P, InnerFirst, Ext, Tile>::value...>>;
 
 }  // namespace Impl
+
+// ---------------------------------------------------------------------------
+// reorder_static_tile — gather-permute a StaticTile's extents.
+//
+// new tile axis i has extent E[Perm[i]] (gather convention, matching
+// reorder_layout / permuted_alias). Compile-time only; used to reorder an
+// operand's (or the output's) tile from user axis order into the canonical
+// [free.., contracted..] order the team GEMM expects.
+//
+//   reorder_static_tile(StaticTile<8,32,4>{}, integer_sequence<int,1,0,2>{})
+//       -> StaticTile<32, 8, 4>
+// ---------------------------------------------------------------------------
+template <int... E, int... Perm>
+KOKKOS_FUNCTION constexpr auto reorder_static_tile(
+    StaticTile<E...>, std::integer_sequence<int, Perm...>) noexcept
+    -> StaticTile<Impl::pack_at<static_cast<std::size_t>(Perm), E...>()...> {
+  static_assert(sizeof...(Perm) == sizeof...(E),
+                "reorder_static_tile: permutation rank must match tile rank");
+  return {};
+}
+
+// Identity-safe wrapper: the identity permutation returns the tile unchanged
+// (so canonical contractions keep their exact original tile type, and
+// non-static tiles are never reorder-instantiated).
+template <typename Tile, int... Perm>
+KOKKOS_FUNCTION auto reorder_tile_value(
+    const Tile& tile, std::integer_sequence<int, Perm...> perm) {
+  if constexpr (Impl::is_identity_seq(perm))
+    return tile;
+  else
+    return reorder_static_tile(tile, perm);
+}
 
 template <int... Extents, int... TileE>
 KOKKOS_FUNCTION constexpr auto tile_layout(StaticTileLayoutRight<Extents...>,
