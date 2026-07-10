@@ -104,6 +104,11 @@ struct NodeHandle<IntermTag, Storage, IntRank, ExecSpace, HookOp> {
 template <TensorLike T, typename ModesSeq, typename HookOp = NoHook>
 KOKKOS_FUNCTION NodeHandle<InputTag, T, ModesSeq, HookOp> make_input_node(
     TensorHandle<T, ModesSeq> h, HookOp hook = {}) {
+  static_assert(
+      std::same_as<HookOp, NoHook> ||
+          HookLike<HookOp, TensorHandle<T, ModesSeq>::Rank,
+                   typename Impl::value_type_of<T>::type>,
+      "input hook must be callable as op(i_0, ..., i_{Rank-1}, value_type&)");
   return {std::move(h), std::move(hook)};
 }
 
@@ -156,6 +161,10 @@ auto make_contraction_node_impl(NodeA a, NodeB b, HookOp hook) {
   constexpr int Rank = static_cast<int>(sizeof...(OutModes));
   static_assert((NodeA::Rank + NodeB::Rank - Rank) % 2 == 0,
                 "Output rank is inconsistent with input ranks");
+  static_assert(
+      std::same_as<HookOp, NoHook> || HookLike<HookOp, Rank, ActualScalar>,
+      "contraction hook must be callable as "
+      "op(i_0, ..., i_{Rank-1}, value_type&)");
 
   using AModes = typename NodeA::modes_seq;
   using BModes = typename NodeB::modes_seq;

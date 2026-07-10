@@ -133,7 +133,7 @@ TEST(GraphTest, HookPreservesType) {
   auto hB = make_input_node(make_handle<'j', 'k'>(B));
 
   [[maybe_unused]] int call_count = 0;
-  auto                 relu       = [&]() { ++call_count; };
+  auto                 relu       = [&](int, int, float&) { ++call_count; };
 
   auto nc = make_contraction_node<'i', 'k'>(hA, hB, relu);
 
@@ -415,7 +415,7 @@ TEST(GraphTest, PermutedOutputOnlyTeam) {
 // Input hooks are applied at load time, when the operand tile is staged into
 // scratch (contraction hooks are applied at store; see HookPreservesType).
 struct Doubler {
-  KOKKOS_FUNCTION float operator()(float v) const { return 2.0f * v; }
+  KOKKOS_FUNCTION void operator()(int, int, int, float& v) const { v *= 2.0f; }
 };
 
 TEST(GraphTest, InputHookAppliedTeam) {
@@ -445,6 +445,88 @@ TEST(GraphTest, InputHookAppliedTeam) {
   auto C_host = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, C);
   for (int i = 0; i < 16; ++i)
     for (int l = 0; l < 32; ++l) EXPECT_FLOAT_EQ(C_host(i, l), 32.0f);
+}
+
+struct WriteRowIndex {
+  KOKKOS_FUNCTION void operator()(int i, int, int, float& v) const {
+    v = static_cast<float>(i);
+  }
+};
+
+TEST(GraphTest, InputHookGlobalIndexAcrossTiles) {
+  // A's i mode splits into 3 load tiles (16 each; same tiling as
+  // MultiTileExecutionTeam). The hook ignores A's data and writes its own
+  // row index instead, so C[i,l] = sum_{j,k} i = 16*i holds only if the hook
+  // observed each element's *global* row index (i in [0,48)) rather than a
+  // tile-local one (which would reset to [0,16) on every tile and corrupt
+  // tiles 1 and 2).
+  using View2 = Kokkos::View<float**, Kokkos::LayoutRight>;
+  using View3 = Kokkos::View<float***, Kokkos::LayoutRight>;
+  View3 A("A", 48, 4, 4);
+  View3 B("B", 4, 4, 32);
+  View2 C("C", 48, 32);
+
+  Kokkos::deep_copy(A, 1.0f);
+  Kokkos::deep_copy(B, 1.0f);
+  Kokkos::deep_copy(C, 0.0f);
+
+  auto hA = make_input_node(make_handle<'i', 'j', 'k'>(A), WriteRowIndex{});
+  auto hB = make_input_node(make_handle<'j', 'k', 'l'>(B));
+
+  auto g        = make_graph();
+  auto [g1, o1] = g.ops(make_contraction_node<'i', 'l'>(hA, hB));
+
+  g1.execute(
+      TeamPolicyTag<>{},
+      Tile<StaticTile<16, 2, 4>, StaticTile<2, 4, 32>, StaticTile<16, 32>>{},
+      C);
+
+  auto C_host = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, C);
+  for (int i = 0; i < 48; ++i)
+    for (int l = 0; l < 32; ++l)
+      EXPECT_FLOAT_EQ(C_host(i, l), 16.0f * static_cast<float>(i))
+          << "i=" << i << " l=" << l;
+}
+
+struct WriteOutputIndex {
+  KOKKOS_FUNCTION void operator()(int i, int l, float& v) const {
+    v = static_cast<float>(i) * 100.0f + static_cast<float>(l);
+  }
+};
+
+TEST(GraphTest, ContractionHookGlobalIndexAcrossTiles) {
+  // C's i mode splits into 3 store tiles (16 each). The hook ignores the
+  // computed contraction value and writes an index-encoded value instead, so
+  // C[i,l] == 100*i+l holds only if the store hook saw each element's
+  // *global* output coordinate rather than a tile-local one.
+  using View2 = Kokkos::View<float**, Kokkos::LayoutRight>;
+  using View3 = Kokkos::View<float***, Kokkos::LayoutRight>;
+  View3 A("A", 48, 4, 4);
+  View3 B("B", 4, 4, 32);
+  View2 C("C", 48, 32);
+
+  Kokkos::deep_copy(A, 1.0f);
+  Kokkos::deep_copy(B, 1.0f);
+  Kokkos::deep_copy(C, 0.0f);
+
+  auto hA = make_input_node(make_handle<'i', 'j', 'k'>(A));
+  auto hB = make_input_node(make_handle<'j', 'k', 'l'>(B));
+
+  auto g = make_graph();
+  auto [g1, o1] =
+      g.ops(make_contraction_node<'i', 'l'>(hA, hB, WriteOutputIndex{}));
+
+  g1.execute(
+      TeamPolicyTag<>{},
+      Tile<StaticTile<16, 2, 4>, StaticTile<2, 4, 32>, StaticTile<16, 32>>{},
+      C);
+
+  auto C_host = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, C);
+  for (int i = 0; i < 48; ++i)
+    for (int l = 0; l < 32; ++l)
+      EXPECT_FLOAT_EQ(C_host(i, l),
+                      static_cast<float>(i) * 100.0f + static_cast<float>(l))
+          << "i=" << i << " l=" << l;
 }
 
 int main(int argc, char* argv[]) {

@@ -74,7 +74,7 @@ TEST(ContractionNodeTest, HookIsStored) {
   auto nb = make_input_node(hb);
 
   [[maybe_unused]] bool hook_constructed = false;
-  auto                  hook = [&](int, int) { hook_constructed = true; };
+  auto hook = [&](int, int, float&) { hook_constructed = true; };
 
   auto nc =
       make_contraction_node<float, Kokkos::DefaultExecutionSpace, 'i', 'l'>(

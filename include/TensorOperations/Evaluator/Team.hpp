@@ -91,7 +91,8 @@ struct Evaluator<TeamPolicyTag<ES>, NodeHandle<InputTag, T, ModesSeq, HookOp>,
                        g_timing_stats.scratch_input_load_count);
     // Canonical tile index -> native (operand-order) tile index; identity
     // scatter for non-permuted operands.
-    fill_team(team, Impl::scatter_index(tile_idx, perm_seq{}), scratch_);
+    fill_team(team, Impl::scatter_index(tile_idx, perm_seq{}), tile_idx,
+              scratch_);
     TIMING_SCOPE_EXIT(g_timing_stats.scratch_input_load_time,
                       g_timing_stats.scratch_input_load_count);
     return result_;
@@ -120,6 +121,7 @@ struct Evaluator<TeamPolicyTag<ES>, NodeHandle<InputTag, T, ModesSeq, HookOp>,
 
   KOKKOS_FUNCTION void fill_team(const team_member_t&            team,
                                  const Kokkos::Array<int, Rank>& native_idx,
+                                 const Kokkos::Array<int, Rank>& tile_idx,
                                  const scratch_view_t&           result) const {
     const auto sv0       = subview_tile(tiled_input_, native_idx);  // ordered
     const auto sv        = reorder_view(sv0, perm_seq{});           // canonical
@@ -127,8 +129,13 @@ struct Evaluator<TeamPolicyTag<ES>, NodeHandle<InputTag, T, ModesSeq, HookOp>,
     const auto total     = sv.size();
     const auto hook = node.hook_op;  // local copy: lambda captures no `this`
     Kokkos::parallel_for(Kokkos::TeamVectorRange(team, total), [=](int i) {
-      const auto coord = sv_layout[i];
-      result[coord]    = Impl::apply_hook(hook, sv[coord]);
+      const auto               coord = sv_layout[i];
+      Kokkos::Array<int, Rank> gidx{};
+      for (int d = 0; d < Rank; ++d)
+        gidx[d] = tile_idx[d] * sv.extent(d) + coord[d];
+      auto v = sv[coord];
+      Impl::apply_hook(hook, gidx, v);
+      result[coord] = v;
     });
   }
 };
@@ -509,8 +516,13 @@ struct Evaluator<
     const auto sv_layout = sv.layout();
     const auto total     = sv.size();
     Kokkos::parallel_for(Kokkos::TeamVectorRange(team, total), [=](int i) {
-      const auto coord = sv_layout[i];
-      sv[coord]        = Impl::apply_hook(hook, scratch[coord]);
+      const auto               coord = sv_layout[i];
+      Kokkos::Array<int, Rank> gidx{};
+      for (int d = 0; d < Rank; ++d)
+        gidx[d] = tile_idx[d] * sv.extent(d) + coord[d];
+      auto v = scratch[coord];
+      Impl::apply_hook(hook, gidx, v);
+      sv[coord] = v;
     });
     TIMING_SCOPE_EXIT(g_timing_stats.store_write_time,
                       g_timing_stats.store_write_count);

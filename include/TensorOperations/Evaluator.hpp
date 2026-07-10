@@ -26,15 +26,28 @@ struct TeamPolicyTag {
 // ---------------------------------------------------------------------------
 namespace Impl {
 
-// Apply an input node's hook at load time. NoHook is the identity.
-template <typename Op, typename V>
-KOKKOS_FORCEINLINE_FUNCTION V apply_hook(const Op& op, V v) {
-  return op(v);
+// Apply a hook (input load-time or contraction store-time) to the element at
+// a given global coordinate. Every hook takes one index per rank followed by
+// the element by mutable reference: op(idx[0], ..., idx[Rank-1], v). NoHook
+// is the no-op identity.
+template <typename Op, std::size_t Rank, typename V, std::size_t... Is>
+KOKKOS_FORCEINLINE_FUNCTION void apply_hook_expand(
+    const Op& op, const Kokkos::Array<int, Rank>& idx, V& v,
+    std::index_sequence<Is...>) {
+  op(idx[Is]..., v);
 }
-template <typename V>
-KOKKOS_FORCEINLINE_FUNCTION V apply_hook(const NoHook&, V v) {
-  return v;
+
+template <typename Op, std::size_t Rank, typename V>
+KOKKOS_FORCEINLINE_FUNCTION void apply_hook(const Op&                       op,
+                                            const Kokkos::Array<int, Rank>& idx,
+                                            V&                              v) {
+  apply_hook_expand(op, idx, v, std::make_index_sequence<Rank>{});
 }
+
+template <std::size_t Rank, typename V>
+KOKKOS_FORCEINLINE_FUNCTION void apply_hook(const NoHook&,
+                                            const Kokkos::Array<int, Rank>&,
+                                            V&) {}
 
 }  // namespace Impl
 
