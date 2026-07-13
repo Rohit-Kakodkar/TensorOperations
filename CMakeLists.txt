@@ -94,6 +94,10 @@ if(TENSOR_OPS_BUILD_BENCHMARKS)
     benchmarks/team_contraction/bench_team_contraction.cpp)
   target_link_libraries(bench_team_contraction PRIVATE tensor)
 
+  add_executable(bench_multilevel_contraction
+    benchmarks/multilevel_contraction/bench_multilevel_contraction.cpp)
+  target_link_libraries(bench_multilevel_contraction PRIVATE tensor)
+
   add_executable(bench_permuted_contraction
     benchmarks/permuted_contraction/bench_permuted_contraction.cpp)
   target_link_libraries(bench_permuted_contraction PRIVATE tensor)

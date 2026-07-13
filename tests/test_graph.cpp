@@ -48,9 +48,8 @@ TEST(GraphTest, SingleContractionNode) {
   auto hA = make_input_node(make_handle<'i', 'j', 'k'>(A));
   auto hB = make_input_node(make_handle<'j', 'k', 'l'>(B));
 
-  auto g          = make_graph();
-  auto [g1, out1] = g.ops(make_contraction_node<'i', 'l'>(hA, hB));
-  auto [T1]       = out1;
+  auto g        = make_graph();
+  auto [g1, T1] = g.ops(make_contraction_node<'i', 'l'>(hA, hB));
 
   static_assert(decltype(T1)::Rank == 2);
   static_assert(decltype(T1)::NumContracted == 2);
@@ -82,15 +81,13 @@ TEST(GraphTest, MultiLevelChain) {
 
   auto g = make_graph();
 
-  auto [g1, lvl1] = g.ops(make_contraction_node<'i', 'j'>(hA, hB),
-                          make_contraction_node<'p', 's'>(hC, hD));
-  auto [T1, T2]   = lvl1;
+  auto [g1, T1, T2] = g.ops(make_contraction_node<'i', 'j'>(hA, hB),
+                            make_contraction_node<'p', 's'>(hC, hD));
 
   static_assert(decltype(T1)::Rank == 2);
   static_assert(decltype(T2)::Rank == 2);
 
-  auto [g2, lvl2] = g1.ops(make_contraction_node<'i', 'j', 'p', 's'>(T1, T2));
-  auto [T3]       = lvl2;
+  auto [g2, T3] = g1.ops(make_contraction_node<'i', 'j', 'p', 's'>(T1, T2));
 
   static_assert(decltype(T3)::Rank == 4);
   static_assert(decltype(T3)::NumContracted == 0);  // outer product
@@ -166,8 +163,7 @@ TEST(GraphTest, SingleContractionExecutionTeam) {
   auto hB = make_input_node(make_handle<'j', 'k', 'l'>(B));
 
   auto g        = make_graph();
-  auto [g1, o1] = g.ops(make_contraction_node<'i', 'l'>(hA, hB));
-  auto [T1]     = o1;
+  auto [g1, T1] = g.ops(make_contraction_node<'i', 'l'>(hA, hB));
 
   // One team, one tile: A[i,j,k], B[j,k,l], C[i,l] each cover the full extent.
   g1.execute(
@@ -199,8 +195,7 @@ TEST(GraphTest, MultiTileExecutionTeam) {
   auto hB = make_input_node(make_handle<'j', 'k', 'l'>(B));
 
   auto g        = make_graph();
-  auto [g1, o1] = g.ops(make_contraction_node<'i', 'l'>(hA, hB));
-  auto [T1]     = o1;
+  auto [g1, T1] = g.ops(make_contraction_node<'i', 'l'>(hA, hB));
 
   // A[i=48,j=4,k=4], B[j=4,k=4,l=32], C[i=48,l=32]: i → 3 tiles, j → 2 tiles
   // (all divide their extents). Per output tile SA=16, SB=32; per accumulation
@@ -250,8 +245,7 @@ TEST(GraphTest, NonSquareNonSymmetricTeam) {
   auto hA       = make_input_node(make_handle<'i', 'j', 'k'>(A));
   auto hB       = make_input_node(make_handle<'j', 'k', 'l'>(B));
   auto g        = make_graph();
-  auto [g1, o1] = g.ops(make_contraction_node<'i', 'l'>(hA, hB));
-  auto [T1]     = o1;
+  auto [g1, T1] = g.ops(make_contraction_node<'i', 'l'>(hA, hB));
 
   g1.execute(
       TeamPolicyTag<>{},
@@ -527,6 +521,221 @@ TEST(GraphTest, ContractionHookGlobalIndexAcrossTiles) {
       EXPECT_FLOAT_EQ(C_host(i, l),
                       static_cast<float>(i) * 100.0f + static_cast<float>(l))
           << "i=" << i << " l=" << l;
+}
+
+TEST(GraphTest, FusedTwoLevelSingleTileTeam) {
+  // Fused chain E = (A·B)·D in one kernel, no materialized intermediate. The
+  // intermediate M = A·B fits a single tile at every level, so there is no
+  // recompute. M[i,j] = sum_k A[i,k] B[k,j]; E[i,l] = sum_j M[i,j] D[j,l].
+  // Non-symmetric, non-square data + an independent host reference guard the
+  // class of transpose/index bug that all-ones inputs cannot detect.
+  //
+  // Tiles satisfy the register-GEMM divisibility contract at BOTH levels:
+  // inner GEMM A[I,K]·B[K,J] and outer GEMM M[I,J]·D[J,L] each need
+  // SA%MT(8)==0, SK%NT(8)==0, SB%NR(2*W, =32 on AVX-512)==0. With I=16, K=8,
+  // J=32, L=32: inner (SA=16,SK=8,SB=32) and outer (SA=16,SK=32,SB=32) all
+  // pass.
+  using View2     = Kokkos::View<float**, Kokkos::LayoutRight>;
+  constexpr int I = 16, K = 8, J = 32, L = 32;
+  View2         A("A", I, K);
+  View2         B("B", K, J);
+  View2         D("D", J, L);
+  View2         E("E", I, L);
+
+  auto Ah = Kokkos::create_mirror_view(A);
+  auto Bh = Kokkos::create_mirror_view(B);
+  auto Dh = Kokkos::create_mirror_view(D);
+  for (int i = 0; i < I; ++i)
+    for (int k = 0; k < K; ++k)
+      Ah(i, k) = static_cast<float>((i + 2 * k) % 5 + 1) * 0.5f;
+  for (int k = 0; k < K; ++k)
+    for (int j = 0; j < J; ++j)
+      Bh(k, j) = static_cast<float>((3 * k + j) % 4 + 1) * 0.25f;
+  for (int j = 0; j < J; ++j)
+    for (int l = 0; l < L; ++l)
+      Dh(j, l) = static_cast<float>((j + 2 * l) % 3 + 1) * 0.5f;
+  Kokkos::deep_copy(A, Ah);
+  Kokkos::deep_copy(B, Bh);
+  Kokkos::deep_copy(D, Dh);
+  Kokkos::deep_copy(E, 0.0f);
+
+  auto hA = make_input_node(make_handle<'i', 'k'>(A));
+  auto hB = make_input_node(make_handle<'k', 'j'>(B));
+  auto hD = make_input_node(make_handle<'j', 'l'>(D));
+
+  auto M = make_contraction_node<'i', 'j'>(hA, hB);  // sum_k
+  auto g = make_graph();
+  [[maybe_unused]] auto [g1, E_node] =
+      g.ops(make_contraction_node<'i', 'l'>(M, hD));  // sum_j
+
+  // Flat tile list: one Tile<A,B,C> bundle per contraction, in pre-order
+  // (top E=M·D, then inner M=A·B). The top's A-slot (M's tile) must match M's
+  // output tile (BundleM.c); execute() assembles these into the nested form.
+  using BundleTop = Tile<StaticTile<I, J>, StaticTile<J, L>, StaticTile<I, L>>;
+  using BundleM   = Tile<StaticTile<I, K>, StaticTile<K, J>, StaticTile<I, J>>;
+  g1.execute(TeamPolicyTag<>{}, std::make_tuple(BundleTop{}, BundleM{}), E);
+
+  auto Eh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, E);
+  for (int i = 0; i < I; ++i)
+    for (int l = 0; l < L; ++l) {
+      double acc = 0.0;
+      for (int j = 0; j < J; ++j) {
+        double m = 0.0;
+        for (int k = 0; k < K; ++k)
+          m += static_cast<double>(Ah(i, k)) * Bh(k, j);
+        acc += m * Dh(j, l);
+      }
+      EXPECT_NEAR(Eh(i, l), static_cast<float>(acc), 1e-2f)
+          << "i=" << i << " l=" << l;
+    }
+}
+
+TEST(GraphTest, FusedContractThenContractTeam) {
+  // Fused chain E = (A·B)·D where the intermediate M = A·B spans MULTIPLE tiles
+  // along the mode j that the outer contraction sums over. The parent k-loops
+  // over j-tiles, re-evaluating the M sub-contraction once per tile (recompute)
+  // on the same evaluator, so this exercises the re-runnable operator() with a
+  // fresh C-scratch per invocation. Missing re-zeroing would corrupt the second
+  // j-tile of M; the independent host reference catches that.
+  //
+  // M[i,j] = sum_k A[i,k] B[k,j];  E[i,l] = sum_j M[i,j] D[j,l]. J=64 with a
+  // j-tile of 32 gives 2 intermediate tiles. Register divisibility holds at
+  // both levels: inner (SA=16,SK=8,SB=32) and outer (SA=16,SK=32,SB=32).
+  using View2     = Kokkos::View<float**, Kokkos::LayoutRight>;
+  constexpr int I = 16, K = 8, J = 64, L = 32;
+  View2         A("A", I, K);
+  View2         B("B", K, J);
+  View2         D("D", J, L);
+  View2         E("E", I, L);
+
+  auto Ah = Kokkos::create_mirror_view(A);
+  auto Bh = Kokkos::create_mirror_view(B);
+  auto Dh = Kokkos::create_mirror_view(D);
+  for (int i = 0; i < I; ++i)
+    for (int k = 0; k < K; ++k)
+      Ah(i, k) = static_cast<float>((i + 2 * k) % 5 + 1) * 0.5f;
+  for (int k = 0; k < K; ++k)
+    for (int j = 0; j < J; ++j)
+      Bh(k, j) = static_cast<float>((3 * k + j) % 4 + 1) * 0.25f;
+  for (int j = 0; j < J; ++j)
+    for (int l = 0; l < L; ++l)
+      Dh(j, l) = static_cast<float>((j + 2 * l) % 3 + 1) * 0.5f;
+  Kokkos::deep_copy(A, Ah);
+  Kokkos::deep_copy(B, Bh);
+  Kokkos::deep_copy(D, Dh);
+  Kokkos::deep_copy(E, 0.0f);
+
+  auto hA = make_input_node(make_handle<'i', 'k'>(A));
+  auto hB = make_input_node(make_handle<'k', 'j'>(B));
+  auto hD = make_input_node(make_handle<'j', 'l'>(D));
+
+  auto M = make_contraction_node<'i', 'j'>(hA, hB);  // sum_k
+  auto g = make_graph();
+  [[maybe_unused]] auto [g1, E_node] =
+      g.ops(make_contraction_node<'i', 'l'>(M, hD));  // sum_j
+
+  // Flat tile list (pre-order: top E=M·D, then inner M=A·B). M's output tile
+  // (i=16, j=32) is smaller than M's j extent (64), so M spans 2 tiles along j;
+  // D's j-tile (32) matches so the parent's j-tile counts agree between the M
+  // and D operands.
+  using BundleTop =
+      Tile<StaticTile<I, 32>, StaticTile<32, L>, StaticTile<I, L>>;
+  using BundleM = Tile<StaticTile<I, K>, StaticTile<K, 32>, StaticTile<I, 32>>;
+  g1.execute(TeamPolicyTag<>{}, std::make_tuple(BundleTop{}, BundleM{}), E);
+
+  auto Eh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, E);
+  for (int i = 0; i < I; ++i)
+    for (int l = 0; l < L; ++l) {
+      double acc = 0.0;
+      for (int j = 0; j < J; ++j) {
+        double m = 0.0;
+        for (int k = 0; k < K; ++k)
+          m += static_cast<double>(Ah(i, k)) * Bh(k, j);
+        acc += m * Dh(j, l);
+      }
+      EXPECT_NEAR(Eh(i, l), static_cast<float>(acc), 1e-2f)
+          << "i=" << i << " l=" << l;
+    }
+}
+
+TEST(GraphTest, FusedBothOperandsContractionTeam) {
+  // Fused chain where BOTH operands of the top contraction are themselves
+  // contractions: T3 = (A·B)·(C·D), contracting the shared mode m.
+  //   T1 = A·B -> [i,m] (sum_k),  T2 = C·D -> [m,j] (sum_p),
+  //   T3 = T1·T2 -> [i,j] (sum_m).
+  // Exercises stage_a_ AND stage_b_ both resolving to the contraction evaluator
+  // (two nested sub-contraction stagers, summed scratch, nested barriers).
+  // Non-symmetric data + host reference guard transpose/index bugs.
+  //
+  // Dims i=16,k=8,m=32,p=8,j=32 satisfy register divisibility at all three
+  // GEMMs: T1 (SA=16,SK=8,SB=32), T2 (SA=32,SK=8,SB=32), top
+  // (SA=16,SK=32,SB=32).
+  using View2     = Kokkos::View<float**, Kokkos::LayoutRight>;
+  constexpr int I = 16, K = 8, M = 32, P = 8, J = 32;
+  View2         A("A", I, K);
+  View2         B("B", K, M);
+  View2         C("C", M, P);
+  View2         D("D", P, J);
+  View2         T3("T3", I, J);
+
+  auto Ah = Kokkos::create_mirror_view(A);
+  auto Bh = Kokkos::create_mirror_view(B);
+  auto Ch = Kokkos::create_mirror_view(C);
+  auto Dh = Kokkos::create_mirror_view(D);
+  for (int i = 0; i < I; ++i)
+    for (int k = 0; k < K; ++k)
+      Ah(i, k) = static_cast<float>((i + 2 * k) % 5 + 1) * 0.5f;
+  for (int k = 0; k < K; ++k)
+    for (int m = 0; m < M; ++m)
+      Bh(k, m) = static_cast<float>((3 * k + m) % 4 + 1) * 0.25f;
+  for (int m = 0; m < M; ++m)
+    for (int p = 0; p < P; ++p)
+      Ch(m, p) = static_cast<float>((m + 2 * p) % 3 + 1) * 0.5f;
+  for (int p = 0; p < P; ++p)
+    for (int j = 0; j < J; ++j)
+      Dh(p, j) = static_cast<float>((2 * p + j) % 5 + 1) * 0.25f;
+  Kokkos::deep_copy(A, Ah);
+  Kokkos::deep_copy(B, Bh);
+  Kokkos::deep_copy(C, Ch);
+  Kokkos::deep_copy(D, Dh);
+  Kokkos::deep_copy(T3, 0.0f);
+
+  auto hA = make_input_node(make_handle<'i', 'k'>(A));
+  auto hB = make_input_node(make_handle<'k', 'm'>(B));
+  auto hC = make_input_node(make_handle<'m', 'p'>(C));
+  auto hD = make_input_node(make_handle<'p', 'j'>(D));
+
+  auto T1 = make_contraction_node<'i', 'm'>(hA, hB);  // sum_k
+  auto T2 = make_contraction_node<'m', 'j'>(hC, hD);  // sum_p
+  auto g  = make_graph();
+  [[maybe_unused]] auto [g1, T3_node] =
+      g.ops(make_contraction_node<'i', 'j'>(T1, T2));  // sum_m
+
+  // Flat tile list, pre-order: top T3=T1·T2, then T1=A·B, then T2=C·D. Both of
+  // the top's operand slots must match the sub-contractions' output tiles
+  // (BundleTop.a == BundleT1.c, BundleTop.b == BundleT2.c).
+  using BundleTop = Tile<StaticTile<I, M>, StaticTile<M, J>, StaticTile<I, J>>;
+  using BundleT1  = Tile<StaticTile<I, K>, StaticTile<K, M>, StaticTile<I, M>>;
+  using BundleT2  = Tile<StaticTile<M, P>, StaticTile<P, J>, StaticTile<M, J>>;
+  g1.execute(TeamPolicyTag<>{},
+             std::make_tuple(BundleTop{}, BundleT1{}, BundleT2{}), T3);
+
+  auto T3h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, T3);
+  for (int i = 0; i < I; ++i)
+    for (int j = 0; j < J; ++j) {
+      double acc = 0.0;
+      for (int m = 0; m < M; ++m) {
+        double t1 = 0.0;
+        for (int k = 0; k < K; ++k)
+          t1 += static_cast<double>(Ah(i, k)) * Bh(k, m);
+        double t2 = 0.0;
+        for (int p = 0; p < P; ++p)
+          t2 += static_cast<double>(Ch(m, p)) * Dh(p, j);
+        acc += t1 * t2;
+      }
+      EXPECT_NEAR(T3h(i, j), static_cast<float>(acc), 1e-2f)
+          << "i=" << i << " j=" << j;
+    }
 }
 
 int main(int argc, char* argv[]) {

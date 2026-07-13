@@ -15,6 +15,56 @@ namespace Impl {
 template <typename Node>
 using is_contraction = has_node_tag<ContractionTag, Node>;
 
+// Number of ContractionTag nodes in a node's subtree (itself + both operands).
+// Fixes the pre-order layout of a flat, per-contraction tile list.
+template <typename Node>
+constexpr std::size_t count_contractions() {
+  if constexpr (is_contraction<Node>::value)
+    return 1 + count_contractions<typename Node::node_a_type>() +
+           count_contractions<typename Node::node_b_type>();
+  else
+    return 0;
+}
+
+// Assemble the nested per-operand tile structure the contraction evaluator
+// consumes from a FLAT, pre-order list of per-contraction Tile<A,B,C> bundles
+// (one bundle per ContractionTag node; order: node, then A-subtree, then
+// B-subtree). Each contraction's own bundle.c is its output tile; an operand
+// that is itself a contraction contributes a nested Tile whose bundle governs,
+// so the parent bundle's slot for that operand must match (checked below). Leaf
+// (input) operands take the parent bundle's .a/.b tile directly.
+template <std::size_t Offset, typename Node, typename Tuple>
+auto assemble_tile(const Node& node, const Tuple& tiles);
+
+template <std::size_t Offset, typename OpNode, typename LeafTile,
+          typename Tuple>
+auto assemble_operand(const OpNode& op, const LeafTile& leaf,
+                      const Tuple& tiles) {
+  if constexpr (is_contraction<OpNode>::value) {
+    auto nested = assemble_tile<Offset>(op, tiles);
+    static_assert(
+        std::is_same_v<LeafTile, decltype(output_tile(nested))>,
+        "flat tile list: a parent's operand tile must equal the fused "
+        "sub-contraction's output tile (bundle.c)");
+    return nested;
+  } else {
+    return leaf;
+  }
+}
+
+template <std::size_t Offset, typename Node, typename Tuple>
+auto assemble_tile(const Node& node, const Tuple& tiles) {
+  static_assert(is_contraction<Node>::value,
+                "assemble_tile expects a contraction node");
+  const auto&           bundle = std::get<Offset>(tiles);
+  constexpr std::size_t offB =
+      Offset + 1 + count_contractions<typename Node::node_a_type>();
+  auto a_spec = assemble_operand<Offset + 1>(node.node_a, bundle.a, tiles);
+  auto b_spec = assemble_operand<offB>(node.node_b, bundle.b, tiles);
+  return Tile<decltype(a_spec), decltype(b_spec), decltype(bundle.c)>{
+      a_spec, b_spec, bundle.c};
+}
+
 // Row-major decode of a linear work-item index into per-mode tile indices.
 // Returns 0-based tile coordinates (not element offsets) along each free mode.
 template <int Rank, typename Tile>
@@ -112,13 +162,16 @@ struct Graph {
   Graph() = default;
 
   // Register any mix of node handles (InputNode, ContractionNode, etc.).
-  // Returns a new Graph storing the outputs and the same tuple for structured
-  // binding decomposition.
+  // Returns a flattened tuple {new Graph, node_0, ..., node_{N-1}} so callers
+  // bind the graph and every output node in one structured-binding step:
+  //   auto [g1, T1, T2] = g.ops(con1, con2);
+  // The new Graph stores the same node tuple as its outputs; the returned nodes
+  // are lightweight handles (no tensor data is copied).
   template <typename... Nodes>
   auto ops(Nodes&&... nodes) const {
     auto node_tuple = std::make_tuple(nodes...);
-    return std::pair{Graph<decltype(node_tuple)>(node_tuple),
-                     std::move(node_tuple)};
+    using G         = Graph<decltype(node_tuple)>;
+    return std::tuple_cat(std::make_tuple(G(node_tuple)), node_tuple);
   }
 
   // Evaluate the graph and write each output into the corresponding view.
@@ -136,6 +189,23 @@ struct Graph {
     }(std::make_index_sequence<N>{});
 
     return wk_items;
+  }
+
+  // Flat tile-list form for fused chains: one Tile<A,B,C> bundle per
+  // contraction node, in pre-order (node, then A-subtree, then B-subtree). The
+  // bundles are assembled into the nested per-operand tile the evaluator
+  // consumes, so the caller writes a flat list rather than a hand-nested Tile.
+  // Single output.
+  template <typename ES, typename... Bundles, TensorLike... Ts>
+  int execute(const TeamPolicyTag<ES>&, const std::tuple<Bundles...>& tiles,
+              const Ts&... ts) const {
+    static_assert(std::tuple_size_v<OutputTuple> == 1,
+                  "flat tile-list execute supports a single output node");
+    static_assert(sizeof...(Ts) == 1, "exactly one output view is required");
+    const auto& out    = std::get<0>(outputs);
+    const auto  nested = Impl::assemble_tile<0>(out, tiles);
+    auto        views  = std::tie(ts...);
+    return Impl::execute_one_output_team(out, std::get<0>(views), nested);
   }
 
  private:

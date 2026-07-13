@@ -2,6 +2,37 @@
 // Included from within TensorOperations namespace by Evaluator.hpp
 
 namespace Impl {
+// Ceil-division. The template form binds the divisor at compile time so the
+// compiler lowers it to a multiply-shift instead of a runtime integer division
+// (expensive on GPU); the runtime form is used only when the divisor genuinely
+// isn't known (dynamic tiles).
+template <int Divisor>
+KOKKOS_FORCEINLINE_FUNCTION int ceil_div(int n) noexcept {
+  static_assert(Divisor > 0, "ceil_div divisor must be positive");
+  return (n + Divisor - 1) / Divisor;
+}
+KOKKOS_FORCEINLINE_FUNCTION int ceil_div(int n, int divisor) noexcept {
+  return (n + divisor - 1) / divisor;
+}
+
+// Number of tiles that cover extent `ext` along dim `d` of `tile`. For a static
+// tile the divisor is compile-time, so we pick the matching dim's constexpr
+// extent (keeping the cheap multiply-shift); dynamic tiles use a runtime
+// divide.
+template <typename Tile>
+KOKKOS_FUNCTION int tile_count_along(const Tile& tile, int d,
+                                     int ext) noexcept {
+  if constexpr (Tile::is_static) {
+    int n = 0;
+    [&]<int... Ds>(std::integer_sequence<int, Ds...>) {
+      ((d == Ds ? (n = ceil_div<Tile::extent(Ds)>(ext)) : 0), ...);
+    }(std::make_integer_sequence<int, Tile::rank>{});
+    return n;
+  } else {
+    return ceil_div(ext, tile.extent(d));
+  }
+}
+
 // --- staging operand canonicalization (native subview -> reorder) ----------
 //
 // A permuted input operand is presented to the contraction as a PermutedView
@@ -171,9 +202,16 @@ struct Evaluator<TeamPolicyTag<ES>,
   static_assert(FreeA + FreeB == RankC,
                 "free-mode counts must sum to the output rank");
 
-  // Check Tile ranks match node ranks
-  static_assert(TileA::rank == RankA, "TileA rank must match node A");
-  static_assert(TileB::rank == RankB, "TileB rank must match node B");
+  // The free-mode (output) tile of each operand: the tile itself for an input
+  // operand, or the fused sub-contraction's output tile for a contraction
+  // operand. GEMM sizing and the reshape below read these leaf tiles uniformly
+  // via output_tile() (identity for a leaf, `.c` for a nested Tile bundle).
+  using a_out_tile_t = decltype(output_tile(std::declval<TileA>()));
+  using b_out_tile_t = decltype(output_tile(std::declval<TileB>()));
+
+  // Check operand output-tile ranks match node ranks
+  static_assert(a_out_tile_t::rank == RankA, "TileA rank must match node A");
+  static_assert(b_out_tile_t::rank == RankB, "TileB rank must match node B");
   static_assert(TileC::rank == RankC, "TileC rank must match output rank");
 
   // Per-operand permutations from user axis order into the GEMM's canonical
@@ -186,6 +224,20 @@ struct Evaluator<TeamPolicyTag<ES>,
   using permB_seq =
       Impl::permB_seq_t<typename NA::modes_seq, typename NB::modes_seq>;
   using permC_seq = PermCSeq;
+
+  // v1 fused chaining: a contraction operand must already sit in the parent's
+  // canonical position (identity permA/permB), so no permuted-intermediate
+  // handling is needed yet. Relabel so the parent's contracted modes come last
+  // in the sub-contraction's output. (Permuting a nested operand is a later
+  // follow-up; input operands may still be permuted as before.)
+  static_assert(!Impl::has_node_tag_v<ContractionTag, NA> ||
+                    Impl::is_identity_seq(permA_seq{}),
+                "fused contraction operand A must be in canonical position "
+                "(identity permA)");
+  static_assert(!Impl::has_node_tag_v<ContractionTag, NB> ||
+                    Impl::is_identity_seq(permB_seq{}),
+                "fused contraction operand B must be in canonical position "
+                "(identity permB)");
 
   using na_canon_t =
       decltype(Impl::canonicalize_input(std::declval<NA>(), permA_seq{}));
@@ -217,7 +269,7 @@ struct Evaluator<TeamPolicyTag<ES>,
   tile_c_canon_t c_tile_;
   stage_a_type   stage_a_;
   stage_b_type   stage_b_;
-  scratch_view_t c_scratch_;
+  scratch_view_t scratch_;
   result_type    result_;
 
   KOKKOS_FUNCTION Evaluator(node_type n, tiling_type t,
@@ -230,19 +282,23 @@ struct Evaluator<TeamPolicyTag<ES>,
             Impl::canonicalize_input(n.node_a, permA_seq{}), a_tile_, team)),
         stage_b_(make_evaluator<TeamPolicyTag<ES>>(
             Impl::canonicalize_input(n.node_b, permB_seq{}), b_tile_, team)),
-        c_scratch_(alloc_c_scratch(team)) {
-    auto c = c_scratch_;
-    Kokkos::parallel_for(Kokkos::TeamVectorRange(team, c.size()),
-                         [c](int i) { c.data()[i] = S{0}; });
-    team.team_barrier();
+        scratch_(alloc_scratch(team)) {
     result_.hook_op  = node.hook_op;
-    result_.storage_ = c_scratch_;
+    result_.storage_ = scratch_;
   }
 
   KOKKOS_FUNCTION result_type operator()(
       const team_member_t& team, Kokkos::Array<int, Rank> tile_idx) const {
     TIMING_SCOPE_ENTER(g_timing_stats.contraction_accum_time,
                        g_timing_stats.contraction_accum_count);
+    // Zero the output scratch at the start of every evaluation so this operator
+    // is re-runnable. A parent contraction re-invokes a fused operand once per
+    // contracted tile (recompute) on the same evaluator instance, and each run
+    // must accumulate from a clean C.
+    auto c = scratch_;
+    Kokkos::parallel_for(Kokkos::TeamVectorRange(team, c.size()),
+                         [c](int i) { c.data()[i] = S{0}; });
+    team.team_barrier();
     // Per-mode k-tile counts (from A's already-tiled outer extents) and their
     // product. Contracted tiles share single-buffered scratch, so the walk over
     // the linearized contracted-tile space is serialized by team barriers.
@@ -267,6 +323,14 @@ struct Evaluator<TeamPolicyTag<ES>,
     return result_;
   }
 
+  // Number of output tiles along canonical output dim d. Lets a parent
+  // contraction treat this evaluator as an operand stager for fused chaining:
+  // the parent reads its contracted-tile counts from here exactly as it does
+  // from the input stager's outer_extent_canon.
+  KOKKOS_FUNCTION int outer_extent_canon(int d) const noexcept {
+    return Impl::tile_count_along(c_tile_, d, node.shape()[d]);
+  }
+
   static std::size_t scratch_size_per_team(const tiling_type& t) {
     const auto        c_canon = reorder_tile_value(t.c, permC_seq{});
     const std::size_t c_sz = c_backing_t::shmem_size(static_cast<std::size_t>(
@@ -280,7 +344,7 @@ struct Evaluator<TeamPolicyTag<ES>,
 
  private:
   KOKKOS_FUNCTION scratch_view_t
-  alloc_c_scratch(const team_member_t& team) const {
+  alloc_scratch(const team_member_t& team) const {
     const auto  layout = make_tile_layout(c_tile_, LayoutRight{});
     c_backing_t backing(team.team_scratch(0),
                         static_cast<std::size_t>(layout.size()));
@@ -312,27 +376,29 @@ struct Evaluator<TeamPolicyTag<ES>,
     // View each operand's scratch as a 2D GEMM matrix: A[SA,SK], B[SK,SB],
     // C[SA,SB] (all row-major). For static tiles these carry compile-time
     // extents, and the register-tiled views below carry compile-time strides.
-    auto a = reshape(stage_a_.scratch_,
-                     prefix_product(a_tile_, rank_c<FreeA>));  // [SA,SK]
-    auto b = reshape(stage_b_.scratch_,
-                     prefix_product(b_tile_, rank_c<NumK>));  // [SK,SB]
+    auto a = reshape(
+        stage_a_.scratch_,
+        prefix_product(output_tile(a_tile_), rank_c<FreeA>));  // [SA,SK]
+    auto b =
+        reshape(stage_b_.scratch_,
+                prefix_product(output_tile(b_tile_), rank_c<NumK>));  // [SK,SB]
     auto c =
-        reshape(c_scratch_, prefix_product(c_tile_, rank_c<FreeA>));  // [SA,SB]
+        reshape(scratch_, prefix_product(c_tile_, rank_c<FreeA>));  // [SA,SB]
 
     int SA = [&]() {
-      if constexpr (TileA::is_static)
+      if constexpr (a_out_tile_t::is_static)
         return decltype(a)::layout_t::extent(0);
       else
         return a.extent(0);
     }();
     int SK = [&]() {
-      if constexpr (TileA::is_static)
+      if constexpr (a_out_tile_t::is_static)
         return decltype(a)::layout_t::extent(1);
       else
         return a.extent(1);
     }();
     int SB = [&]() {
-      if constexpr (TileB::is_static)
+      if constexpr (b_out_tile_t::is_static)
         return decltype(b)::layout_t::extent(1);
       else
         return b.extent(1);
@@ -369,7 +435,7 @@ struct Evaluator<TeamPolicyTag<ES>,
     // yields a zero outer extent (a hard error) or silently drops the remainder
     // (wrong results). Static tiles are rejected at compile time with clear
     // messages; dynamic tiles get the same guard at runtime in debug builds.
-    if constexpr (TileA::is_static) {
+    if constexpr (a_out_tile_t::is_static) {
       constexpr int SAs = decltype(a)::layout_t::extent(0);
       constexpr int SKs = decltype(a)::layout_t::extent(1);
       static_assert(
@@ -386,7 +452,7 @@ struct Evaluator<TeamPolicyTag<ES>,
       assert(SK >= NT && SK % NT == 0 &&
              "team GEMM: SK must be a multiple of the register depth NT");
     }
-    if constexpr (TileB::is_static) {
+    if constexpr (b_out_tile_t::is_static) {
       constexpr int SBs = decltype(b)::layout_t::extent(1);
       static_assert(
           SBs >= NR && SBs % NR == 0,
