@@ -49,6 +49,58 @@ KOKKOS_FORCEINLINE_FUNCTION void apply_hook(const NoHook&,
                                             const Kokkos::Array<int, Rank>&,
                                             V&) {}
 
+// Apply a pointwise combine op to N (homogeneous) operand values at a given
+// global coordinate, returning the combined result. Mirrors apply_hook's index
+// expansion but takes N values and yields fn's result — either a scalar or a
+// Kokkos::Array<V, M> for a multi-output combine:
+// fn(idx[0], ..., idx[Rank-1], vals[0], ..., vals[N-1]).
+template <typename Fn, std::size_t Rank, typename V, std::size_t N,
+          std::size_t... Is, std::size_t... Ks>
+KOKKOS_FORCEINLINE_FUNCTION auto apply_combine_expand(
+    const Fn& fn, const Kokkos::Array<int, Rank>& idx,
+    const Kokkos::Array<V, N>& vals, std::index_sequence<Is...>,
+    std::index_sequence<Ks...>) {
+  return fn(idx[Is]..., vals[Ks]...);
+}
+
+template <typename Fn, std::size_t Rank, typename V, std::size_t N>
+KOKKOS_FORCEINLINE_FUNCTION auto apply_combine(
+    const Fn& fn, const Kokkos::Array<int, Rank>& idx,
+    const Kokkos::Array<V, N>& vals) {
+  return apply_combine_expand(fn, idx, vals, std::make_index_sequence<Rank>{},
+                              std::make_index_sequence<N>{});
+}
+
+// Normalize a combine result to a Kokkos::Array<V, M> so the evaluator can
+// write output m uniformly. A scalar becomes a 1-element array; an array passes
+// through. V is the output scalar (the array element type).
+template <typename V, typename R>
+KOKKOS_FORCEINLINE_FUNCTION Kokkos::Array<V, 1> as_output_array(const R& r) {
+  return {static_cast<V>(r)};
+}
+template <typename V, typename U, std::size_t M>
+KOKKOS_FORCEINLINE_FUNCTION Kokkos::Array<V, M> as_output_array(
+    const Kokkos::Array<U, M>& r) {
+  Kokkos::Array<V, M> out{};
+  for (std::size_t m = 0; m < M; ++m) out[m] = static_cast<V>(r[m]);
+  return out;
+}
+
+// Normalize an evaluator result to Kokkos::Array<T, M> so the store loop can
+// index output m uniformly: a single interm handle (single-output evaluators)
+// becomes a 1-element array; a multi-output combine's array passes through.
+// Returns BY VALUE in both overloads — a const& pass-through would dangle when
+// called on the temporary returned by eval().
+template <typename T>
+KOKKOS_FORCEINLINE_FUNCTION Kokkos::Array<T, 1> as_result_array(const T& r) {
+  return {r};
+}
+template <typename T, std::size_t M>
+KOKKOS_FORCEINLINE_FUNCTION Kokkos::Array<T, M> as_result_array(
+    const Kokkos::Array<T, M>& r) {
+  return r;
+}
+
 }  // namespace Impl
 
 // ---------------------------------------------------------------------------

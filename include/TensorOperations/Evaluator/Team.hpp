@@ -33,6 +33,33 @@ KOKKOS_FUNCTION int tile_count_along(const Tile& tile, int d,
   }
 }
 
+// --- team-scratch tile allocation -------------------------------------------
+//
+// Every scratch-tier evaluator stages tiles as LayoutRight scratch views sized
+// by a tile spec. alloc_scratch_tile carves one such tile out of team scratch
+// (each call advances the team's scratch cursor); scratch_tile_bytes is the
+// matching per-tile contribution to scratch_size_per_team.
+template <typename ValueType, typename ES>
+using scratch_backing_t =
+    Kokkos::View<ValueType*, typename ES::scratch_memory_space,
+                 Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+
+template <typename ValueType, typename ES, typename Team, typename Tile>
+KOKKOS_FORCEINLINE_FUNCTION auto alloc_scratch_tile(const Team& team,
+                                                    const Tile& tile) {
+  const auto layout   = make_tile_layout(tile, LayoutRight{});
+  using tile_layout_t = std::decay_t<decltype(layout)>;
+  scratch_backing_t<ValueType, ES> backing(
+      team.team_scratch(0), static_cast<std::size_t>(layout.size()));
+  return ScratchView<ValueType, ES, tile_layout_t>{backing, layout};
+}
+
+template <typename ValueType, typename ES, typename Tile>
+std::size_t scratch_tile_bytes(const Tile& tile) {
+  return scratch_backing_t<ValueType, ES>::shmem_size(
+      static_cast<std::size_t>(make_tile_layout(tile, LayoutRight{}).size()));
+}
+
 // --- staging operand canonicalization (native subview -> reorder) ----------
 //
 // A permuted input operand is presented to the contraction as a PermutedView
@@ -71,11 +98,8 @@ struct Evaluator<TeamPolicyTag<ES>, NodeHandle<InputTag, T, ModesSeq, HookOp>,
   static constexpr int Rank = tiling_type::rank;
   using value_type          = typename node_type::value_type;
   using exec_space          = ES;
-  using scratch_space       = typename exec_space::scratch_memory_space;
   using tile_layout_t = decltype(make_tile_layout(std::declval<tiling_type>(),
                                                   std::declval<LayoutRight>()));
-  using backing_t     = Kokkos::View<value_type*, scratch_space,
-                                     Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
   using scratch_view_t = ScratchView<value_type, exec_space, tile_layout_t>;
   using interm_type =
       NodeHandle<IntermTag, scratch_view_t, std::integral_constant<int, Rank>,
@@ -112,7 +136,7 @@ struct Evaluator<TeamPolicyTag<ES>, NodeHandle<InputTag, T, ModesSeq, HookOp>,
         tiling(t),
         tiled_input_(tile_view(stg::get(n.handle),
                                reorder_tile_value(t, inv_perm_seq{}))),
-        scratch_(alloc_scratch(team)) {
+        scratch_(Impl::alloc_scratch_tile<value_type, exec_space>(team, t)) {
     result_.storage_ = scratch_;
   }
 
@@ -137,19 +161,10 @@ struct Evaluator<TeamPolicyTag<ES>, NodeHandle<InputTag, T, ModesSeq, HookOp>,
   }
 
   static std::size_t scratch_size_per_team(const tiling_type& t) {
-    const auto layout = make_tile_layout(t, LayoutRight{});
-    return backing_t::shmem_size(static_cast<std::size_t>(layout.size()));
+    return Impl::scratch_tile_bytes<value_type, exec_space>(t);
   }
 
  private:
-  KOKKOS_FUNCTION scratch_view_t
-  alloc_scratch(const team_member_t& team) const {
-    const auto layout = make_tile_layout(tiling, LayoutRight{});
-    backing_t  backing(team.team_scratch(0),
-                       static_cast<std::size_t>(layout.size()));
-    return {backing, layout};
-  }
-
   KOKKOS_FUNCTION void fill_team(const team_member_t&            team,
                                  const Kokkos::Array<int, Rank>& native_idx,
                                  const Kokkos::Array<int, Rank>& tile_idx,
@@ -188,9 +203,6 @@ struct Evaluator<TeamPolicyTag<ES>,
   static constexpr int Rank = node_type::Rank;
   using value_type          = S;
   using exec_space          = ES;
-  using scratch_space       = typename ES::scratch_memory_space;
-  using c_backing_t = Kokkos::View<value_type*, scratch_space,
-                                   Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
 
  private:
   static constexpr int RankC = Rank;
@@ -224,6 +236,13 @@ struct Evaluator<TeamPolicyTag<ES>,
   using permB_seq =
       Impl::permB_seq_t<typename NA::modes_seq, typename NB::modes_seq>;
   using permC_seq = PermCSeq;
+
+  static_assert((Impl::has_node_tag_v<InputTag, NA> ||
+                 Impl::has_node_tag_v<ContractionTag, NA>) &&
+                    (Impl::has_node_tag_v<InputTag, NB> ||
+                     Impl::has_node_tag_v<ContractionTag, NB>),
+                "contraction evaluator v1: operands must be input or fused "
+                "contraction nodes (combine operands are a follow-up)");
 
   // v1 fused chaining: a contraction operand must already sit in the parent's
   // canonical position (identity permA/permB), so no permuted-intermediate
@@ -282,7 +301,8 @@ struct Evaluator<TeamPolicyTag<ES>,
             Impl::canonicalize_input(n.node_a, permA_seq{}), a_tile_, team)),
         stage_b_(make_evaluator<TeamPolicyTag<ES>>(
             Impl::canonicalize_input(n.node_b, permB_seq{}), b_tile_, team)),
-        scratch_(alloc_scratch(team)) {
+        scratch_(
+            Impl::alloc_scratch_tile<value_type, exec_space>(team, c_tile_)) {
     result_.hook_op  = node.hook_op;
     result_.storage_ = scratch_;
   }
@@ -332,10 +352,8 @@ struct Evaluator<TeamPolicyTag<ES>,
   }
 
   static std::size_t scratch_size_per_team(const tiling_type& t) {
-    const auto        c_canon = reorder_tile_value(t.c, permC_seq{});
-    const std::size_t c_sz = c_backing_t::shmem_size(static_cast<std::size_t>(
-        make_tile_layout(c_canon, LayoutRight{}).size()));
-    return c_sz +
+    return Impl::scratch_tile_bytes<value_type, exec_space>(
+               reorder_tile_value(t.c, permC_seq{})) +
            stage_a_type::scratch_size_per_team(
                reorder_tile_value(t.a, permA_seq{})) +
            stage_b_type::scratch_size_per_team(
@@ -343,14 +361,6 @@ struct Evaluator<TeamPolicyTag<ES>,
   }
 
  private:
-  KOKKOS_FUNCTION scratch_view_t
-  alloc_scratch(const team_member_t& team) const {
-    const auto  layout = make_tile_layout(c_tile_, LayoutRight{});
-    c_backing_t backing(team.team_scratch(0),
-                        static_cast<std::size_t>(layout.size()));
-    return {backing, layout};
-  }
-
   // Stage one contracted tile of A and B into scratch and accumulate the block
   // product into C. The barriers bracket the shared-scratch reads/writes;
   // consecutive calls reuse the same scratch (no double buffering).
@@ -511,6 +521,199 @@ struct Evaluator<TeamPolicyTag<ES>,
                                      KE::simd_flag_default);
         });
     team.team_barrier();
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Specialization 5: TeamPolicyTag + CombineTag + Tile_  (pointwise scratch
+// tier)
+//
+// P{modes} = fn(A{modes}, B{modes}, ...), a pure per-coordinate combine over N
+// operands (no mode reduced). Structurally a stripped-down contraction
+// evaluator: stage each operand tile into scratch (reusing the input evaluator,
+// Specialization 2, which already handles permuted operands), then a single
+// TeamVectorRange applies fn per element into the output scratch tile — no
+// GEMM, no k-loop, no zeroing. Operands may be in any axis order; each is
+// gathered into the output (canonical) order via label_perm_seq +
+// canonicalize_input, exactly as the contraction evaluator canonicalizes A/B.
+// Tile_ is the single output tile: every operand and the output share this
+// canonical LayoutRight layout, so all scratch tiles align element-for-element.
+// The heterogeneous per-operand stagers live in a DeviceTuple; because all
+// their scratch views have the SAME type (same tile, same scalar), the combine
+// loop reads them from a homogeneous Kokkos::Array. fn receives the global
+// output coordinate: fn(i_0, ..., i_{Rank-1}, v_0, ..., v_{N-1}).
+//
+// Multi-output: when fn returns a Kokkos::Array<V, NumOut>, the evaluator
+// allocates NumOut output scratch tiles (all sharing the output tile layout)
+// and writes result component m into output m; operator() returns a
+// Kokkos::Array<interm_type, NumOut>. A scalar-returning fn is the NumOut == 1
+// case. Every output shares the node's modes, so there is a single output tile.
+// ---------------------------------------------------------------------------
+template <typename CombineFn, typename IntCRank, typename S, typename ES,
+          typename CModesSeq, typename IntNumOut, typename... Ops,
+          typename Tile_>
+struct Evaluator<TeamPolicyTag<ES>,
+                 NodeHandle<CombineTag, CombineFn, IntCRank, S, ES, CModesSeq,
+                            IntNumOut, Ops...>,
+                 Tile_> {
+  using node_type           = NodeHandle<CombineTag, CombineFn, IntCRank, S, ES,
+                                         CModesSeq, IntNumOut, Ops...>;
+  using tiling_type         = Tile_;
+  using policy_tag          = TeamPolicyTag<ES>;
+  static constexpr int Rank = node_type::Rank;
+  static constexpr int NumOps = node_type::NumOps;
+  static constexpr int NumOut = node_type::NumOut;
+  using value_type            = S;
+  using exec_space            = ES;
+  using tile_layout_t = decltype(make_tile_layout(std::declval<tiling_type>(),
+                                                  std::declval<LayoutRight>()));
+  using scratch_view_t = ScratchView<value_type, exec_space, tile_layout_t>;
+
+  static_assert((Impl::has_node_tag_v<InputTag, Ops> && ...),
+                "combine evaluator v1: operands must be input nodes (nested "
+                "contraction/combine operands are a follow-up)");
+  static_assert(tiling_type::rank == Rank,
+                "combine tile must carry one extent per output mode");
+
+  using ops_seq  = std::make_index_sequence<NumOps>;
+  using outs_seq = std::make_index_sequence<NumOut>;
+
+  // Per-operand (K) type helpers. Each operand is gathered into output
+  // (canonical) order (identity when already there) and staged with the SAME
+  // output tile Tile_, so no per-operand tile reorder is needed.
+  template <std::size_t K>
+  using op_node_t = tuple_element_t<K, typename node_type::ops_tuple_t>;
+  template <std::size_t K>
+  using perm_seq =
+      Impl::label_perm_seq_t<CModesSeq, typename op_node_t<K>::modes_seq>;
+  template <std::size_t K>
+  using canon_node_t = decltype(Impl::canonicalize_input(
+      std::declval<op_node_t<K>>(), perm_seq<K>{}));
+  template <std::size_t K>
+  using stage_t = Evaluator<TeamPolicyTag<ES>, canon_node_t<K>, tiling_type>;
+
+  // The heterogeneous tuple of per-operand stagers, DeviceTuple<stage_t<0>,
+  // ...>.
+  template <std::size_t... Ks>
+  static DeviceTuple<stage_t<Ks>...> stages_tuple_type(
+      std::index_sequence<Ks...>);
+  using stages_tuple_t = decltype(stages_tuple_type(ops_seq{}));
+
+  using interm_type =
+      NodeHandle<IntermTag, scratch_view_t, std::integral_constant<int, Rank>,
+                 exec_space, NoHook>;
+  // One interm per output; a scalar-returning fn is simply NumOut == 1.
+  using result_type   = Kokkos::Array<interm_type, NumOut>;
+  using team_member_t = typename Kokkos::TeamPolicy<exec_space>::member_type;
+
+  node_type      node;
+  tiling_type    tiling;  // the output tile (== canonical)
+  stages_tuple_t stages_;
+  Kokkos::Array<scratch_view_t, NumOut>
+      outs_;  // one output scratch tile / output
+
+  KOKKOS_FUNCTION Evaluator(node_type n, tiling_type t,
+                            const team_member_t& team)
+      : node(n),
+        tiling(t),
+        stages_(build_stages(n, t, team, ops_seq{})),
+        outs_(alloc_out_scratch(team, outs_seq{})) {}
+
+  KOKKOS_FUNCTION result_type operator()(
+      const team_member_t& team, Kokkos::Array<int, Rank> tile_idx) const {
+    // Stage every operand tile into its scratch (in output order); the barrier
+    // makes the staged reads visible before the combine.
+    stage_all(team, tile_idx, ops_seq{});
+    team.team_barrier();
+
+    // The per-operand scratch views are all the same type, so gather them into
+    // a homogeneous array indexed by operand in the combine loop.
+    const Kokkos::Array<scratch_view_t, NumOps> sv = gather_scratch(ops_seq{});
+    const Kokkos::Array<scratch_view_t, NumOut> outs =
+        outs_;                             // capture by value
+    const auto layout = outs[0].layout();  // all outputs share this layout
+    const auto total  = outs[0].size();
+    const auto f      = node.fn;  // local copy: lambda captures no `this`
+    Kokkos::parallel_for(Kokkos::TeamVectorRange(team, total), [=](int i) {
+      const auto               coord = layout[i];
+      Kokkos::Array<int, Rank> gidx{};
+      TENSOR_PRAGMA_UNROLL
+      for (int d = 0; d < Rank; ++d)
+        gidx[d] = tile_idx[d] * outs[0].extent(d) + coord[d];
+      Kokkos::Array<value_type, NumOps> vals{};
+      TENSOR_PRAGMA_UNROLL
+      for (int k = 0; k < NumOps; ++k) vals[k] = sv[k][coord];
+      // Normalize fn's result (scalar or Kokkos::Array) to NumOut components
+      // and scatter each into its output tile.
+      const Kokkos::Array<value_type, NumOut> r =
+          Impl::as_output_array<value_type>(Impl::apply_combine(f, gidx, vals));
+      TENSOR_PRAGMA_UNROLL
+      for (int m = 0; m < NumOut; ++m) outs[m][coord] = r[m];
+    });
+    return make_results(outs_seq{});
+  }
+
+  // Output tile count along canonical dim d (output order is canonical here).
+  // Lets a parent treat this evaluator as an operand stager for fused chaining.
+  KOKKOS_FUNCTION int outer_extent_canon(int d) const noexcept {
+    return Impl::tile_count_along(tiling, d, node.shape()[d]);
+  }
+
+  static std::size_t scratch_size_per_team(const tiling_type& t) {
+    return static_cast<std::size_t>(NumOut) *
+               Impl::scratch_tile_bytes<value_type, exec_space>(t) +
+           stages_scratch_size(t, ops_seq{});
+  }
+
+ private:
+  // Build the per-operand stagers by pack-expanding over the operand indices.
+  template <std::size_t... Ks>
+  KOKKOS_FUNCTION static stages_tuple_t build_stages(
+      const node_type& n, const tiling_type& t, const team_member_t& team,
+      std::index_sequence<Ks...>) {
+    return stages_tuple_t(make_evaluator<TeamPolicyTag<ES>>(
+        Impl::canonicalize_input(n.operands.template get<Ks>(), perm_seq<Ks>{}),
+        t, team)...);
+  }
+
+  template <std::size_t... Ks>
+  KOKKOS_FUNCTION void stage_all(const team_member_t&            team,
+                                 const Kokkos::Array<int, Rank>& tile_idx,
+                                 std::index_sequence<Ks...>) const {
+    ((void)stages_.template get<Ks>()(team, tile_idx), ...);
+  }
+
+  template <std::size_t... Ks>
+  KOKKOS_FUNCTION Kokkos::Array<scratch_view_t, NumOps> gather_scratch(
+      std::index_sequence<Ks...>) const {
+    return {stages_.template get<Ks>().scratch_...};
+  }
+
+  template <std::size_t... Ks>
+  static std::size_t stages_scratch_size(const tiling_type& t,
+                                         std::index_sequence<Ks...>) {
+    std::size_t total = 0;
+    ((total += stage_t<Ks>::scratch_size_per_team(t)), ...);
+    return total;
+  }
+
+  // Allocate NumOut distinct output scratch tiles (each alloc bumps team
+  // scratch; braced-init evaluation order is left-to-right).
+  template <std::size_t... Ms>
+  KOKKOS_FUNCTION Kokkos::Array<scratch_view_t, NumOut> alloc_out_scratch(
+      const team_member_t& team, std::index_sequence<Ms...>) const {
+    return {
+        (static_cast<void>(Ms),
+         Impl::alloc_scratch_tile<value_type, exec_space>(team, tiling))...};
+  }
+
+  // Wrap each output scratch tile in an interm handle (NoHook: the store just
+  // writes; fn already applied any per-coordinate transform).
+  template <std::size_t... Ms>
+  KOKKOS_FUNCTION result_type make_results(std::index_sequence<Ms...>) const {
+    result_type r{};
+    ((r[Ms].storage_ = outs_[Ms]), ...);
+    return r;
   }
 };
 

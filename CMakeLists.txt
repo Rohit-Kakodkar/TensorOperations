@@ -61,6 +61,16 @@ add_executable(test_graph tests/test_graph.cpp)
 target_link_libraries(test_graph PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_graph)
 
+# test_device_tuple — custom main() wraps Kokkos init/finalize
+add_executable(test_device_tuple tests/test_device_tuple.cpp)
+target_link_libraries(test_device_tuple PRIVATE tensor GTest::gtest)
+gtest_discover_tests(test_device_tuple)
+
+# test_combine_node — custom main() wraps Kokkos init/finalize
+add_executable(test_combine_node tests/test_combine_node.cpp)
+target_link_libraries(test_combine_node PRIVATE tensor GTest::gtest)
+gtest_discover_tests(test_combine_node)
+
 # test_tiling — custom main() wraps Kokkos init/finalize
 add_executable(test_tiling tests/test_tiling.cpp)
 target_link_libraries(test_tiling PRIVATE tensor GTest::gtest)

@@ -333,6 +333,57 @@ using gather_modes_seq_t =
     array_to_seq_t<gather_modes_array<ModesSeq, PermSeq>()>;
 /** @} */
 
+// --- generic label-set matching (elementwise / combine operands) ------------
+
+/**
+ * @brief Gather permutation matching two label sequences over the *same* set.
+ *
+ * `perm[i]` is the axis of @p SourceSeq carrying @p TargetSeq's label `i`, i.e.
+ * `SourceSeq[perm[i]] == TargetSeq[i]`. Following the header's gather
+ * convention, this is the permutation that presents a source operand in the
+ * target's axis order (`canonical.extent(i) == source.extent(perm[i])`), so it
+ * drives `canonicalize_input` / `reorder_tile_value` for combine operands whose
+ * labels match the output but may be permuted. Both sequences must be a
+ * permutation of one another (checked by @ref same_label_set at the call site).
+ */
+template <typename TargetSeq, typename SourceSeq>
+constexpr auto compute_label_perm() {
+  constexpr auto tgt = seq_to_array(TargetSeq{});
+  constexpr auto src = seq_to_array(SourceSeq{});
+  static_assert(tgt.size() == src.size(),
+                "label-match permutation requires equal-rank label sequences");
+  constexpr int      R = static_cast<int>(tgt.size());
+  std::array<int, R> perm{};
+  for (int i = 0; i < R; ++i)
+    for (int j = 0; j < R; ++j)
+      if (src[j] == tgt[i]) {
+        perm[i] = j;
+        break;
+      }
+  return perm;
+}
+
+/// The label-match gather (see @ref compute_label_perm) as an
+/// `integer_sequence`. Identity when the operand is already in target order.
+template <typename TargetSeq, typename SourceSeq>
+using label_perm_seq_t =
+    array_to_seq_t<compute_label_perm<TargetSeq, SourceSeq>()>;
+
+/// @return `true` iff @p A and @p B are label sequences over the same set (each
+/// label of one appears in the other; equal rank). Distinctness within each is
+/// enforced where labels are attached (`TensorHandle`).
+template <typename A, typename B>
+constexpr bool same_label_set() {
+  constexpr auto a = seq_to_array(A{});
+  constexpr auto b = seq_to_array(B{});
+  if (a.size() != b.size()) return false;
+  for (std::size_t i = 0; i < a.size(); ++i)
+    if (!arr_contains(b, a[i])) return false;
+  for (std::size_t i = 0; i < b.size(); ++i)
+    if (!arr_contains(a, b[i])) return false;
+  return true;
+}
+
 // --- device-side permutation application ------------------------------------
 
 /// Canonical -> native index scatter: `native[Perm[i]] = canonical[i]`.
