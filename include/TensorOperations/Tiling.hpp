@@ -1,4 +1,5 @@
 #pragma once
+#include <TensorOperations/DeviceTuple.hpp>
 #include <TensorOperations/Permute.hpp>
 #include <TensorOperations/TileLayout.hpp>
 
@@ -423,6 +424,62 @@ KOKKOS_FUNCTION constexpr StaticTile<E...> output_tile(
 template <int R>
 KOKKOS_FUNCTION DynamicTile<R> output_tile(DynamicTile<R> t) noexcept {
   return t;
+}
+
+// ---------------------------------------------------------------------------
+// CombineTile — per-operand tile bundle for a combine node.
+//
+// A combine node's output tile fixes both its own output and every operand's
+// tile IF every operand is a leaf (input) node: operand K stages its input
+// slab with the same output tile. To support a contraction node as a combine
+// operand, operand K needs a `Tile<A,B,C>` bundle instead — the inner
+// contraction's A/B/C tile spec — whose C tile equals the combine's output
+// tile. CombineTile carries the output tile plus one per-operand tile spec:
+//
+//   OpTile == OutTile        for input operands (staged in output order)
+//   OpTile == Tile<A,B,C>    for contraction operands (C must == OutTile in
+//                             canonical/combine order)
+//
+// `output_tile(CombineTile)` returns the shared output tile so the graph
+// driver keeps sizing work items / decoding tile indices uniformly. For a
+// plain combine (all input operands), callers can keep passing the plain
+// output tile directly; the combine evaluator accepts either form.
+// ---------------------------------------------------------------------------
+template <typename OutTile, typename... OpTiles>
+struct CombineTile {
+  static constexpr int    rank      = OutTile::rank;
+  static constexpr bool   is_static = OutTile::is_static;
+  static constexpr int    num_ops   = static_cast<int>(sizeof...(OpTiles));
+  OutTile                 out{};
+  DeviceTuple<OpTiles...> ops{};
+
+  KOKKOS_FUNCTION constexpr int extent(int i) const noexcept {
+    return out.extent(i);
+  }
+};
+
+namespace Impl {
+template <typename T>
+struct is_combine_tile : std::false_type {};
+template <typename OutTile, typename... OpTiles>
+struct is_combine_tile<CombineTile<OutTile, OpTiles...>> : std::true_type {};
+template <typename T>
+inline constexpr bool is_combine_tile_v = is_combine_tile<T>::value;
+}  // namespace Impl
+
+template <typename OutTile, typename... OpTiles>
+KOKKOS_FUNCTION OutTile
+output_tile(const CombineTile<OutTile, OpTiles...>& t) noexcept {
+  return t.out;
+}
+
+// Host-side factory: assemble a CombineTile from an output tile and one tile
+// spec per operand. For input operands pass the output tile again (or its
+// equivalent); for contraction operands pass the corresponding Tile<A,B,C>.
+template <typename OutTile, typename... OpTiles>
+CombineTile<OutTile, OpTiles...> make_combine_tile(const OutTile& out,
+                                                   const OpTiles&... ops) {
+  return CombineTile<OutTile, OpTiles...>{out, DeviceTuple<OpTiles...>(ops...)};
 }
 
 }  // namespace TensorOperations

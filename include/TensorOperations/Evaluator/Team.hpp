@@ -531,17 +531,29 @@ struct Evaluator<TeamPolicyTag<ES>,
 // P{modes} = fn(A{modes}, B{modes}, ...), a pure per-coordinate combine over N
 // operands (no mode reduced). Structurally a stripped-down contraction
 // evaluator: stage each operand tile into scratch (reusing the input evaluator,
-// Specialization 2, which already handles permuted operands), then a single
-// TeamVectorRange applies fn per element into the output scratch tile — no
-// GEMM, no k-loop, no zeroing. Operands may be in any axis order; each is
-// gathered into the output (canonical) order via label_perm_seq +
-// canonicalize_input, exactly as the contraction evaluator canonicalizes A/B.
-// Tile_ is the single output tile: every operand and the output share this
-// canonical LayoutRight layout, so all scratch tiles align element-for-element.
-// The heterogeneous per-operand stagers live in a DeviceTuple; because all
-// their scratch views have the SAME type (same tile, same scalar), the combine
-// loop reads them from a homogeneous Kokkos::Array. fn receives the global
-// output coordinate: fn(i_0, ..., i_{Rank-1}, v_0, ..., v_{N-1}).
+// Specialization 2, which already handles permuted operands; or the
+// contraction evaluator, Specialization 4, for a contraction operand), then a
+// single TeamVectorRange applies fn per element into the output scratch tile
+// — no GEMM, no k-loop, no zeroing at this tier. Operands may be in any axis
+// order; each input operand is gathered into the output (canonical) order via
+// label_perm_seq + canonicalize_input, exactly as the contraction evaluator
+// canonicalizes A/B.
+//
+// Tile_ is either:
+//   (a) a plain output tile (StaticTile/DynamicTile) — requires every operand
+//       to be an input node (all operand tiles == output tile), or
+//   (b) a CombineTile<OutTile, OpTile_0, ..., OpTile_{N-1}> — carries the
+//       output tile plus a per-operand tile spec. An input operand's OpTile
+//       must equal OutTile; a contraction operand's OpTile is the inner
+//       Tile<A,B,C> bundle (with C == OutTile in the operand's canonical
+//       order).
+//
+// Every operand and the output share the same LayoutRight scratch layout, so
+// all scratch tiles align element-for-element. The heterogeneous per-operand
+// stagers live in a DeviceTuple; because all their scratch views have the
+// SAME type (same output tile, same scalar), the combine loop reads them from
+// a homogeneous Kokkos::Array. fn receives the global output coordinate:
+// fn(i_0, ..., i_{Rank-1}, v_0, ..., v_{N-1}).
 //
 // Multi-output: when fn returns a Kokkos::Array<V, NumOut>, the evaluator
 // allocates NumOut output scratch tiles (all sharing the output tile layout)
@@ -549,6 +561,23 @@ struct Evaluator<TeamPolicyTag<ES>,
 // Kokkos::Array<interm_type, NumOut>. A scalar-returning fn is the NumOut == 1
 // case. Every output shares the node's modes, so there is a single output tile.
 // ---------------------------------------------------------------------------
+namespace Impl {
+// Extract operand K's tile spec from either form (host + device):
+//   • plain tile form: the output tile itself, for every K,
+//   • CombineTile form: the K-th OpTile in the bundle.
+template <std::size_t K, typename Tile>
+KOKKOS_FUNCTION auto combine_op_tile(const Tile& t) {
+  if constexpr (is_combine_tile_v<Tile>) {
+    return t.ops.template get<K>();
+  } else {
+    return t;  // plain tile: every operand uses the output tile
+  }
+}
+template <std::size_t K, typename Tile>
+using combine_op_tile_t =
+    decltype(combine_op_tile<K>(std::declval<const Tile&>()));
+}  // namespace Impl
+
 template <typename CombineFn, typename IntCRank, typename S, typename ES,
           typename CModesSeq, typename IntNumOut, typename... Ops,
           typename Tile_>
@@ -556,41 +585,113 @@ struct Evaluator<TeamPolicyTag<ES>,
                  NodeHandle<CombineTag, CombineFn, IntCRank, S, ES, CModesSeq,
                             IntNumOut, Ops...>,
                  Tile_> {
-  using node_type           = NodeHandle<CombineTag, CombineFn, IntCRank, S, ES,
-                                         CModesSeq, IntNumOut, Ops...>;
-  using tiling_type         = Tile_;
-  using policy_tag          = TeamPolicyTag<ES>;
-  static constexpr int Rank = node_type::Rank;
+  using node_type   = NodeHandle<CombineTag, CombineFn, IntCRank, S, ES,
+                                 CModesSeq, IntNumOut, Ops...>;
+  using tiling_type = Tile_;
+  using policy_tag  = TeamPolicyTag<ES>;
+  // The output tile: either Tile_ itself (plain form) or Tile_::out (bundle).
+  using out_tile_t            = decltype(output_tile(std::declval<Tile_>()));
+  static constexpr int Rank   = node_type::Rank;
   static constexpr int NumOps = node_type::NumOps;
   static constexpr int NumOut = node_type::NumOut;
   using value_type            = S;
   using exec_space            = ES;
-  using tile_layout_t = decltype(make_tile_layout(std::declval<tiling_type>(),
+  using tile_layout_t = decltype(make_tile_layout(std::declval<out_tile_t>(),
                                                   std::declval<LayoutRight>()));
   using scratch_view_t = ScratchView<value_type, exec_space, tile_layout_t>;
 
-  static_assert((Impl::has_node_tag_v<InputTag, Ops> && ...),
-                "combine evaluator v1: operands must be input nodes (nested "
-                "contraction/combine operands are a follow-up)");
-  static_assert(tiling_type::rank == Rank,
-                "combine tile must carry one extent per output mode");
+  // Every operand must be an input node or a contraction node. Contraction
+  // operand support requires the CombineTile form (each contraction operand
+  // needs its own Tile<A,B,C> bundle).
+  static_assert(((Impl::has_node_tag_v<InputTag, Ops> ||
+                  Impl::has_node_tag_v<ContractionTag, Ops>) &&
+                 ...),
+                "combine evaluator: operands must be input or contraction "
+                "nodes (combine operands are a follow-up)");
+  static_assert(
+      Impl::is_combine_tile_v<Tile_> ||
+          (Impl::has_node_tag_v<InputTag, Ops> && ...),
+      "combine node with any contraction operand requires a CombineTile bundle "
+      "(use make_combine_tile(out_tile, op_tile_0, ..., op_tile_{N-1}))");
+  // Verify the per-operand tile count matches the operand count when a
+  // CombineTile bundle is supplied. Guarded by if constexpr because a direct
+  // `Tile_::num_ops` reference is ill-formed on plain tiles even when
+  // short-circuited by ||.
+  static_assert(
+      [] {
+        if constexpr (Impl::is_combine_tile_v<Tile_>)
+          return Tile_::num_ops == NumOps;
+        else
+          return true;
+      }(),
+      "CombineTile must carry one per-operand tile spec per operand");
+  static_assert(out_tile_t::rank == Rank,
+                "combine output tile must carry one extent per output mode");
 
   using ops_seq  = std::make_index_sequence<NumOps>;
   using outs_seq = std::make_index_sequence<NumOut>;
 
-  // Per-operand (K) type helpers. Each operand is gathered into output
-  // (canonical) order (identity when already there) and staged with the SAME
-  // output tile Tile_, so no per-operand tile reorder is needed.
+  // Per-operand (K) type helpers.
   template <std::size_t K>
   using op_node_t = tuple_element_t<K, typename node_type::ops_tuple_t>;
   template <std::size_t K>
   using perm_seq =
       Impl::label_perm_seq_t<CModesSeq, typename op_node_t<K>::modes_seq>;
+  // A contraction operand must already be in the combine's canonical output
+  // order (identity gather from operand modes to output modes). Combined with
+  // the check further below that the contraction's own permC is identity, this
+  // guarantees the operand's canonical C tile == the combine's output tile in
+  // the same LayoutRight layout, so its scratch view matches scratch_view_t.
   template <std::size_t K>
-  using canon_node_t = decltype(Impl::canonicalize_input(
-      std::declval<op_node_t<K>>(), perm_seq<K>{}));
+  static constexpr bool op_is_contraction_v =
+      Impl::has_node_tag_v<ContractionTag, op_node_t<K>>;
+  // A contraction operand's scratch tile is written in the operand's own
+  // canonical (freeA ++ freeB) axis order, LayoutRight. For it to match the
+  // combine's scratch_view_t exactly (same layout type, so all operand scratch
+  // views collapse into a homogeneous Kokkos::Array in the combine loop), we
+  // require the operand to be *fully canonical against the combine output*:
+  //   (1) the operand's user-output labels match the combine's output labels
+  //       in the same order (identity label gather from operand → combine), and
+  //   (2) the operand contraction's own permC is identity (freeA++freeB ==
+  //       operand user output).
+  // Together these mirror the existing "fused contraction operand must be in
+  // canonical position" restriction of Specialization 4, so combine and
+  // fused-contraction chaining share the same operand-canonicality rules.
   template <std::size_t K>
-  using stage_t = Evaluator<TeamPolicyTag<ES>, canon_node_t<K>, tiling_type>;
+  static constexpr bool op_contraction_permC_identity() {
+    if constexpr (op_is_contraction_v<K>)
+      return Impl::is_identity_seq(typename op_node_t<K>::permC_seq{});
+    else
+      return true;
+  }
+  static_assert(
+      []<std::size_t... Ks>(std::index_sequence<Ks...>) {
+        return ((!op_is_contraction_v<Ks> ||
+                 Impl::is_identity_seq(perm_seq<Ks>{})) &&
+                ...);
+      }(ops_seq{}),
+      "combine evaluator: a contraction operand must already be in the "
+      "combine's output order (identity label gather); relabel the contraction "
+      "output to match the combine output modes");
+  static_assert(
+      []<std::size_t... Ks>(std::index_sequence<Ks...>) {
+        return (op_contraction_permC_identity<Ks>() && ...);
+      }(ops_seq{}),
+      "combine evaluator: a contraction operand must be in canonical position "
+      "(identity permC); construct it with output modes == freeA++freeB");
+
+  template <std::size_t K>
+  using canon_node_t =
+      std::conditional_t<op_is_contraction_v<K>, op_node_t<K>,
+                         decltype(Impl::canonicalize_input(
+                             std::declval<op_node_t<K>>(), perm_seq<K>{}))>;
+
+  // Per-operand tile spec (identity for plain-tile form; the K-th slot of the
+  // CombineTile bundle otherwise).
+  template <std::size_t K>
+  using op_tile_t = Impl::combine_op_tile_t<K, Tile_>;
+  template <std::size_t K>
+  using stage_t = Evaluator<TeamPolicyTag<ES>, canon_node_t<K>, op_tile_t<K>>;
 
   // The heterogeneous tuple of per-operand stagers, DeviceTuple<stage_t<0>,
   // ...>.
@@ -607,7 +708,7 @@ struct Evaluator<TeamPolicyTag<ES>,
   using team_member_t = typename Kokkos::TeamPolicy<exec_space>::member_type;
 
   node_type      node;
-  tiling_type    tiling;  // the output tile (== canonical)
+  tiling_type    tiling;  // the tile spec (plain output tile or CombineTile)
   stages_tuple_t stages_;
   Kokkos::Array<scratch_view_t, NumOut>
       outs_;  // one output scratch tile / output
@@ -626,8 +727,9 @@ struct Evaluator<TeamPolicyTag<ES>,
     stage_all(team, tile_idx, ops_seq{});
     team.team_barrier();
 
-    // The per-operand scratch views are all the same type, so gather them into
-    // a homogeneous array indexed by operand in the combine loop.
+    // The per-operand scratch views are all the same type (same output tile,
+    // LayoutRight, same scalar), so gather them into a homogeneous array
+    // indexed by operand in the combine loop.
     const Kokkos::Array<scratch_view_t, NumOps> sv = gather_scratch(ops_seq{});
     const Kokkos::Array<scratch_view_t, NumOut> outs =
         outs_;                             // capture by value
@@ -656,26 +758,46 @@ struct Evaluator<TeamPolicyTag<ES>,
   // Output tile count along canonical dim d (output order is canonical here).
   // Lets a parent treat this evaluator as an operand stager for fused chaining.
   KOKKOS_FUNCTION int outer_extent_canon(int d) const noexcept {
-    return Impl::tile_count_along(tiling, d, node.shape()[d]);
+    return Impl::tile_count_along(output_tile(tiling), d, node.shape()[d]);
   }
 
   static std::size_t scratch_size_per_team(const tiling_type& t) {
     return static_cast<std::size_t>(NumOut) *
-               Impl::scratch_tile_bytes<value_type, exec_space>(t) +
+               Impl::scratch_tile_bytes<value_type, exec_space>(
+                   output_tile(t)) +
            stages_scratch_size(t, ops_seq{});
   }
 
  private:
+  // Operand K in the combine's canonical (output) order: input operands are
+  // gathered against the output labels; contraction operands are already
+  // canonical (asserted above), so they pass through unchanged.
+  template <std::size_t K>
+  KOKKOS_FUNCTION static canon_node_t<K> canon_operand(const node_type& n) {
+    if constexpr (op_is_contraction_v<K>)
+      return n.operands.template get<K>();
+    else
+      return Impl::canonicalize_input(n.operands.template get<K>(),
+                                      perm_seq<K>{});
+  }
+
   // Build the per-operand stagers by pack-expanding over the operand indices.
+  // Input operands are staged with the output tile; contraction operands are
+  // staged with their own Tile<A,B,C> bundle (from the CombineTile) and produce
+  // a scratch tile whose canonical C tile equals the combine output tile.
   template <std::size_t... Ks>
   KOKKOS_FUNCTION static stages_tuple_t build_stages(
       const node_type& n, const tiling_type& t, const team_member_t& team,
       std::index_sequence<Ks...>) {
     return stages_tuple_t(make_evaluator<TeamPolicyTag<ES>>(
-        Impl::canonicalize_input(n.operands.template get<Ks>(), perm_seq<Ks>{}),
-        t, team)...);
+        canon_operand<Ks>(n), Impl::combine_op_tile<Ks>(t), team)...);
   }
 
+  // Invoke each operand's stager. An input stager writes its output tile in
+  // one pass; a contraction stager runs a full contraction into its scratch
+  // tile (accumulating over its own contracted-tile space). Either way, the
+  // barrier after this ensures the resulting scratch tile is visible to the
+  // combine loop.
   template <std::size_t... Ks>
   KOKKOS_FUNCTION void stage_all(const team_member_t&            team,
                                  const Kokkos::Array<int, Rank>& tile_idx,
@@ -693,7 +815,9 @@ struct Evaluator<TeamPolicyTag<ES>,
   static std::size_t stages_scratch_size(const tiling_type& t,
                                          std::index_sequence<Ks...>) {
     std::size_t total = 0;
-    ((total += stage_t<Ks>::scratch_size_per_team(t)), ...);
+    ((total +=
+      stage_t<Ks>::scratch_size_per_team(Impl::combine_op_tile<Ks>(t))),
+     ...);
     return total;
   }
 
@@ -702,9 +826,9 @@ struct Evaluator<TeamPolicyTag<ES>,
   template <std::size_t... Ms>
   KOKKOS_FUNCTION Kokkos::Array<scratch_view_t, NumOut> alloc_out_scratch(
       const team_member_t& team, std::index_sequence<Ms...>) const {
-    return {
-        (static_cast<void>(Ms),
-         Impl::alloc_scratch_tile<value_type, exec_space>(team, tiling))...};
+    return {(static_cast<void>(Ms),
+             Impl::alloc_scratch_tile<value_type, exec_space>(
+                 team, output_tile(tiling)))...};
   }
 
   // Wrap each output scratch tile in an interm handle (NoHook: the store just

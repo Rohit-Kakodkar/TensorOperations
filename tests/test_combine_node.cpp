@@ -297,6 +297,151 @@ TEST(CombineNodeTest, MultiOutputPermutedOperandTeam) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Shared setup for the contraction-operand tests:
+//   c{i,l} = sum_{j,k} A{i,j,k} * B{j,k,l}   (contraction operand)
+//   D{i,l}                                   (plain input operand)
+// Exercises the CombineTile bundle path (per-operand tile specs): operand 0
+// gets a Tile<A,B,C> for the inner contraction, operand 1 gets the combine
+// output tile for the plain input D. The contraction's canonical output tile
+// must equal the combine output tile so all operand scratch views collapse to
+// the same scratch_view_t.
+//
+// Static-tile register-kernel constraints on CPU: the contraction operand's
+// SA (output row extent) must be a multiple of MT=8, flattened SK a multiple
+// of NT=8, and SB (output col extent) a multiple of NR=2*simd_width (32 on
+// AVX-512). Team scratch on the serial backend is capped near 32 KB, so we
+// keep the K stage small: J=2, K=4 gives SK=8 (minimum) and shrinks the
+// per-team footprint below the cap. Tile choices: SA=16 (%MT=8), flattened
+// SK=8*32=256 (%NT=8), SB=32 (%NR up to 32).
+// ---------------------------------------------------------------------------
+namespace {
+struct ContractionCombineData {
+  using View2            = Kokkos::View<float**, Kokkos::LayoutRight>;
+  using View3            = Kokkos::View<float***, Kokkos::LayoutRight>;
+  static constexpr int I = 16, J = 2, K = 4, L = 32;
+  using OutTile = StaticTile<16, 32>;
+  using CBundle =
+      Tile<StaticTile<16, 2, 4>, StaticTile<2, 4, 32>, StaticTile<16, 32>>;
+
+  View3                   A{"A", I, J, K};
+  View3                   B{"B", J, K, L};
+  View2                   D{"D", I, L};
+  View3::host_mirror_type Ah{Kokkos::create_mirror_view(A)};
+  View3::host_mirror_type Bh{Kokkos::create_mirror_view(B)};
+  View2::host_mirror_type Dh{Kokkos::create_mirror_view(D)};
+
+  ContractionCombineData() {
+    for (int i = 0; i < I; ++i)
+      for (int j = 0; j < J; ++j)
+        for (int k = 0; k < K; ++k)
+          Ah(i, j, k) =
+              static_cast<float>(((i * 7 + j * 3 + k) % 5) + 1) * 0.25f;
+    for (int j = 0; j < J; ++j)
+      for (int k = 0; k < K; ++k)
+        for (int l = 0; l < L; ++l)
+          Bh(j, k, l) =
+              static_cast<float>(((j * 5 + k * 2 + l) % 4) + 1) * 0.5f;
+    for (int i = 0; i < I; ++i)
+      for (int l = 0; l < L; ++l)
+        Dh(i, l) = static_cast<float>((i + 3 * l) % 7 + 1) * 0.125f;
+    Kokkos::deep_copy(A, Ah);
+    Kokkos::deep_copy(B, Bh);
+    Kokkos::deep_copy(D, Dh);
+  }
+
+  // Canonical output order: freeA(i) ++ freeB(l) == user output <i,l>, so the
+  // contraction's permC is identity (required by the combine evaluator).
+  auto contraction_node() const {
+    return make_contraction_node<float, Kokkos::DefaultExecutionSpace, 'i',
+                                 'l'>(
+        make_input_node(make_handle<'i', 'j', 'k'>(A)),
+        make_input_node(make_handle<'j', 'k', 'l'>(B)));
+  }
+  auto d_node() const { return make_input_node(make_handle<'i', 'l'>(D)); }
+  static auto combine_tile() {
+    return make_combine_tile(OutTile{}, CBundle{}, OutTile{});
+  }
+
+  // Host reference for the contraction operand c{i,l}.
+  float host_c(int i, int l) const {
+    float c = 0.0f;
+    for (int j = 0; j < J; ++j)
+      for (int k = 0; k < K; ++k) c += Ah(i, j, k) * Bh(j, k, l);
+    return c;
+  }
+};
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// Combine with a contraction operand:
+//   P{i,l} = fn(c{i,l}, D{i,l}) = c{i,l} * D{i,l} + 100*i + l
+// ---------------------------------------------------------------------------
+TEST(CombineNodeTest, ContractionOperandTeam) {
+  const ContractionCombineData  d;
+  ContractionCombineData::View2 P("P", d.I, d.L);
+  Kokkos::deep_copy(P, 0.0f);
+
+  auto g        = make_graph();
+  auto [g1, o1] = g.ops(make_combine_node<'i', 'l'>(
+      d.contraction_node(), d.d_node(), MulPlusCoord{}));
+  g1.execute(TeamPolicyTag<>{}, d.combine_tile(), P);
+
+  auto Ph = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, P);
+  for (int i = 0; i < d.I; ++i)
+    for (int l = 0; l < d.L; ++l) {
+      const float expected = d.host_c(i, l) * d.Dh(i, l) +
+                             static_cast<float>(i) * 100.0f +
+                             static_cast<float>(l);
+      EXPECT_FLOAT_EQ(Ph(i, l), expected) << "i=" << i << " l=" << l;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-output combine with a contraction operand: fn returns
+// Kokkos::Array<float,2>, and operand 0 is a contraction. Verifies that the
+// NumOut > 1 output path composes with the contraction-operand staging path.
+//   p0{i,l} = c{i,l} * D{i,l} + 100*i + l    (uses coord + both operands)
+//   p1{i,l} = c{i,l} - D{i,l} + (i - l)      (independent formula)
+// Multi-output only adds one extra output tile to the scratch total.
+// ---------------------------------------------------------------------------
+struct MulPlusCoordAndSubDiff {
+  KOKKOS_FUNCTION Kokkos::Array<float, 2> operator()(int i, int l, float c,
+                                                     float d) const {
+    return {c * d + static_cast<float>(i) * 100.0f + static_cast<float>(l),
+            c - d + static_cast<float>(i - l)};
+  }
+};
+
+TEST(CombineNodeTest, MultiOutputContractionOperandTeam) {
+  const ContractionCombineData  d;
+  ContractionCombineData::View2 P0("P0", d.I, d.L);
+  ContractionCombineData::View2 P1("P1", d.I, d.L);
+  Kokkos::deep_copy(P0, 0.0f);
+  Kokkos::deep_copy(P1, 0.0f);
+
+  auto g            = make_graph();
+  auto [g1, p0, p1] = g.ops(make_combine_node<'i', 'l'>(
+      d.contraction_node(), d.d_node(), MulPlusCoordAndSubDiff{}));
+  static_assert(decltype(p0)::OutputIndex == 0);
+  static_assert(decltype(p1)::OutputIndex == 1);
+
+  g1.execute(TeamPolicyTag<>{}, d.combine_tile(), P0, P1);
+
+  auto P0h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, P0);
+  auto P1h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, P1);
+  for (int i = 0; i < d.I; ++i)
+    for (int l = 0; l < d.L; ++l) {
+      const float c  = d.host_c(i, l);
+      const float dv = d.Dh(i, l);
+      const float expected0 =
+          c * dv + static_cast<float>(i) * 100.0f + static_cast<float>(l);
+      const float expected1 = c - dv + static_cast<float>(i - l);
+      EXPECT_FLOAT_EQ(P0h(i, l), expected0) << "p0 i=" << i << " l=" << l;
+      EXPECT_FLOAT_EQ(P1h(i, l), expected1) << "p1 i=" << i << " l=" << l;
+    }
+}
+
 int main(int argc, char* argv[]) {
   ::testing::InitGoogleTest(&argc, argv);
   Kokkos::initialize(argc, argv);
