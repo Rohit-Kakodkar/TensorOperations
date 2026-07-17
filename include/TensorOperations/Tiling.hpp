@@ -130,6 +130,24 @@ auto build_static_tiled(std::index_sequence<P...>) -> std::conditional_t<
     StaticTileLayoutLeft<TiledExtentAt<P, InnerFirst, Ext, Tile>::value...>,
     StaticTileLayoutRight<TiledExtentAt<P, InnerFirst, Ext, Tile>::value...>>;
 
+// Build the interleaved (outer, inner)-per-dim extent array used by every
+// dynamic tile_layout overload. InnerFirst=true (Left layout): position 2*d
+// holds the inner (tile) extent, 2*d+1 holds the outer (src/tile) count.
+// InnerFirst=false (Right layout): outer comes first.
+template <bool InnerFirst, int N>
+KOKKOS_FUNCTION Kokkos::Array<int, 2 * N> interleave_tile_extents(
+    const Kokkos::Array<int, N>& src_ext,
+    const Kokkos::Array<int, N>& tile_ext) noexcept {
+  Kokkos::Array<int, 2 * N> exts{};
+  for (int d = 0; d < N; ++d) {
+    const int outer = src_ext[d] / tile_ext[d];
+    const int inner = tile_ext[d];
+    exts[2 * d]     = InnerFirst ? inner : outer;
+    exts[2 * d + 1] = InnerFirst ? outer : inner;
+  }
+  return exts;
+}
+
 }  // namespace Impl
 
 // ---------------------------------------------------------------------------
@@ -192,12 +210,13 @@ KOKKOS_FUNCTION auto tile_layout(DynamicTileLayoutRight<N> src,
     -> DynamicTileLayoutRight<2 * N> {
   static_assert(N == static_cast<int>(sizeof...(TileE)),
                 "tile_layout: source rank must match tile rank");
-  Kokkos::Array<int, 2 * N> exts{};
+  Kokkos::Array<int, N> src_ext{}, tile_ext{};
   for (int d = 0; d < N; ++d) {
-    exts[2 * d]     = src.extent(d) / tile.extent(d);  // outer (Right: first)
-    exts[2 * d + 1] = tile.extent(d);                  // inner
+    src_ext[d]  = src.extent(d);
+    tile_ext[d] = tile.extent(d);
   }
-  return DynamicTileLayoutRight<2 * N>{exts};
+  return DynamicTileLayoutRight<2 * N>{
+      Impl::interleave_tile_extents<false, N>(src_ext, tile_ext)};
 }
 
 template <int N, int... TileE>
@@ -206,12 +225,13 @@ KOKKOS_FUNCTION auto tile_layout(DynamicTileLayoutLeft<N> src,
     -> DynamicTileLayoutLeft<2 * N> {
   static_assert(N == static_cast<int>(sizeof...(TileE)),
                 "tile_layout: source rank must match tile rank");
-  Kokkos::Array<int, 2 * N> exts{};
+  Kokkos::Array<int, N> src_ext{}, tile_ext{};
   for (int d = 0; d < N; ++d) {
-    exts[2 * d]     = tile.extent(d);                  // inner (Left: first)
-    exts[2 * d + 1] = src.extent(d) / tile.extent(d);  // outer
+    src_ext[d]  = src.extent(d);
+    tile_ext[d] = tile.extent(d);
   }
-  return DynamicTileLayoutLeft<2 * N>{exts};
+  return DynamicTileLayoutLeft<2 * N>{
+      Impl::interleave_tile_extents<true, N>(src_ext, tile_ext)};
 }
 
 template <int... Extents, int N>
@@ -220,13 +240,14 @@ KOKKOS_FUNCTION auto tile_layout(StaticTileLayoutRight<Extents...>,
     -> DynamicTileLayoutRight<2 * N> {
   static_assert(static_cast<int>(sizeof...(Extents)) == N,
                 "tile_layout: source rank must match tile rank");
-  constexpr int             src_e[] = {Extents...};
-  Kokkos::Array<int, 2 * N> exts{};
+  constexpr int         src_e[] = {Extents...};
+  Kokkos::Array<int, N> src_ext{}, tile_ext{};
   for (int d = 0; d < N; ++d) {
-    exts[2 * d]     = src_e[d] / tile.extent(d);  // outer (Right: first)
-    exts[2 * d + 1] = tile.extent(d);             // inner
+    src_ext[d]  = src_e[d];
+    tile_ext[d] = tile.extent(d);
   }
-  return DynamicTileLayoutRight<2 * N>{exts};
+  return DynamicTileLayoutRight<2 * N>{
+      Impl::interleave_tile_extents<false, N>(src_ext, tile_ext)};
 }
 
 template <int... Extents, int N>
@@ -235,37 +256,40 @@ KOKKOS_FUNCTION auto tile_layout(StaticTileLayoutLeft<Extents...>,
     -> DynamicTileLayoutLeft<2 * N> {
   static_assert(static_cast<int>(sizeof...(Extents)) == N,
                 "tile_layout: source rank must match tile rank");
-  constexpr int             src_e[] = {Extents...};
-  Kokkos::Array<int, 2 * N> exts{};
+  constexpr int         src_e[] = {Extents...};
+  Kokkos::Array<int, N> src_ext{}, tile_ext{};
   for (int d = 0; d < N; ++d) {
-    exts[2 * d]     = tile.extent(d);             // inner (Left: first)
-    exts[2 * d + 1] = src_e[d] / tile.extent(d);  // outer
+    src_ext[d]  = src_e[d];
+    tile_ext[d] = tile.extent(d);
   }
-  return DynamicTileLayoutLeft<2 * N>{exts};
+  return DynamicTileLayoutLeft<2 * N>{
+      Impl::interleave_tile_extents<true, N>(src_ext, tile_ext)};
 }
 
 template <int N>
 KOKKOS_FUNCTION auto tile_layout(DynamicTileLayoutRight<N> src,
                                  DynamicTile<N>            tile) noexcept
     -> DynamicTileLayoutRight<2 * N> {
-  Kokkos::Array<int, 2 * N> exts{};
+  Kokkos::Array<int, N> src_ext{}, tile_ext{};
   for (int d = 0; d < N; ++d) {
-    exts[2 * d]     = src.extent(d) / tile.extent(d);  // outer (Right: first)
-    exts[2 * d + 1] = tile.extent(d);                  // inner
+    src_ext[d]  = src.extent(d);
+    tile_ext[d] = tile.extent(d);
   }
-  return DynamicTileLayoutRight<2 * N>{exts};
+  return DynamicTileLayoutRight<2 * N>{
+      Impl::interleave_tile_extents<false, N>(src_ext, tile_ext)};
 }
 
 template <int N>
 KOKKOS_FUNCTION auto tile_layout(DynamicTileLayoutLeft<N> src,
                                  DynamicTile<N>           tile) noexcept
     -> DynamicTileLayoutLeft<2 * N> {
-  Kokkos::Array<int, 2 * N> exts{};
+  Kokkos::Array<int, N> src_ext{}, tile_ext{};
   for (int d = 0; d < N; ++d) {
-    exts[2 * d]     = tile.extent(d);                  // inner (Left: first)
-    exts[2 * d + 1] = src.extent(d) / tile.extent(d);  // outer
+    src_ext[d]  = src.extent(d);
+    tile_ext[d] = tile.extent(d);
   }
-  return DynamicTileLayoutLeft<2 * N>{exts};
+  return DynamicTileLayoutLeft<2 * N>{
+      Impl::interleave_tile_extents<true, N>(src_ext, tile_ext)};
 }
 
 // ---------------------------------------------------------------------------

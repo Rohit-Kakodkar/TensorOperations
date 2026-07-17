@@ -2,6 +2,18 @@
 // Included from within TensorOperations namespace by Evaluator.hpp
 
 namespace Impl {
+
+// Extract extent D from a scratch View: compile-time when the layout is static
+// (avoids a runtime `.extent()` call), runtime otherwise. Replaces the three
+// repeated if-constexpr lambdas that extract SA, SK, SB in accumulate_block.
+template <int D, typename V>
+KOKKOS_FORCEINLINE_FUNCTION int scratch_extent(const V& v) noexcept {
+  if constexpr (V::layout_t::is_static)
+    return V::layout_t::extent(D);
+  else
+    return v.extent(D);
+}
+
 // Ceil-division. The template form binds the divisor at compile time so the
 // compiler lowers it to a multiply-shift instead of a runtime integer division
 // (expensive on GPU); the runtime form is used only when the divisor genuinely
@@ -309,6 +321,43 @@ struct Evaluator<TeamPolicyTag<ES>,
   }
 
  private:
+  // Validate that each GEMM dimension (SA, SK, SB) is a multiple of its
+  // register-block factor (MT, NT, NR). Static tiles are checked at compile
+  // time via static_assert; dynamic tiles fall back to runtime assert.
+  template <int MT, int NT, int NR, typename AView, typename BView>
+  KOKKOS_FUNCTION static void validate_gemm_tile_dims(const AView&,
+                                                      const BView&, int SA,
+                                                      int SK, int SB) {
+    if constexpr (AView::layout_t::is_static) {
+      constexpr int SAs = AView::layout_t::extent(0);
+      constexpr int SKs = AView::layout_t::extent(1);
+      static_assert(
+          SAs >= MT && SAs % MT == 0,
+          "team GEMM: operand row dim (SA) must be a multiple of the register "
+          "row block MT; enlarge the output C tile's free extent");
+      static_assert(
+          SKs >= NT && SKs % NT == 0,
+          "team GEMM: operand contracted dim (SK) must be a multiple of the "
+          "register depth NT; enlarge the contracted tile extents");
+    } else {
+      assert(SA >= MT && SA % MT == 0 &&
+             "team GEMM: SA must be a multiple of the register row block MT");
+      assert(SK >= NT && SK % NT == 0 &&
+             "team GEMM: SK must be a multiple of the register depth NT");
+    }
+    if constexpr (BView::layout_t::is_static) {
+      constexpr int SBs = BView::layout_t::extent(1);
+      static_assert(
+          SBs >= NR && SBs % NR == 0,
+          "team GEMM: operand free dim (SB) must be a multiple of the register "
+          "column block (2*W on CPU); enlarge the output C tile's free extent");
+    } else {
+      assert(
+          SB >= NR && SB % NR == 0 &&
+          "team GEMM: SB must be a multiple of the register column block NR");
+    }
+  }
+
   // Stage one contracted tile of A and B into scratch and accumulate the block
   // product into C. The barriers bracket the shared-scratch reads/writes;
   // consecutive calls reuse the same scratch (no double buffering).
@@ -363,24 +412,9 @@ struct Evaluator<TeamPolicyTag<ES>,
     auto c =
         reshape(scratch_, prefix_product(c_tile_, rank_c<FreeA>));  // [SA,SB]
 
-    int SA = [&]() {
-      if constexpr (a_out_tile_t::is_static)
-        return decltype(a)::layout_t::extent(0);
-      else
-        return a.extent(0);
-    }();
-    int SK = [&]() {
-      if constexpr (a_out_tile_t::is_static)
-        return decltype(a)::layout_t::extent(1);
-      else
-        return a.extent(1);
-    }();
-    int SB = [&]() {
-      if constexpr (b_out_tile_t::is_static)
-        return decltype(b)::layout_t::extent(1);
-      else
-        return b.extent(1);
-    }();
+    const int SA = Impl::scratch_extent<0>(a);
+    const int SK = Impl::scratch_extent<1>(a);
+    const int SB = Impl::scratch_extent<1>(b);
 
     namespace KE    = Kokkos::Experimental;
     using simd_t    = KE::simd<value_type>;
@@ -413,34 +447,7 @@ struct Evaluator<TeamPolicyTag<ES>,
     // yields a zero outer extent (a hard error) or silently drops the remainder
     // (wrong results). Static tiles are rejected at compile time with clear
     // messages; dynamic tiles get the same guard at runtime in debug builds.
-    if constexpr (a_out_tile_t::is_static) {
-      constexpr int SAs = decltype(a)::layout_t::extent(0);
-      constexpr int SKs = decltype(a)::layout_t::extent(1);
-      static_assert(
-          SAs >= MT && SAs % MT == 0,
-          "team GEMM: operand row dim (SA) must be a multiple of the register "
-          "row block MT; enlarge the output C tile's free extent");
-      static_assert(
-          SKs >= NT && SKs % NT == 0,
-          "team GEMM: operand contracted dim (SK) must be a multiple of the "
-          "register depth NT; enlarge the contracted tile extents");
-    } else {
-      assert(SA >= MT && SA % MT == 0 &&
-             "team GEMM: SA must be a multiple of the register row block MT");
-      assert(SK >= NT && SK % NT == 0 &&
-             "team GEMM: SK must be a multiple of the register depth NT");
-    }
-    if constexpr (b_out_tile_t::is_static) {
-      constexpr int SBs = decltype(b)::layout_t::extent(1);
-      static_assert(
-          SBs >= NR && SBs % NR == 0,
-          "team GEMM: operand free dim (SB) must be a multiple of the register "
-          "column block (2*W on CPU); enlarge the output C tile's free extent");
-    } else {
-      assert(
-          SB >= NR && SB % NR == 0 &&
-          "team GEMM: SB must be a multiple of the register column block NR");
-    }
+    validate_gemm_tile_dims<MT, NT, NR>(a, b, SA, SK, SB);
 
     using RegA = StaticTile<MT, NT>;
     using RegB = StaticTile<NT, NR>;

@@ -2,11 +2,8 @@
 
 // TENSOR_PRAGMA_UNROLL — full unroll hint for the immediately following loop.
 // Each branch emits the compiler-native pragma; the fallback is a no-op.
-#if defined(KOKKOS_ENABLE_CUDA)
-// NVCC / CUDA device compiler
-#define TENSOR_PRAGMA_UNROLL _Pragma("unroll")
-#elif defined(KOKKOS_ENABLE_HIP)
-// AMD HIP / ROCm device compiler (hipcc, clang-based)
+#if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
+// NVCC/CUDA and AMD HIP/ROCm both accept the plain unroll pragma
 #define TENSOR_PRAGMA_UNROLL _Pragma("unroll")
 #elif defined(__INTEL_LLVM_COMPILER)
 // Intel oneAPI DPC++/icx (LLVM-based)
