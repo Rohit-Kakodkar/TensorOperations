@@ -195,6 +195,119 @@ TEST(StaticTileLayoutStride, MakeTileLayoutFactory) {
 }
 
 // ---------------------------------------------------------------------------
+// Compile-time checks for reorder_tile
+// ---------------------------------------------------------------------------
+
+// Right<4,8> + Perm{1,0}: new extents {8,4}, new order {0,1}
+namespace {
+using ReorderedRight2D = decltype(reorder_tile(
+    StaticTileLayoutRight<4, 8>{}, std::integer_sequence<int, 1, 0>{}));
+static_assert(std::is_same_v<ReorderedRight2D,
+                             StaticTileLayoutStride<StaticTile<8, 4>, 0, 1>>);
+static_assert(ReorderedRight2D::extent(0) == 8);
+static_assert(ReorderedRight2D::extent(1) == 4);
+static_assert(ReorderedRight2D::stride(0) == 1);
+static_assert(ReorderedRight2D::stride(1) == 8);
+
+// Left<4,8> + Perm{1,0}: new extents {8,4}, new order {1,0}
+using ReorderedLeft2D = decltype(reorder_tile(
+    StaticTileLayoutLeft<4, 8>{}, std::integer_sequence<int, 1, 0>{}));
+static_assert(std::is_same_v<ReorderedLeft2D,
+                             StaticTileLayoutStride<StaticTile<8, 4>, 1, 0>>);
+static_assert(ReorderedLeft2D::stride(1) == 1);
+static_assert(ReorderedLeft2D::stride(0) == 4);
+
+// Right<4,8,3> + Perm{2,0,1}: new extents {3,4,8}, new order {0,2,1}
+using ReorderedRight3D = decltype(reorder_tile(
+    StaticTileLayoutRight<4, 8, 3>{}, std::integer_sequence<int, 2, 0, 1>{}));
+static_assert(
+    std::is_same_v<ReorderedRight3D,
+                   StaticTileLayoutStride<StaticTile<3, 4, 8>, 0, 2, 1>>);
+static_assert(ReorderedRight3D::stride(0) == 1);
+static_assert(ReorderedRight3D::stride(2) == 3);
+static_assert(ReorderedRight3D::stride(1) == 24);
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// TEST: reorder_tile runtime correctness
+// ---------------------------------------------------------------------------
+
+TEST(ReorderTile, RightIdentity2D) {
+  // Identity permutation: result type matches Right, strides identical
+  auto layout   = reorder_tile(StaticTileLayoutRight<4, 8>{},
+                               std::integer_sequence<int, 0, 1>{});
+  using Right48 = StaticTileLayoutRight<4, 8>;
+  EXPECT_EQ(layout.extent(0), 4);
+  EXPECT_EQ(layout.extent(1), 8);
+  EXPECT_EQ(layout.stride(0), Right48::stride(0));
+  EXPECT_EQ(layout.stride(1), Right48::stride(1));
+}
+
+TEST(ReorderTile, RightTranspose2D) {
+  auto layout = reorder_tile(StaticTileLayoutRight<4, 8>{},
+                             std::integer_sequence<int, 1, 0>{});
+  EXPECT_EQ(layout.extent(0), 8);
+  EXPECT_EQ(layout.extent(1), 4);
+  EXPECT_EQ(layout.stride(0), 1);
+  EXPECT_EQ(layout.stride(1), 8);
+}
+
+TEST(ReorderTile, LeftTranspose2D) {
+  auto layout = reorder_tile(StaticTileLayoutLeft<4, 8>{},
+                             std::integer_sequence<int, 1, 0>{});
+  EXPECT_EQ(layout.extent(0), 8);
+  EXPECT_EQ(layout.extent(1), 4);
+  EXPECT_EQ(layout.stride(1), 1);
+  EXPECT_EQ(layout.stride(0), 4);
+}
+
+TEST(ReorderTile, Right3DArbitrary) {
+  // Right<4,8,3> + {2,0,1}: stride(old2)→new0=1, stride(old0)→new1=24,
+  // stride(old1)→new2=3
+  auto layout = reorder_tile(StaticTileLayoutRight<4, 8, 3>{},
+                             std::integer_sequence<int, 2, 0, 1>{});
+  EXPECT_EQ(layout.extent(0), 3);
+  EXPECT_EQ(layout.extent(1), 4);
+  EXPECT_EQ(layout.extent(2), 8);
+  EXPECT_EQ(layout.stride(0), 1);
+  EXPECT_EQ(layout.stride(2), 3);
+  EXPECT_EQ(layout.stride(1), 24);
+}
+
+TEST(ReorderTile, Left3DArbitrary) {
+  // Left<4,8,3>: stride(0)=1, stride(1)=4, stride(2)=32
+  // Perm {2,0,1}: new dim0←old2, new dim1←old0, new dim2←old1
+  // new.stride(0)=32, new.stride(1)=1, new.stride(2)=4
+  auto layout = reorder_tile(StaticTileLayoutLeft<4, 8, 3>{},
+                             std::integer_sequence<int, 2, 0, 1>{});
+  EXPECT_EQ(layout.extent(0), 3);
+  EXPECT_EQ(layout.extent(1), 4);
+  EXPECT_EQ(layout.extent(2), 8);
+  EXPECT_EQ(layout.stride(0), 32);
+  EXPECT_EQ(layout.stride(1), 1);
+  EXPECT_EQ(layout.stride(2), 4);
+}
+
+TEST(ReorderTile, RoundTrip2D) {
+  // Write through a View backed by reorder_tile result, verify flat offsets
+  using Buf = Kokkos::View<float*, Kokkos::LayoutRight, Kokkos::HostSpace>;
+  using L   = decltype(reorder_tile(StaticTileLayoutRight<4, 8>{},
+                                    std::integer_sequence<int, 1, 0>{}));
+  Buf buf("buf", 32);
+  Kokkos::deep_copy(buf, 0.f);
+
+  View<Buf, L> v{buf, L{}};
+  for (int i = 0; i < 8; ++i)
+    for (int j = 0; j < 4; ++j) v(i, j) = static_cast<float>(i + j * 8);
+
+  // stride(0)=1, stride(1)=8 → flat(i,j) = i*1 + j*8
+  for (int i = 0; i < 8; ++i)
+    for (int j = 0; j < 4; ++j)
+      EXPECT_FLOAT_EQ(buf(i + j * 8), static_cast<float>(i + j * 8))
+          << "i=" << i << " j=" << j;
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 int main(int argc, char* argv[]) {
