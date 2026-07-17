@@ -776,4 +776,42 @@ KOKKOS_FUNCTION auto reorder_view(const View<ViewType, Layout>&       view,
   return {view.backing_, reorder_layout(view.layout(), perm)};
 }
 
+// ---------------------------------------------------------------------------
+// reorder_tile — permute axes of a static tile layout, producing a
+// StaticTileLayoutStride that preserves the original memory ordering.
+//
+// Gather convention (matches reorder_layout / reorder_static_tile):
+// Perm[i] is the source dimension that becomes new dimension i, so
+// result.extent(i) == src.extent(Perm[i]) and
+// result.stride(i) == src.stride(Perm[i]).
+//
+//   reorder_tile(StaticTileLayoutRight<4,8>{}, integer_sequence<int,1,0>{})
+//       -> StaticTileLayoutStride<StaticTile<8,4>, 0, 1>
+//          (stride(0)=1, stride(1)=8)
+// ---------------------------------------------------------------------------
+
+template <int... E, int... Perm>
+KOKKOS_FUNCTION constexpr auto reorder_tile(
+    StaticTileLayoutRight<E...>,
+    std::integer_sequence<int, Perm...> perm) noexcept {
+  constexpr int  N        = sizeof...(E);
+  constexpr auto new_tile = reorder_static_tile(StaticTile<E...>{}, perm);
+  constexpr auto old_order =
+      Impl::right_order_seq<N>(std::make_index_sequence<N>{});
+  constexpr auto new_order = Impl::reorder_order_seq(old_order, perm);
+  return make_tile_layout(new_tile, new_order);
+}
+
+template <int... E, int... Perm>
+KOKKOS_FUNCTION constexpr auto reorder_tile(
+    StaticTileLayoutLeft<E...>,
+    std::integer_sequence<int, Perm...> perm) noexcept {
+  constexpr int  N        = sizeof...(E);
+  constexpr auto new_tile = reorder_static_tile(StaticTile<E...>{}, perm);
+  constexpr auto old_order =
+      Impl::left_order_seq<N>(std::make_index_sequence<N>{});
+  constexpr auto new_order = Impl::reorder_order_seq(old_order, perm);
+  return make_tile_layout(new_tile, new_order);
+}
+
 }  // namespace TensorOperations

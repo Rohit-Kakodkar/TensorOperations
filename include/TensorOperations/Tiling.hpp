@@ -79,6 +79,14 @@ KOKKOS_FUNCTION DynamicTileLayoutLeft<N> make_tile_layout(DynamicTile<N> t,
   return DynamicTileLayoutLeft<N>{t.extents};
 }
 
+// StaticTile<E...> + integer_sequence<int, Ord...> → StaticTileLayoutStride
+template <int... E, int... Ord>
+KOKKOS_FUNCTION constexpr StaticTileLayoutStride<StaticTile<E...>, Ord...>
+make_tile_layout(StaticTile<E...>,
+                 std::integer_sequence<int, Ord...>) noexcept {
+  return {};
+}
+
 // ---------------------------------------------------------------------------
 // tile_layout — factory: TileLayout × Tile → 2N-dimensional TileLayout
 //
