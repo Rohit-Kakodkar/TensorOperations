@@ -626,21 +626,37 @@ KOKKOS_FUNCTION auto tile_view(const View<ViewType, Layout>& view, Tile tile)
 // CUDA keeps idx.data and the extents/inv_extents in registers.
 // ---------------------------------------------------------------------------
 
+namespace Impl {
+// Shared setup for all subview_tile overloads: flat base offset of the
+// selected outer tile plus the inner extents and strides.
+template <int N, typename VT, typename TL>
+KOKKOS_FUNCTION auto subview_tile_params(
+    const View<VT, TiledLayout<N, TL>>&                    tv,
+    const Kokkos::Array<int, static_cast<std::size_t>(N)>& outer_idx) {
+  struct Params {
+    int                   base;
+    Kokkos::Array<int, N> ext;
+    Kokkos::Array<int, N> str;
+  };
+  Params p{0, {}, {}};
+  for (int d = 0; d < N; ++d) p.base += outer_idx[d] * tv.stride(d);
+  for (int d = 0; d < N; ++d) {
+    p.ext[d] = tv.extent(N + d);
+    p.str[d] = tv.stride(N + d);
+  }
+  return p;
+}
+}  // namespace Impl
+
 // LayoutRight specialization.
 template <typename VT, int N, typename TL>
   requires std::is_same_v<typename VT::array_layout, Kokkos::LayoutRight>
 KOKKOS_FUNCTION auto subview_tile(
     const View<VT, TiledLayout<N, TL>>&             tv,
     Kokkos::Array<int, static_cast<std::size_t>(N)> outer_idx) {
-  int base = 0;
-  for (int d = 0; d < N; ++d) base += outer_idx[d] * tv.stride(d);
-  Kokkos::Array<int, N> ext{}, str{};
-  for (int d = 0; d < N; ++d) {
-    ext[d] = tv.extent(N + d);
-    str[d] = tv.stride(N + d);
-  }
+  const auto p = Impl::subview_tile_params(tv, outer_idx);
   return Impl::make_ordered_subview(
-      tv.backing_, base, ext, str, Impl::reciprocals<N>(ext),
+      tv.backing_, p.base, p.ext, p.str, Impl::reciprocals<N>(p.ext),
       Impl::right_order_seq<N>(std::make_index_sequence<N>{}));
 }
 
@@ -650,15 +666,9 @@ template <typename VT, int N, typename TL>
 KOKKOS_FUNCTION auto subview_tile(
     const View<VT, TiledLayout<N, TL>>&             tv,
     Kokkos::Array<int, static_cast<std::size_t>(N)> outer_idx) {
-  int base = 0;
-  for (int d = 0; d < N; ++d) base += outer_idx[d] * tv.stride(d);
-  Kokkos::Array<int, N> ext{}, str{};
-  for (int d = 0; d < N; ++d) {
-    ext[d] = tv.extent(N + d);
-    str[d] = tv.stride(N + d);
-  }
+  const auto p = Impl::subview_tile_params(tv, outer_idx);
   return Impl::make_ordered_subview(
-      tv.backing_, base, ext, str, Impl::reciprocals<N>(ext),
+      tv.backing_, p.base, p.ext, p.str, Impl::reciprocals<N>(p.ext),
       Impl::left_order_seq<N>(std::make_index_sequence<N>{}));
 }
 
@@ -667,16 +677,10 @@ template <typename VT, int N, typename TL>
 KOKKOS_FUNCTION auto subview_tile(
     const View<VT, TiledLayout<N, TL>>&             tv,
     Kokkos::Array<int, static_cast<std::size_t>(N)> outer_idx) {
-  int base_offset = 0;
-  for (int d = 0; d < N; ++d) base_offset += outer_idx[d] * tv.stride(d);
-  Kokkos::Array<int, N> extents{}, strides{};
-  for (int d = 0; d < N; ++d) {
-    extents[d] = tv.extent(N + d);
-    strides[d] = tv.stride(N + d);
-  }
+  const auto p = Impl::subview_tile_params(tv, outer_idx);
   return Subview<VT, N>{
       tv.backing_,
-      SubviewLayout<N>{base_offset, extents, strides, tv.layout_.inner_order(),
+      SubviewLayout<N>{p.base, p.ext, p.str, tv.layout_.inner_order(),
                        tv.layout_.inner_inv_extents()}};
 }
 

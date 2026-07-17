@@ -63,7 +63,8 @@ struct Index {
 // ---------------------------------------------------------------------------
 template <int... Extents>
 struct StaticTileLayoutBase {
-  static constexpr int         rank = sizeof...(Extents);
+  static constexpr bool        is_static = true;
+  static constexpr int         rank      = sizeof...(Extents);
   static constexpr std::size_t num_elements =
       (static_cast<std::size_t>(Extents) * ...);
 
@@ -87,6 +88,61 @@ struct StaticTileLayoutBase {
 
   KOKKOS_FORCEINLINE_FUNCTION static constexpr int size() noexcept {
     return static_cast<int>(num_elements);
+  }
+};
+
+// ---------------------------------------------------------------------------
+// DynamicTileLayoutBase<Rank>
+//
+// Shared runtime members for DynamicTileLayoutRight and DynamicTileLayoutLeft:
+// the extents_ / strides_ arrays, extent(), stride(), base_offset(), size(),
+// flat(), and flat_offset(). Both directions use the same strides_ field and
+// the same access formulas — they differ only in how strides_ is initialized
+// (constructor direction) and how operator[] peels dimensions. Those two pieces
+// stay in the derived classes.
+// ---------------------------------------------------------------------------
+template <int Rank>
+struct DynamicTileLayoutBase {
+  static constexpr bool is_static = false;
+  static constexpr int  rank      = Rank;
+
+  Kokkos::Array<int, Rank>         extents_;
+  Kokkos::Array<std::size_t, Rank> strides_;
+
+  KOKKOS_FUNCTION DynamicTileLayoutBase() : extents_{}, strides_{} {}
+
+ protected:
+  // Protected so derived constructors can supply pre-built strides.
+  KOKKOS_FUNCTION DynamicTileLayoutBase(Kokkos::Array<int, Rank>         ext,
+                                        Kokkos::Array<std::size_t, Rank> str)
+      : extents_(ext), strides_(str) {}
+
+ public:
+  KOKKOS_FUNCTION int extent(int k) const noexcept { return extents_[k]; }
+  KOKKOS_FUNCTION int stride(int k) const noexcept {
+    return static_cast<int>(strides_[k]);
+  }
+  KOKKOS_FUNCTION static constexpr int base_offset() noexcept { return 0; }
+  KOKKOS_FUNCTION int                  size() const noexcept {
+    int s = 1;
+    for (int k = 0; k < Rank; ++k) s *= extents_[k];
+    return s;
+  }
+
+  KOKKOS_FUNCTION std::size_t flat(
+      Kokkos::Array<int, Rank> idx) const noexcept {
+    std::size_t f = 0;
+    for (int k = 0; k < Rank; ++k)
+      f += static_cast<std::size_t>(idx[k]) * strides_[k];
+    return f;
+  }
+
+  KOKKOS_FUNCTION int flat_offset(
+      const Impl::Index<Rank>& coord) const noexcept {
+    int off = base_offset();
+    for (int d = 0; d < Rank; ++d)
+      off += coord[d] * static_cast<int>(strides_[d]);
+    return off;
   }
 };
 
@@ -154,8 +210,7 @@ struct StaticTileLayoutRight : Impl::StaticTileLayoutBase<Extents...> {
     return s;
   }
 
-  // flat → multi-index (decode): independent per-dim, exposes compile-time
-  // divisors
+  // flat → multi-index (decode): independent per-dim, compile-time divisors
   KOKKOS_FORCEINLINE_FUNCTION auto operator[](int linear) const noexcept {
     return decode_impl(linear, std::make_index_sequence<rank>{});
   }
@@ -372,30 +427,20 @@ struct StaticTileLayoutStride<StaticTile<Extents...>, Order...>
 // DynamicTileLayoutRight — runtime extents, row-major (rightmost fastest)
 // ---------------------------------------------------------------------------
 template <int Rank>
-struct DynamicTileLayoutRight {
-  static constexpr int rank = Rank;
+struct DynamicTileLayoutRight : Impl::DynamicTileLayoutBase<Rank> {
+  using Base = Impl::DynamicTileLayoutBase<Rank>;
+  using Base::extents_;
+  using Base::strides_;
 
-  Kokkos::Array<int, Rank>         extents_;
-  Kokkos::Array<std::size_t, Rank> strides_;  // precomputed row-major strides
-
-  KOKKOS_FUNCTION DynamicTileLayoutRight() : extents_{}, strides_{} {}
+  KOKKOS_FUNCTION DynamicTileLayoutRight() : Base() {}
 
   KOKKOS_FUNCTION explicit DynamicTileLayoutRight(Kokkos::Array<int, Rank> ext)
-      : extents_(ext) {
-    strides_[Rank - 1] = 1;
+      : Base() {
+    this->extents_           = ext;
+    this->strides_[Rank - 1] = 1;
     for (int k = Rank - 2; k >= 0; --k)
-      strides_[k] = strides_[k + 1] * static_cast<std::size_t>(ext[k + 1]);
-  }
-
-  KOKKOS_FUNCTION int extent(int k) const noexcept { return extents_[k]; }
-  KOKKOS_FUNCTION int stride(int k) const noexcept {
-    return static_cast<int>(strides_[k]);
-  }
-  KOKKOS_FUNCTION static constexpr int base_offset() noexcept { return 0; }
-  KOKKOS_FUNCTION int                  size() const noexcept {
-    int s = 1;
-    for (int k = 0; k < Rank; ++k) s *= extents_[k];
-    return s;
+      this->strides_[k] =
+          this->strides_[k + 1] * static_cast<std::size_t>(ext[k + 1]);
   }
 
   // flat → multi-index (decode): peel from rightmost (row-major)
@@ -407,54 +452,26 @@ struct DynamicTileLayoutRight {
     }
     return Impl::Index<Rank>{idx};
   }
-
-  // multi-index → flat offset (encode)
-  KOKKOS_FUNCTION std::size_t flat(
-      Kokkos::Array<int, Rank> idx) const noexcept {
-    std::size_t f = 0;
-    for (int k = 0; k < Rank; ++k)
-      f += static_cast<std::size_t>(idx[k]) * strides_[k];
-    return f;
-  }
-
-  KOKKOS_FUNCTION int flat_offset(
-      const Impl::Index<Rank>& coord) const noexcept {
-    int off = base_offset();
-    for (int d = 0; d < Rank; ++d)
-      off += coord[d] * static_cast<int>(strides_[d]);
-    return off;
-  }
 };
 
 // ---------------------------------------------------------------------------
 // DynamicTileLayoutLeft — runtime extents, column-major (leftmost fastest)
 // ---------------------------------------------------------------------------
 template <int Rank>
-struct DynamicTileLayoutLeft {
-  static constexpr int rank = Rank;
+struct DynamicTileLayoutLeft : Impl::DynamicTileLayoutBase<Rank> {
+  using Base = Impl::DynamicTileLayoutBase<Rank>;
+  using Base::extents_;
+  using Base::strides_;
 
-  Kokkos::Array<int, Rank> extents_;
-  Kokkos::Array<std::size_t, Rank>
-      strides_;  // precomputed column-major strides
-
-  KOKKOS_FUNCTION DynamicTileLayoutLeft() : extents_{}, strides_{} {}
+  KOKKOS_FUNCTION DynamicTileLayoutLeft() : Base() {}
 
   KOKKOS_FUNCTION explicit DynamicTileLayoutLeft(Kokkos::Array<int, Rank> ext)
-      : extents_(ext) {
-    strides_[0] = 1;
+      : Base() {
+    this->extents_    = ext;
+    this->strides_[0] = 1;
     for (int k = 1; k < Rank; ++k)
-      strides_[k] = strides_[k - 1] * static_cast<std::size_t>(ext[k - 1]);
-  }
-
-  KOKKOS_FUNCTION int extent(int k) const noexcept { return extents_[k]; }
-  KOKKOS_FUNCTION int stride(int k) const noexcept {
-    return static_cast<int>(strides_[k]);
-  }
-  KOKKOS_FUNCTION static constexpr int base_offset() noexcept { return 0; }
-  KOKKOS_FUNCTION int                  size() const noexcept {
-    int s = 1;
-    for (int k = 0; k < Rank; ++k) s *= extents_[k];
-    return s;
+      this->strides_[k] =
+          this->strides_[k - 1] * static_cast<std::size_t>(ext[k - 1]);
   }
 
   // flat → multi-index (decode): peel from leftmost (column-major)
@@ -465,23 +482,6 @@ struct DynamicTileLayoutLeft {
       linear /= extents_[d];
     }
     return Impl::Index<Rank>{idx};
-  }
-
-  // multi-index → flat offset (encode)
-  KOKKOS_FUNCTION std::size_t flat(
-      Kokkos::Array<int, Rank> idx) const noexcept {
-    std::size_t f = 0;
-    for (int k = 0; k < Rank; ++k)
-      f += static_cast<std::size_t>(idx[k]) * strides_[k];
-    return f;
-  }
-
-  KOKKOS_FUNCTION int flat_offset(
-      const Impl::Index<Rank>& coord) const noexcept {
-    int off = base_offset();
-    for (int d = 0; d < Rank; ++d)
-      off += coord[d] * static_cast<int>(strides_[d]);
-    return off;
   }
 };
 
