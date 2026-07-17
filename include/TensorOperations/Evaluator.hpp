@@ -26,28 +26,37 @@ struct TeamPolicyTag {
 // ---------------------------------------------------------------------------
 namespace Impl {
 
-// Apply a hook (input load-time or contraction store-time) to the element at
-// a given global coordinate. Every hook takes one index per rank followed by
-// the element by mutable reference: op(idx[0], ..., idx[Rank-1], v). NoHook
-// is the no-op identity.
+// Apply a hook (input load-time or contraction store-time) to staged scratch.
+// Every hook takes one index per rank followed by the element by mutable
+// reference: op(idx[0], ..., idx[Rank-1], v). NoHook is the no-op identity.
 template <typename Op, std::size_t Rank, typename V, std::size_t... Is>
-KOKKOS_FORCEINLINE_FUNCTION void apply_hook_expand(
+KOKKOS_FORCEINLINE_FUNCTION void apply_hook_at(
     const Op& op, const Kokkos::Array<int, Rank>& idx, V& v,
     std::index_sequence<Is...>) {
   op(idx[Is]..., v);
 }
 
-template <typename Op, std::size_t Rank, typename V>
-KOKKOS_FORCEINLINE_FUNCTION void apply_hook(const Op&                       op,
-                                            const Kokkos::Array<int, Rank>& idx,
-                                            V&                              v) {
-  apply_hook_expand(op, idx, v, std::make_index_sequence<Rank>{});
+template <typename Op, typename TeamMember, typename Scratch, std::size_t Rank>
+KOKKOS_FUNCTION void apply_hook(const Op& op, const TeamMember& team,
+                                const Kokkos::Array<int, Rank>& tile_idx,
+                                const Scratch&                  scratch) {
+  const auto layout = scratch.layout();
+  const auto total  = scratch.size();
+  Kokkos::parallel_for(Kokkos::TeamVectorRange(team, total), [=](int i) {
+    const auto               coord = layout[i];
+    Kokkos::Array<int, Rank> gidx{};
+    for (std::size_t d = 0; d < Rank; ++d)
+      gidx[d] = tile_idx[d] * scratch.extent(static_cast<int>(d)) + coord[d];
+    auto v = scratch[coord];
+    apply_hook_at(op, gidx, v, std::make_index_sequence<Rank>{});
+    scratch[coord] = v;
+  });
 }
 
-template <std::size_t Rank, typename V>
-KOKKOS_FORCEINLINE_FUNCTION void apply_hook(const NoHook&,
+template <typename TeamMember, typename Scratch, std::size_t Rank>
+KOKKOS_FORCEINLINE_FUNCTION void apply_hook(const NoHook&, const TeamMember&,
                                             const Kokkos::Array<int, Rank>&,
-                                            V&) {}
+                                            const Scratch&) {}
 
 // Apply a pointwise combine op to N (homogeneous) operand values at a given
 // global coordinate, returning the combined result. Mirrors apply_hook's index

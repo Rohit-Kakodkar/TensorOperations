@@ -126,6 +126,20 @@ KOKKOS_FUNCTION NodeHandle<InputTag, T, ModesSeq, HookOp> make_input_node(
   return {std::move(h), std::move(hook)};
 }
 
+// Intermediate node — wraps an existing storage View (a scratch/team tile, or
+// an empty View for a deferred full-tensor intermediate).
+template <typename Storage, typename HookOp = NoHook>
+KOKKOS_FUNCTION auto make_interm_node(Storage storage, HookOp hook = {}) {
+  constexpr int Rank = static_cast<int>(Storage::rank);
+  using ExecSpace    = typename Impl::exec_space_of<Storage>::type;
+  static_assert(
+      std::same_as<HookOp, NoHook> ||
+          HookLike<HookOp, Rank, typename Storage::value_type>,
+      "interm hook must be callable as op(i_0, ..., i_{Rank-1}, value_type&)");
+  return NodeHandle<IntermTag, Storage, std::integral_constant<int, Rank>,
+                    ExecSpace, HookOp>{std::move(storage), std::move(hook)};
+}
+
 // ---------------------------------------------------------------------------
 // Contraction specialization — C{free modes} = sum{contracted} A × B
 // ---------------------------------------------------------------------------

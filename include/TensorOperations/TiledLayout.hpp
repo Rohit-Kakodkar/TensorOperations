@@ -502,6 +502,19 @@ using ScratchView =
          Layout>;
 
 // ---------------------------------------------------------------------------
+// GlobalView<ViewType, Layout>
+//
+// Semantic alias for View<ViewType, Layout> used when ViewType is backed by
+// global (not scratch) memory — e.g. an operand's native TensorHandle view,
+// reinterpreted under a tile's Layout with no data movement. Purely
+// documentary: distinguishes "a View over global memory" from ScratchView at
+// a call site; it is not a distinct type.
+// ---------------------------------------------------------------------------
+
+template <typename ViewType, typename Layout>
+using GlobalView = View<ViewType, Layout>;
+
+// ---------------------------------------------------------------------------
 // Impl helpers for subview_tile
 // ---------------------------------------------------------------------------
 

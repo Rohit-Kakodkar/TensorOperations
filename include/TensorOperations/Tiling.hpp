@@ -482,4 +482,21 @@ CombineTile<OutTile, OpTiles...> make_combine_tile(const OutTile& out,
   return CombineTile<OutTile, OpTiles...>{out, DeviceTuple<OpTiles...>(ops...)};
 }
 
+// ---------------------------------------------------------------------------
+// StageTile<SourceTile, PermSeq> — target spec for staging a global-view
+// interm node into scratch.
+//
+// Bundles the operand's own (native-order) tile shape with the gather
+// permutation (native -> canonical) needed to bring it into the order the
+// destination scratch tile expects. The scratch tile's actual shape is
+// derived on demand via reorder_tile_value(source_tile, PermSeq{}) — the same
+// helper the contraction evaluator already uses to build its canonical
+// per-operand tiles. PermSeq carries no runtime data; it's a template
+// parameter only.
+// ---------------------------------------------------------------------------
+template <typename SourceTile, typename PermSeq>
+struct StageTile {
+  SourceTile source_tile{};
+};
+
 }  // namespace TensorOperations
