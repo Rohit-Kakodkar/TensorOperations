@@ -80,6 +80,7 @@ struct NodeHandle<InputTag, T, ModesSeq, HookOp> {
   TensorHandle<T, ModesSeq>    handle;
   [[no_unique_address]] HookOp hook_op;
 
+  using node_tag            = InputTag;
   static constexpr int Rank = TensorHandle<T, ModesSeq>::Rank;
   using value_type          = typename Impl::value_type_of<T>::type;
   using exec_space          = typename Impl::exec_space_of<T>::type;
@@ -101,6 +102,7 @@ struct NodeHandle<InputTag, T, ModesSeq, HookOp> {
 template <typename Storage, typename IntRank, typename ExecSpace,
           typename HookOp>
 struct NodeHandle<IntermTag, Storage, IntRank, ExecSpace, HookOp> {
+  using node_tag            = IntermTag;
   static constexpr int Rank = IntRank::value;
   using storage_type        = Storage;
   using value_type          = typename Storage::value_type;
@@ -152,6 +154,7 @@ template <typename NodeA, typename NodeB, typename IntCRank, typename Scalar,
           typename PermCSeq>
 struct NodeHandle<ContractionTag, NodeA, NodeB, IntCRank, Scalar, ExecSpace,
                   HookOp, ModesSeq, PermCSeq> {
+  using node_tag                     = ContractionTag;
   static constexpr int Rank          = IntCRank::value;
   static constexpr int NumContracted = (NodeA::Rank + NodeB::Rank - Rank) / 2;
   using hook_type                    = HookOp;
@@ -279,6 +282,7 @@ template <typename CombineFn, typename IntRank, typename Scalar,
           typename... Ops>
 struct NodeHandle<CombineTag, CombineFn, IntRank, Scalar, ExecSpace, ModesSeq,
                   IntNumOut, Ops...> {
+  using node_tag              = CombineTag;
   static constexpr int Rank   = IntRank::value;
   static constexpr int NumOps = static_cast<int>(sizeof...(Ops));
   static constexpr int NumOut = IntNumOut::value;  // outputs emitted by fn

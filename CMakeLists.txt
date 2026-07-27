@@ -81,6 +81,11 @@ add_executable(test_tiled_layout tests/test_tiled_layout.cpp)
 target_link_libraries(test_tiled_layout PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_tiled_layout)
 
+# test_scratch_allocator — custom main() wraps Kokkos init/finalize
+add_executable(test_scratch_allocator tests/test_scratch_allocator.cpp)
+target_link_libraries(test_scratch_allocator PRIVATE tensor GTest::gtest)
+gtest_discover_tests(test_scratch_allocator)
+
 # Benchmarks (opt-in: -DTENSOR_OPS_BUILD_BENCHMARKS=ON). No gtest; own main().
 if(TENSOR_OPS_BUILD_BENCHMARKS)
   # KokkosKernels — needed for bench_matrix_multiply's BLAS3 GEMM path.
