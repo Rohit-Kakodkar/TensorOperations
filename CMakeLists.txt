@@ -85,6 +85,10 @@ gtest_discover_tests(test_tiled_layout)
 add_executable(test_scratch_allocator tests/test_scratch_allocator.cpp)
 target_link_libraries(test_scratch_allocator PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_scratch_allocator)
+# test_tile_layout_stride — custom main() wraps Kokkos init/finalize
+add_executable(test_tile_layout_stride tests/test_tile_layout_stride.cpp)
+target_link_libraries(test_tile_layout_stride PRIVATE tensor GTest::gtest)
+gtest_discover_tests(test_tile_layout_stride)
 
 # Benchmarks (opt-in: -DTENSOR_OPS_BUILD_BENCHMARKS=ON). No gtest; own main().
 if(TENSOR_OPS_BUILD_BENCHMARKS)
