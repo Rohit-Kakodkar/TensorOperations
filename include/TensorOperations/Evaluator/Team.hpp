@@ -74,6 +74,10 @@ std::size_t scratch_tile_bytes(const Tile& tile) {
 
 }  // namespace Impl
 
+// ScratchAllocator is defined here (after Impl::scratch_tile_bytes) because
+// its TeamPolicyTag specializations call scratch_tile_bytes internally.
+#include <TensorOperations/ScratchAllocator.hpp>
+
 // ---------------------------------------------------------------------------
 // Specialization 2: TeamPolicyTag + InputTag + Tile_  (global-view tier)
 //
@@ -226,6 +230,17 @@ struct Evaluator<TeamPolicyTag<ES>,
                   decltype(make_tile_layout(output_tile(tile_b_canon_t{}),
                                             LayoutRight{}))>;
 
+  using alloc_a_t =
+      decltype(make_scratch_allocator<TeamPolicyTag<ES>, ContractionTag>(
+          std::declval<NA>(), std::declval<TileA>(),
+          std::declval<typename Kokkos::TeamPolicy<ES>::member_type>()));
+  using alloc_b_t =
+      decltype(make_scratch_allocator<TeamPolicyTag<ES>, ContractionTag>(
+          std::declval<NB>(), std::declval<TileB>(),
+          std::declval<typename Kokkos::TeamPolicy<ES>::member_type>()));
+  using alloc_c_t =
+      ScratchAllocator<TeamPolicyTag<ES>, ContractionTag, IntermTag>;
+
  public:
   using scratch_view_t = ScratchView<value_type, exec_space, c_layout_t>;
   using interm_type =
@@ -240,6 +255,9 @@ struct Evaluator<TeamPolicyTag<ES>,
   tile_a_canon_t a_tile_;
   tile_b_canon_t b_tile_;
   tile_c_canon_t c_tile_;
+  alloc_a_t      alloc_a_;
+  alloc_b_t      alloc_b_;
+  alloc_c_t      alloc_c_;
   a_scratch_t    scratch_a_;
   b_scratch_t    scratch_b_;
   scratch_view_t scratch_;
@@ -253,12 +271,16 @@ struct Evaluator<TeamPolicyTag<ES>,
         a_tile_(reorder_tile_value(t.a, permA_seq{})),
         b_tile_(reorder_tile_value(t.b, permB_seq{})),
         c_tile_(reorder_tile_value(t.c, permC_seq{})),
-        scratch_a_(Impl::alloc_scratch_tile<value_type, exec_space>(
-            team, output_tile(a_tile_))),
-        scratch_b_(Impl::alloc_scratch_tile<value_type, exec_space>(
-            team, output_tile(b_tile_))),
-        scratch_(
-            Impl::alloc_scratch_tile<value_type, exec_space>(team, c_tile_)) {
+        alloc_a_(make_scratch_allocator<TeamPolicyTag<ES>, ContractionTag>(
+            n.node_a, tile_a_native_, team)),
+        alloc_b_(make_scratch_allocator<TeamPolicyTag<ES>, ContractionTag>(
+            n.node_b, tile_b_native_, team)),
+        alloc_c_(),
+        scratch_a_(
+            alloc_a_.template alloc<value_type>(team, output_tile(a_tile_))),
+        scratch_b_(
+            alloc_b_.template alloc<value_type>(team, output_tile(b_tile_))),
+        scratch_(alloc_c_.template alloc<value_type>(team, c_tile_)) {
     result_.hook_op  = node.hook_op;
     result_.storage_ = scratch_;
   }
@@ -312,12 +334,12 @@ struct Evaluator<TeamPolicyTag<ES>,
   }
 
   static std::size_t scratch_size_per_team(const tiling_type& t) {
-    return Impl::scratch_tile_bytes<value_type, exec_space>(
-               reorder_tile_value(t.c, permC_seq{})) +
-           Impl::scratch_tile_bytes<value_type, exec_space>(
-               output_tile(reorder_tile_value(t.a, permA_seq{}))) +
-           Impl::scratch_tile_bytes<value_type, exec_space>(
-               output_tile(reorder_tile_value(t.b, permB_seq{})));
+    const tile_c_canon_t c_canon = reorder_tile_value(t.c, permC_seq{});
+    const tile_a_canon_t a_canon = reorder_tile_value(t.a, permA_seq{});
+    const tile_b_canon_t b_canon = reorder_tile_value(t.b, permB_seq{});
+    return alloc_c_t::template bytes<value_type>(c_canon) +
+           alloc_a_t::template bytes<value_type>(a_canon) +
+           alloc_b_t::template bytes<value_type>(b_canon);
   }
 
  private:
@@ -384,11 +406,6 @@ struct Evaluator<TeamPolicyTag<ES>,
     const auto a_native_idx = Impl::scatter_index(a_tile_idx, permA_seq{});
     const auto b_native_idx = Impl::scatter_index(b_tile_idx, permB_seq{});
 
-    auto eval_a =
-        make_evaluator<TeamPolicyTag<ES>>(node.node_a, tile_a_native_, team);
-    auto eval_b =
-        make_evaluator<TeamPolicyTag<ES>>(node.node_b, tile_b_native_, team);
-
     auto stage_a = make_evaluator<TeamPolicyTag<ES>>(
         make_interm_node(scratch_a_),
         StageTile<TileA, permA_seq>{tile_a_native_}, team);
@@ -396,8 +413,10 @@ struct Evaluator<TeamPolicyTag<ES>,
         make_interm_node(scratch_b_),
         StageTile<TileB, permB_seq>{tile_b_native_}, team);
 
-    auto staged_a = stage_a(team, a_tile_idx) = eval_a(team, a_native_idx);
-    auto staged_b = stage_b(team, b_tile_idx) = eval_b(team, b_native_idx);
+    auto staged_a = stage_a(team, a_tile_idx) =
+        alloc_a_.stage(team, a_native_idx);
+    auto staged_b = stage_b(team, b_tile_idx) =
+        alloc_b_.stage(team, b_native_idx);
     team.team_barrier();
 
     // View each operand's scratch as a 2D GEMM matrix: A[SA,SK], B[SK,SB],
@@ -609,6 +628,19 @@ struct Evaluator<TeamPolicyTag<ES>,
   // Per-operand (K) type helpers.
   template <std::size_t K>
   using op_node_t = tuple_element_t<K, typename node_type::ops_tuple_t>;
+
+  template <std::size_t K>
+  using op_alloc_t =
+      ScratchAllocator<TeamPolicyTag<ES>, CombineTag, op_node_t<K>>;
+  using out_alloc_t =
+      ScratchAllocator<TeamPolicyTag<ES>, CombineTag, IntermTag>;
+
+  // Heterogeneous tuple of per-operand allocators (deduced via an unevaluated
+  // helper so we can name the type before the private helpers are defined).
+  template <std::size_t... Ks>
+  static auto op_allocs_type_helper(std::index_sequence<Ks...>)
+      -> DeviceTuple<op_alloc_t<Ks>...>;
+  using op_allocs_t = decltype(op_allocs_type_helper(ops_seq{}));
   template <std::size_t K>
   using perm_seq =
       Impl::label_perm_seq_t<CModesSeq, typename op_node_t<K>::modes_seq>;
@@ -677,7 +709,9 @@ struct Evaluator<TeamPolicyTag<ES>,
   using team_member_t = typename Kokkos::TeamPolicy<exec_space>::member_type;
 
   node_type   node;
-  tiling_type tiling;  // the tile spec (plain output tile or CombineTile)
+  tiling_type tiling;      // the tile spec (plain output tile or CombineTile)
+  op_allocs_t op_allocs_;  // one allocator / operand
+  Kokkos::Array<out_alloc_t, NumOut> out_allocs_;  // one allocator / output
   Kokkos::Array<scratch_view_t, NumOps>
       op_scratch_;  // one scratch tile / operand
   Kokkos::Array<scratch_view_t, NumOut>
@@ -687,6 +721,8 @@ struct Evaluator<TeamPolicyTag<ES>,
                             const team_member_t& team)
       : node(n),
         tiling(t),
+        op_allocs_(make_op_allocs(node, ops_seq{})),
+        out_allocs_(make_out_allocs(outs_seq{})),
         op_scratch_(alloc_op_scratch(team, ops_seq{})),
         outs_(alloc_out_scratch(team, outs_seq{})) {}
 
@@ -732,12 +768,11 @@ struct Evaluator<TeamPolicyTag<ES>,
   }
 
   static std::size_t scratch_size_per_team(const tiling_type& t) {
+    const out_tile_t out = output_tile(t);
     return static_cast<std::size_t>(NumOut) *
-               Impl::scratch_tile_bytes<value_type, exec_space>(
-                   output_tile(t)) +
-           static_cast<std::size_t>(NumOps) *
-               Impl::scratch_tile_bytes<value_type, exec_space>(
-                   output_tile(t)) +
+               ScratchAllocator<TeamPolicyTag<exec_space>, CombineTag,
+                                IntermTag>::template bytes<value_type>(out) +
+           operand_staging_size(out, ops_seq{}) +
            operand_scratch_size(t, ops_seq{});
   }
 
@@ -775,6 +810,20 @@ struct Evaluator<TeamPolicyTag<ES>,
     return {stage_operand<Ks>(team, tile_idx)...};  // left-to-right
   }
 
+  // Staging buffer cost for operand K: dispatched via K's node type so that a
+  // future ContractionTag specialization can return 0 (skip re-staging).
+  template <std::size_t K>
+  static std::size_t operand_staging_bytes(const out_tile_t& out) {
+    return ScratchAllocator<TeamPolicyTag<exec_space>, CombineTag,
+                            op_node_t<K>>::template bytes<value_type>(out);
+  }
+
+  template <std::size_t... Ks>
+  static std::size_t operand_staging_size(const out_tile_t& out,
+                                          std::index_sequence<Ks...>) {
+    return ((operand_staging_bytes<Ks>(out)) + ...);
+  }
+
   // Each operand's own internal scratch cost: 0 for an InputTag operand
   // (Specialization 2 owns no scratch of its own now); the nested
   // contraction's real a+b+c bytes for a ContractionTag operand.
@@ -798,24 +847,37 @@ struct Evaluator<TeamPolicyTag<ES>,
     return total;
   }
 
-  // Allocate NumOps distinct per-operand scratch tiles (each alloc bumps team
-  // scratch; braced-init evaluation order is left-to-right).
+  // Construct one allocator per operand from the node's operand pack.
+  template <std::size_t... Ks>
+  KOKKOS_FUNCTION static op_allocs_t make_op_allocs(
+      const node_type& n, std::index_sequence<Ks...>) {
+    return op_allocs_t{make_scratch_allocator<TeamPolicyTag<ES>, CombineTag>(
+        n.operands.template get<Ks>())...};
+  }
+
+  // Default-construct one IntermTag allocator per output slot.
+  template <std::size_t... Ms>
+  KOKKOS_FUNCTION static Kokkos::Array<out_alloc_t, NumOut> make_out_allocs(
+      std::index_sequence<Ms...>) {
+    return {(static_cast<void>(Ms), out_alloc_t{})...};
+  }
+
+  // Allocate NumOps distinct per-operand scratch tiles via the stored
+  // allocators (braced-init evaluation order is left-to-right).
   template <std::size_t... Ks>
   KOKKOS_FUNCTION Kokkos::Array<scratch_view_t, NumOps> alloc_op_scratch(
       const team_member_t& team, std::index_sequence<Ks...>) const {
-    return {(static_cast<void>(Ks),
-             Impl::alloc_scratch_tile<value_type, exec_space>(
-                 team, output_tile(tiling)))...};
+    return {op_allocs_.template get<Ks>().template alloc<value_type>(
+        team, output_tile(tiling))...};
   }
 
-  // Allocate NumOut distinct output scratch tiles (each alloc bumps team
-  // scratch; braced-init evaluation order is left-to-right).
+  // Allocate NumOut distinct output scratch tiles via the stored allocators
+  // (braced-init evaluation order is left-to-right).
   template <std::size_t... Ms>
   KOKKOS_FUNCTION Kokkos::Array<scratch_view_t, NumOut> alloc_out_scratch(
       const team_member_t& team, std::index_sequence<Ms...>) const {
-    return {(static_cast<void>(Ms),
-             Impl::alloc_scratch_tile<value_type, exec_space>(
-                 team, output_tile(tiling)))...};
+    return {out_allocs_[Ms].template alloc<value_type>(team,
+                                                       output_tile(tiling))...};
   }
 
   // Wrap each output scratch tile in an interm handle (NoHook: the store just
