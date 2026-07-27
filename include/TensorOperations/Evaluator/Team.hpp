@@ -648,38 +648,9 @@ struct Evaluator<TeamPolicyTag<ES>,
   using perm_seq =
       Impl::label_perm_seq_t<CModesSeq, typename op_node_t<K>::modes_seq>;
 
-  // Per-operand tile spec (identity for plain-tile form; the K-th slot of the
-  // CombineTile bundle otherwise). combine_op_tile<K> presents this in the
-  // combine's canonical (output) order; native_perm_seq<K> undoes perm_seq<K>
-  // to recover operand K's true native axis order (identity for every
-  // ContractionTag operand, per the asserts below), mirroring how
-  // accumulate_block derives tile_a_native_/a_tile_ from permA_seq.
-  template <std::size_t K>
-  using op_tile_t = Impl::combine_op_tile_t<K, Tile_>;
-  template <std::size_t K>
-  using native_perm_seq = Impl::inverse_perm_seq_t<perm_seq<K>>;
-  template <std::size_t K>
-  using native_tile_t = decltype(reorder_tile_value(
-      std::declval<op_tile_t<K>>(), native_perm_seq<K>{}));
-
-  // Per-operand allocator: the 4-param ScratchAllocator specialization, keyed
-  // on the operand's native tile, so it stores an inner Evaluator built once
-  // at construction (mirroring the ContractionTag evaluator's alloc_a_/
-  // alloc_b_). stage() below then delegates to it instead of rebuilding an
-  // evaluator on every call.
-  template <std::size_t K>
-  using op_alloc_t = ScratchAllocator<TeamPolicyTag<ES>, CombineTag,
-                                      op_node_t<K>, native_tile_t<K>>;
-  using out_alloc_t =
-      ScratchAllocator<TeamPolicyTag<ES>, CombineTag, IntermTag>;
-
-  // Heterogeneous tuple of per-operand allocators (deduced via an unevaluated
-  // helper so we can name the type before the private helpers are defined).
-  template <std::size_t... Ks>
-  static auto op_allocs_type_helper(std::index_sequence<Ks...>)
-      -> DeviceTuple<op_alloc_t<Ks>...>;
-  using op_allocs_t = decltype(op_allocs_type_helper(ops_seq{}));
-
+  // A contraction operand's output order/canonicality must be verified before
+  // it's relied upon below (native_perm_seq<K> assumes every ContractionTag
+  // operand has identity perm_seq<K>).
   template <std::size_t K>
   static constexpr bool op_contraction_permC_identity() {
     if constexpr (op_is_contraction_v<K>)
@@ -702,6 +673,56 @@ struct Evaluator<TeamPolicyTag<ES>,
       }(ops_seq{}),
       "combine evaluator: a contraction operand must be in canonical position "
       "(identity permC); construct it with output modes == freeA++freeB");
+
+  // Per-operand tile spec (identity for plain-tile form; the K-th slot of the
+  // CombineTile bundle otherwise). combine_op_tile<K> presents this in the
+  // combine's canonical (output) order; native_perm_seq<K> undoes perm_seq<K>
+  // to recover operand K's true native axis order (identity for every
+  // ContractionTag operand, per the asserts above), mirroring how
+  // accumulate_block derives tile_a_native_/a_tile_ from permA_seq.
+  template <std::size_t K>
+  using op_tile_t = Impl::combine_op_tile_t<K, Tile_>;
+  template <std::size_t K>
+  using native_perm_seq = Impl::inverse_perm_seq_t<perm_seq<K>>;
+  template <std::size_t K>
+  using native_tile_t = decltype(reorder_tile_value(
+      std::declval<op_tile_t<K>>(), native_perm_seq<K>{}));
+
+  // Reconstruct operand K's tile in its true native axis order from the
+  // combine's tiling spec. Shared by the host-side sizing path
+  // (operand_native_scratch_bytes) and the device-side construction path
+  // (make_op_allocs), which previously duplicated this expression.
+  template <std::size_t K>
+  static native_tile_t<K> native_op_tile(const tiling_type& t) {
+    return reorder_tile_value(Impl::combine_op_tile<K>(t),
+                              native_perm_seq<K>{});
+  }
+
+  // Per-operand allocator: the 4-param ScratchAllocator specialization, keyed
+  // on the operand's native tile, so it stores an inner Evaluator built once
+  // at construction (mirroring the ContractionTag evaluator's alloc_a_/
+  // alloc_b_) rather than in stage_operand() on every call. Since a combine
+  // node currently invokes stage_operand() exactly once per operand per team
+  // (no k-loop at the combine level; combine operands can't yet be fused/
+  // repeated, see the static_asserts above), construction count is unchanged
+  // either way today -- this just moves it earlier. The real payoff is
+  // future-proofing for when combine operands support repeated/fused
+  // invocation, at which point building once here (instead of per stage()
+  // call) will actually avoid redundant rebuilds, mirroring the fix already
+  // applied to ContractionTag's A/B operands (which really do loop over
+  // k-tiles).
+  template <std::size_t K>
+  using op_alloc_t = ScratchAllocator<TeamPolicyTag<ES>, CombineTag,
+                                      op_node_t<K>, native_tile_t<K>>;
+  using out_alloc_t =
+      ScratchAllocator<TeamPolicyTag<ES>, CombineTag, IntermTag>;
+
+  // Heterogeneous tuple of per-operand allocators (deduced via an unevaluated
+  // helper so we can name the type before the private helpers are defined).
+  template <std::size_t... Ks>
+  static auto op_allocs_type_helper(std::index_sequence<Ks...>)
+      -> DeviceTuple<op_alloc_t<Ks>...>;
+  using op_allocs_t = decltype(op_allocs_type_helper(ops_seq{}));
 
   using interm_type =
       NodeHandle<IntermTag, scratch_view_t, std::integral_constant<int, Rank>,
@@ -783,13 +804,15 @@ struct Evaluator<TeamPolicyTag<ES>,
   // allocator (op_allocs_) holds an inner Evaluator built once at construction
   // time, so stage() here just evaluates it at the native-order tile index
   // (scattered from the combine's canonical tile_idx via perm_seq<K>) instead
-  // of rebuilding an evaluator on every call -- the same nested-scratch fix
-  // already applied to the ContractionTag evaluator's A/B operands. The
-  // result is handed off to the merged stage-or-passthrough evaluator
-  // (Specialization 8), exactly like accumulate_block does for A and B. That
-  // evaluator's own if constexpr on the source's storage type picks
-  // copy+reorder (InputTag) vs. true zero-copy passthrough (ContractionTag,
-  // asserted-identity perm) -- no tag branching needed here.
+  // of rebuilding an evaluator inline (as op_alloc_t's doc comment above
+  // notes, this is called exactly once per operand per team today, so the
+  // benefit is future-proofing rather than avoiding a current rebuild loop --
+  // unlike accumulate_block's A/B operands, which really do loop over
+  // k-tiles). The result is handed off to the merged stage-or-passthrough
+  // evaluator (Specialization 8), exactly like accumulate_block does for A
+  // and B. That evaluator's own if constexpr on the source's storage type
+  // picks copy+reorder (InputTag) vs. true zero-copy passthrough
+  // (ContractionTag, asserted-identity perm) -- no tag branching needed here.
   template <std::size_t K>
   KOKKOS_FUNCTION scratch_view_t
   stage_operand(const team_member_t&            team,
@@ -811,11 +834,18 @@ struct Evaluator<TeamPolicyTag<ES>,
     return {stage_operand<Ks>(team, tile_idx)...};  // left-to-right
   }
 
-  // Staging buffer cost for operand K: dispatched via K's node type so that a
-  // future ContractionTag specialization can return 0 (skip re-staging).
+  // Staging buffer cost for operand K: a ContractionTag operand is staged
+  // zero-copy (its ScratchAllocator::alloc() returns the inner evaluator's
+  // own C scratch directly, mirroring ContractionTag's own ContractionTag-
+  // operand form), so it needs no separate staging buffer; only an InputTag
+  // operand carves one via op_alloc_t<K>::bytes().
   template <std::size_t K>
   static std::size_t operand_staging_bytes(const out_tile_t& out) {
-    return op_alloc_t<K>::template bytes<value_type>(out);
+    if constexpr (op_is_contraction_v<K>) {
+      return 0;
+    } else {
+      return op_alloc_t<K>::template bytes<value_type>(out);
+    }
   }
 
   template <std::size_t... Ks>
@@ -830,8 +860,7 @@ struct Evaluator<TeamPolicyTag<ES>,
   template <std::size_t K>
   static std::size_t operand_native_scratch_bytes(const tiling_type& t) {
     if constexpr (op_is_contraction_v<K>) {
-      const native_tile_t<K> native_tile =
-          reorder_tile_value(Impl::combine_op_tile<K>(t), native_perm_seq<K>{});
+      const native_tile_t<K> native_tile = native_op_tile<K>(t);
       return Evaluator<TeamPolicyTag<ES>, op_node_t<K>,
                        native_tile_t<K>>::scratch_size_per_team(native_tile);
     } else {
@@ -849,15 +878,15 @@ struct Evaluator<TeamPolicyTag<ES>,
 
   // Construct one allocator per operand from the node's operand pack, each
   // built from its native-order tile + team so the inner Evaluator's scratch
-  // is allocated exactly once here (not on every stage() call).
+  // is allocated exactly once here rather than in stage_operand() (see the
+  // op_alloc_t comment above for why this is currently neutral in cost and
+  // primarily future-proofing).
   template <std::size_t... Ks>
   KOKKOS_FUNCTION static op_allocs_t make_op_allocs(
       const node_type& n, const tiling_type& t, const team_member_t& team,
       std::index_sequence<Ks...>) {
     return op_allocs_t{make_scratch_allocator<TeamPolicyTag<ES>, CombineTag>(
-        n.operands.template get<Ks>(),
-        reorder_tile_value(Impl::combine_op_tile<Ks>(t), native_perm_seq<Ks>{}),
-        team)...};
+        n.operands.template get<Ks>(), native_op_tile<Ks>(t), team)...};
   }
 
   // Default-construct one IntermTag allocator per output slot.

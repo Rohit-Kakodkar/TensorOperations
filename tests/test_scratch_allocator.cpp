@@ -174,26 +174,32 @@ TEST(ScratchAllocatorTest, CombineInputOperandBytes) {
 }
 
 // ---------------------------------------------------------------------------
-// CombineTag outer op, ContractionTag operand (4-param): bytes() stays
-// NON-recursive (Impl::scratch_tile_bytes on the C tile alone), unlike the
-// ContractionTag-outer-op form's recursive bytes() for the exact same nested
-// node + tile bundle -- the combine evaluator already adds the nested
-// operand's full recursive scratch separately (operand_native_scratch_bytes
-// in the CombineTag evaluator), so a recursive bytes() here would
-// double-count.
+// CombineTag outer op, ContractionTag operand (4-param): the ContractionTag-
+// operand specialization body is shared across every OuterOpTag
+// (ContractionTag, CombineTag) -- OuterOpTag is an unused template parameter
+// in this specialization -- so this form now has the SAME zero-copy alloc()
+// and RECURSIVE bytes() (the inner evaluator's full scratch_size_per_team)
+// as the ContractionTag-outer-op form for the identical (node, tile bundle)
+// pair, matching that form's bytes() exactly. The CombineTag evaluator
+// (Team.hpp) independently computes this same recursive size via
+// operand_native_scratch_bytes and skips calling this allocator's bytes()
+// for staging purposes (operand_staging_bytes returns 0 for a ContractionTag
+// operand), so there is no double-counting in practice.
 // ---------------------------------------------------------------------------
-TEST(ScratchAllocatorTest, CombineNestedOperandBytesIsNonRecursive) {
+TEST(ScratchAllocatorTest, CombineNestedOperandBytesIsRecursive) {
   using NC    = decltype(make_contraction_3d());
   using Alloc = ScratchAllocator<TeamPolicyTag<ES>, CombineTag, NC, Bundle3>;
-
-  const std::size_t expected = Impl::scratch_tile_bytes<float, ES>(TileC3{});
-  EXPECT_EQ((Alloc::bytes<float>(TileC3{})), expected);
-
-  // Confirm this really differs from the recursive ContractionTag-outer-op
-  // form for the identical (node, tile bundle) pair.
   using ContrAlloc =
       ScratchAllocator<TeamPolicyTag<ES>, ContractionTag, NC, Bundle3>;
-  EXPECT_GT((ContrAlloc::bytes<float>(Bundle3{})), expected);
+
+  using InnerEval            = Evaluator<TeamPolicyTag<ES>, NC, Bundle3>;
+  const std::size_t expected = InnerEval::scratch_size_per_team(Bundle3{});
+  EXPECT_GT(expected, 0u);
+  EXPECT_EQ((Alloc::bytes<float>(Bundle3{})), expected);
+  // Matches the ContractionTag-outer-op form exactly (same recursive bytes()),
+  // unlike before this fix, when CombineTag's form stayed non-recursive.
+  EXPECT_EQ((Alloc::bytes<float>(Bundle3{})),
+            (ContrAlloc::bytes<float>(Bundle3{})));
 
   static_assert(requires(const Alloc& a) {
     a.stage(std::declval<team_t>(), std::declval<Kokkos::Array<int, 2>>());
