@@ -190,7 +190,7 @@ template <typename NodeType, typename Tile, typename... ViewTs>
 int execute_one_output_team(const NodeType& node, const Tile& tile,
                             const ViewTs&... views) {
   using exec_space = typename NodeType::exec_space;
-  using member_t   = typename Kokkos::TeamPolicy<exec_space>::member_type;
+  using member_t   = Impl::team_member_t<exec_space>;
   using eval_type  = Evaluator<TeamPolicyTag<exec_space>, NodeType, Tile>;
   constexpr int M  = output_arity<NodeType>::value;
   static_assert(sizeof...(ViewTs) == static_cast<std::size_t>(M),

@@ -190,6 +190,55 @@ KOKKOS_FUNCTION auto reorder_tile_value(
     return reorder_static_tile(tile, perm);
 }
 
+// ---------------------------------------------------------------------------
+// OperandAxes<PermSeq> — relates one operand's native axis order to the
+// canonical order the evaluators work in.
+//
+// PermSeq is the gather permutation: canonical axis i comes from native axis
+// PermSeq[i], so canon.extent(i) == native.extent(PermSeq[i]). Both directions
+// are needed across the evaluators and each was previously open-coded:
+//   • the contraction evaluator stores each operand's NATIVE tile and derives
+//     the canonical one (permA/permB/permC),
+//   • the combine evaluator receives each operand's tile already in CANONICAL
+//     (output) order and derives the native one (inverse of the label gather).
+// Both then scatter a canonical tile index into the operand's native order to
+// drive that operand's own natively-tiled evaluator — the identical operation
+// in each case.
+//
+// Everything here is compile-time or a trivially-inlined value transform; the
+// identity permutation short-circuits via reorder_tile_value.
+// ---------------------------------------------------------------------------
+template <typename PermSeq>
+struct OperandAxes {
+  using perm_seq         = PermSeq;
+  using inverse_perm_seq = Impl::inverse_perm_seq_t<PermSeq>;
+
+  static constexpr bool is_identity = Impl::is_identity_seq(PermSeq{});
+
+  // native tile -> canonical tile, and back.
+  template <typename Tile>
+  using canon_tile_t =
+      decltype(reorder_tile_value(std::declval<Tile>(), PermSeq{}));
+  template <typename Tile>
+  using native_tile_t =
+      decltype(reorder_tile_value(std::declval<Tile>(), inverse_perm_seq{}));
+
+  template <typename Tile>
+  KOKKOS_FUNCTION static canon_tile_t<Tile> to_canon_tile(const Tile& t) {
+    return reorder_tile_value(t, PermSeq{});
+  }
+  template <typename Tile>
+  KOKKOS_FUNCTION static native_tile_t<Tile> to_native_tile(const Tile& t) {
+    return reorder_tile_value(t, inverse_perm_seq{});
+  }
+
+  // Canonical tile index -> the operand's own native tile index.
+  template <std::size_t R>
+  KOKKOS_FUNCTION static auto to_native_idx(const Kokkos::Array<int, R>& idx) {
+    return Impl::scatter_index(idx, PermSeq{});
+  }
+};
+
 template <int... Extents, int... TileE>
 KOKKOS_FUNCTION constexpr auto tile_layout(StaticTileLayoutRight<Extents...>,
                                            StaticTile<TileE...>) noexcept
@@ -528,6 +577,9 @@ CombineTile<OutTile, OpTiles...> make_combine_tile(const OutTile& out,
 // ---------------------------------------------------------------------------
 template <typename SourceTile, typename PermSeq>
 struct StageTile {
+  using source_tile_t = SourceTile;
+  using perm_seq      = PermSeq;
+
   SourceTile source_tile{};
 };
 
