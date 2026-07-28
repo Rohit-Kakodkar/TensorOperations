@@ -738,6 +738,269 @@ TEST(GraphTest, FusedBothOperandsContractionTeam) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Compile-time rejection of a permuted fused operand whose tile dimensions are
+// mismatched.
+//
+// A permuted fused operand is staged by transposing its own C scratch IN
+// PLACE, so the permutation has to map that tile's extent tuple onto itself: a
+// 32x64 tile has no room to become 64x32 inside its own storage. This is the
+// negative counterpart to FusedPermutedOperandATeam below, which is the same
+// chain with a legal (square) operand tile.
+//
+// It cannot be written as a runtime TEST: the violation is a static_assert
+// inside the evaluator's class body, i.e. a hard compile error that no
+// `requires` / SFINAE probe can catch, so merely naming the bad Evaluator type
+// would fail the build rather than fail the test. What is checkable is the
+// predicate the evaluator's static_assert is spelled in terms of --
+// Impl::operand_stageable_v -- asserted here in BOTH directions over the exact
+// node types of that chain.
+// ---------------------------------------------------------------------------
+namespace {
+using ViewPF = Kokkos::View<float**, Kokkos::LayoutRight>;
+
+// Never called; named only inside decltype to recover the chain's node types.
+// T1 = A{i,k}·B{k,m} -> canonical [i,m] (sum_k);  E = T1·D{i,l} -> [m,l].
+auto permuted_fused_chain() {
+  auto hA = make_input_node(make_handle<'i', 'k'>(ViewPF{}));
+  auto hB = make_input_node(make_handle<'k', 'm'>(ViewPF{}));
+  auto hD = make_input_node(make_handle<'i', 'l'>(ViewPF{}));
+  return make_contraction_node<'m', 'l'>(
+      make_contraction_node<'i', 'm'>(hA, hB), hD);
+}
+using TopNode = decltype(permuted_fused_chain());
+using FusedA  = TopNode::node_a_type;  // the fused sub-contraction T1
+using InputB  = TopNode::node_b_type;  // the plain input operand D
+using PermA   = Impl::permA_seq_t<FusedA::modes_seq, InputB::modes_seq>;
+
+// The operand really is permuted -- otherwise the rejection below would hold
+// vacuously and this test would prove nothing.
+static_assert(std::is_same_v<PermA, std::integer_sequence<int, 1, 0>>,
+              "the A operand of this chain must be permuted for the "
+              "extent-preservation rule to have anything to say");
+
+// T1's own A/B tiles are irrelevant to the rule; only its output tile (.c) is.
+using SquareT1 = Tile<StaticTile<32, 8>, StaticTile<8, 32>, StaticTile<32, 32>>;
+using SkewedT1 = Tile<StaticTile<32, 8>, StaticTile<8, 64>, StaticTile<32, 64>>;
+
+// Square: the transpose is a self-map of the buffer, so this is accepted --
+// and is exactly the configuration FusedPermutedOperandATeam then runs.
+static_assert(Impl::operand_stageable_v<FusedA, SquareT1, PermA>);
+
+// Mismatched: 32x64 cannot become 64x32 in place, so the evaluator rejects it.
+// Instantiating Evaluator<..., TopNode, Tile<SkewedT1, ...>> here would abort
+// the build with the "permA must preserve the tile's extent tuple" message.
+static_assert(!Impl::operand_stageable_v<FusedA, SkewedT1, PermA>,
+              "a 32x64 fused operand tile must NOT be accepted under a "
+              "transposing permA -- it cannot be reordered in place");
+
+// The rule is specific to FUSED operands: an input operand is copied into a
+// fresh staging buffer on the way in, so a shape-changing permutation is fine.
+static_assert(Impl::operand_stageable_v<InputB, StaticTile<32, 64>, PermA>);
+}  // namespace
+
+TEST(GraphTest, FusedPermutedOperandATeam) {
+  // A fused sub-contraction sitting in a NON-canonical position in the A slot
+  // -- the case the "fused contraction operand must be in canonical position"
+  // static_assert used to reject outright.
+  //   T1 = A·B -> canonical [i,m] (sum_k);  E = T1·D -> [m,l] (sum_i).
+  // The parent contracts over i, so A's canonical order is freeA ++ contracted
+  // = [m,i] while T1 hands its scratch back as [i,m]: permA == [1,0]. The
+  // operand is staged by transposing its own C scratch IN PLACE, which is why
+  // T1's output tile must be square (32x32 here).
+  //
+  // I=64 with an i-tile of 32 also gives the parent TWO i-tiles, so the fused
+  // operand is recomputed and re-transposed once per k-tile -- a stale or
+  // doubly-transposed buffer on the second pass would show up in the reference
+  // comparison.
+  //
+  // Register divisibility (SA%8, SK%8, SB%2W): inner (SA=32,SK=8,SB=32),
+  // outer (SA=32,SK=32,SB=32).
+  using View2     = Kokkos::View<float**, Kokkos::LayoutRight>;
+  constexpr int I = 64, K = 8, M = 32, L = 32;
+  View2         A("A", I, K);
+  View2         B("B", K, M);
+  View2         D("D", I, L);
+  View2         E("E", M, L);
+
+  auto Ah = Kokkos::create_mirror_view(A);
+  auto Bh = Kokkos::create_mirror_view(B);
+  auto Dh = Kokkos::create_mirror_view(D);
+  for (int i = 0; i < I; ++i)
+    for (int k = 0; k < K; ++k)
+      Ah(i, k) = static_cast<float>((i + 2 * k) % 5 + 1) * 0.5f;
+  for (int k = 0; k < K; ++k)
+    for (int m = 0; m < M; ++m)
+      Bh(k, m) = static_cast<float>((3 * k + m) % 4 + 1) * 0.25f;
+  for (int i = 0; i < I; ++i)
+    for (int l = 0; l < L; ++l)
+      Dh(i, l) = static_cast<float>((i + 2 * l) % 3 + 1) * 0.5f;
+  Kokkos::deep_copy(A, Ah);
+  Kokkos::deep_copy(B, Bh);
+  Kokkos::deep_copy(D, Dh);
+  Kokkos::deep_copy(E, 0.0f);
+
+  auto hA = make_input_node(make_handle<'i', 'k'>(A));
+  auto hB = make_input_node(make_handle<'k', 'm'>(B));
+  auto hD = make_input_node(make_handle<'i', 'l'>(D));
+
+  auto T1 = make_contraction_node<'i', 'm'>(hA, hB);  // sum_k
+  auto g  = make_graph();
+  [[maybe_unused]] auto [g1, E_node] =
+      g.ops(make_contraction_node<'m', 'l'>(T1, hD));  // sum_i
+
+  // Flat tile list, pre-order: top E=T1·D, then T1=A·B. The top's A slot must
+  // match T1's output tile; its B slot tiles D in D's own [i,l] order, whose
+  // i-tile (32) matches T1's, so the parent's i-tile counts agree between the
+  // two operands.
+  using BundleTop =
+      Tile<StaticTile<32, M>, StaticTile<32, L>, StaticTile<M, L>>;
+  using BundleT1 = Tile<StaticTile<32, K>, StaticTile<K, M>, StaticTile<32, M>>;
+  g1.execute(TeamPolicyTag<>{}, std::make_tuple(BundleTop{}, BundleT1{}), E);
+
+  auto Eh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, E);
+  for (int m = 0; m < M; ++m)
+    for (int l = 0; l < L; ++l) {
+      double acc = 0.0;
+      for (int i = 0; i < I; ++i) {
+        double t1 = 0.0;
+        for (int k = 0; k < K; ++k)
+          t1 += static_cast<double>(Ah(i, k)) * Bh(k, m);
+        acc += t1 * Dh(i, l);
+      }
+      EXPECT_NEAR(Eh(m, l), static_cast<float>(acc), 1e-2f)
+          << "m=" << m << " l=" << l;
+    }
+}
+
+TEST(GraphTest, FusedPermutedOperandBTeam) {
+  // Same lifted restriction, exercised through the B slot (permB non-identity)
+  // so the in-place staging path is covered on both operands.
+  //   T2 = C·D -> canonical [m,j] (sum_p);  E = A·T2 -> [i,m] (sum_j).
+  // B's canonical order is contracted ++ freeB = [j,m] while T2 hands back
+  // [m,j]: permB == [1,0], again requiring T2's output tile to be square.
+  //
+  // Register divisibility: inner (SA=32,SK=8,SB=32), outer (SA=32,SK=32,SB=32).
+  using View2     = Kokkos::View<float**, Kokkos::LayoutRight>;
+  constexpr int I = 32, J = 32, M = 32, P = 8;
+  View2         A("A", I, J);
+  View2         C("C", M, P);
+  View2         D("D", P, J);
+  View2         E("E", I, M);
+
+  auto Ah = Kokkos::create_mirror_view(A);
+  auto Ch = Kokkos::create_mirror_view(C);
+  auto Dh = Kokkos::create_mirror_view(D);
+  for (int i = 0; i < I; ++i)
+    for (int j = 0; j < J; ++j)
+      Ah(i, j) = static_cast<float>((i + 2 * j) % 5 + 1) * 0.5f;
+  for (int m = 0; m < M; ++m)
+    for (int p = 0; p < P; ++p)
+      Ch(m, p) = static_cast<float>((m + 2 * p) % 3 + 1) * 0.5f;
+  for (int p = 0; p < P; ++p)
+    for (int j = 0; j < J; ++j)
+      Dh(p, j) = static_cast<float>((2 * p + j) % 4 + 1) * 0.25f;
+  Kokkos::deep_copy(A, Ah);
+  Kokkos::deep_copy(C, Ch);
+  Kokkos::deep_copy(D, Dh);
+  Kokkos::deep_copy(E, 0.0f);
+
+  auto hA = make_input_node(make_handle<'i', 'j'>(A));
+  auto hC = make_input_node(make_handle<'m', 'p'>(C));
+  auto hD = make_input_node(make_handle<'p', 'j'>(D));
+
+  auto T2 = make_contraction_node<'m', 'j'>(hC, hD);  // sum_p
+  auto g  = make_graph();
+  [[maybe_unused]] auto [g1, E_node] =
+      g.ops(make_contraction_node<'i', 'm'>(hA, T2));  // sum_j
+
+  // Flat tile list, pre-order: top E=A·T2, then (A is a leaf, contributing no
+  // bundle) T2=C·D. The top's B slot must match T2's output tile.
+  using BundleTop = Tile<StaticTile<I, J>, StaticTile<M, J>, StaticTile<I, M>>;
+  using BundleT2  = Tile<StaticTile<M, P>, StaticTile<P, J>, StaticTile<M, J>>;
+  g1.execute(TeamPolicyTag<>{}, std::make_tuple(BundleTop{}, BundleT2{}), E);
+
+  auto Eh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, E);
+  for (int i = 0; i < I; ++i)
+    for (int m = 0; m < M; ++m) {
+      double acc = 0.0;
+      for (int j = 0; j < J; ++j) {
+        double t2 = 0.0;
+        for (int p = 0; p < P; ++p)
+          t2 += static_cast<double>(Ch(m, p)) * Dh(p, j);
+        acc += static_cast<double>(Ah(i, j)) * t2;
+      }
+      EXPECT_NEAR(Eh(i, m), static_cast<float>(acc), 1e-2f)
+          << "i=" << i << " m=" << m;
+    }
+}
+
+TEST(GraphTest, FusedOperandNonIdentityPermCTeam) {
+  // A fused operand whose OWN output is non-canonical: T1 is declared with
+  // output modes [m,i] while its canonical (freeA ++ freeB) order is [i,m], so
+  // T1's permC == [1,0] and its tile bundle's `.c` slot (32x16, user order)
+  // describes a different shape than the scratch it actually produces (16x32,
+  // canonical). The parent's own permA is identity here, so nothing is
+  // reordered -- this pins down that the parent reads a fused operand's leaf
+  // tile through that operand's permC. The extents are deliberately UNEQUAL,
+  // which an in-place reorder could not have papered over.
+  //
+  //   T1 = A·B (sum_k);  E = T1·D -> [i,l] (sum_m).
+  // Register divisibility: inner (SA=16,SK=8,SB=32), outer (SA=16,SK=32,SB=32).
+  using View2     = Kokkos::View<float**, Kokkos::LayoutRight>;
+  constexpr int I = 16, K = 8, M = 32, L = 32;
+  View2         A("A", I, K);
+  View2         B("B", K, M);
+  View2         D("D", M, L);
+  View2         E("E", I, L);
+
+  auto Ah = Kokkos::create_mirror_view(A);
+  auto Bh = Kokkos::create_mirror_view(B);
+  auto Dh = Kokkos::create_mirror_view(D);
+  for (int i = 0; i < I; ++i)
+    for (int k = 0; k < K; ++k)
+      Ah(i, k) = static_cast<float>((i + 2 * k) % 5 + 1) * 0.5f;
+  for (int k = 0; k < K; ++k)
+    for (int m = 0; m < M; ++m)
+      Bh(k, m) = static_cast<float>((3 * k + m) % 4 + 1) * 0.25f;
+  for (int m = 0; m < M; ++m)
+    for (int l = 0; l < L; ++l)
+      Dh(m, l) = static_cast<float>((m + 2 * l) % 3 + 1) * 0.5f;
+  Kokkos::deep_copy(A, Ah);
+  Kokkos::deep_copy(B, Bh);
+  Kokkos::deep_copy(D, Dh);
+  Kokkos::deep_copy(E, 0.0f);
+
+  auto hA = make_input_node(make_handle<'i', 'k'>(A));
+  auto hB = make_input_node(make_handle<'k', 'm'>(B));
+  auto hD = make_input_node(make_handle<'m', 'l'>(D));
+
+  auto T1 = make_contraction_node<'m', 'i'>(hA, hB);  // sum_k; permC = [1,0]
+  auto g  = make_graph();
+  [[maybe_unused]] auto [g1, E_node] =
+      g.ops(make_contraction_node<'i', 'l'>(T1, hD));  // sum_m
+
+  // T1's bundle `.c` is written in T1's USER order [m,i] = 32x16, and the top
+  // bundle's A slot must match it; the evaluator canonicalizes it to 16x32.
+  using BundleTop = Tile<StaticTile<M, I>, StaticTile<M, L>, StaticTile<I, L>>;
+  using BundleT1  = Tile<StaticTile<I, K>, StaticTile<K, M>, StaticTile<M, I>>;
+  g1.execute(TeamPolicyTag<>{}, std::make_tuple(BundleTop{}, BundleT1{}), E);
+
+  auto Eh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, E);
+  for (int i = 0; i < I; ++i)
+    for (int l = 0; l < L; ++l) {
+      double acc = 0.0;
+      for (int m = 0; m < M; ++m) {
+        double t1 = 0.0;
+        for (int k = 0; k < K; ++k)
+          t1 += static_cast<double>(Ah(i, k)) * Bh(k, m);
+        acc += t1 * Dh(m, l);
+      }
+      EXPECT_NEAR(Eh(i, l), static_cast<float>(acc), 1e-2f)
+          << "i=" << i << " l=" << l;
+    }
+}
+
 int main(int argc, char* argv[]) {
   ::testing::InitGoogleTest(&argc, argv);
   Kokkos::initialize(argc, argv);
