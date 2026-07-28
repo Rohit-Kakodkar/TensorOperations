@@ -814,4 +814,19 @@ KOKKOS_FUNCTION constexpr auto reorder_tile(
   return make_tile_layout(new_tile, new_order);
 }
 
+// View-level wrapper for reorder_tile (mirrors the reorder_layout overload
+// above), so callers can write plain reorder_view(view, perm) regardless of
+// whether the backing layout is an OrderedSubviewLayout (global/subview
+// tiles) or a StaticTileLayoutRight/Left (scratch tiles) -- SFINAE picks the
+// matching overload per layout family.
+template <typename ViewType, typename Layout, int... Perm>
+  requires(requires(Layout l) {
+    reorder_tile(l, std::integer_sequence<int, Perm...>{});
+  })
+KOKKOS_FUNCTION auto reorder_view(const View<ViewType, Layout>&       view,
+                                  std::integer_sequence<int, Perm...> perm)
+    -> View<ViewType, decltype(reorder_tile(view.layout(), perm))> {
+  return {view.backing_, reorder_tile(view.layout(), perm)};
+}
+
 }  // namespace TensorOperations

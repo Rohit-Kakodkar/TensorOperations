@@ -90,6 +90,11 @@ add_executable(test_tile_layout_stride tests/test_tile_layout_stride.cpp)
 target_link_libraries(test_tile_layout_stride PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_tile_layout_stride)
 
+# test_reorder_scratch — custom main() wraps Kokkos init/finalize
+add_executable(test_reorder_scratch tests/test_reorder_scratch.cpp)
+target_link_libraries(test_reorder_scratch PRIVATE tensor GTest::gtest)
+gtest_discover_tests(test_reorder_scratch)
+
 # Benchmarks (opt-in: -DTENSOR_OPS_BUILD_BENCHMARKS=ON). No gtest; own main().
 if(TENSOR_OPS_BUILD_BENCHMARKS)
   # KokkosKernels — needed for bench_matrix_multiply's BLAS3 GEMM path.
