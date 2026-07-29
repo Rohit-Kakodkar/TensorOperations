@@ -518,8 +518,13 @@ KOKKOS_FUNCTION DynamicTile<R> output_tile(DynamicTile<R> t) noexcept {
 // tile. CombineTile carries the output tile plus one per-operand tile spec:
 //
 //   OpTile == OutTile        for input operands (staged in output order)
-//   OpTile == Tile<A,B,C>    for contraction operands (C must == OutTile in
-//                             canonical/combine order)
+//   OpTile == Tile<A,B,C>    for contraction operands. C is in that operand's
+//                             own USER order and need not match OutTile
+//                             directly: the combine evaluator reads it through
+//                             the operand's permC and gathers it into the
+//                             combine's output order, which is what must equal
+//                             OutTile. Both collapse to C == OutTile when the
+//                             operand is canonical and in the output's order.
 //
 // `output_tile(CombineTile)` returns the shared output tile so the graph
 // driver keeps sizing work items / decoding tile indices uniformly. For a

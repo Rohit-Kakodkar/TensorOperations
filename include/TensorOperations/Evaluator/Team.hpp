@@ -620,9 +620,12 @@ struct Evaluator<TeamPolicyTag<ES>,
 // contraction evaluator, Specialization 4, for a contraction operand), then a
 // single TeamVectorRange applies fn per element into the output scratch tile
 // — no GEMM, no k-loop, no zeroing at this tier. Operands may be in any axis
-// order; each input operand is gathered into the output (canonical) order via
+// order: an input operand is gathered into the output (canonical) order via
 // label_perm_seq + canonicalize_input, exactly as the contraction evaluator
-// canonicalizes A/B.
+// canonicalizes A/B, and a contraction operand is either gathered the same way
+// or relabeled in place of a copy (see op_is_relabeled_v). A contraction
+// operand may also sit in a non-canonical position of its own (non-identity
+// permC); its tile bundle is read through that permC by leaf_tile_t.
 //
 // Tile_ is either:
 //   (a) a plain output tile (StaticTile/DynamicTile) — requires every operand
@@ -630,15 +633,18 @@ struct Evaluator<TeamPolicyTag<ES>,
 //   (b) a CombineTile<OutTile, OpTile_0, ..., OpTile_{N-1}> — carries the
 //       output tile plus a per-operand tile spec. An input operand's OpTile
 //       must equal OutTile; a contraction operand's OpTile is the inner
-//       Tile<A,B,C> bundle (with C == OutTile in the operand's canonical
-//       order).
+//       Tile<A,B,C> bundle, whose C slot is in that operand's own USER order
+//       and must equal OutTile once read through its permC and gathered into
+//       the combine's output order (see the static_assert below).
 //
-// Every operand and the output share the same LayoutRight scratch layout, so
-// all scratch tiles align element-for-element. The heterogeneous per-operand
-// stagers live in a DeviceTuple; because all their scratch views have the
-// SAME type (same output tile, same scalar), the combine loop reads them from
-// a homogeneous Kokkos::Array. fn receives the global output coordinate:
-// fn(i_0, ..., i_{Rank-1}, v_0, ..., v_{N-1}).
+// Every operand presents the combine's output SHAPE, so all operand tiles
+// align element-for-element with the output and one coordinate indexes them
+// all. They need not share a LAYOUT: a permuted, unhooked contraction operand
+// is consumed as a zero-copy relabel of the sub-contraction's own C scratch (a
+// strided view over the same bytes), while every other operand is staged into
+// a LayoutRight buffer. Both the per-operand stagers and the resulting views
+// therefore live in DeviceTuples, read by compile-time folds. fn receives the
+// global output coordinate: fn(i_0, ..., i_{Rank-1}, v_0, ..., v_{N-1}).
 //
 // Multi-output: when fn returns a Kokkos::Array<V, NumOut>, the evaluator
 // allocates NumOut output scratch tiles (all sharing the output tile layout)
@@ -661,6 +667,51 @@ KOKKOS_FUNCTION auto combine_op_tile(const Tile& t) {
 template <std::size_t K, typename Tile>
 using combine_op_tile_t =
     decltype(combine_op_tile<K>(std::declval<const Tile&>()));
+
+// The tile a combine operand's OWN evaluator is constructed with (host +
+// device), in the same shape as combine_op_tile above.
+//
+// An input operand's tile is supplied in the combine's output order, so the
+// label gather has to be undone to recover the operand's native order. A
+// contraction operand's tile is the inner Tile<A,B,C> bundle, already in the
+// sub-contraction's own terms, and must pass through untouched -- gathering it
+// would be a hard error, since reorder_tile_value has no overload taking a
+// bundle. The discarded if-constexpr branch is never instantiated, so only the
+// selected one has to be well-formed.
+template <typename Node, typename Tile, typename PermSeq>
+KOKKOS_FUNCTION auto combine_native_tile(const Tile& t, PermSeq) {
+  if constexpr (has_node_tag_v<ContractionTag, Node>)
+    return t;  // bundle: already native
+  else
+    return OperandAxes<PermSeq>::to_native_tile(t);
+}
+template <typename Node, typename Tile, typename PermSeq>
+using combine_native_tile_t =
+    decltype(combine_native_tile<Node>(std::declval<const Tile&>(), PermSeq{}));
+
+// The view type a combine reads one operand through: the allocator's own
+// scratch view, or -- for a relabeled operand -- that same view retyped into
+// the combine's axis order. Both staging paths hand back the allocator's view
+// (Specialization 8's interm wraps the destination the allocator carved), so
+// one parameter covers both. Selected by partial specialization rather than
+// if-constexpr because this is a type, not a value, and reorder_view is
+// SFINAE-constrained on the layout family: the relabel expression must not be
+// formed at all for an operand that does not take that path.
+template <bool Relabeled, typename View, typename PermSeq>
+struct combine_op_view {
+  using type = View;
+};
+template <typename View, typename PermSeq>
+struct combine_op_view<true, View, PermSeq> {
+  // Same expression Specialization 7 publishes as its dest_view_t; the combine
+  // applies it inline rather than constructing that evaluator, because a
+  // relabeled operand is NoHook by construction (see operand_relabelable_v) and
+  // the hook pass is the only thing Specialization 7 would add.
+  using type = decltype(reorder_view(std::declval<View>(), PermSeq{}));
+};
+template <bool Relabeled, typename View, typename PermSeq>
+using combine_op_view_t =
+    typename combine_op_view<Relabeled, View, PermSeq>::type;
 }  // namespace Impl
 
 template <typename CombineFn, typename IntCRank, typename S, typename ES,
@@ -721,22 +772,22 @@ struct Evaluator<TeamPolicyTag<ES>,
   using op_node_t = tuple_element_t<K, typename node_type::ops_tuple_t>;
 
   // A contraction operand's scratch tile is written in the operand's own
-  // canonical (freeA ++ freeB) axis order, LayoutRight. For it to match the
-  // combine's scratch_view_t exactly (same layout type, so all operand scratch
-  // views collapse into a homogeneous Kokkos::Array in the combine loop), we
-  // require the operand to be *fully canonical against the combine output*:
-  //   (1) the operand's user-output labels match the combine's output labels
-  //       in the same order (identity label gather from operand → combine), and
-  //   (2) the operand contraction's own permC is identity (freeA++freeB ==
-  //       operand user output).
-  // Specialization 4 used to impose the same restriction and no longer does:
-  // it stages a permuted fused operand by reordering that operand's own scratch
-  // in place (Impl::reorder_scratch_in_place, via Specialization 8), which
-  // needs nothing combine-specific and would lift (1) here as well, subject to
-  // the same requirement that the permutation preserve the tile's extent tuple.
-  // Requirement (2) would additionally need op_tile_t<K> to be reconciled
-  // against the operand's permC, the way Impl::canonical_c_tile now does for
-  // a contraction's A/B. Both are left as a follow-up.
+  // canonical (freeA ++ freeB) axis order, LayoutRight, which need not be the
+  // combine's output order. Two independent things can differ:
+  //   (1) the label gather from the operand's canonical modes into the
+  //       combine's output modes (perm_seq<K>), and
+  //   (2) the operand contraction's own permC, which relates its canonical
+  //       order to the USER order its tile bundle's `.c` slot is spelled in.
+  // (2) is purely a shape derivation -- Impl::operand_leaf_tile_t reads the
+  // bundle's `.c` through permC to recover the tile the C scratch is actually
+  // written with -- and is handled by leaf_tile_t<K> below. (1) is a real axis
+  // permutation, resolved at staging time: see op_is_relabeled_v.
+  //
+  // Note perm_seq<K> gathers from the operand's CANONICAL modes, not its user
+  // ones: a ContractionTag node's modes_seq is its canonical output labels
+  // (NodeHandle.hpp), which is also the order its C scratch is laid out in. So
+  // the two directions never need composing -- perm_seq<K> already maps
+  // operand-canonical -> combine-output.
   template <std::size_t K>
   static constexpr bool op_is_contraction_v =
       Impl::has_node_tag_v<ContractionTag, op_node_t<K>>;
@@ -751,37 +802,49 @@ struct Evaluator<TeamPolicyTag<ES>,
   template <std::size_t K>
   using axes = OperandAxes<perm_seq<K>>;
 
-  // A contraction operand's output order/canonicality must be verified before
-  // it's relied upon below (native_perm_seq<K> assumes every ContractionTag
-  // operand has identity perm_seq<K>).
-  static_assert(
-      Impl::all_of_index<NumOps>([](auto k) {
-        constexpr std::size_t K = decltype(k)::value;
-        return !op_is_contraction_v<K> || Impl::is_identity_seq(perm_seq<K>{});
-      }),
-      "combine evaluator: a contraction operand must already be in the "
-      "combine's output order (identity label gather); relabel the contraction "
-      "output to match the combine output modes");
-  static_assert(
-      Impl::all_of_index<NumOps>([](auto k) {
-        constexpr std::size_t K = decltype(k)::value;
-        if constexpr (op_is_contraction_v<K>)
-          return Impl::is_identity_seq(typename op_node_t<K>::permC_seq{});
-        else
-          return true;
-      }),
-      "combine evaluator: a contraction operand must be in canonical position "
-      "(identity permC); construct it with output modes == freeA++freeB");
-
   // Per-operand tile spec (identity for plain-tile form; the K-th slot of the
-  // CombineTile bundle otherwise). combine_op_tile<K> presents this in the
-  // combine's canonical (output) order; axes<K>::to_native_tile undoes the
-  // label gather to recover operand K's true native axis order (identity for
-  // every ContractionTag operand, per the asserts above).
+  // CombineTile bundle otherwise).
   template <std::size_t K>
   using op_tile_t = Impl::combine_op_tile_t<K, Tile_>;
+
+  // The tile each operand's own evaluator is constructed with: an input
+  // operand's native (label-gather-undone) tile, or a contraction operand's
+  // Tile<A,B,C> bundle passed through.
   template <std::size_t K>
-  using native_tile_t = typename axes<K>::template native_tile_t<op_tile_t<K>>;
+  using native_tile_t =
+      Impl::combine_native_tile_t<op_node_t<K>, op_tile_t<K>, perm_seq<K>>;
+
+  // The free-mode tile operand K's own evaluator actually hands back, in that
+  // operand's own axis order: its native tile for an input operand, or the
+  // fused sub-contraction's canonical output tile (its bundle's `.c` read
+  // through permC) for a contraction operand. Same helper the contraction
+  // evaluator uses for its A/B leaves.
+  template <std::size_t K>
+  using leaf_tile_t = Impl::operand_leaf_tile_t<op_node_t<K>, native_tile_t<K>>;
+
+  // Every operand must present the combine's output shape, however it got
+  // there (staged copy, in-place reorder, or zero-copy relabel). Reading the
+  // leaf tile off the NATIVE tile is what lets one condition cover both operand
+  // kinds, since it puts them in a common frame: leaf_tile_t is in the
+  // operand's own order, and gathering it into the combine's output order must
+  // land on out_tile_t. For an input operand the two transforms are exact
+  // inverses and this reduces to op_tile_t == out_tile_t; for a contraction
+  // operand it is the real condition, and it subsumes both of the canonicality
+  // restrictions this evaluator used to impose -- leaf_tile_t consumes the
+  // operand's permC, canon_tile_t consumes the label gather. Stated here rather
+  // than left to surface as an opaque type mismatch deep in stage_all().
+  static_assert(
+      Impl::all_of_index<NumOps>([](auto k) {
+        constexpr std::size_t K = decltype(k)::value;
+        return std::is_same_v<
+            typename axes<K>::template canon_tile_t<leaf_tile_t<K>>,
+            out_tile_t>;
+      }),
+      "combine evaluator: every operand must present the combine's output "
+      "tile -- an input operand's tile must equal it directly, and a "
+      "contraction operand's Tile<A,B,C> bundle `.c` slot (read through that "
+      "operand's own permC) must equal it once gathered into the combine's "
+      "output order");
 
   // Reconstruct operand K's tile in its true native axis order from the
   // combine's tiling spec. Shared by the host-side sizing path
@@ -789,26 +852,31 @@ struct Evaluator<TeamPolicyTag<ES>,
   // (make_op_allocs), which previously duplicated this expression.
   template <std::size_t K>
   static native_tile_t<K> native_op_tile(const tiling_type& t) {
-    return axes<K>::to_native_tile(Impl::combine_op_tile<K>(t));
+    return Impl::combine_native_tile<op_node_t<K>>(Impl::combine_op_tile<K>(t),
+                                                   perm_seq<K>{});
   }
 
-  // An input operand's staging buffer is typed by its OWN canonicalized tile
-  // (op_alloc_t<K> derives it from native_tile_t<K>), while the combine loop
-  // reads every operand out of a homogeneous Kokkos::Array of scratch_view_t,
-  // typed by out_tile_t. Those coincide only if the two tiles agree -- true by
-  // construction today, since every operand is staged into the output shape --
-  // so state it here rather than let a violation surface as an opaque
-  // array-initialization type mismatch in stage_all(). Contraction operands are
-  // exempt: their op_tile_t is the inner Tile<A,B,C> bundle, and they are
-  // staged zero-copy out of the sub-contraction's own C scratch.
+  // Is operand K consumed as a zero-copy relabel of the sub-contraction's own
+  // C scratch, rather than staged through Specialization 8? The rule itself
+  // lives beside operand_stageable_v (the staging path it opts out of) so the
+  // two are read -- and tested -- together; the combine is its only consumer,
+  // because a contraction's GEMM needs a contiguous source and must stage.
+  template <std::size_t K>
+  static constexpr bool op_is_relabeled_v =
+      Impl::operand_relabelable_v<op_node_t<K>, perm_seq<K>>;
+
+  // reorder_view's scratch overload is reorder_tile, defined only for
+  // StaticTileLayoutRight/Left -- there is no dynamic-stride tile layout to
+  // retype into. Say so here; otherwise a dynamically-tiled permuted operand
+  // fails as an unexplained "no matching reorder_view" inside stage_operand.
   static_assert(
       Impl::all_of_index<NumOps>([](auto k) {
         constexpr std::size_t K = decltype(k)::value;
-        return op_is_contraction_v<K> ||
-               std::is_same_v<op_tile_t<K>, out_tile_t>;
+        return !op_is_relabeled_v<K> || leaf_tile_t<K>::is_static;
       }),
-      "combine evaluator: an input operand's tile must equal the output tile "
-      "(operands are staged into the output shape)");
+      "combine evaluator: a permuted contraction operand must be statically "
+      "tiled (the zero-copy relabel retypes its scratch layout, which only the "
+      "StaticTileLayout* family supports)");
 
   // Per-operand allocator, keyed on the operand's native tile and its label
   // gather, so it owns both an inner Evaluator and the scratch tile it stages
@@ -816,8 +884,11 @@ struct Evaluator<TeamPolicyTag<ES>,
   // alloc_a_/alloc_b_) rather than in stage_operand() on every call. Since a
   // combine node currently invokes stage_operand() exactly once per operand per
   // team (no k-loop at the combine level; combine operands can't yet be fused/
-  // repeated, see the static_asserts above), construction count is unchanged
-  // either way today -- this just moves it earlier. The real payoff is
+  // repeated, see the operand-tag assert above), construction count is
+  // unchanged either way today -- this just moves it earlier. Read-once is also
+  // what makes the relabel path a clear win: a relabeled operand re-reads its
+  // source per use where a staged copy amortizes, which would need revisiting
+  // if combine operands ever become repeated. The real payoff is
   // future-proofing for when combine operands support repeated/fused
   // invocation, at which point building once here (instead of per stage()
   // call) will actually avoid redundant rebuilds, mirroring the fix already
@@ -836,6 +907,23 @@ struct Evaluator<TeamPolicyTag<ES>,
   static auto op_allocs_type_helper(std::index_sequence<Ks...>)
       -> DeviceTuple<op_alloc_t<Ks>...>;
   using op_allocs_t = decltype(op_allocs_type_helper(ops_seq{}));
+
+  // The view type the combine loop reads operand K through. A staged operand
+  // lands in the combine's own scratch_view_t; a relabeled one is a retype of
+  // the sub-contraction's C scratch into a StaticTileLayoutStride view, which
+  // is a DIFFERENT type carrying the same bytes. Hence the operand views form
+  // a DeviceTuple read by a compile-time fold rather than a Kokkos::Array read
+  // by a runtime loop -- the same reason op_allocs_ is a tuple.
+  template <std::size_t K>
+  using op_view_t =
+      Impl::combine_op_view_t<op_is_relabeled_v<K>,
+                              typename op_alloc_t<K>::scratch_view_t,
+                              perm_seq<K>>;
+
+  template <std::size_t... Ks>
+  static auto op_views_type_helper(std::index_sequence<Ks...>)
+      -> DeviceTuple<op_view_t<Ks>...>;
+  using op_views_t = decltype(op_views_type_helper(ops_seq{}));
 
   using interm_type =
       NodeHandle<IntermTag, scratch_view_t, std::integral_constant<int, Rank>,
@@ -858,13 +946,12 @@ struct Evaluator<TeamPolicyTag<ES>,
 
   KOKKOS_FUNCTION result_type operator()(
       const team_member_t& team, Kokkos::Array<int, Rank> tile_idx) const {
-    // Stage every operand tile into its scratch (in output order); the
-    // per-operand scratch views are all the same type (same output tile,
-    // LayoutRight, same scalar), so this collects into a homogeneous array
-    // indexed by operand. The barrier makes the staged reads visible before
-    // the combine.
-    const Kokkos::Array<scratch_view_t, NumOps> sv =
-        stage_all(team, tile_idx, ops_seq{});
+    // Bring every operand tile into the combine's output order -- by staging a
+    // copy, or by relabeling a fused operand's own scratch (op_is_relabeled_v).
+    // Those two yield different view types, so the results collect into a
+    // tuple keyed by operand rather than a homogeneous array. The barrier makes
+    // every staged write visible before the combine reads it.
+    const op_views_t sv = stage_all(team, tile_idx, ops_seq{});
     team.team_barrier();
 
     // The interm handles wrapping each output allocator's scratch: built once
@@ -878,9 +965,8 @@ struct Evaluator<TeamPolicyTag<ES>,
       TENSOR_PRAGMA_UNROLL
       for (int d = 0; d < Rank; ++d)
         gidx[d] = tile_idx[d] * out0.extent(d) + coord[d];
-      Kokkos::Array<value_type, NumOps> vals{};
-      TENSOR_PRAGMA_UNROLL
-      for (int k = 0; k < NumOps; ++k) vals[k] = sv[k][coord];
+      const Kokkos::Array<value_type, NumOps> vals =
+          gather_vals(sv, coord, ops_seq{});
       // Normalize fn's result (scalar or Kokkos::Array) to NumOut components
       // and scatter each into its output tile.
       const Kokkos::Array<value_type, NumOut> r =
@@ -913,36 +999,71 @@ struct Evaluator<TeamPolicyTag<ES>,
   // notes, this is called exactly once per operand per team today, so the
   // benefit is future-proofing rather than avoiding a current rebuild loop --
   // unlike accumulate_block's A/B operands, which really do loop over
-  // k-tiles). The result is handed off to the merged stage-or-passthrough
-  // evaluator (Specialization 8), exactly like accumulate_block does for A
-  // and B. That evaluator's own if constexpr on the source's storage type
-  // picks copy+reorder (InputTag) vs. true zero-copy passthrough
-  // (ContractionTag, asserted-identity perm) -- no tag branching needed here.
+  // k-tiles).
+  //
+  // Two ways out, chosen at compile time:
+  //   • RELABEL (op_is_relabeled_v): run the sub-contraction, then retype its
+  //     C scratch into the combine's axis order with reorder_view. No copy, no
+  //     data movement, no barrier of its own -- and no constraint relating the
+  //     permuted axes' extents, because nothing has to fit back into a fixed
+  //     buffer. This is what Specialization 7 does; the contraction evaluator
+  //     cannot use it (its GEMM needs a contiguous LayoutRight destination),
+  //     but a combine reads its operands one element at a time and does not
+  //     care about their memory order.
+  //   • STAGE (everything else): hand off to the merged stage-or-passthrough
+  //     evaluator (Specialization 8), exactly like accumulate_block does for A
+  //     and B. Its own if constexpr on the source's storage type picks
+  //     copy+reorder (an input operand), in-place reorder (a hooked permuted
+  //     fused operand, which keeps the equal-extent restriction), or true
+  //     zero-copy passthrough (identity perm).
   template <std::size_t K>
-  KOKKOS_FUNCTION scratch_view_t
-  stage_operand(const team_member_t&            team,
-                const Kokkos::Array<int, Rank>& tile_idx) const {
-    return Impl::stage_operand_into<TeamPolicyTag<ES>>(
-               team, StageTile<native_tile_t<K>, perm_seq<K>>{}, tile_idx,
-               op_allocs_.template get<K>())
-        .storage_;
+  KOKKOS_FUNCTION op_view_t<K> stage_operand(
+      const team_member_t&            team,
+      const Kokkos::Array<int, Rank>& tile_idx) const {
+    const auto& alloc = op_allocs_.template get<K>();
+    if constexpr (op_is_relabeled_v<K>) {
+      // NoHook is part of op_is_relabeled_v, so there is no hook to apply over
+      // the relabeled view -- and hence nothing here writes to the operand's
+      // scratch, which stays exactly as its own evaluator left it.
+      return reorder_view(
+          alloc.stage(team, axes<K>::to_native_idx(tile_idx)).storage_,
+          perm_seq<K>{});
+    } else {
+      return Impl::stage_operand_into<TeamPolicyTag<ES>>(
+                 team, StageTile<native_tile_t<K>, perm_seq<K>>{}, tile_idx,
+                 alloc)
+          .storage_;
+    }
   }
 
   template <std::size_t... Ks>
-  KOKKOS_FUNCTION Kokkos::Array<scratch_view_t, NumOps> stage_all(
-      const team_member_t& team, const Kokkos::Array<int, Rank>& tile_idx,
-      std::index_sequence<Ks...>) const {
-    return {stage_operand<Ks>(team, tile_idx)...};  // left-to-right
+  KOKKOS_FUNCTION op_views_t stage_all(const team_member_t&            team,
+                                       const Kokkos::Array<int, Rank>& tile_idx,
+                                       std::index_sequence<Ks...>) const {
+    return op_views_t{stage_operand<Ks>(team, tile_idx)...};  // left-to-right
+  }
+
+  // Read one element of every operand at the output coordinate. The views are
+  // heterogeneously typed (a relabeled operand is a strided view over the same
+  // bytes), so operand indexing is a pack expansion rather than a runtime loop.
+  // Every view -- staged or relabeled -- presents the combine's output shape,
+  // so a single coordinate indexes them all.
+  template <typename Coord, std::size_t... Ks>
+  KOKKOS_FORCEINLINE_FUNCTION static Kokkos::Array<value_type, NumOps>
+  gather_vals(const op_views_t& sv, const Coord& coord,
+              std::index_sequence<Ks...>) {
+    return {sv.template get<Ks>()[coord]...};
   }
 
   // Total per-operand scratch cost. Each allocator is handed operand K's own
   // NATIVE tile and derives its own cost from that plus the label gather baked
   // into its type, so the two operand kinds no longer need separate folds here:
   // an InputTag operand carves a staging buffer of the canonical (output)
-  // shape, while a ContractionTag operand is staged zero-copy (its
+  // shape, while a ContractionTag operand is consumed zero-copy (its
   // ScratchAllocator::get() returns the inner evaluator's own C scratch
   // directly) and instead charges that sub-contraction's real recursive a+b+c
-  // bytes.
+  // bytes. A permuted contraction operand costs the same: relabeling retypes
+  // that buffer without carving a second one.
   static std::size_t operand_bytes(const tiling_type& t) {
     return Impl::sum_over_index<NumOps>([&](auto k) {
       constexpr std::size_t K = decltype(k)::value;

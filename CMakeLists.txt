@@ -126,6 +126,10 @@ if(TENSOR_OPS_BUILD_BENCHMARKS)
     benchmarks/permuted_contraction/bench_permuted_contraction.cpp)
   target_link_libraries(bench_permuted_contraction PRIVATE tensor)
 
+  add_executable(bench_permuted_combine
+    benchmarks/permuted_combine/bench_permuted_combine.cpp)
+  target_link_libraries(bench_permuted_combine PRIVATE tensor)
+
   add_executable(bench_matrix_multiply
     benchmarks/matrix_multiply/bench_matrix_multiply.cpp)
   target_link_libraries(bench_matrix_multiply PRIVATE tensor Kokkos::kokkoskernels)
