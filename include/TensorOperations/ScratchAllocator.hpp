@@ -18,13 +18,28 @@
 //     than on every k-tile/combine call, and stage() never rebuilds it.
 //
 // Static interface (host-side sizing):
-//   ScratchAllocator<P,O,N[,T]>::bytes<V>(tile)
+//   ScratchAllocator<P,O,IntermTag>::bytes<V>(canon_tile)
+//   ScratchAllocator<P,O,N,T>::bytes<V>(native_tile, perm)
+//
+// The operand-bearing forms take the operand's NATIVE tile (the same spec the
+// allocator was keyed on) plus the gather permutation that brings it into the
+// consuming operation's canonical order — the two pieces of information the
+// specializations need to disagree about. A ContractionTag operand recurses
+// into its inner evaluator, which is keyed on the native tile BUNDLE and
+// accepts nothing else; an InputTag operand sizes a staging buffer, whose shape
+// is the CANONICAL one. Callers therefore cannot supply a single tile that
+// serves both, and the perm is what lets each form derive its own. It defaults
+// to the identity sequence, which is the whole story for an unpermuted operand.
 //
 // Instance interface (device-side allocation):
 //   ScratchAllocator<P,O,IntermTag> sa{};            // output (C) slot only
-//   ScratchAllocator<P,O,N,T> sa{node, tile, team};  // operand
-//   (Input/Contraction) auto view = sa.alloc<V>(team, tile); auto staged =
-//   sa.stage(team, idx);  // operand-bearing forms only
+//   ScratchAllocator<P,O,N,T> sa{node, tile, team};  // operand (Input/Contr.)
+//   auto view   = sa.alloc<V>(team, canon_tile);
+//   auto staged = sa.stage(team, idx);               // operand-bearing only
+//
+// alloc() keeps taking the canonical tile directly: unlike bytes(), both
+// operand forms agree there (the ContractionTag one ignores the argument
+// entirely, since it hands back the inner evaluator's own scratch).
 //
 // Uniform factory (3-arg form selects the InputTag- or ContractionTag-operand
 // specialization via requires constraints on the operand node type):
@@ -50,10 +65,11 @@ struct ScratchAllocator;
 // ContractionTag operand: stores the inner Evaluator so its scratch is
 // allocated exactly once during construction, not on every k-tile/combine
 // call. alloc() returns the inner C scratch directly (zero-copy, no cursor
-// bump) -- valid for either OuterOpTag, since a ContractionTag operand's
-// canonicality (identity permC, matching output order) is statically
-// asserted at the use site regardless of which operation contains it.
-// bytes() returns the full recursive scratch_size_per_team of the inner eval.
+// bump) -- valid for either OuterOpTag, and now also for a PERMUTED operand,
+// which the consumer stages by reordering that same buffer in place rather
+// than by copying it elsewhere. bytes() returns the full recursive
+// scratch_size_per_team of the inner eval and ignores `perm`: neither the
+// zero-copy nor the in-place-reorder path costs a byte beyond it.
 template <typename ES, typename OuterOpTag, typename NA, typename TileA>
   requires(Impl::has_node_tag_v<ContractionTag, NA>)
 struct ScratchAllocator<TeamPolicyTag<ES>, OuterOpTag, NA, TileA> {
@@ -65,8 +81,10 @@ struct ScratchAllocator<TeamPolicyTag<ES>, OuterOpTag, NA, TileA> {
                                    const Team& team)
       : eval_(make_evaluator<TeamPolicyTag<ES>>(node, tile, team)) {}
 
-  template <typename V, typename CanonTile>
-  static std::size_t bytes(const CanonTile& tile) {
+  // Variadic perm: this form genuinely has nothing to do with it, so accepting
+  // zero or one says so more plainly than a defaulted parameter it discards.
+  template <typename V, typename... PermSeq>
+  static std::size_t bytes(const TileA& tile, const PermSeq&...) {
     return inner_eval_t::scratch_size_per_team(tile);
   }
   template <typename V, typename Team, typename CanonTile>
@@ -83,9 +101,10 @@ struct ScratchAllocator<TeamPolicyTag<ES>, OuterOpTag, NA, TileA> {
 // InputTag operand: stores the inner Evaluator so its tiled view is set up
 // once during construction rather than recreated on every call. alloc()
 // carves a new scratch tile from the team cursor. bytes() is the operand
-// staging cost, not a recursive evaluation cost. Also valid for either
-// OuterOpTag -- an input operand is staged identically regardless of the
-// containing operation.
+// staging cost, not a recursive evaluation cost -- and the staging buffer has
+// the CANONICAL shape, so this is the one form that actually applies `perm`.
+// Also valid for either OuterOpTag -- an input operand is staged identically
+// regardless of the containing operation.
 template <typename ES, typename OuterOpTag, typename NA, typename TileA>
   requires(Impl::has_node_tag_v<InputTag, NA>)
 struct ScratchAllocator<TeamPolicyTag<ES>, OuterOpTag, NA, TileA> {
@@ -97,9 +116,12 @@ struct ScratchAllocator<TeamPolicyTag<ES>, OuterOpTag, NA, TileA> {
                                    const Team& team)
       : eval_(make_evaluator<TeamPolicyTag<ES>>(node, tile, team)) {}
 
-  template <typename V, typename CanonTile>
-  static std::size_t bytes(const CanonTile& tile) {
-    return Impl::scratch_tile_bytes<V, ES>(tile);
+  // TileA is a leaf tile here (only a fused operand is tiled with a bundle), so
+  // the identity default reads straight off its rank.
+  template <typename V,
+            typename PermSeq = std::make_integer_sequence<int, TileA::rank>>
+  static std::size_t bytes(const TileA& tile, PermSeq perm = {}) {
+    return Impl::scratch_tile_bytes<V, ES>(reorder_tile_value(tile, perm));
   }
   template <typename V, typename Team, typename CanonTile>
   KOKKOS_FUNCTION auto alloc(const Team& team, const CanonTile& tile) const {
@@ -112,9 +134,11 @@ struct ScratchAllocator<TeamPolicyTag<ES>, OuterOpTag, NA, TileA> {
 };
 
 // IntermTag = the output (C) accumulator slot: no operand node, so this is
-// the only 3-param form. stage() has no source to stage from, so it's a
-// trivial alias for alloc() (kept for interface uniformity with the
-// operand-bearing specializations above). Uniform across every OuterOpTag.
+// the only 3-param form. With no operand there is no native-vs-canonical
+// distinction to reconcile, so bytes() keeps taking the canonical tile alone
+// (no perm parameter). stage() has no source to stage from, so it's a trivial
+// alias for alloc() (kept for interface uniformity with the operand-bearing
+// specializations above). Uniform across every OuterOpTag.
 template <typename ES, typename OuterOpTag>
 struct ScratchAllocator<TeamPolicyTag<ES>, OuterOpTag, IntermTag> {
   KOKKOS_DEFAULTED_FUNCTION ScratchAllocator() = default;

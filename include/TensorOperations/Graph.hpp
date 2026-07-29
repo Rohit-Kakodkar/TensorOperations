@@ -147,27 +147,7 @@ int work_items(const Node& n, const Tile& tile) {
   return total;
 }
 
-// The output permutation (permC) as a full-rank sequence: maps canonical output
-// mode i -> its position in the user output order. The store evaluator subviews
-// the native output on the ordered path and reorders it into canonical order
-// via this sequence. Identity seq for canonical contractions and
-// non-contraction outputs (so the store's scatter + reorder collapse to
-// no-ops).
-template <typename NodeType>
-KOKKOS_FUNCTION auto output_perm_seq() {
-  if constexpr (is_contraction<NodeType>::value)
-    return typename NodeType::permC_seq{};
-  else
-    return std::make_integer_sequence<int, NodeType::Rank>{};
-}
-
-// The output (C) tile in the node's canonical (freeA ++ freeB) mode order:
-// the user-order output tile gathered by permC. Identity permC (canonical
-// contractions, non-contraction outputs) passes the tile through unchanged.
-template <typename NodeType, typename Tile>
-KOKKOS_FUNCTION auto canonical_c_tile(const Tile& tile) {
-  return reorder_tile_value(output_tile(tile), output_perm_seq<NodeType>());
-}
+// output_perm_seq / canonical_c_tile live in Evaluator.hpp's Impl block.
 
 // Launches one team-policy kernel for one output node (one view per output
 // tensor) and returns the work-item count.

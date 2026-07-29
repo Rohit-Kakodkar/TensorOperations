@@ -259,23 +259,31 @@ struct Evaluator<TeamPolicyTag<ES>,
   static_assert(FreeA + FreeB == RankC,
                 "free-mode counts must sum to the output rank");
 
-  // The free-mode (output) tile of each operand: the tile itself for an input
-  // operand, or the fused sub-contraction's output tile for a contraction
-  // operand. GEMM sizing and the reshape below read these leaf tiles uniformly
-  // via output_tile() (identity for a leaf, `.c` for a nested Tile bundle).
-  using a_out_tile_t = decltype(output_tile(std::declval<TileA>()));
-  using b_out_tile_t = decltype(output_tile(std::declval<TileB>()));
+  // The free-mode (output) tile of each operand, in the axis order that
+  // operand's own evaluator hands back: the tile itself for an input operand,
+  // or the fused sub-contraction's CANONICAL output tile for a contraction
+  // operand (its bundle's `.c` slot is written in the sub-contraction's user
+  // order, which permC reconciles -- see Impl::canonical_c_tile). Everything
+  // below that describes A or B "natively" -- the GEMM sizing, the k-tile
+  // counts, permA/permB -- is expressed against these leaf tiles, and all three
+  // agree only because they are all canonical for a fused operand.
+  using a_leaf_t = Impl::operand_leaf_tile_t<NA, TileA>;
+  using b_leaf_t = Impl::operand_leaf_tile_t<NB, TileB>;
 
   // Check operand output-tile ranks match node ranks
-  static_assert(a_out_tile_t::rank == RankA, "TileA rank must match node A");
-  static_assert(b_out_tile_t::rank == RankB, "TileB rank must match node B");
+  static_assert(a_leaf_t::rank == RankA, "TileA rank must match node A");
+  static_assert(b_leaf_t::rank == RankB, "TileB rank must match node B");
   static_assert(TileC::rank == RankC, "TileC rank must match output rank");
 
-  // Per-operand permutations from user axis order into the GEMM's canonical
-  // order (freeA ++ contracted for A, contracted ++ freeB for B). permC maps
-  // the canonical output back to the user order. Identity for canonical
-  // contractions (in which case every canonicalization below is a no-op
-  // passthrough).
+  // Per-operand permutations from the operand's own axis order into the GEMM's
+  // canonical order (freeA ++ contracted for A, contracted ++ freeB for B).
+  // They are computed from each operand's modes_seq, so "the operand's own
+  // order" means the input's declared labels for a leaf and the CANONICAL ones
+  // for a fused sub-contraction (whose modes_seq is canonical) -- exactly the
+  // order Impl::operand_leaf_tile_t presents that operand's tile in. permC maps
+  // this contraction's canonical output back to the user order. All three are
+  // identity for a canonical contraction, in which case every canonicalization
+  // below is a no-op passthrough.
   using permA_seq =
       Impl::permA_seq_t<typename NA::modes_seq, typename NB::modes_seq>;
   using permB_seq =
@@ -283,8 +291,8 @@ struct Evaluator<TeamPolicyTag<ES>,
   using permC_seq = PermCSeq;
 
   // Native <-> canonical axis relation per operand. This evaluator holds each
-  // operand's NATIVE tile and derives the canonical one (the combine evaluator
-  // runs the same vocabulary in the opposite direction).
+  // operand's own-order leaf tile and derives the canonical one (the combine
+  // evaluator runs the same vocabulary in the opposite direction).
   using axes_a = OperandAxes<permA_seq>;
   using axes_b = OperandAxes<permB_seq>;
   using axes_c = OperandAxes<permC_seq>;
@@ -296,36 +304,38 @@ struct Evaluator<TeamPolicyTag<ES>,
                 "contraction evaluator v1: operands must be input or fused "
                 "contraction nodes (combine operands are a follow-up)");
 
-  // v1 fused chaining: a contraction operand must already sit in the parent's
-  // canonical position (identity permA/permB), so no permuted-intermediate
-  // handling is needed yet. Relabel so the parent's contracted modes come last
-  // in the sub-contraction's output. (Permuting a nested operand is a later
-  // follow-up; input operands may still be permuted as before.)
-  static_assert(!Impl::has_node_tag_v<ContractionTag, NA> ||
-                    axes_a::is_identity,
-                "fused contraction operand A must be in canonical position "
-                "(identity permA)");
-  static_assert(!Impl::has_node_tag_v<ContractionTag, NB> ||
-                    axes_b::is_identity,
-                "fused contraction operand B must be in canonical position "
-                "(identity permB)");
-
-  using tile_a_canon_t = typename axes_a::template canon_tile_t<TileA>;
-  using tile_b_canon_t = typename axes_b::template canon_tile_t<TileB>;
+  // Each operand's leaf tile brought into this contraction's canonical order.
+  // Only the LEAF is permuted, never the whole Tile<A,B,C> bundle a fused
+  // operand is tiled with: that bundle belongs to the sub-contraction, whose
+  // evaluator is keyed on it and canonicalizes its own A/B/C internally.
+  using a_out_canon_t  = typename axes_a::template canon_tile_t<a_leaf_t>;
+  using b_out_canon_t  = typename axes_b::template canon_tile_t<b_leaf_t>;
   using tile_c_canon_t = typename axes_c::template canon_tile_t<TileC>;
+
+  // A fused contraction operand may sit in ANY position: it is staged by
+  // reordering its own C scratch in place (see Impl::operand_stageable_v for
+  // the rule and why a shape-changing permutation is excluded). Rejecting one
+  // here, early, is what keeps it from reaching Specialization 8 as a scratch
+  // type that no longer matches a_scratch_t/b_scratch_t below -- which would
+  // silently take the COPY branch, whose source and destination are the very
+  // same buffer for a fused operand.
+  static_assert(Impl::operand_stageable_v<NA, TileA, permA_seq>,
+                "permA must preserve fused operand A's tile extents (it is "
+                "staged in place); see Impl::operand_stageable_v");
+  static_assert(Impl::operand_stageable_v<NB, TileB, permB_seq>,
+                "permB must preserve fused operand B's tile extents (it is "
+                "staged in place); see Impl::operand_stageable_v");
 
   using c_layout_t =
       decltype(make_tile_layout(tile_c_canon_t{}, LayoutRight{}));
 
   using a_scratch_t =
       ScratchView<value_type, exec_space,
-                  decltype(make_tile_layout(output_tile(tile_a_canon_t{}),
-                                            LayoutRight{}))>;
+                  decltype(make_tile_layout(a_out_canon_t{}, LayoutRight{}))>;
 
   using b_scratch_t =
       ScratchView<value_type, exec_space,
-                  decltype(make_tile_layout(output_tile(tile_b_canon_t{}),
-                                            LayoutRight{}))>;
+                  decltype(make_tile_layout(b_out_canon_t{}, LayoutRight{}))>;
 
   using alloc_a_t =
       decltype(make_scratch_allocator<TeamPolicyTag<ES>, ContractionTag>(
@@ -346,11 +356,14 @@ struct Evaluator<TeamPolicyTag<ES>,
   using result_type   = interm_type;
   using team_member_t = Impl::team_member_t<exec_space>;
 
+  // The operands' full tiling specs (a nested Tile<A,B,C> bundle, when fused)
+  // are not retained: only the allocators, built from them here, still need
+  // them. What the evaluator itself works in is the leaf tiles below.
   node_type      node;
-  TileA          tile_a_native_;
-  TileB          tile_b_native_;
-  tile_a_canon_t a_tile_;
-  tile_b_canon_t b_tile_;
+  a_leaf_t       a_leaf_;  // A's leaf tile, in A's own axis order
+  b_leaf_t       b_leaf_;  // B's leaf tile, in B's own axis order
+  a_out_canon_t  a_tile_;  // ... and in this contraction's canonical order
+  b_out_canon_t  b_tile_;
   tile_c_canon_t c_tile_;
   alloc_a_t      alloc_a_;
   alloc_b_t      alloc_b_;
@@ -363,20 +376,18 @@ struct Evaluator<TeamPolicyTag<ES>,
   KOKKOS_FUNCTION Evaluator(node_type n, tiling_type t,
                             const team_member_t& team)
       : node(n),
-        tile_a_native_(t.a),
-        tile_b_native_(t.b),
-        a_tile_(axes_a::to_canon_tile(t.a)),
-        b_tile_(axes_b::to_canon_tile(t.b)),
+        a_leaf_(Impl::canonical_c_tile<NA>(t.a)),
+        b_leaf_(Impl::canonical_c_tile<NB>(t.b)),
+        a_tile_(axes_a::to_canon_tile(a_leaf_)),
+        b_tile_(axes_b::to_canon_tile(b_leaf_)),
         c_tile_(axes_c::to_canon_tile(t.c)),
         alloc_a_(make_scratch_allocator<TeamPolicyTag<ES>, ContractionTag>(
-            n.node_a, tile_a_native_, team)),
+            n.node_a, t.a, team)),
         alloc_b_(make_scratch_allocator<TeamPolicyTag<ES>, ContractionTag>(
-            n.node_b, tile_b_native_, team)),
+            n.node_b, t.b, team)),
         alloc_c_(),
-        scratch_a_(
-            alloc_a_.template alloc<value_type>(team, output_tile(a_tile_))),
-        scratch_b_(
-            alloc_b_.template alloc<value_type>(team, output_tile(b_tile_))),
+        scratch_a_(alloc_a_.template alloc<value_type>(team, a_tile_)),
+        scratch_b_(alloc_b_.template alloc<value_type>(team, b_tile_)),
         scratch_(alloc_c_.template alloc<value_type>(team, c_tile_)) {
     result_.hook_op  = node.hook_op;
     result_.storage_ = scratch_;
@@ -394,21 +405,21 @@ struct Evaluator<TeamPolicyTag<ES>,
     Kokkos::parallel_for(Kokkos::TeamVectorRange(team, c.size()),
                          [c](int i) { c.data()[i] = S{0}; });
     team.team_barrier();
-    // Per-mode k-tile counts (from A's own native tile/shape, read through
-    // permA_seq) and their product. output_tile() normalizes "leaf tile"
-    // uniformly whether A is an input leaf or a fused sub-contraction (same
-    // precedent used for GEMM sizing below); permA_seq is identity in the
-    // fused case, so this needs no dispatch on the operand's tag. Contracted
-    // tiles share single-buffered scratch, so the walk over the linearized
-    // contracted-tile space is serialized by team barriers.
+    // Per-mode k-tile counts (from A's own leaf tile/shape, read through
+    // permA_seq) and their product. a_leaf_ and node.node_a.shape() are both
+    // in A's own axis order -- the operand's declared order for an input leaf,
+    // canonical for a fused sub-contraction (whose modes_seq, and hence
+    // permA_seq, is canonical too) -- so one indexing scheme covers both and
+    // this needs no dispatch on the operand's tag. Contracted tiles share
+    // single-buffered scratch, so the walk over the linearized contracted-tile
+    // space is serialized by team barriers.
     const auto               pA = Impl::seq_to_karray(permA_seq{});
     Kokkos::Array<int, NumK> n_k_tiles{};
     int                      total_k_tiles = 1;
     for (int i = 0; i < NumK; ++i) {
       int native_dim = pA[FreeA + i];
-      n_k_tiles[i] =
-          Impl::tile_count_along(output_tile(tile_a_native_), native_dim,
-                                 node.node_a.shape()[native_dim]);
+      n_k_tiles[i]   = Impl::tile_count_along(a_leaf_, native_dim,
+                                              node.node_a.shape()[native_dim]);
       total_k_tiles *= n_k_tiles[i];
     }
     // Mixed-radix counter (LSB fastest); carry-increment avoids per-step
@@ -430,13 +441,16 @@ struct Evaluator<TeamPolicyTag<ES>,
     return Impl::tile_count_along(c_tile_, d, node.shape()[d]);
   }
 
+  // Each operand allocator is handed its own NATIVE tiling spec plus the perm
+  // into this contraction's canonical order, and derives its own cost: a fused
+  // operand recurses into the sub-contraction's full scratch_size_per_team
+  // (which only accepts that native bundle), an input operand sizes a staging
+  // buffer of the canonical shape. The output (C) slot has no operand and so
+  // no perm to apply.
   static std::size_t scratch_size_per_team(const tiling_type& t) {
-    const tile_c_canon_t c_canon = axes_c::to_canon_tile(t.c);
-    const tile_a_canon_t a_canon = axes_a::to_canon_tile(t.a);
-    const tile_b_canon_t b_canon = axes_b::to_canon_tile(t.b);
-    return alloc_c_t::template bytes<value_type>(c_canon) +
-           alloc_a_t::template bytes<value_type>(a_canon) +
-           alloc_b_t::template bytes<value_type>(b_canon);
+    return alloc_c_t::template bytes<value_type>(axes_c::to_canon_tile(t.c)) +
+           alloc_a_t::template bytes<value_type>(t.a, permA_seq{}) +
+           alloc_b_t::template bytes<value_type>(t.b, permB_seq{});
   }
 
  private:
@@ -497,25 +511,29 @@ struct Evaluator<TeamPolicyTag<ES>,
 
     // a_tile_idx/b_tile_idx are canonical (free++contracted) order -- what
     // a_tile_/b_tile_ and the staged scratch use. stage_operand_into scatters
-    // each into the operand's own native axis order to drive its native-tiled
-    // evaluator (identity scatter for a fused contraction operand, whose
-    // permA/permB are asserted identity above).
+    // each into the operand's own axis order to drive that operand's evaluator,
+    // then hands the perm to Specialization 8, which reorders an input
+    // operand's copy on the way into scratch and a fused operand's own scratch
+    // in place.
     auto staged_a = Impl::stage_operand_into<TeamPolicyTag<ES>>(
-        team, scratch_a_, StageTile<TileA, permA_seq>{tile_a_native_},
-        a_tile_idx, alloc_a_);
+        team, scratch_a_, StageTile<a_leaf_t, permA_seq>{a_leaf_}, a_tile_idx,
+        alloc_a_);
     auto staged_b = Impl::stage_operand_into<TeamPolicyTag<ES>>(
-        team, scratch_b_, StageTile<TileB, permB_seq>{tile_b_native_},
-        b_tile_idx, alloc_b_);
+        team, scratch_b_, StageTile<b_leaf_t, permB_seq>{b_leaf_}, b_tile_idx,
+        alloc_b_);
     team.team_barrier();
 
     // View each operand's scratch as a 2D GEMM matrix: A[SA,SK], B[SK,SB],
     // C[SA,SB] (all row-major). For static tiles these carry compile-time
     // extents, and the register-tiled views below carry compile-time strides.
-    auto a = Impl::as_matrix<FreeA>(staged_a.storage_,
-                                    output_tile(a_tile_));  // [SA,SK]
-    auto b = Impl::as_matrix<NumK>(staged_b.storage_,
-                                   output_tile(b_tile_));  // [SK,SB]
-    auto c = Impl::as_matrix<FreeA>(scratch_, c_tile_);    // [SA,SB]
+    // The shape comes from the CANONICAL leaf tile even when the staged view's
+    // own layout type is the operand's native one (a fused operand keeps its
+    // buffer's type across an in-place reorder): reshape only checks the total
+    // element count, and after staging the buffer holds canonically ordered
+    // data contiguously row-major, which is all the GEMM reads.
+    auto a = Impl::as_matrix<FreeA>(staged_a.storage_, a_tile_);  // [SA,SK]
+    auto b = Impl::as_matrix<NumK>(staged_b.storage_, b_tile_);   // [SK,SB]
+    auto c = Impl::as_matrix<FreeA>(scratch_, c_tile_);           // [SA,SB]
 
     const int SA = Impl::scratch_extent<0>(a);
     const int SK = Impl::scratch_extent<1>(a);
@@ -724,9 +742,14 @@ struct Evaluator<TeamPolicyTag<ES>,
   //       in the same order (identity label gather from operand → combine), and
   //   (2) the operand contraction's own permC is identity (freeA++freeB ==
   //       operand user output).
-  // Together these mirror the existing "fused contraction operand must be in
-  // canonical position" restriction of Specialization 4, so combine and
-  // fused-contraction chaining share the same operand-canonicality rules.
+  // Specialization 4 used to impose the same restriction and no longer does:
+  // it stages a permuted fused operand by reordering that operand's own scratch
+  // in place (Impl::reorder_scratch_in_place, via Specialization 8), which
+  // needs nothing combine-specific and would lift (1) here as well, subject to
+  // the same requirement that the permutation preserve the tile's extent tuple.
+  // Requirement (2) would additionally need op_tile_t<K> to be reconciled
+  // against the operand's permC, the way Impl::canonical_c_tile now does for
+  // a contraction's A/B. Both are left as a follow-up.
   template <std::size_t K>
   static constexpr bool op_is_contraction_v =
       Impl::has_node_tag_v<ContractionTag, op_node_t<K>>;
@@ -877,7 +900,7 @@ struct Evaluator<TeamPolicyTag<ES>,
     return static_cast<std::size_t>(NumOut) *
                ScratchAllocator<TeamPolicyTag<exec_space>, CombineTag,
                                 IntermTag>::template bytes<value_type>(out) +
-           operand_staging_size(out) + operand_scratch_size(t);
+           operand_bytes(t);
   }
 
  private:
@@ -911,32 +934,19 @@ struct Evaluator<TeamPolicyTag<ES>,
     return {stage_operand<Ks>(team, tile_idx)...};  // left-to-right
   }
 
-  // Total staging-buffer cost: a ContractionTag operand is staged zero-copy
-  // (its ScratchAllocator::alloc() returns the inner evaluator's own C scratch
-  // directly, mirroring ContractionTag's own ContractionTag-operand form), so
-  // it needs no separate staging buffer; only an InputTag operand carves one
-  // via op_alloc_t<K>::bytes().
-  static std::size_t operand_staging_size(const out_tile_t& out) {
+  // Total per-operand scratch cost. Each allocator is handed operand K's own
+  // NATIVE tile plus the label gather into the combine's output order and
+  // derives its own cost, so the two operand kinds no longer need separate
+  // folds here: an InputTag operand carves a staging buffer of the canonical
+  // (output) shape, while a ContractionTag operand is staged zero-copy (its
+  // ScratchAllocator::alloc() returns the inner evaluator's own C scratch
+  // directly) and instead charges that sub-contraction's real recursive a+b+c
+  // bytes.
+  static std::size_t operand_bytes(const tiling_type& t) {
     return Impl::sum_over_index<NumOps>([&](auto k) {
       constexpr std::size_t K = decltype(k)::value;
-      if constexpr (op_is_contraction_v<K>)
-        return std::size_t{0};
-      else
-        return op_alloc_t<K>::template bytes<value_type>(out);
-    });
-  }
-
-  // Total of each operand's own internal scratch: 0 for an InputTag operand
-  // (Specialization 2 owns no scratch of its own now); the nested
-  // contraction's real a+b+c bytes for a ContractionTag operand.
-  static std::size_t operand_scratch_size(const tiling_type& t) {
-    return Impl::sum_over_index<NumOps>([&](auto k) {
-      constexpr std::size_t K = decltype(k)::value;
-      if constexpr (op_is_contraction_v<K>)
-        return Evaluator<TeamPolicyTag<ES>, op_node_t<K>, native_tile_t<K>>::
-            scratch_size_per_team(native_op_tile<K>(t));
-      else
-        return std::size_t{0};
+      return op_alloc_t<K>::template bytes<value_type>(native_op_tile<K>(t),
+                                                       perm_seq<K>{});
     });
   }
 
@@ -1188,6 +1198,13 @@ struct Evaluator<TeamPolicyTag<ES>,
 
   // Invoked by the TileAssignable base on assignment; public for that reason.
   // operator() is inherited from that base.
+  //
+  // TODO: both branches apply the source's hook AFTER the reorder, against the
+  // CANONICAL tile_idx, so for a permuted operand the hook sees canonical
+  // rather than operand-native coordinates. Long-standing for permuted input
+  // operands, and now reachable for permuted fused ones too; fixing it means
+  // applying the hook to the source before reordering, at
+  // OperandAxes<perm_seq>::to_native_idx(tile_idx).
   template <typename SrcNode>
   KOKKOS_FUNCTION interm_type assign(const Kokkos::Array<int, Rank>& tile_idx,
                                      const SrcNode& src) const {

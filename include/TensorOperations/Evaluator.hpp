@@ -224,6 +224,82 @@ KOKKOS_FORCEINLINE_FUNCTION Kokkos::Array<T, M> as_result_array(
   return r;
 }
 
+// --- node output order ------------------------------------------------------
+//
+// A contraction node's modes_seq, shape() and C scratch are all CANONICAL
+// (freeA ++ freeB); permC records where each canonical mode sits in the USER's
+// requested output order. A node's Tile<A,B,C> bundle, by contrast, is written
+// by the user, so its `.c` slot is in USER order. The helpers below are the
+// single place that reconciles the two, and they are used both by the graph
+// driver (which presents the user's output view canonically) and by the
+// contraction evaluator (which must know the axis order a fused operand's
+// scratch actually comes back in). Every one of them collapses to a no-op for a
+// non-contraction node.
+
+// permC as a full-rank sequence: canonical output mode i -> its position in the
+// user output order. Identity for canonical contractions and for every
+// non-contraction node.
+template <typename NodeType>
+KOKKOS_FUNCTION auto output_perm_seq() {
+  if constexpr (has_node_tag_v<ContractionTag, NodeType>)
+    return typename NodeType::permC_seq{};
+  else
+    return std::make_integer_sequence<int, NodeType::Rank>{};
+}
+
+// The output (C) tile of a tiling spec in the node's canonical mode order: the
+// user-order output tile gathered by permC.
+//
+// Read as an OPERAND's tile (see operand_leaf_tile_t), this is the axis order
+// that operand's own evaluator actually produces: an input operand's evaluator
+// yields the operand's declared order, so its tile passes straight through,
+// while a fused contraction hands back its CANONICAL C scratch even though the
+// bundle it was tiled with carries `.c` in that sub-contraction's USER order.
+// Going through here keeps a parent's tile shapes, its k-tile counts (which
+// index node.shape(), also canonical) and its permA/permB (computed from
+// modes_seq, also canonical) in one consistent axis order.
+template <typename NodeType, typename Tile>
+KOKKOS_FUNCTION auto canonical_c_tile(const Tile& tile) {
+  return reorder_tile_value(output_tile(tile), output_perm_seq<NodeType>());
+}
+
+template <typename Node, typename Tile>
+using operand_leaf_tile_t =
+    decltype(canonical_c_tile<Node>(std::declval<Tile>()));
+
+// Can operand `Node`, tiled by `Tile`, be staged into the axis order `PermSeq`
+// gathers into?
+//
+// A fused (contraction) operand hands back its own C scratch and is reordered
+// IN PLACE, which is a self-map of that fixed buffer only when every transposed
+// axis pair has equal extents -- a 16x32 tile cannot be transposed inside its
+// own storage. Every other operand is copied into a fresh staging buffer on the
+// way in, so nothing constrains it.
+//
+// Deliberately spelled with transpositions_equal_extent, the SAME predicate the
+// in-place reorder asserts on the scratch layout at its call site (see
+// Specialization 8 in Evaluator/Team.hpp): stating the rule once means an
+// evaluator's early, friendly rejection cannot drift from what the reorder
+// actually requires. Naming it also makes the rule testable -- a violation is a
+// hard error from inside an evaluator's class body, which no `requires` can
+// detect, so a test can only check it by asserting this predicate directly (see
+// the static_asserts above FusedPermutedOperandATeam in test_graph.cpp).
+// The branches are if constexpr rather than a `||` chain for the same reason
+// Specialization 8 guards its own static_assert that way: transpositions_equal_
+// extent reads extents statically off its argument, which only a StaticTile
+// offers, and a `||` would instantiate it even for the cases that never reach
+// the reorder.
+template <typename Node, typename Tile, typename PermSeq>
+inline constexpr bool operand_stageable_v = [] {
+  if constexpr (!has_node_tag_v<ContractionTag, Node>)
+    return true;  // copied into its own staging buffer; shape unconstrained
+  else if constexpr (is_identity_seq(PermSeq{}))
+    return true;  // zero-copy passthrough; nothing is reordered
+  else
+    return transpositions_equal_extent<operand_leaf_tile_t<Node, Tile>>(
+        PermSeq{});
+}();
+
 }  // namespace Impl
 
 // ---------------------------------------------------------------------------
