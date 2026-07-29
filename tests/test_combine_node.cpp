@@ -51,6 +51,12 @@ struct FmaCoord3 {
   }
 };
 
+// A do-nothing store hook. Used only to give a node a non-NoHook hook_type in
+// the compile-time staging-rule assertions below.
+struct NoopHook {
+  KOKKOS_FUNCTION void operator()(int, int, float&) const {}
+};
+
 // Multi-output combine: returns Kokkos::Array<float,2> -> two output tensors.
 struct SumDiff {
   KOKKOS_FUNCTION Kokkos::Array<float, 2> operator()(int i, int j, float a,
@@ -351,16 +357,40 @@ struct ContractionCombineData {
   }
 
   // Canonical output order: freeA(i) ++ freeB(l) == user output <i,l>, so the
-  // contraction's permC is identity (required by the combine evaluator).
+  // contraction's permC is identity.
   auto contraction_node() const {
     return make_contraction_node<float, Kokkos::DefaultExecutionSpace, 'i',
                                  'l'>(
         make_input_node(make_handle<'i', 'j', 'k'>(A)),
         make_input_node(make_handle<'j', 'k', 'l'>(B)));
   }
+
+  // The SAME contraction declared in a non-canonical position: identical
+  // operands, so freeA ++ freeB is still [i,l], but the user output order is
+  // <l,i>, giving permC == [1,0]. The combine matches operands on their
+  // CANONICAL modes, so this operand's label gather stays identity and it is
+  // consumed by the plain zero-copy passthrough -- what differs is purely the
+  // frame its tile bundle is spelled in (below).
+  auto noncanonical_contraction_node() const {
+    return make_contraction_node<float, Kokkos::DefaultExecutionSpace, 'l',
+                                 'i'>(
+        make_input_node(make_handle<'i', 'j', 'k'>(A)),
+        make_input_node(make_handle<'j', 'k', 'l'>(B)));
+  }
+
   auto d_node() const { return make_input_node(make_handle<'i', 'l'>(D)); }
   static auto combine_tile() {
     return make_combine_tile(OutTile{}, CBundle{}, OutTile{});
+  }
+
+  // Bundle for the non-canonical node. A tile bundle's `.c` slot is always in
+  // its own node's USER order, so here it is L x I -- the transpose of the
+  // 16x32 scratch that contraction actually writes. The evaluator recovers the
+  // canonical shape by reading `.c` through permC (Impl::operand_leaf_tile_t).
+  using NCBundle =
+      Tile<StaticTile<16, 2, 4>, StaticTile<2, 4, 32>, StaticTile<32, 16>>;
+  static auto noncanonical_combine_tile() {
+    return make_combine_tile(OutTile{}, NCBundle{}, OutTile{});
   }
 
   // Host reference for the contraction operand c{i,l}.
@@ -439,6 +469,205 @@ TEST(CombineNodeTest, MultiOutputContractionOperandTeam) {
       const float expected1 = c - dv + static_cast<float>(i - l);
       EXPECT_FLOAT_EQ(P0h(i, l), expected0) << "p0 i=" << i << " l=" << l;
       EXPECT_FLOAT_EQ(P1h(i, l), expected1) << "p1 i=" << i << " l=" << l;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Combine with a NON-CANONICAL contraction operand (permC != identity).
+//
+// Same numbers as ContractionOperandTeam -- only the operand's declared output
+// order changes, from <i,l> to <l,i>. That leaves its canonical (freeA++freeB)
+// order, its scratch, and its label gather into the combine untouched; the one
+// thing that moves is the frame its tile bundle's `.c` slot is written in.
+// Isolates requirement (2): the evaluator must read that slot through permC
+// rather than assuming it is already canonical. Rejected before this change by
+// the combine evaluator's identity-permC static_assert.
+//
+// The combine analogue of GraphTest.FusedOperandNonIdentityPermCTeam.
+// ---------------------------------------------------------------------------
+TEST(CombineNodeTest, NonCanonicalContractionOperandTeam) {
+  const ContractionCombineData  d;
+  ContractionCombineData::View2 P("P", d.I, d.L);
+  Kokkos::deep_copy(P, 0.0f);
+
+  auto g        = make_graph();
+  auto [g1, o1] = g.ops(make_combine_node<'i', 'l'>(
+      d.noncanonical_contraction_node(), d.d_node(), MulPlusCoord{}));
+  g1.execute(TeamPolicyTag<>{}, d.noncanonical_combine_tile(), P);
+
+  // Identical expected values to ContractionOperandTeam: re-declaring the
+  // operand's output order must not change what it computes.
+  auto Ph = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, P);
+  for (int i = 0; i < d.I; ++i)
+    for (int l = 0; l < d.L; ++l) {
+      const float expected = d.host_c(i, l) * d.Dh(i, l) +
+                             static_cast<float>(i) * 100.0f +
+                             static_cast<float>(l);
+      EXPECT_FLOAT_EQ(Ph(i, l), expected) << "i=" << i << " l=" << l;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Combine with a PERMUTED contraction operand, at UNEQUAL extents.
+//
+//   c{l,i} = sum_{j,k} A{l,j,k} * B{j,k,i}      (canonical order [l,i])
+//   P{i,l} = c{l,i} * D{i,l} + 100*i + l        (combine output order [i,l])
+//
+// The operand's canonical order is the reverse of the combine's output order,
+// so its label gather is [1,0] and its 64x32 C scratch must be read as 32x64.
+// Isolates requirement (1), and does so at extents that can ONLY be served by
+// the zero-copy relabel: an in-place axis swap is a self-map of a fixed buffer
+// only at equal extents, so the path the contraction evaluator uses for its own
+// permuted fused operands could never stage this (asserted below). That is the
+// capability this test exists to pin, over and above the refactor.
+//
+// Register-kernel constraints apply to the operand in ITS canonical order, so
+// with A and B swapped relative to ContractionCombineData it is I -- not L --
+// that carries the output-column (NR) constraint: SA = L = 64 (%MT=8),
+// flattened SK = J*K = 8 (%NT=8), SB = I = 32 (%NR up to 32). Team scratch is
+// 2048+1024+8192 (operand a+b+c) + 8192 (D staging) + 8192 (output) = 27 KB,
+// inside the serial backend's ~32 KB cap.
+// ---------------------------------------------------------------------------
+namespace {
+struct PermutedContractionCombineData {
+  using View2            = Kokkos::View<float**, Kokkos::LayoutRight>;
+  using View3            = Kokkos::View<float***, Kokkos::LayoutRight>;
+  static constexpr int I = 32, J = 2, K = 4, L = 64;
+  using OutTile = StaticTile<32, 64>;  // combine output <i,l>
+  // `.c` is 64x32: the operand's own canonical (and user) order [l,i].
+  using CBundle =
+      Tile<StaticTile<64, 2, 4>, StaticTile<2, 4, 32>, StaticTile<64, 32>>;
+
+  View3                   A{"A", L, J, K};
+  View3                   B{"B", J, K, I};
+  View2                   D{"D", I, L};
+  View3::host_mirror_type Ah{Kokkos::create_mirror_view(A)};
+  View3::host_mirror_type Bh{Kokkos::create_mirror_view(B)};
+  View2::host_mirror_type Dh{Kokkos::create_mirror_view(D)};
+
+  PermutedContractionCombineData() {
+    for (int l = 0; l < L; ++l)
+      for (int j = 0; j < J; ++j)
+        for (int k = 0; k < K; ++k)
+          Ah(l, j, k) =
+              static_cast<float>(((l * 7 + j * 3 + k) % 5) + 1) * 0.25f;
+    for (int j = 0; j < J; ++j)
+      for (int k = 0; k < K; ++k)
+        for (int i = 0; i < I; ++i)
+          Bh(j, k, i) =
+              static_cast<float>(((j * 5 + k * 2 + i) % 4) + 1) * 0.5f;
+    for (int i = 0; i < I; ++i)
+      for (int l = 0; l < L; ++l)
+        Dh(i, l) = static_cast<float>((i + 3 * l) % 7 + 1) * 0.125f;
+    Kokkos::deep_copy(A, Ah);
+    Kokkos::deep_copy(B, Bh);
+    Kokkos::deep_copy(D, Dh);
+  }
+
+  // freeA(l) ++ freeB(i) == user output <l,i>, so permC is identity here and
+  // the only thing out of step with the combine is the label gather.
+  auto contraction_node() const {
+    return make_contraction_node<float, Kokkos::DefaultExecutionSpace, 'l',
+                                 'i'>(
+        make_input_node(make_handle<'l', 'j', 'k'>(A)),
+        make_input_node(make_handle<'j', 'k', 'i'>(B)));
+  }
+  // The same node carrying a hook. Not executed -- it exists so the static_
+  // asserts below can pin that hooking an operand takes it off the relabel
+  // path, which is otherwise only observable by reading the evaluator.
+  auto hooked_contraction_node() const {
+    return make_contraction_node<float, Kokkos::DefaultExecutionSpace, 'l',
+                                 'i'>(
+        make_input_node(make_handle<'l', 'j', 'k'>(A)),
+        make_input_node(make_handle<'j', 'k', 'i'>(B)), NoopHook{});
+  }
+
+  auto d_node() const { return make_input_node(make_handle<'i', 'l'>(D)); }
+  static auto combine_tile() {
+    return make_combine_tile(OutTile{}, CBundle{}, OutTile{});
+  }
+
+  // Host reference for the contraction operand, in ITS order: c{l,i}.
+  float host_c(int l, int i) const {
+    float c = 0.0f;
+    for (int j = 0; j < J; ++j)
+      for (int k = 0; k < K; ++k) c += Ah(l, j, k) * Bh(j, k, i);
+    return c;
+  }
+};
+
+// The divergence between the two staging rules, asserted in both directions
+// over the exact node/tile/perm the test below runs.
+//
+// Impl::operand_stageable_v is what the CONTRACTION evaluator gates its own
+// operands on, and it rejects this one: a 64x32 tile has no room to become
+// 32x16 inside its own storage. Impl::operand_relabelable_v is the rule the
+// COMBINE evaluator uses instead, and it accepts it, because a relabel moves no
+// data and so has nothing to say about extents. The test below proves that
+// acceptance is correct.
+//
+// Asserting both is what keeps the two from being "unified" later: relaxing
+// operand_stageable_v would let the contraction evaluator through to an
+// in-place reorder it cannot perform.
+using PermutedFusedOp =
+    decltype(std::declval<PermutedContractionCombineData>().contraction_node());
+using PermutedFusedTile = PermutedContractionCombineData::CBundle;
+using PermutedFusedPerm =
+    Impl::label_perm_seq_t<std::integer_sequence<int32_t, 'i', 'l'>,
+                           PermutedFusedOp::modes_seq>;
+static_assert(
+    std::is_same_v<PermutedFusedPerm, std::integer_sequence<int, 1, 0>>,
+    "operand canonical order is [l,i]; gathering it into the "
+    "combine's [i,l] must be the transposition");
+static_assert(!Impl::operand_stageable_v<PermutedFusedOp, PermutedFusedTile,
+                                         PermutedFusedPerm>,
+              "a 64x32 fused operand tile must NOT be stageable under a "
+              "transposing perm -- it cannot be reordered in place");
+static_assert(Impl::operand_relabelable_v<PermutedFusedOp, PermutedFusedPerm>,
+              "the same operand MUST be relabelable -- that is the path the "
+              "combine evaluator reaches it by, and the reason the test below "
+              "compiles at all");
+
+// The three ways out of the relabel path, each pinned. Together with the
+// positive above these are the whole of operand_relabelable_v.
+static_assert(!Impl::operand_relabelable_v<PermutedFusedOp,
+                                           std::integer_sequence<int, 0, 1>>,
+              "an unpermuted operand stays on the zero-copy passthrough");
+static_assert(
+    !Impl::operand_relabelable_v<
+        decltype(std::declval<PermutedContractionCombineData>().d_node()),
+        PermutedFusedPerm>,
+    "an INPUT operand must never be relabeled -- its storage is the user's "
+    "global tensor, not private scratch");
+static_assert(
+    !Impl::operand_relabelable_v<
+        decltype(std::declval<PermutedContractionCombineData>()
+                     .hooked_contraction_node()),
+        PermutedFusedPerm>,
+    "a HOOKED operand stays on the staging path, where the hook is already "
+    "written back into its own scratch");
+}  // namespace
+
+TEST(CombineNodeTest, PermutedContractionOperandTeam) {
+  const PermutedContractionCombineData  d;
+  PermutedContractionCombineData::View2 P("P", d.I, d.L);
+  Kokkos::deep_copy(P, 0.0f);
+
+  auto g        = make_graph();
+  auto [g1, o1] = g.ops(make_combine_node<'i', 'l'>(
+      d.contraction_node(), d.d_node(), MulPlusCoord{}));
+  g1.execute(TeamPolicyTag<>{}, d.combine_tile(), P);
+
+  auto Ph = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, P);
+  for (int i = 0; i < d.I; ++i)
+    for (int l = 0; l < d.L; ++l) {
+      // host_c is indexed in the OPERAND's order (l,i) while the output is
+      // (i,l): a missed relabel shows up here, and cannot hide behind a square
+      // tile because I != L.
+      const float expected = d.host_c(l, i) * d.Dh(i, l) +
+                             static_cast<float>(i) * 100.0f +
+                             static_cast<float>(l);
+      EXPECT_FLOAT_EQ(Ph(i, l), expected) << "i=" << i << " l=" << l;
     }
 }
 

@@ -300,6 +300,42 @@ inline constexpr bool operand_stageable_v = [] {
         PermSeq{});
 }();
 
+// Should operand `Node` instead be RELABELED into the order `PermSeq` gathers
+// into -- consumed as a strided view over its own scratch, with no copy, no
+// reorder pass, and no constraint relating the permuted axes' extents?
+//
+// The complement of operand_stageable_v, and stated here beside it so the two
+// staging rules are read together and for the same testability reason: a
+// consumer's choice between them is otherwise buried in an evaluator class
+// body, where a test can only observe it by instantiating the whole evaluator.
+//
+// Only a contraction operand qualifies. Its storage is private per-team
+// scratch, so relabeling it aliases nothing observable -- unlike an input
+// operand, whose storage is the user's global tensor and whose reads would also
+// lose their coalescing if driven by the consumer's traversal order rather than
+// the source's memory order.
+//
+// Restricted further to the permuted, unhooked case:
+//   • an identity permutation already costs nothing on the staging path (true
+//     zero-copy passthrough), and relabeling would needlessly retype it;
+//   • a hook is applied by writing back into the operand's own C scratch, so
+//     hooked operands stay on the staging path rather than growing a second
+//     place that mutates a sub-contraction's buffer.
+// Whether the consumer CAN relabel at all is a separate question this predicate
+// does not answer: a contraction's GEMM needs a contiguous LayoutRight source
+// and must always stage. Only the combine evaluator consults this.
+//
+// hook_type is declared only on the ContractionTag node specialization, hence
+// the if constexpr rather than a `&&` chain.
+template <typename Node, typename PermSeq>
+inline constexpr bool operand_relabelable_v = [] {
+  if constexpr (has_node_tag_v<ContractionTag, Node>)
+    return !is_identity_seq(PermSeq{}) &&
+           std::is_same_v<typename Node::hook_type, NoHook>;
+  else
+    return false;
+}();
+
 }  // namespace Impl
 
 // ---------------------------------------------------------------------------
