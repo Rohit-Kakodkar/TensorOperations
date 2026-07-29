@@ -58,6 +58,15 @@ static_assert(TensorLike<T2>);
 static_assert(TensorLike<T3A>);
 static_assert(TensorLike<T3B>);
 
+// Does this allocator offer the operand-staging entry point? Spelled as a
+// concept (rather than a bare requires-expression at each use) so the check is
+// a dependent -- hence SFINAE-friendly -- context: probing for a member that
+// genuinely does not exist is a hard error on a concrete type.
+template <typename Alloc>
+concept HasStage = requires(const Alloc& a) {
+  a.stage(std::declval<team_t>(), std::declval<Kokkos::Array<int, 2>>());
+};
+
 // Helpers — node types used across tests
 static auto make_input_2d() {
   return make_input_node(make_handle<'i', 'j'>(T2{}));
@@ -83,56 +92,114 @@ using Bundle3 = Tile<TileA3, TileB3, TileC3>;
 
 // ---------------------------------------------------------------------------
 // IntermTag (output/C slot): bytes() matches raw scratch_tile_bytes for both
-// outer-op families; stage() is a trivial alias for alloc() (no operand to
-// stage from), kept for interface uniformity.
+// outer-op families. The scalar type is now baked into the allocator's type, so
+// bytes() takes no template argument.
 // ---------------------------------------------------------------------------
 TEST(ScratchAllocatorTest, IntermTagBytesMatchesRaw) {
-  using ContrAlloc =
-      ScratchAllocator<TeamPolicyTag<ES>, ContractionTag, IntermTag>;
-  using CombAlloc = ScratchAllocator<TeamPolicyTag<ES>, CombineTag, IntermTag>;
+  using Tile       = StaticTile<4, 8>;
+  using ContrAlloc = ScratchAllocator<TeamPolicyTag<ES>, ContractionTag,
+                                      IntermTag, float, Tile>;
+  using CombAlloc =
+      ScratchAllocator<TeamPolicyTag<ES>, CombineTag, IntermTag, float, Tile>;
 
   // StaticTile<4,8>: 32 floats
-  const std::size_t expected =
-      Impl::scratch_tile_bytes<float, ES>(StaticTile<4, 8>{});
-  EXPECT_EQ((ContrAlloc::bytes<float>(StaticTile<4, 8>{})), expected);
-  EXPECT_EQ((CombAlloc::bytes<float>(StaticTile<4, 8>{})), expected);
+  const std::size_t expected = Impl::scratch_tile_bytes<float, ES>(Tile{});
+  EXPECT_EQ(ContrAlloc::bytes(Tile{}), expected);
+  EXPECT_EQ(CombAlloc::bytes(Tile{}), expected);
 }
 
-TEST(ScratchAllocatorTest, IntermTagStageMatchesAllocType) {
-  using ContrAlloc =
-      ScratchAllocator<TeamPolicyTag<ES>, ContractionTag, IntermTag>;
-  using CombAlloc = ScratchAllocator<TeamPolicyTag<ES>, CombineTag, IntermTag>;
-  using Tile      = StaticTile<4, 8>;
+// The IntermTag slot carves its scratch in the constructor and hands it back
+// from get(); there is no operand, so it has no stage(). The view it produces
+// must be exactly what Impl::alloc_scratch_tile would give for the same tile.
+TEST(ScratchAllocatorTest, IntermTagGetMatchesAllocScratchTile) {
+  using Tile  = StaticTile<4, 8>;
+  using Alloc = ScratchAllocator<TeamPolicyTag<ES>, ContractionTag, IntermTag,
+                                 float, Tile>;
 
   static_assert(
-      std::is_same_v<
-          decltype(std::declval<const ContrAlloc&>().template stage<float>(
-              std::declval<team_t>(), Tile{})),
-          decltype(std::declval<const ContrAlloc&>().template alloc<float>(
-              std::declval<team_t>(), Tile{}))>);
-  static_assert(std::is_same_v<
-                decltype(std::declval<const CombAlloc&>().template stage<float>(
-                    std::declval<team_t>(), Tile{})),
-                decltype(std::declval<const CombAlloc&>().template alloc<float>(
-                    std::declval<team_t>(), Tile{}))>);
+      std::is_same_v<decltype(std::declval<const Alloc&>().get()),
+                     decltype(Impl::alloc_scratch_tile<float, ES>(
+                         std::declval<team_t>(), std::declval<Tile>()))>);
+  // No source to stage from, so no stage() on this specialization.
+  static_assert(!HasStage<Alloc>);
+
+  // The constructed view really is a distinct, correctly-sized team-scratch
+  // tile: run one team with exactly the bytes bytes() asks for and write
+  // through get().
+  const std::size_t     bytes = Alloc::bytes(Tile{});
+  Kokkos::View<int, ES> ok("ok");
+  Kokkos::parallel_for(
+      Kokkos::TeamPolicy<ES>(1, Kokkos::AUTO)
+          .set_scratch_size(0, Kokkos::PerTeam(static_cast<int>(bytes))),
+      KOKKOS_LAMBDA(const team_t& team) {
+        Alloc a{Tile{}, team};
+        auto  v = a.get();
+        Kokkos::single(Kokkos::PerTeam(team), [&] {
+          for (std::size_t i = 0; i < v.size(); ++i) v.data()[i] = float(i);
+          ok() = (v.size() == 32u && v.data()[31] == 31.f) ? 1 : 0;
+        });
+      });
+  Kokkos::fence();
+  int ok_h = 0;
+  Kokkos::deep_copy(ok_h, ok);
+  EXPECT_EQ(ok_h, 1);
 }
 
 // ---------------------------------------------------------------------------
-// ContractionTag outer op, InputTag operand (4-param): bytes() is the plain
+// ContractionTag outer op, InputTag operand: bytes() is the plain
 // (non-recursive) staging cost; stage() delegates to the cached inner
-// Evaluator.
+// Evaluator. PermSeq is omitted, exercising the identity default.
 // ---------------------------------------------------------------------------
 TEST(ScratchAllocatorTest, ContractionInputOperandBytes) {
   using NA    = decltype(make_input_2d());
   using TileA = StaticTile<4, 8>;
-  using Alloc = ScratchAllocator<TeamPolicyTag<ES>, ContractionTag, NA, TileA>;
+  using Alloc =
+      ScratchAllocator<TeamPolicyTag<ES>, ContractionTag, NA, float, TileA>;
 
   const std::size_t expected = Impl::scratch_tile_bytes<float, ES>(TileA{});
-  EXPECT_EQ((Alloc::bytes<float>(TileA{})), expected);
+  EXPECT_EQ(Alloc::bytes(TileA{}), expected);
 
-  static_assert(requires(const Alloc& a) {
-    a.stage(std::declval<team_t>(), std::declval<Kokkos::Array<int, 2>>());
-  });
+  static_assert(HasStage<Alloc>);
+}
+
+// ---------------------------------------------------------------------------
+// The same InputTag operand with an explicit, NON-identity PermSeq: the
+// staging buffer has the CANONICAL shape, so a transposing perm flips the
+// tile the buffer is sized and typed on. This is the one form that consumes
+// PermSeq at all, and the path the evaluators actually take for a permuted
+// operand (nothing else in the suite covers it).
+// ---------------------------------------------------------------------------
+TEST(ScratchAllocatorTest, InputOperandPermSeqCanonicalizesStagingBuffer) {
+  using NA        = decltype(make_input_2d());
+  using TileA     = StaticTile<4, 8>;
+  using Swap      = std::integer_sequence<int, 1, 0>;
+  using Identity  = std::integer_sequence<int, 0, 1>;
+  using PermAlloc = ScratchAllocator<TeamPolicyTag<ES>, ContractionTag, NA,
+                                     float, TileA, Swap>;
+  using IdAlloc = ScratchAllocator<TeamPolicyTag<ES>, ContractionTag, NA, float,
+                                   TileA, Identity>;
+
+  // Sized on the canonical (transposed) tile...
+  EXPECT_EQ(PermAlloc::bytes(TileA{}),
+            (Impl::scratch_tile_bytes<float, ES>(StaticTile<8, 4>{})));
+  // ... and typed on it too, which is what makes the staged copy match the
+  // consumer's canonical layout rather than the operand's native one.
+  static_assert(
+      std::is_same_v<typename PermAlloc::scratch_view_t,
+                     decltype(Impl::alloc_scratch_tile<float, ES>(
+                         std::declval<team_t>(), StaticTile<8, 4>{}))>);
+  static_assert(!std::is_same_v<typename PermAlloc::scratch_view_t,
+                                typename IdAlloc::scratch_view_t>);
+
+  // Omitting PermSeq leaves the `void` sentinel, a distinct type from an
+  // explicit identity sequence but resolved to exactly the same axes -- so the
+  // two allocators behave identically even though they are not the same type.
+  using DefaultAlloc =
+      ScratchAllocator<TeamPolicyTag<ES>, ContractionTag, NA, float, TileA>;
+  static_assert(!std::is_same_v<DefaultAlloc, IdAlloc>);
+  static_assert(std::is_same_v<typename DefaultAlloc::scratch_view_t,
+                               typename IdAlloc::scratch_view_t>);
+  EXPECT_EQ(DefaultAlloc::bytes(TileA{}), IdAlloc::bytes(TileA{}));
 }
 
 // ---------------------------------------------------------------------------
@@ -144,16 +211,18 @@ TEST(ScratchAllocatorTest, ContractionInputOperandBytes) {
 TEST(ScratchAllocatorTest, ContractionNestedOperandBytesIsRecursive) {
   using NC = decltype(make_contraction_3d());
   using Alloc =
-      ScratchAllocator<TeamPolicyTag<ES>, ContractionTag, NC, Bundle3>;
+      ScratchAllocator<TeamPolicyTag<ES>, ContractionTag, NC, float, Bundle3>;
   using InnerEval = Evaluator<TeamPolicyTag<ES>, NC, Bundle3>;
 
   const std::size_t expected = InnerEval::scratch_size_per_team(Bundle3{});
   EXPECT_GT(expected, 0u);
-  EXPECT_EQ((Alloc::bytes<float>(Bundle3{})), expected);
+  EXPECT_EQ(Alloc::bytes(Bundle3{}), expected);
 
-  static_assert(requires(const Alloc& a) {
-    a.stage(std::declval<team_t>(), std::declval<Kokkos::Array<int, 2>>());
-  });
+  static_assert(HasStage<Alloc>);
+  // get() is a pure accessor onto the inner evaluator's own C scratch -- this
+  // form carves nothing of its own.
+  static_assert(std::is_same_v<decltype(std::declval<const Alloc&>().get()),
+                               typename InnerEval::scratch_view_t>);
 }
 
 // ---------------------------------------------------------------------------
@@ -163,73 +232,40 @@ TEST(ScratchAllocatorTest, ContractionNestedOperandBytesIsRecursive) {
 TEST(ScratchAllocatorTest, CombineInputOperandBytes) {
   using NA    = decltype(make_input_2d());
   using TileA = StaticTile<4, 8>;
-  using Alloc = ScratchAllocator<TeamPolicyTag<ES>, CombineTag, NA, TileA>;
+  using Alloc =
+      ScratchAllocator<TeamPolicyTag<ES>, CombineTag, NA, float, TileA>;
 
   const std::size_t expected = Impl::scratch_tile_bytes<float, ES>(TileA{});
-  EXPECT_EQ((Alloc::bytes<float>(TileA{})), expected);
+  EXPECT_EQ(Alloc::bytes(TileA{}), expected);
 
-  static_assert(requires(const Alloc& a) {
-    a.stage(std::declval<team_t>(), std::declval<Kokkos::Array<int, 2>>());
-  });
+  static_assert(HasStage<Alloc>);
 }
 
 // ---------------------------------------------------------------------------
-// CombineTag outer op, ContractionTag operand (4-param): the ContractionTag-
-// operand specialization body is shared across every OuterOpTag
-// (ContractionTag, CombineTag) -- OuterOpTag is an unused template parameter
-// in this specialization -- so this form now has the SAME zero-copy alloc()
-// and RECURSIVE bytes() (the inner evaluator's full scratch_size_per_team)
-// as the ContractionTag-outer-op form for the identical (node, tile bundle)
-// pair, matching that form's bytes() exactly. The CombineTag evaluator
-// (Team.hpp) independently computes this same recursive size via
-// operand_native_scratch_bytes and skips calling this allocator's bytes()
-// for staging purposes (operand_staging_bytes returns 0 for a ContractionTag
-// operand), so there is no double-counting in practice.
+// CombineTag outer op, ContractionTag operand: the ContractionTag-operand
+// specialization body is shared across every OuterOpTag (ContractionTag,
+// CombineTag) -- OuterOpTag is an unused template parameter in this
+// specialization -- so this form has the SAME zero-copy get() and RECURSIVE
+// bytes() (the inner evaluator's full scratch_size_per_team) as the
+// ContractionTag-outer-op form for the identical (node, tile bundle) pair,
+// matching that form's bytes() exactly.
 // ---------------------------------------------------------------------------
 TEST(ScratchAllocatorTest, CombineNestedOperandBytesIsRecursive) {
-  using NC    = decltype(make_contraction_3d());
-  using Alloc = ScratchAllocator<TeamPolicyTag<ES>, CombineTag, NC, Bundle3>;
+  using NC = decltype(make_contraction_3d());
+  using Alloc =
+      ScratchAllocator<TeamPolicyTag<ES>, CombineTag, NC, float, Bundle3>;
   using ContrAlloc =
-      ScratchAllocator<TeamPolicyTag<ES>, ContractionTag, NC, Bundle3>;
+      ScratchAllocator<TeamPolicyTag<ES>, ContractionTag, NC, float, Bundle3>;
 
   using InnerEval            = Evaluator<TeamPolicyTag<ES>, NC, Bundle3>;
   const std::size_t expected = InnerEval::scratch_size_per_team(Bundle3{});
   EXPECT_GT(expected, 0u);
-  EXPECT_EQ((Alloc::bytes<float>(Bundle3{})), expected);
+  EXPECT_EQ(Alloc::bytes(Bundle3{}), expected);
   // Matches the ContractionTag-outer-op form exactly (same recursive bytes()),
   // unlike before this fix, when CombineTag's form stayed non-recursive.
-  EXPECT_EQ((Alloc::bytes<float>(Bundle3{})),
-            (ContrAlloc::bytes<float>(Bundle3{})));
+  EXPECT_EQ(Alloc::bytes(Bundle3{}), ContrAlloc::bytes(Bundle3{}));
 
-  static_assert(requires(const Alloc& a) {
-    a.stage(std::declval<team_t>(), std::declval<Kokkos::Array<int, 2>>());
-  });
-}
-
-// ---------------------------------------------------------------------------
-// make_scratch_allocator factory: the 3-arg form deduces the 4-param
-// specialization for both outer-op families (unevaluated decltype/declval —
-// no team instance is actually constructed, mirroring how Evaluator/Team.hpp
-// itself declares alloc_a_t/alloc_b_t).
-// ---------------------------------------------------------------------------
-TEST(ScratchAllocatorTest, MakeScratchAllocatorFactoryProducesFourParamType) {
-  using NA    = decltype(make_input_2d());
-  using TileA = StaticTile<4, 8>;
-
-  using ContrFactoryT =
-      decltype(make_scratch_allocator<TeamPolicyTag<ES>, ContractionTag>(
-          std::declval<NA>(), std::declval<TileA>(), std::declval<team_t>()));
-  using CombFactoryT =
-      decltype(make_scratch_allocator<TeamPolicyTag<ES>, CombineTag>(
-          std::declval<NA>(), std::declval<TileA>(), std::declval<team_t>()));
-
-  static_assert(
-      std::is_same_v<
-          ContrFactoryT,
-          ScratchAllocator<TeamPolicyTag<ES>, ContractionTag, NA, TileA>>);
-  static_assert(
-      std::is_same_v<CombFactoryT, ScratchAllocator<TeamPolicyTag<ES>,
-                                                    CombineTag, NA, TileA>>);
+  static_assert(HasStage<Alloc>);
 }
 
 // ---------------------------------------------------------------------------

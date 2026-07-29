@@ -145,22 +145,24 @@ struct TileAssignable {
   }
 };
 
-// Stage one operand tile into `dst` scratch and return the resulting interm
-// handle. `stage_tile` carries both the operand's native tile shape and the
-// native->canonical permutation, so the native tile index is derived here from
-// canon_idx rather than being scattered by hand at each call site (the two can
-// no longer disagree). The assignment drives the stage-or-passthrough evaluator
-// (Specialization 8), whose own dispatch on the source's storage type picks
-// copy+reorder, in-place reorder, or zero-copy passthrough.
-template <typename PolicyTag, typename Team, typename Scratch,
-          typename StageTileT, std::size_t R, typename Alloc>
-KOKKOS_FUNCTION auto stage_operand_into(const Team& team, const Scratch& dst,
+// Stage one operand tile into the allocator's own scratch and return the
+// resulting interm handle. `stage_tile` carries both the operand's native tile
+// shape and the native->canonical permutation, so the native tile index is
+// derived here from canon_idx rather than being scattered by hand at each call
+// site; the destination likewise comes from the same allocator that produces
+// the source, so neither pair can disagree. The assignment drives the
+// stage-or-passthrough evaluator (Specialization 8), whose own dispatch on the
+// source's storage type picks copy+reorder, in-place reorder, or zero-copy
+// passthrough.
+template <typename PolicyTag, typename Team, typename StageTileT, std::size_t R,
+          typename Alloc>
+KOKKOS_FUNCTION auto stage_operand_into(const Team&                  team,
                                         const StageTileT&            stage_tile,
                                         const Kokkos::Array<int, R>& canon_idx,
                                         const Alloc&                 alloc) {
   using axes_t = OperandAxes<typename StageTileT::perm_seq>;
-  auto stager =
-      make_evaluator<PolicyTag>(make_interm_node(dst), stage_tile, team);
+  auto stager  = make_evaluator<PolicyTag>(make_interm_node(alloc.get()),
+                                           stage_tile, team);
   return stager(team, canon_idx) =
              alloc.stage(team, axes_t::to_native_idx(canon_idx));
 }
@@ -316,9 +318,9 @@ struct Evaluator<TeamPolicyTag<ES>,
   // reordering its own C scratch in place (see Impl::operand_stageable_v for
   // the rule and why a shape-changing permutation is excluded). Rejecting one
   // here, early, is what keeps it from reaching Specialization 8 as a scratch
-  // type that no longer matches a_scratch_t/b_scratch_t below -- which would
-  // silently take the COPY branch, whose source and destination are the very
-  // same buffer for a fused operand.
+  // type that no longer matches the one alloc_a_.get()/alloc_b_.get() produces
+  // -- which would silently take the COPY branch, whose source and destination
+  // are the very same buffer for a fused operand.
   static_assert(Impl::operand_stageable_v<NA, TileA, permA_seq>,
                 "permA must preserve fused operand A's tile extents (it is "
                 "staged in place); see Impl::operand_stageable_v");
@@ -326,30 +328,21 @@ struct Evaluator<TeamPolicyTag<ES>,
                 "permB must preserve fused operand B's tile extents (it is "
                 "staged in place); see Impl::operand_stageable_v");
 
-  using c_layout_t =
-      decltype(make_tile_layout(tile_c_canon_t{}, LayoutRight{}));
-
-  using a_scratch_t =
-      ScratchView<value_type, exec_space,
-                  decltype(make_tile_layout(a_out_canon_t{}, LayoutRight{}))>;
-
-  using b_scratch_t =
-      ScratchView<value_type, exec_space,
-                  decltype(make_tile_layout(b_out_canon_t{}, LayoutRight{}))>;
-
-  using alloc_a_t =
-      decltype(make_scratch_allocator<TeamPolicyTag<ES>, ContractionTag>(
-          std::declval<NA>(), std::declval<TileA>(),
-          std::declval<Impl::team_member_t<ES>>()));
-  using alloc_b_t =
-      decltype(make_scratch_allocator<TeamPolicyTag<ES>, ContractionTag>(
-          std::declval<NB>(), std::declval<TileB>(),
-          std::declval<Impl::team_member_t<ES>>()));
-  using alloc_c_t =
-      ScratchAllocator<TeamPolicyTag<ES>, ContractionTag, IntermTag>;
+  // One allocator per slot, each owning the scratch it carves. Every operand
+  // passes its real perm: the InputTag form stages a canonically-shaped copy
+  // with it, the ContractionTag form ignores it (it reorders its own C scratch
+  // in place downstream instead).
+  using alloc_a_t = ScratchAllocator<TeamPolicyTag<ES>, ContractionTag, NA,
+                                     value_type, TileA, permA_seq>;
+  using alloc_b_t = ScratchAllocator<TeamPolicyTag<ES>, ContractionTag, NB,
+                                     value_type, TileB, permB_seq>;
+  using alloc_c_t = ScratchAllocator<TeamPolicyTag<ES>, ContractionTag,
+                                     IntermTag, value_type, tile_c_canon_t>;
 
  public:
-  using scratch_view_t = ScratchView<value_type, exec_space, c_layout_t>;
+  // The C slot's allocator already derives this from tile_c_canon_t; naming it
+  // here keeps interm_type/result_type spelled in terms of one layout.
+  using scratch_view_t = typename alloc_c_t::scratch_view_t;
   using interm_type =
       NodeHandle<IntermTag, scratch_view_t, std::integral_constant<int, Rank>,
                  exec_space, HookOp>;
@@ -368,9 +361,6 @@ struct Evaluator<TeamPolicyTag<ES>,
   alloc_a_t      alloc_a_;
   alloc_b_t      alloc_b_;
   alloc_c_t      alloc_c_;
-  a_scratch_t    scratch_a_;
-  b_scratch_t    scratch_b_;
-  scratch_view_t scratch_;
   result_type    result_;
 
   KOKKOS_FUNCTION Evaluator(node_type n, tiling_type t,
@@ -381,17 +371,17 @@ struct Evaluator<TeamPolicyTag<ES>,
         a_tile_(axes_a::to_canon_tile(a_leaf_)),
         b_tile_(axes_b::to_canon_tile(b_leaf_)),
         c_tile_(axes_c::to_canon_tile(t.c)),
-        alloc_a_(make_scratch_allocator<TeamPolicyTag<ES>, ContractionTag>(
-            n.node_a, t.a, team)),
-        alloc_b_(make_scratch_allocator<TeamPolicyTag<ES>, ContractionTag>(
-            n.node_b, t.b, team)),
-        alloc_c_(),
-        scratch_a_(alloc_a_.template alloc<value_type>(team, a_tile_)),
-        scratch_b_(alloc_b_.template alloc<value_type>(team, b_tile_)),
-        scratch_(alloc_c_.template alloc<value_type>(team, c_tile_)) {
+        alloc_a_(n.node_a, t.a, team),
+        alloc_b_(n.node_b, t.b, team),
+        alloc_c_(c_tile_, team) {
     result_.hook_op  = node.hook_op;
-    result_.storage_ = scratch_;
+    result_.storage_ = alloc_c_.get();
   }
+
+  // This evaluator's output (C) scratch tile. Read by a PARENT contraction or
+  // combine that fuses this node as an operand: its ScratchAllocator stages
+  // this buffer directly rather than copying it elsewhere.
+  KOKKOS_FUNCTION scratch_view_t scratch() const { return alloc_c_.get(); }
 
   KOKKOS_FUNCTION result_type operator()(
       const team_member_t& team, Kokkos::Array<int, Rank> tile_idx) const {
@@ -401,7 +391,7 @@ struct Evaluator<TeamPolicyTag<ES>,
     // is re-runnable. A parent contraction re-invokes a fused operand once per
     // contracted tile (recompute) on the same evaluator instance, and each run
     // must accumulate from a clean C.
-    auto c = scratch_;
+    auto c = alloc_c_.get();
     Kokkos::parallel_for(Kokkos::TeamVectorRange(team, c.size()),
                          [c](int i) { c.data()[i] = S{0}; });
     team.team_barrier();
@@ -441,16 +431,15 @@ struct Evaluator<TeamPolicyTag<ES>,
     return Impl::tile_count_along(c_tile_, d, node.shape()[d]);
   }
 
-  // Each operand allocator is handed its own NATIVE tiling spec plus the perm
-  // into this contraction's canonical order, and derives its own cost: a fused
+  // Each operand allocator is handed its own NATIVE tiling spec and derives its
+  // own cost from that plus the perm already baked into its type: a fused
   // operand recurses into the sub-contraction's full scratch_size_per_team
   // (which only accepts that native bundle), an input operand sizes a staging
   // buffer of the canonical shape. The output (C) slot has no operand and so
   // no perm to apply.
   static std::size_t scratch_size_per_team(const tiling_type& t) {
-    return alloc_c_t::template bytes<value_type>(axes_c::to_canon_tile(t.c)) +
-           alloc_a_t::template bytes<value_type>(t.a, permA_seq{}) +
-           alloc_b_t::template bytes<value_type>(t.b, permB_seq{});
+    return alloc_c_t::bytes(axes_c::to_canon_tile(t.c)) +
+           alloc_a_t::bytes(t.a) + alloc_b_t::bytes(t.b);
   }
 
  private:
@@ -516,11 +505,9 @@ struct Evaluator<TeamPolicyTag<ES>,
     // operand's copy on the way into scratch and a fused operand's own scratch
     // in place.
     auto staged_a = Impl::stage_operand_into<TeamPolicyTag<ES>>(
-        team, scratch_a_, StageTile<a_leaf_t, permA_seq>{a_leaf_}, a_tile_idx,
-        alloc_a_);
+        team, StageTile<a_leaf_t, permA_seq>{a_leaf_}, a_tile_idx, alloc_a_);
     auto staged_b = Impl::stage_operand_into<TeamPolicyTag<ES>>(
-        team, scratch_b_, StageTile<b_leaf_t, permB_seq>{b_leaf_}, b_tile_idx,
-        alloc_b_);
+        team, StageTile<b_leaf_t, permB_seq>{b_leaf_}, b_tile_idx, alloc_b_);
     team.team_barrier();
 
     // View each operand's scratch as a 2D GEMM matrix: A[SA,SK], B[SK,SB],
@@ -533,7 +520,7 @@ struct Evaluator<TeamPolicyTag<ES>,
     // data contiguously row-major, which is all the GEMM reads.
     auto a = Impl::as_matrix<FreeA>(staged_a.storage_, a_tile_);  // [SA,SK]
     auto b = Impl::as_matrix<NumK>(staged_b.storage_, b_tile_);   // [SK,SB]
-    auto c = Impl::as_matrix<FreeA>(scratch_, c_tile_);           // [SA,SB]
+    auto c = Impl::as_matrix<FreeA>(alloc_c_.get(), c_tile_);     // [SA,SB]
 
     const int SA = Impl::scratch_extent<0>(a);
     const int SK = Impl::scratch_extent<1>(a);
@@ -805,12 +792,30 @@ struct Evaluator<TeamPolicyTag<ES>,
     return axes<K>::to_native_tile(Impl::combine_op_tile<K>(t));
   }
 
-  // Per-operand allocator: the 4-param ScratchAllocator specialization, keyed
-  // on the operand's native tile, so it stores an inner Evaluator built once
-  // at construction (mirroring the ContractionTag evaluator's alloc_a_/
-  // alloc_b_) rather than in stage_operand() on every call. Since a combine
-  // node currently invokes stage_operand() exactly once per operand per team
-  // (no k-loop at the combine level; combine operands can't yet be fused/
+  // An input operand's staging buffer is typed by its OWN canonicalized tile
+  // (op_alloc_t<K> derives it from native_tile_t<K>), while the combine loop
+  // reads every operand out of a homogeneous Kokkos::Array of scratch_view_t,
+  // typed by out_tile_t. Those coincide only if the two tiles agree -- true by
+  // construction today, since every operand is staged into the output shape --
+  // so state it here rather than let a violation surface as an opaque
+  // array-initialization type mismatch in stage_all(). Contraction operands are
+  // exempt: their op_tile_t is the inner Tile<A,B,C> bundle, and they are
+  // staged zero-copy out of the sub-contraction's own C scratch.
+  static_assert(
+      Impl::all_of_index<NumOps>([](auto k) {
+        constexpr std::size_t K = decltype(k)::value;
+        return op_is_contraction_v<K> ||
+               std::is_same_v<op_tile_t<K>, out_tile_t>;
+      }),
+      "combine evaluator: an input operand's tile must equal the output tile "
+      "(operands are staged into the output shape)");
+
+  // Per-operand allocator, keyed on the operand's native tile and its label
+  // gather, so it owns both an inner Evaluator and the scratch tile it stages
+  // into, built once at construction (mirroring the ContractionTag evaluator's
+  // alloc_a_/alloc_b_) rather than in stage_operand() on every call. Since a
+  // combine node currently invokes stage_operand() exactly once per operand per
+  // team (no k-loop at the combine level; combine operands can't yet be fused/
   // repeated, see the static_asserts above), construction count is unchanged
   // either way today -- this just moves it earlier. The real payoff is
   // future-proofing for when combine operands support repeated/fused
@@ -819,10 +824,11 @@ struct Evaluator<TeamPolicyTag<ES>,
   // applied to ContractionTag's A/B operands (which really do loop over
   // k-tiles).
   template <std::size_t K>
-  using op_alloc_t = ScratchAllocator<TeamPolicyTag<ES>, CombineTag,
-                                      op_node_t<K>, native_tile_t<K>>;
-  using out_alloc_t =
-      ScratchAllocator<TeamPolicyTag<ES>, CombineTag, IntermTag>;
+  using op_alloc_t =
+      ScratchAllocator<TeamPolicyTag<ES>, CombineTag, op_node_t<K>, value_type,
+                       native_tile_t<K>, perm_seq<K>>;
+  using out_alloc_t = ScratchAllocator<TeamPolicyTag<ES>, CombineTag, IntermTag,
+                                       value_type, out_tile_t>;
 
   // Heterogeneous tuple of per-operand allocators (deduced via an unevaluated
   // helper so we can name the type before the private helpers are defined).
@@ -840,21 +846,15 @@ struct Evaluator<TeamPolicyTag<ES>,
 
   node_type   node;
   tiling_type tiling;      // the tile spec (plain output tile or CombineTile)
-  op_allocs_t op_allocs_;  // one allocator / operand
+  op_allocs_t op_allocs_;  // one allocator / operand, each owning its scratch
   Kokkos::Array<out_alloc_t, NumOut> out_allocs_;  // one allocator / output
-  Kokkos::Array<scratch_view_t, NumOps>
-      op_scratch_;  // one scratch tile / operand
-  Kokkos::Array<scratch_view_t, NumOut>
-      outs_;  // one output scratch tile / output
 
   KOKKOS_FUNCTION Evaluator(node_type n, tiling_type t,
                             const team_member_t& team)
       : node(n),
         tiling(t),
         op_allocs_(make_op_allocs(node, tiling, team, ops_seq{})),
-        out_allocs_(make_out_allocs(outs_seq{})),
-        op_scratch_(alloc_op_scratch(team, ops_seq{})),
-        outs_(alloc_out_scratch(team, outs_seq{})) {}
+        out_allocs_(make_out_allocs(tiling, team, outs_seq{})) {}
 
   KOKKOS_FUNCTION result_type operator()(
       const team_member_t& team, Kokkos::Array<int, Rank> tile_idx) const {
@@ -867,15 +867,17 @@ struct Evaluator<TeamPolicyTag<ES>,
         stage_all(team, tile_idx, ops_seq{});
     team.team_barrier();
 
-    const Kokkos::Array<scratch_view_t, NumOut> outs =
-        outs_;               // capture by value
-    const auto f = node.fn;  // local copy: lambda captures no `this`
-    // All outputs share one layout, so outs[0] drives the traversal.
-    Impl::team_for_each_coord(team, outs[0], [=](auto coord) {
+    // The interm handles wrapping each output allocator's scratch: built once
+    // here, written through below, and returned as-is.
+    const result_type results = make_results(outs_seq{});
+    const auto        f = node.fn;  // local copy: lambda captures no `this`
+    // All outputs share one layout, so the first drives the traversal.
+    const scratch_view_t out0 = results[0].storage_;
+    Impl::team_for_each_coord(team, out0, [=](auto coord) {
       Kokkos::Array<int, Rank> gidx{};
       TENSOR_PRAGMA_UNROLL
       for (int d = 0; d < Rank; ++d)
-        gidx[d] = tile_idx[d] * outs[0].extent(d) + coord[d];
+        gidx[d] = tile_idx[d] * out0.extent(d) + coord[d];
       Kokkos::Array<value_type, NumOps> vals{};
       TENSOR_PRAGMA_UNROLL
       for (int k = 0; k < NumOps; ++k) vals[k] = sv[k][coord];
@@ -884,9 +886,9 @@ struct Evaluator<TeamPolicyTag<ES>,
       const Kokkos::Array<value_type, NumOut> r =
           Impl::as_output_array<value_type>(Impl::apply_combine(f, gidx, vals));
       TENSOR_PRAGMA_UNROLL
-      for (int m = 0; m < NumOut; ++m) outs[m][coord] = r[m];
+      for (int m = 0; m < NumOut; ++m) results[m].storage_[coord] = r[m];
     });
-    return make_results(outs_seq{});
+    return results;
   }
 
   // Output tile count along canonical dim d (output order is canonical here).
@@ -897,16 +899,15 @@ struct Evaluator<TeamPolicyTag<ES>,
 
   static std::size_t scratch_size_per_team(const tiling_type& t) {
     const out_tile_t out = output_tile(t);
-    return static_cast<std::size_t>(NumOut) *
-               ScratchAllocator<TeamPolicyTag<exec_space>, CombineTag,
-                                IntermTag>::template bytes<value_type>(out) +
+    return static_cast<std::size_t>(NumOut) * out_alloc_t::bytes(out) +
            operand_bytes(t);
   }
 
  private:
-  // Stage operand K into op_scratch_[K]: the operand's already-constructed
-  // allocator (op_allocs_) holds an inner Evaluator built once at construction
-  // time, so stage() here just evaluates it at the native-order tile index
+  // Stage operand K into its allocator's own scratch tile: the
+  // already-constructed allocator (op_allocs_) holds both that tile and an
+  // inner Evaluator built once at construction time, so this just runs that
+  // evaluator at the native-order tile index
   // (scattered from the combine's canonical tile_idx via perm_seq<K>) instead
   // of rebuilding an evaluator inline (as op_alloc_t's doc comment above
   // notes, this is called exactly once per operand per team today, so the
@@ -922,8 +923,8 @@ struct Evaluator<TeamPolicyTag<ES>,
   stage_operand(const team_member_t&            team,
                 const Kokkos::Array<int, Rank>& tile_idx) const {
     return Impl::stage_operand_into<TeamPolicyTag<ES>>(
-               team, op_scratch_[K], StageTile<native_tile_t<K>, perm_seq<K>>{},
-               tile_idx, op_allocs_.template get<K>())
+               team, StageTile<native_tile_t<K>, perm_seq<K>>{}, tile_idx,
+               op_allocs_.template get<K>())
         .storage_;
   }
 
@@ -935,65 +936,47 @@ struct Evaluator<TeamPolicyTag<ES>,
   }
 
   // Total per-operand scratch cost. Each allocator is handed operand K's own
-  // NATIVE tile plus the label gather into the combine's output order and
-  // derives its own cost, so the two operand kinds no longer need separate
-  // folds here: an InputTag operand carves a staging buffer of the canonical
-  // (output) shape, while a ContractionTag operand is staged zero-copy (its
-  // ScratchAllocator::alloc() returns the inner evaluator's own C scratch
+  // NATIVE tile and derives its own cost from that plus the label gather baked
+  // into its type, so the two operand kinds no longer need separate folds here:
+  // an InputTag operand carves a staging buffer of the canonical (output)
+  // shape, while a ContractionTag operand is staged zero-copy (its
+  // ScratchAllocator::get() returns the inner evaluator's own C scratch
   // directly) and instead charges that sub-contraction's real recursive a+b+c
   // bytes.
   static std::size_t operand_bytes(const tiling_type& t) {
     return Impl::sum_over_index<NumOps>([&](auto k) {
       constexpr std::size_t K = decltype(k)::value;
-      return op_alloc_t<K>::template bytes<value_type>(native_op_tile<K>(t),
-                                                       perm_seq<K>{});
+      return op_alloc_t<K>::bytes(native_op_tile<K>(t));
     });
   }
 
   // Construct one allocator per operand from the node's operand pack, each
-  // built from its native-order tile + team so the inner Evaluator's scratch
-  // is allocated exactly once here rather than in stage_operand() (see the
-  // op_alloc_t comment above for why this is currently neutral in cost and
-  // primarily future-proofing).
+  // built from its native-order tile + team. Constructing the allocator IS the
+  // allocation now, so these braced-init packs are the only place the team's
+  // scratch cursor is advanced -- and their left-to-right evaluation order
+  // gives each operand a distinct tile.
   template <std::size_t... Ks>
   KOKKOS_FUNCTION static op_allocs_t make_op_allocs(
       const node_type& n, const tiling_type& t, const team_member_t& team,
       std::index_sequence<Ks...>) {
-    return op_allocs_t{make_scratch_allocator<TeamPolicyTag<ES>, CombineTag>(
-        n.operands.template get<Ks>(), native_op_tile<Ks>(t), team)...};
+    return op_allocs_t{op_alloc_t<Ks>{n.operands.template get<Ks>(),
+                                      native_op_tile<Ks>(t), team}...};
   }
 
-  // Default-construct one IntermTag allocator per output slot.
+  // One IntermTag allocator per output slot, each carving its own tile.
   template <std::size_t... Ms>
   KOKKOS_FUNCTION static Kokkos::Array<out_alloc_t, NumOut> make_out_allocs(
+      const tiling_type& t, const team_member_t& team,
       std::index_sequence<Ms...>) {
-    return {(static_cast<void>(Ms), out_alloc_t{})...};
+    return {(static_cast<void>(Ms), out_alloc_t{output_tile(t), team})...};
   }
 
-  // Allocate NumOps distinct per-operand scratch tiles via the stored
-  // allocators (braced-init evaluation order is left-to-right).
-  template <std::size_t... Ks>
-  KOKKOS_FUNCTION Kokkos::Array<scratch_view_t, NumOps> alloc_op_scratch(
-      const team_member_t& team, std::index_sequence<Ks...>) const {
-    return {op_allocs_.template get<Ks>().template alloc<value_type>(
-        team, output_tile(tiling))...};
-  }
-
-  // Allocate NumOut distinct output scratch tiles via the stored allocators
-  // (braced-init evaluation order is left-to-right).
-  template <std::size_t... Ms>
-  KOKKOS_FUNCTION Kokkos::Array<scratch_view_t, NumOut> alloc_out_scratch(
-      const team_member_t& team, std::index_sequence<Ms...>) const {
-    return {out_allocs_[Ms].template alloc<value_type>(team,
-                                                       output_tile(tiling))...};
-  }
-
-  // Wrap each output scratch tile in an interm handle (NoHook: the store just
-  // writes; fn already applied any per-coordinate transform).
+  // Wrap each output allocator's scratch tile in an interm handle (NoHook: the
+  // store just writes; fn already applied any per-coordinate transform).
   template <std::size_t... Ms>
   KOKKOS_FUNCTION result_type make_results(std::index_sequence<Ms...>) const {
     result_type r{};
-    ((r[Ms].storage_ = outs_[Ms]), ...);
+    ((r[Ms].storage_ = out_allocs_[Ms].get()), ...);
     return r;
   }
 };
