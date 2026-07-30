@@ -708,6 +708,28 @@ KOKKOS_FUNCTION auto reshape(const View<ViewType, Layout>& view,
 }
 
 // ---------------------------------------------------------------------------
+// reshape(View, tile, order) — the three-argument sibling, for the generic
+// static reshape (padded strides and/or arbitrary memory order). Same
+// delegation, same requires-constraint idiom.
+//
+//   reshape(View<VT, Padded2D>{...}, StaticTile<32>{}, order<0>{})
+//       -> View<VT, StaticLayout<DeviceTuple<ext<8,4>>, ...>>
+//
+// When the reshape lands on the nested StaticLayout, the resulting View has no
+// stride(d): a multi-leaf mode has no single stride. View::stride is only
+// instantiated on use, so the view still works through operator() and
+// operator[]; only .stride() is a compile error.
+// ---------------------------------------------------------------------------
+
+template <typename ViewType, typename Layout, typename Tile, typename Order>
+  requires(requires(Layout l, Tile t, Order o) { reshape(l, t, o); })
+KOKKOS_FUNCTION auto reshape(const View<ViewType, Layout>& view,
+                             const Tile& tile, Order order)
+    -> View<ViewType, decltype(reshape(view.layout(), tile, order))> {
+  return {view.backing_, reshape(view.layout(), tile, order)};
+}
+
+// ---------------------------------------------------------------------------
 // reorder_layout — logically permute (transpose) a subview's dimensions.
 //
 // Gather convention: Perm[i] is the source dimension that becomes new

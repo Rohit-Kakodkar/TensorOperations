@@ -6,6 +6,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 option(TENSOR_OPS_ENABLE_TIMING "Enable timing instrumentation for evaluator operations" OFF)
 option(TENSOR_OPS_BUILD_BENCHMARKS "Build performance benchmarks" OFF)
+# Compile-time verification that a generic reshape reproduces its source's
+# element->offset map. O(num_elements) constexpr work per instantiation, so it
+# defaults to debug builds only (see TENSOR_OPS_VERIFY_RESHAPE in
+# include/TensorOperations/TileLayout.hpp); this option forces it on regardless.
+option(TENSOR_OPS_VERIFY_RESHAPE "Compile-time-verify generic reshape plans (implied by debug builds)" OFF)
 
 include(FetchContent)
 
@@ -36,6 +41,10 @@ target_compile_options(tensor INTERFACE
 
 if(TENSOR_OPS_ENABLE_TIMING)
   target_compile_definitions(tensor INTERFACE TENSOR_OPS_ENABLE_TIMING)
+endif()
+
+if(TENSOR_OPS_VERIFY_RESHAPE)
+  target_compile_definitions(tensor INTERFACE TENSOR_OPS_VERIFY_RESHAPE=1)
 endif()
 
 enable_testing()
@@ -90,9 +99,13 @@ add_executable(test_tile_layout_stride tests/test_tile_layout_stride.cpp)
 target_link_libraries(test_tile_layout_stride PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_tile_layout_stride)
 
-# test_static_layout — custom main() wraps Kokkos init/finalize
+# test_static_layout — custom main() wraps Kokkos init/finalize.
+# Forces the reshape verification on regardless of build type: this is the file
+# that covers the generic reshape, so its invariant should be checked in every
+# CI configuration, not only debug ones.
 add_executable(test_static_layout tests/test_static_layout.cpp)
 target_link_libraries(test_static_layout PRIVATE tensor GTest::gtest)
+target_compile_definitions(test_static_layout PRIVATE TENSOR_OPS_VERIFY_RESHAPE=1)
 gtest_discover_tests(test_static_layout)
 
 # test_reorder_scratch — custom main() wraps Kokkos init/finalize
