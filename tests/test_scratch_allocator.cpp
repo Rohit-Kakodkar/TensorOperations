@@ -108,6 +108,29 @@ TEST(ScratchAllocatorTest, IntermTagBytesMatchesRaw) {
   EXPECT_EQ(CombAlloc::bytes(Tile{}), expected);
 }
 
+// The kernel lives in a free function, not in the TEST body: nvcc rejects an
+// extended (KOKKOS_LAMBDA) lambda whose enclosing function has private access
+// within its class, and gtest's TestBody() is private.
+template <typename Alloc, typename Tile>
+int run_interm_get_kernel(std::size_t bytes) {
+  Kokkos::View<int, ES> ok("ok");
+  Kokkos::parallel_for(
+      Kokkos::TeamPolicy<ES>(1, Kokkos::AUTO)
+          .set_scratch_size(0, Kokkos::PerTeam(static_cast<int>(bytes))),
+      KOKKOS_LAMBDA(const team_t& team) {
+        Alloc a{Tile{}, team};
+        auto  v = a.get();
+        Kokkos::single(Kokkos::PerTeam(team), [&] {
+          for (std::size_t i = 0; i < v.size(); ++i) v.data()[i] = float(i);
+          ok() = (v.size() == 32u && v.data()[31] == 31.f) ? 1 : 0;
+        });
+      });
+  Kokkos::fence();
+  int ok_h = 0;
+  Kokkos::deep_copy(ok_h, ok);
+  return ok_h;
+}
+
 // The IntermTag slot carves its scratch in the constructor and hands it back
 // from get(); there is no operand, so it has no stage(). The view it produces
 // must be exactly what Impl::alloc_scratch_tile would give for the same tile.
@@ -126,23 +149,8 @@ TEST(ScratchAllocatorTest, IntermTagGetMatchesAllocScratchTile) {
   // The constructed view really is a distinct, correctly-sized team-scratch
   // tile: run one team with exactly the bytes bytes() asks for and write
   // through get().
-  const std::size_t     bytes = Alloc::bytes(Tile{});
-  Kokkos::View<int, ES> ok("ok");
-  Kokkos::parallel_for(
-      Kokkos::TeamPolicy<ES>(1, Kokkos::AUTO)
-          .set_scratch_size(0, Kokkos::PerTeam(static_cast<int>(bytes))),
-      KOKKOS_LAMBDA(const team_t& team) {
-        Alloc a{Tile{}, team};
-        auto  v = a.get();
-        Kokkos::single(Kokkos::PerTeam(team), [&] {
-          for (std::size_t i = 0; i < v.size(); ++i) v.data()[i] = float(i);
-          ok() = (v.size() == 32u && v.data()[31] == 31.f) ? 1 : 0;
-        });
-      });
-  Kokkos::fence();
-  int ok_h = 0;
-  Kokkos::deep_copy(ok_h, ok);
-  EXPECT_EQ(ok_h, 1);
+  const std::size_t bytes = Alloc::bytes(Tile{});
+  EXPECT_EQ((run_interm_get_kernel<Alloc, Tile>(bytes)), 1);
 }
 
 // ---------------------------------------------------------------------------

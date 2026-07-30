@@ -851,7 +851,7 @@ struct Evaluator<TeamPolicyTag<ES>,
   // (operand_scratch_size) and the device-side construction path
   // (make_op_allocs), which previously duplicated this expression.
   template <std::size_t K>
-  static native_tile_t<K> native_op_tile(const tiling_type& t) {
+  KOKKOS_FUNCTION static native_tile_t<K> native_op_tile(const tiling_type& t) {
     return Impl::combine_native_tile<op_node_t<K>>(Impl::combine_op_tile<K>(t),
                                                    perm_seq<K>{});
   }
