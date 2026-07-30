@@ -20,6 +20,11 @@ struct CombineTag {};
 // Sentinel for "no hook"
 struct NoHook {};
 
+// Forward declaration — TiledLayout.hpp defines it; exec_space_of below has to
+// look through it, and including it here would be a cycle.
+template <typename ViewType, typename Layout>
+struct View;
+
 // Primary template — undefined; must use a specialization
 template <typename Tag, typename... Args>
 struct NodeHandle;
@@ -68,6 +73,16 @@ struct exec_space_of {
 template <typename T>
 struct exec_space_of<T, std::void_t<typename T::execution_space>> {
   using type = typename T::execution_space;
+};
+// A TensorOperations::View is a layout reinterpretation of a backing view and
+// does not republish its typedefs, so look through to the backing. Without
+// this, storage carved from a non-default space -- host scratch in a CUDA
+// build, say -- would deduce Kokkos::DefaultExecutionSpace and disagree with
+// the policy tag it is evaluated under, which shows up as an Evaluator with no
+// matching specialization rather than as a diagnosable error.
+template <typename ViewType, typename Layout>
+struct exec_space_of<TensorOperations::View<ViewType, Layout>, void> {
+  using type = typename exec_space_of<ViewType>::type;
 };
 
 }  // namespace Impl
