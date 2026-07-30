@@ -365,6 +365,10 @@ KOKKOS_FUNCTION auto tile_layout(DynamicTileLayoutLeft<N> src,
 //       -> DynamicTileLayoutRight<2>
 //   reshape(DynamicTileLayoutLeft<1>{{32}},  DynamicTile<2>{{4, 8}})
 //       -> DynamicTileLayoutLeft<2>
+//
+// A fifth, three-argument overload below handles the generic static case
+// (padded strides and/or arbitrary memory order), where the new memory order
+// cannot be inferred and has to be supplied.
 // ---------------------------------------------------------------------------
 
 template <int... OldE, int... NewE>
@@ -415,6 +419,117 @@ KOKKOS_FUNCTION auto reshape(DynamicTileLayoutLeft<OldRank> src,
   (void)src;
 #endif
   return DynamicTileLayoutLeft<NewRank>{tile.extents};
+}
+
+// ---------------------------------------------------------------------------
+// reshape(StaticLayout, Tile, Order) — the generic static reshape.
+//
+// Reinterprets any flat StaticLayout — packed or PADDED, in any memory order —
+// under a new shape and a new memory order, with no data movement. Order[j] is
+// the new mode at memory position j, fastest-varying first, the same convention
+// StaticLayout's own Order and make_tile_layout(tile, order_seq) use.
+//
+// The third argument is not optional sugar. reshape(Right<32>, Tile<4,8>) lists
+// the new extents slowest-first while reshape(Left<32>, Tile<4,8>) lists them
+// fastest-first, so no rule inferred from the extents alone reproduces both,
+// and a generic Order matches neither. Being a different arity, this overload
+// also cannot compete with the four packed ones above — which matters, because
+// StaticTileLayoutRight<4,8> and StaticTileLayoutStride<StaticTile<4,8>,1,0>
+// are distinct types sharing one StaticLayout base and could otherwise reshape
+// under two different conventions.
+//
+// The result is a FLAT StaticLayout whenever every new mode maps to a single
+// contiguous run of the source, and the NESTED StaticLayout when one does not:
+//
+//   using Padded2D = StaticLayout<StaticTile<4,8>, strides<9,1>, order<1,0>>;
+//
+//   reshape(StaticTileLayoutRight<32>{}, StaticTile<4,8>{}, LayoutRight{})
+//       -> StaticLayout<StaticTile<4,8>, strides<8,1>, order<1,0>>
+//          (flat — the base class of StaticTileLayoutRight<4,8>)
+//   reshape(Padded2D{}, StaticTile<32>{}, order<0>{})
+//       -> StaticLayout<DeviceTuple<ext<8,4>>, DeviceTuple<ext<1,9>>,
+//                       DeviceTuple<ext<0,1>>>
+//          (nested: one mode of two leaves, merging across the padding gap)
+//
+// A nested result has no stride(d) — a multi-leaf mode has no single stride —
+// so it does not satisfy the TensorLike concept and cannot be fed back in as a
+// leaf tensor. That is a compile error on .stride(), never a wrong answer.
+//
+// Not every shape is reachable: a new mode that straddles source dimensions
+// whose extents share no common factor is not an affine reinterpretation of the
+// source, and is rejected by static_assert rather than approximated.
+// ---------------------------------------------------------------------------
+
+template <int... E, int... S, int... O, int... F, int... NO>
+KOKKOS_FORCEINLINE_FUNCTION auto reshape(
+    StaticLayout<StaticTile<E...>, std::integer_sequence<int, S...>,
+                 std::integer_sequence<int, O...>>,
+    StaticTile<F...>, std::integer_sequence<int, NO...>) noexcept
+    -> Impl::reshaped_layout_t<
+        StaticTile<E...>, std::integer_sequence<int, S...>,
+        std::integer_sequence<int, O...>, StaticTile<F...>,
+        std::integer_sequence<int, NO...>> {
+  using Fn =
+      Impl::ReshapePlanFor<StaticTile<E...>, std::integer_sequence<int, S...>,
+                           std::integer_sequence<int, O...>, StaticTile<F...>,
+                           std::integer_sequence<int, NO...>>;
+  // The plan is read through Impl::reshape_status_v rather than invoked here:
+  // this function is __host__ __device__ and the planner is host-only, so
+  // calling it — even inside a static_assert — would trip nvcc warning #20013.
+  constexpr Impl::ReshapeStatus status = Impl::reshape_status_v<Fn>;
+
+  // One assert per status, so the diagnostic names the actual problem.
+  static_assert(status != Impl::ReshapeStatus::CountMismatch,
+                "reshape: element count must be preserved");
+  static_assert(status != Impl::ReshapeStatus::BadOrder,
+                "reshape: the new memory order must be a permutation of "
+                "[0, new rank), with one entry per new extent");
+  static_assert(status != Impl::ReshapeStatus::NotFactorable,
+                "reshape: the target shape cannot be carved from the source's "
+                "memory-order stream — a new mode straddles source dimensions "
+                "whose extents share no common factor, so the result is not an "
+                "affine reinterpretation of the source");
+  static_assert(status != Impl::ReshapeStatus::CapacityExceeded,
+                "reshape: plan capacity exceeded; raise "
+                "Impl::kReshapeMaxModes / kReshapeMaxLeaves");
+
+#if TENSOR_OPS_VERIFY_RESHAPE
+  static_assert(
+      Impl::ReshapeVerifyIf<Impl::reshape_ok_v<Fn>, Impl::reshape_result_t<Fn>,
+                            StaticTile<E...>, std::integer_sequence<int, S...>,
+                            std::integer_sequence<int, O...>>::value,
+      "reshape: the emitted layout does not reproduce the source's "
+      "element->offset map (planner bug)");
+#endif
+
+  return {};
+}
+
+// LayoutRight / LayoutLeft spellings of the new memory order, so the common
+// cases read like the rest of the API instead of spelling out an
+// integer_sequence. Same convention as make_tile_layout(tile, LayoutRight{}).
+template <int... E, int... S, int... O, int... F>
+KOKKOS_FORCEINLINE_FUNCTION auto reshape(
+    StaticLayout<StaticTile<E...>, std::integer_sequence<int, S...>,
+                 std::integer_sequence<int, O...>>
+                     src,
+    StaticTile<F...> tile, LayoutRight) noexcept
+    -> decltype(reshape(
+        src, tile, Impl::right_order_t<static_cast<int>(sizeof...(F))>{})) {
+  return reshape(src, tile,
+                 Impl::right_order_t<static_cast<int>(sizeof...(F))>{});
+}
+
+template <int... E, int... S, int... O, int... F>
+KOKKOS_FORCEINLINE_FUNCTION auto reshape(
+    StaticLayout<StaticTile<E...>, std::integer_sequence<int, S...>,
+                 std::integer_sequence<int, O...>>
+                     src,
+    StaticTile<F...> tile, LayoutLeft) noexcept
+    -> decltype(reshape(src, tile,
+                        Impl::left_order_t<static_cast<int>(sizeof...(F))>{})) {
+  return reshape(src, tile,
+                 Impl::left_order_t<static_cast<int>(sizeof...(F))>{});
 }
 
 // ---------------------------------------------------------------------------
