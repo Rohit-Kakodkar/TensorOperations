@@ -90,6 +90,11 @@ add_executable(test_tile_layout_stride tests/test_tile_layout_stride.cpp)
 target_link_libraries(test_tile_layout_stride PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_tile_layout_stride)
 
+# test_static_layout — custom main() wraps Kokkos init/finalize
+add_executable(test_static_layout tests/test_static_layout.cpp)
+target_link_libraries(test_static_layout PRIVATE tensor GTest::gtest)
+gtest_discover_tests(test_static_layout)
+
 # test_reorder_scratch — custom main() wraps Kokkos init/finalize
 add_executable(test_reorder_scratch tests/test_reorder_scratch.cpp)
 target_link_libraries(test_reorder_scratch PRIVATE tensor GTest::gtest)
