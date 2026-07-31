@@ -103,6 +103,30 @@ make_tile_layout(StaticTile<E...>,
 //                             extents AND strides, zero runtime cost).
 // Dynamic src + static tile → DynamicTileLayout (outer counts are runtime).
 // Any src    + dynamic tile → DynamicTileLayout with runtime extents.
+//
+// The STATIC overloads are the generic reshape (see below) applied to the
+// interleaved shape: tiling *is* a reshape that splits each dimension E into
+// (E/T, T), so the planner derives the strides and picks the result type rather
+// than this file deriving them a second time. Two consequences:
+//
+//   • Coverage is whatever reshape covers, so a source in an arbitrary memory
+//     order (StaticTileLayoutStride) or with padding (a non-packed
+//     StaticLayout) tiles too — neither was expressible before. A padded
+//     source's result is a flat but non-packed StaticLayout, i.e. it keeps
+//     stride(d) and TensorLike but is not one of the four NAMED layout types.
+//   • A tile that does not divide the source extent is now a compile error
+//     rather than a truncating E/T that silently drops the remainder. This is
+//     intentional; Evaluator/Team.hpp already treats that truncation as a
+//     wrong-results hazard and guards it separately.
+//
+// The dynamic overloads keep their hand-rolled interleaving: the planner is
+// compile-time-only and cannot serve a runtime extent.
+//
+// Index order for the new (Stride / padded) overloads is OUTER-FIRST,
+// view(o0, i0, o1, i1, ...), matching Right. Left's inner-first spelling is a
+// quirk of StaticTileLayoutLeft — it is what makes a Left result packed
+// column-major — not a general rule, and there is no such constraint for an
+// arbitrary order.
 // ---------------------------------------------------------------------------
 
 namespace Impl {
@@ -130,13 +154,128 @@ struct TiledExtentAt<P, InnerFirst, StaticTile<E...>, StaticTile<T...>> {
       inner ? pack_at<d, T...>() : pack_at<d, E...>() / pack_at<d, T...>();
 };
 
-// Build a StaticTileLayout{Right,Left} from the interleaved extents (declared
-// only; used in the trailing-return decltype of tile_layout).
+// tiled_tile_t<InnerFirst, Ext, Tile> — the interleaved extents as a
+// StaticTile, in MODE order. This is the target *shape*; the strides and the
+// layout type are left to the reshape planner, which is what the
+// layout-selecting build_static_tiled used to decide here.
+template <bool InnerFirst, class Ext, class Tile, class Ps>
+struct TiledTile;
 template <bool InnerFirst, class Ext, class Tile, std::size_t... P>
-auto build_static_tiled(std::index_sequence<P...>) -> std::conditional_t<
-    InnerFirst,
-    StaticTileLayoutLeft<TiledExtentAt<P, InnerFirst, Ext, Tile>::value...>,
-    StaticTileLayoutRight<TiledExtentAt<P, InnerFirst, Ext, Tile>::value...>>;
+struct TiledTile<InnerFirst, Ext, Tile, std::index_sequence<P...>> {
+  using type = StaticTile<TiledExtentAt<P, InnerFirst, Ext, Tile>::value...>;
+};
+
+template <bool InnerFirst, class Ext, class Tile>
+using tiled_tile_t =
+    typename TiledTile<InnerFirst, Ext, Tile,
+                       std::make_index_sequence<2 * Ext::rank>>::type;
+
+// TiledOrderAt<InnerFirst, SrcOrderSeq>::get(q) — which of the 2N new modes
+// sits at memory position q, fastest first.
+//
+// Source dimension d splits into modes 2d and 2d+1, and the INNER of that pair
+// is always the faster of the two; InnerFirst says which of the two the inner
+// mode is. So walking the source's own memory order O and emitting each
+// dimension's pair inner-first gives the tiled order for any source — packed or
+// padded, in any memory order:
+//
+//   NO[q] = 2*O[q/2] + (InnerFirst ? q%2 : 1 - q%2)
+//
+// Right (O = {N-1,...,0}, outer-first) reproduces right_order_t<2N> and Left
+// (O = {0,...,N-1}, inner-first) reproduces left_order_t<2N>, so this one rule
+// covers the named overloads and the arbitrary-order ones alike.
+//
+// The result is a permutation of [0, 2N) by construction — 2d + {0,1} over a
+// permutation of the dimensions hits every value exactly once — so a tiling can
+// never trip the planner's BadOrder.
+//
+// Two classes for the same reason as PackedStrideAt in TileLayout.hpp: get() is
+// consumed in a template argument, which requires an already complete class.
+// Deliberately NOT KOKKOS_FUNCTION, like the planner it feeds — see the note
+// above Impl::make_reshape_plan.
+template <bool InnerFirst, class SrcOrderSeq>
+struct TiledOrderAt;
+
+template <bool InnerFirst, int... O>
+struct TiledOrderAt<InnerFirst, std::integer_sequence<int, O...>> {
+  static constexpr int rank = sizeof...(O);
+
+  static constexpr int get(std::size_t q) noexcept {
+    constexpr int ord[] = {O...};
+    const int     half  = static_cast<int>(q % 2);
+    return 2 * ord[q / 2] + (InnerFirst ? half : 1 - half);
+  }
+};
+
+template <bool InnerFirst, class SrcOrderSeq, class Qs>
+struct TiledOrder;
+template <bool InnerFirst, class SrcOrderSeq, std::size_t... Q>
+struct TiledOrder<InnerFirst, SrcOrderSeq, std::index_sequence<Q...>> {
+  using type =
+      std::integer_sequence<int,
+                            TiledOrderAt<InnerFirst, SrcOrderSeq>::get(Q)...>;
+};
+
+template <bool InnerFirst, class SrcOrderSeq>
+using tiled_order_t = typename TiledOrder<
+    InnerFirst, SrcOrderSeq,
+    std::make_index_sequence<2 * TiledOrderAt<InnerFirst, SrcOrderSeq>::rank>>::
+    type;
+
+// The layout a tiling produces, and the plan behind it, named straight from the
+// source's own (extents, strides, order) and the tile.
+//
+// Naming the result through reshaped_layout_t rather than calling reshape() is
+// deliberate: reshape() is not constexpr and tile_layout is, so a call would
+// silently cost tile_layout its constexpr-ness. The plan alias exists so the
+// overloads can report a rejection in TILING terms — a non-dividing tile reads
+// far better than "element count must be preserved".
+template <bool InnerFirst, class Ext, class Str, class Ord, class Tile>
+using tiled_plan_t =
+    ReshapePlanFor<Ext, Str, Ord, tiled_tile_t<InnerFirst, Ext, Tile>,
+                   tiled_order_t<InnerFirst, Ord>>;
+
+// TiledLayoutOf — the result type, with the plan's rejections reported in
+// TILING terms. The diagnostics live here rather than in each tile_layout body
+// so that naming the return type is all an overload has to do; a "count
+// mismatch" is always a non-dividing tile in this context, and saying so beats
+// reshape's necessarily generic wording. The status is read through
+// reshape_status_v rather than by calling the host-only planner — see the note
+// above it in TileLayout.hpp.
+template <bool InnerFirst, class Ext, class Str, class Ord, class Tile>
+struct TiledLayoutOf {
+  using plan_t = tiled_plan_t<InnerFirst, Ext, Str, Ord, Tile>;
+  static constexpr ReshapeStatus status = reshape_status_v<plan_t>;
+
+  static_assert(status != ReshapeStatus::CountMismatch,
+                "tile_layout: every tile extent must divide the corresponding "
+                "source extent exactly");
+  static_assert(status != ReshapeStatus::CapacityExceeded,
+                "tile_layout: source rank exceeds Impl::kReshapeMaxModes / 2; "
+                "raise Impl::kReshapeMaxModes");
+  static_assert(
+      status != ReshapeStatus::NotFactorable &&
+          status != ReshapeStatus::BadOrder,
+      "tile_layout: the tiled shape is not carvable from the source's "
+      "memory-order stream — unreachable for a dividing tile, so this "
+      "is a planner bug");
+
+  using type = reshape_result_t<plan_t>;
+};
+
+template <bool InnerFirst, class Ext, class Str, class Ord, class Tile>
+using tiled_layout_t =
+    typename TiledLayoutOf<InnerFirst, Ext, Str, Ord, Tile>::type;
+
+// Same, for a PACKED source — which is all three named static layouts, since
+// each derives from static_layout_for_t (a packed StaticLayout) for its order.
+template <bool InnerFirst, class Ext, class Ord, class Tile>
+using tiled_packed_layout_t =
+    tiled_layout_t<InnerFirst, Ext, packed_strides_t<Ext, Ord>, Ord, Tile>;
+
+template <bool InnerFirst, class Ext, class Ord, class Tile>
+using tiled_packed_plan_t =
+    tiled_plan_t<InnerFirst, Ext, packed_strides_t<Ext, Ord>, Ord, Tile>;
 
 // Build the interleaved (outer, inner)-per-dim extent array used by every
 // dynamic tile_layout overload. InnerFirst=true (Left layout): position 2*d
@@ -242,9 +381,10 @@ struct OperandAxes {
 template <int... Extents, int... TileE>
 KOKKOS_FUNCTION constexpr auto tile_layout(StaticTileLayoutRight<Extents...>,
                                            StaticTile<TileE...>) noexcept
-    -> decltype(Impl::build_static_tiled<false, StaticTile<Extents...>,
-                                         StaticTile<TileE...>>(
-        std::make_index_sequence<2 * sizeof...(Extents)>{})) {
+    -> Impl::tiled_packed_layout_t<
+        false, StaticTile<Extents...>,
+        Impl::right_order_t<static_cast<int>(sizeof...(Extents))>,
+        StaticTile<TileE...>> {
   static_assert(sizeof...(Extents) == sizeof...(TileE),
                 "tile_layout: source rank must match tile rank");
   return {};
@@ -253,9 +393,45 @@ KOKKOS_FUNCTION constexpr auto tile_layout(StaticTileLayoutRight<Extents...>,
 template <int... Extents, int... TileE>
 KOKKOS_FUNCTION constexpr auto tile_layout(StaticTileLayoutLeft<Extents...>,
                                            StaticTile<TileE...>) noexcept
-    -> decltype(Impl::build_static_tiled<true, StaticTile<Extents...>,
-                                         StaticTile<TileE...>>(
-        std::make_index_sequence<2 * sizeof...(Extents)>{})) {
+    -> Impl::tiled_packed_layout_t<
+        true, StaticTile<Extents...>,
+        Impl::left_order_t<static_cast<int>(sizeof...(Extents))>,
+        StaticTile<TileE...>> {
+  static_assert(sizeof...(Extents) == sizeof...(TileE),
+                "tile_layout: source rank must match tile rank");
+  return {};
+}
+
+// Arbitrary compile-time memory order. Packed like the two above, so it goes
+// through the same packed alias; only the order differs. Outer-first.
+//
+// An exact match on StaticTileLayoutStride beats the derived-to-base conversion
+// to the StaticLayout overload below, so the two never compete even though the
+// named layout derives from exactly that StaticLayout.
+template <int... Extents, int... Order, int... TileE>
+KOKKOS_FUNCTION constexpr auto tile_layout(
+    StaticTileLayoutStride<StaticTile<Extents...>, Order...>,
+    StaticTile<TileE...>) noexcept
+    -> Impl::tiled_packed_layout_t<false, StaticTile<Extents...>,
+                                   std::integer_sequence<int, Order...>,
+                                   StaticTile<TileE...>> {
+  static_assert(sizeof...(Extents) == sizeof...(TileE),
+                "tile_layout: source rank must match tile rank");
+  return {};
+}
+
+// Any flat StaticLayout, PADDED included — the case no named layout can
+// express. A padded source tiles to a flat but non-packed StaticLayout:
+// stride(d) and TensorLike survive, the named-type recovery does not.
+// Outer-first.
+template <int... Extents, int... S, int... O, int... TileE>
+KOKKOS_FUNCTION constexpr auto tile_layout(
+    StaticLayout<StaticTile<Extents...>, std::integer_sequence<int, S...>,
+                 std::integer_sequence<int, O...>>,
+    StaticTile<TileE...>) noexcept
+    -> Impl::tiled_layout_t<
+        false, StaticTile<Extents...>, std::integer_sequence<int, S...>,
+        std::integer_sequence<int, O...>, StaticTile<TileE...>> {
   static_assert(sizeof...(Extents) == sizeof...(TileE),
                 "tile_layout: source rank must match tile rank");
   return {};
@@ -532,7 +708,6 @@ KOKKOS_FORCEINLINE_FUNCTION auto reshape(
                  Impl::left_order_t<static_cast<int>(sizeof...(F))>{});
 }
 
-// ---------------------------------------------------------------------------
 // prefix_product — collapse a tile to a 2D [before, after] shape at a split.
 //
 // Given a split point S, returns a 2-extent tile whose first extent is the

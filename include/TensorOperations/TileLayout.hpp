@@ -910,7 +910,12 @@ namespace Impl {
 // Fixed capacities for the ragged plan below. A plan is a compile-time value,
 // so it cannot allocate; exceeding either bound is reported as CapacityExceeded
 // rather than silently truncated.
-inline constexpr int kReshapeMaxModes  = 8;
+//
+// Modes is 16 rather than 8 because tile_layout() reshapes a rank-N source into
+// 2N modes: at 8 it would have capped tiling at rank 4, where the hand-rolled
+// interleaving it replaced had no rank limit at all. With 16 leaves the real
+// ceiling is a rank-8 source, whose tiling needs exactly 16 of each.
+inline constexpr int kReshapeMaxModes  = 16;
 inline constexpr int kReshapeMaxLeaves = 16;
 
 enum class ReshapeStatus : int {

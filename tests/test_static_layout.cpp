@@ -373,6 +373,145 @@ static_assert(plan_status<StaticTile<4, 8>, strides<9, 1>, order<1, 0>,
 static_assert(plan_status<StaticTile<4, 8>, strides<9, 1>, order<1, 0>,
                           StaticTile<32>, order<0>> == Impl::ReshapeStatus::Ok);
 
+// ---------------------------------------------------------------------------
+// 5. tile_layout on top of the generic reshape.
+//
+// Tiling IS a reshape that splits each dimension E into (E/T, T), so the static
+// tile_layout overloads name Impl::tiled_layout_t instead of deriving strides a
+// second time. Two things need proving: the named overloads still produce
+// exactly what they produced before, and the sources that only reshape can
+// describe — arbitrary order, and padding — now tile as well.
+// ---------------------------------------------------------------------------
+
+// --- 5a. The named overloads are unchanged ---------------------------------
+// The load-bearing property of the whole refactor: same source, same tile, same
+// type as the hand-rolled interleaving produced. tests/test_tiling.cpp asserts
+// the literal types; this asserts the equivalence the implementation rests on.
+static_assert(
+    std::is_same_v<decltype(tile_layout(StaticTileLayoutRight<8, 12>{},
+                                        StaticTile<2, 4>{})),
+                   StaticTileLayoutRight<4, 2, 3, 4>>);
+static_assert(std::is_same_v<decltype(tile_layout(StaticTileLayoutLeft<8, 12>{},
+                                                  StaticTile<2, 4>{})),
+                             StaticTileLayoutLeft<2, 4, 4, 3>>);
+
+// ...and each is literally the reshape to the interleaved shape and order.
+static_assert(
+    std::is_same_v<decltype(tile_layout(StaticTileLayoutRight<8, 12>{},
+                                        StaticTile<2, 4>{})),
+                   decltype(reshape(StaticTileLayoutRight<8, 12>{},
+                                    StaticTile<4, 2, 3, 4>{}, LayoutRight{}))>);
+static_assert(
+    std::is_same_v<decltype(tile_layout(StaticTileLayoutLeft<8, 12>{},
+                                        StaticTile<2, 4>{})),
+                   decltype(reshape(StaticTileLayoutLeft<8, 12>{},
+                                    StaticTile<2, 4, 4, 3>{}, LayoutLeft{}))>);
+
+// --- 5b. Arbitrary memory order --------------------------------------------
+// 8x12 with dim 0 fastest (strides {1,8}). Tiled by (2,4) outer-first the modes
+// are <8/2, 2, 12/4, 4> = <4,2,3,4>; dim 0's pair stays fastest and within each
+// pair the inner mode leads, so the memory order is (1,0,3,2) and the strides
+// are outer0=2, inner0=1, outer1=32, inner1=8.
+using Src2DStride = StaticTileLayoutStride<StaticTile<8, 12>, 0, 1>;
+static_assert(Src2DStride::stride(0) == 1 && Src2DStride::stride(1) == 8);
+
+using StrideTiled = decltype(tile_layout(Src2DStride{}, StaticTile<2, 4>{}));
+static_assert(StrideTiled::rank == 4);
+static_assert(StrideTiled::extent(0) == 4 && StrideTiled::extent(1) == 2 &&
+              StrideTiled::extent(2) == 3 && StrideTiled::extent(3) == 4);
+static_assert(StrideTiled::stride(0) == 2 && StrideTiled::stride(1) == 1 &&
+              StrideTiled::stride(2) == 32 && StrideTiled::stride(3) == 8);
+// Flat, not nested: every mode is a single contiguous run, so stride(d) — and
+// therefore the TensorLike concept — survives.
+static_assert(StrideTiled::mode_arity<0>() == 1 &&
+              StrideTiled::mode_arity<1>() == 1 &&
+              StrideTiled::mode_arity<2>() == 1 &&
+              StrideTiled::mode_arity<3>() == 1);
+// Packed in its own order, but that order is neither Right's nor Left's, so
+// ReshapeFlat's named recovery does not fire and the result is the bare
+// StaticLayout the named Stride layout derives from.
+static_assert(
+    std::is_same_v<StrideTiled,
+                   StaticLayout<StaticTile<4, 2, 3, 4>, strides<2, 1, 32, 8>,
+                                order<1, 0, 3, 2>>>);
+static_assert(std::is_base_of_v<
+              StrideTiled,
+              StaticTileLayoutStride<StaticTile<4, 2, 3, 4>, 1, 0, 3, 2>>);
+
+// Position-preserving: mode (o0,i0,o1,i1) must land where the source puts
+// element (2*o0+i0, 4*o1+i1).
+constexpr bool stride_tiling_preserves_positions() noexcept {
+  for (int o0 = 0; o0 < 4; ++o0)
+    for (int i0 = 0; i0 < 2; ++i0)
+      for (int o1 = 0; o1 < 3; ++o1)
+        for (int i1 = 0; i1 < 4; ++i1) {
+          const int src = Src2DStride{}.flat(2 * o0 + i0, 4 * o1 + i1);
+          if (static_cast<int>(StrideTiled{}.flat(o0, i0, o1, i1)) != src)
+            return false;
+        }
+  return true;
+}
+static_assert(stride_tiling_preserves_positions());
+
+// --- 5c. Padded source — the case no named layout can express --------------
+// Padded2D is 4x8 at a row pitch of 9. Tiled by (2,4): modes <2,2,2,4>, order
+// (3,2,1,0), strides outer0=18 (two padded rows), inner0=9, outer1=4, inner1=1.
+using PaddedTiled = decltype(tile_layout(Padded2D{}, StaticTile<2, 4>{}));
+static_assert(
+    std::is_same_v<PaddedTiled,
+                   StaticLayout<StaticTile<2, 2, 2, 4>, strides<18, 9, 4, 1>,
+                                order<3, 2, 1, 0>>>);
+static_assert(PaddedTiled::mode_arity<0>() == 1 &&
+              PaddedTiled::mode_arity<3>() == 1);
+static_assert(PaddedTiled::stride(0) == 18 && PaddedTiled::stride(3) == 1);
+
+constexpr bool padded_tiling_preserves_positions() noexcept {
+  for (int o0 = 0; o0 < 2; ++o0)
+    for (int i0 = 0; i0 < 2; ++i0)
+      for (int o1 = 0; o1 < 2; ++o1)
+        for (int i1 = 0; i1 < 4; ++i1) {
+          const int src = Padded2D{}.flat(2 * o0 + i0, 4 * o1 + i1);
+          if (static_cast<int>(PaddedTiled{}.flat(o0, i0, o1, i1)) != src)
+            return false;
+        }
+  return true;
+}
+static_assert(padded_tiling_preserves_positions());
+
+// --- 5d. Rejections ---------------------------------------------------------
+// Same trick as 4f: the plan is inspectable without provoking the compile error
+// it is supposed to provoke.
+template <bool InnerFirst, typename SrcExt, typename SrcOrd, typename Tile>
+inline constexpr Impl::ReshapeStatus tiling_status =
+    Impl::tiled_packed_plan_t<InnerFirst, SrcExt, SrcOrd, Tile>{}().status;
+
+// A tile that does not divide the source extent. This used to truncate E/T and
+// silently drop the remainder; it is now a diagnosed compile error.
+static_assert(
+    tiling_status<false, StaticTile<8, 12>, order<1, 0>, StaticTile<5, 4>> ==
+    Impl::ReshapeStatus::CountMismatch);
+// The dividing tile next to it really is accepted.
+static_assert(
+    tiling_status<false, StaticTile<8, 12>, order<1, 0>, StaticTile<2, 4>> ==
+    Impl::ReshapeStatus::Ok);
+
+// --- 5e. Rank ceiling -------------------------------------------------------
+// A rank-N tiling needs 2N modes, so kReshapeMaxModes is what bounds the source
+// rank. At the old value of 8 a rank-5 source would have been rejected, where
+// the hand-rolled interleaving it replaced had no limit at all.
+static_assert(tiling_status<false, StaticTile<4, 4, 4, 4, 4>,
+                            order<4, 3, 2, 1, 0>, StaticTile<2, 2, 2, 2, 2>> ==
+              Impl::ReshapeStatus::Ok);
+static_assert(
+    std::is_same_v<decltype(tile_layout(StaticTileLayoutRight<4, 4, 4, 4, 4>{},
+                                        StaticTile<2, 2, 2, 2, 2>{})),
+                   StaticTileLayoutRight<2, 2, 2, 2, 2, 2, 2, 2, 2, 2>>);
+// Past the ceiling it is reported, not silently truncated: rank 9 needs 18.
+static_assert(tiling_status<false, StaticTile<2, 2, 2, 2, 2, 2, 2, 2, 2>,
+                            order<8, 7, 6, 5, 4, 3, 2, 1, 0>,
+                            StaticTile<1, 1, 1, 1, 1, 1, 1, 1, 1>> ==
+              Impl::ReshapeStatus::CapacityExceeded);
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -699,6 +838,72 @@ TEST(GenericReshape, DecodeRoundTripRagged) {
   EXPECT_FALSE(hit[26]);
   for (int f = 0; f < 32; ++f)
     EXPECT_TRUE(hit[padded2d_offset_at(f)]) << "element " << f << " missed";
+}
+
+// TEST: tile_view over a PADDED source — the tiling no named layout could
+// express. The pad slots are the oracle: an offset map that ignored the row
+// pitch would still look dense and plausible, and would write over them.
+// ---------------------------------------------------------------------------
+TEST(TiledStaticLayout, ViewWriteThroughPaddedTiling) {
+  using Buf1D = Kokkos::View<float*, Kokkos::LayoutRight, Kokkos::HostSpace>;
+  Buf1D buf("buf", 36);  // 4 rows x pitch 9
+  Kokkos::deep_copy(buf, -1.f);
+
+  View<Buf1D, Padded2D> v{buf, Padded2D{}};
+  auto                  tiled = tile_view(v, StaticTile<2, 4>{});
+  static_assert(std::is_same_v<decltype(tiled)::layout_t, PaddedTiled>);
+  ASSERT_EQ(tiled.extent(0), 2);
+  ASSERT_EQ(tiled.extent(1), 2);
+  ASSERT_EQ(tiled.extent(2), 2);
+  ASSERT_EQ(tiled.extent(3), 4);
+
+  // Distinct per element, so a transposed or collapsed map cannot pass.
+  for (int o0 = 0; o0 < 2; ++o0)
+    for (int i0 = 0; i0 < 2; ++i0)
+      for (int o1 = 0; o1 < 2; ++o1)
+        for (int i1 = 0; i1 < 4; ++i1)
+          tiled(o0, i0, o1, i1) =
+              static_cast<float>(100 + 8 * (2 * o0 + i0) + (4 * o1 + i1));
+
+  // Tile coordinate (o0,i0,o1,i1) is source element (2*o0+i0, 4*o1+i1), which
+  // the padded source puts at 9*row + col.
+  for (int o0 = 0; o0 < 2; ++o0)
+    for (int i0 = 0; i0 < 2; ++i0)
+      for (int o1 = 0; o1 < 2; ++o1)
+        for (int i1 = 0; i1 < 4; ++i1) {
+          const int row = 2 * o0 + i0, col = 4 * o1 + i1;
+          EXPECT_FLOAT_EQ(buf(9 * row + col),
+                          static_cast<float>(100 + 8 * row + col))
+              << "o0=" << o0 << " i0=" << i0 << " o1=" << o1 << " i1=" << i1;
+        }
+  for (int i = 0; i < 4; ++i)
+    EXPECT_FLOAT_EQ(buf(9 * i + 8), -1.f) << "pad of row " << i << " written";
+
+  // Reading back through the untiled view agrees element for element.
+  for (int i = 0; i < 4; ++i)
+    for (int j = 0; j < 8; ++j)
+      EXPECT_FLOAT_EQ(v(i, j), static_cast<float>(100 + 8 * i + j))
+          << "i=" << i << " j=" << j;
+}
+
+// ---------------------------------------------------------------------------
+// TEST: an arbitrary-order source tiles to a bijection onto its own slots —
+// the decode path every tier kernel's flat loop uses.
+// ---------------------------------------------------------------------------
+TEST(TiledStaticLayout, StrideTilingDecodeRoundTrip) {
+  StrideTiled layout{};
+  ASSERT_EQ(layout.size(), 96);
+
+  bool hit[96] = {};
+  for (int f = 0; f < layout.size(); ++f) {
+    const auto c   = layout[f];
+    const auto off = layout.flat(c[0], c[1], c[2], c[3]);
+    ASSERT_LT(off, 96u) << "f=" << f;
+    EXPECT_FALSE(hit[off]) << "flat offset " << off << " reached twice";
+    hit[off] = true;
+  }
+  // Onto: the source is packed, so every one of its 96 slots is covered.
+  for (int s = 0; s < 96; ++s) EXPECT_TRUE(hit[s]) << "slot " << s << " missed";
 }
 
 // ---------------------------------------------------------------------------
