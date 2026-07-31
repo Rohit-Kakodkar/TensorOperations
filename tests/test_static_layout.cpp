@@ -197,15 +197,17 @@ constexpr int padded2d_offset_at(int k) noexcept {
 
 // --- 4a. Packed source, flat result ----------------------------------------
 // Every new mode maps to a single contiguous run, so the result collapses to
-// the FLAT specialisation — which is what keeps stride(d) available.
+// the FLAT specialisation — which is what keeps stride(d) available. A flat
+// result whose strides are also packed goes one step further and recovers the
+// NAMED layout, so that the result stays usable with tile_layout()/tile_view().
 using ReshRight = decltype(reshape(StaticTileLayoutRight<32>{},
                                    StaticTile<4, 8>{}, order<1, 0>{}));
+static_assert(std::is_same_v<ReshRight, StaticTileLayoutRight<4, 8>>);
+// ...whose base is exactly the packed StaticLayout for that shape and order.
+static_assert(std::is_base_of_v<Manual2D, ReshRight>);
 static_assert(
-    std::is_same_v<ReshRight,
-                   StaticLayout<StaticTile<4, 8>, strides<8, 1>, order<1, 0>>>);
-// ...and it is exactly the base of the named layout the 2-arg overload returns.
-static_assert(std::is_base_of_v<ReshRight, StaticTileLayoutRight<4, 8>>);
-static_assert(std::is_same_v<ReshRight, Manual2D>);
+    std::is_base_of_v<
+        StaticLayout<StaticTile<4, 8>, strides<8, 1>, order<1, 0>>, ReshRight>);
 static_assert(ReshRight::stride(0) == 8 && ReshRight::stride(1) == 1);
 static_assert(ReshRight::mode_arity<0>() == 1 &&
               ReshRight::mode_arity<1>() == 1);
@@ -215,10 +217,11 @@ static_assert(ReshRight::mode_arity<0>() == 1 &&
 // overloads hard-code.
 using ReshLeft = decltype(reshape(StaticTileLayoutRight<32>{},
                                   StaticTile<4, 8>{}, order<0, 1>{}));
+static_assert(std::is_same_v<ReshLeft, StaticTileLayoutLeft<4, 8>>);
 static_assert(
-    std::is_same_v<ReshLeft,
-                   StaticLayout<StaticTile<4, 8>, strides<1, 4>, order<0, 1>>>);
-static_assert(std::is_base_of_v<ReshLeft, StaticTileLayoutLeft<4, 8>>);
+    std::is_base_of_v<
+        StaticLayout<StaticTile<4, 8>, strides<1, 4>, order<0, 1>>, ReshLeft>);
+static_assert(ReshLeft::stride(0) == 1 && ReshLeft::stride(1) == 4);
 
 // The LayoutRight / LayoutLeft spellings are the same two results.
 static_assert(
@@ -230,12 +233,19 @@ static_assert(
                                     StaticTile<4, 8>{}, LayoutLeft{})),
                    ReshLeft>);
 
-// A named layout binds to the generic overload by base-class deduction, so the
-// three-argument form is a strict superset of the two-argument ones.
+// A named layout binds to the generic overload by base-class deduction, and a
+// packed result comes back named, so the three-argument form is a drop-in
+// superset of the two-argument ones: same source, same target order, same type.
 static_assert(
-    std::is_base_of_v<decltype(reshape(StaticTileLayoutLeft<32>{},
-                                       StaticTile<4, 8>{}, LayoutLeft{})),
-                      StaticTileLayoutLeft<4, 8>>);
+    std::is_same_v<decltype(reshape(StaticTileLayoutRight<32>{},
+                                    StaticTile<4, 8>{}, LayoutRight{})),
+                   decltype(reshape(StaticTileLayoutRight<32>{},
+                                    StaticTile<4, 8>{}))>);
+static_assert(
+    std::is_same_v<decltype(reshape(StaticTileLayoutLeft<32>{},
+                                    StaticTile<4, 8>{}, LayoutLeft{})),
+                   decltype(reshape(StaticTileLayoutLeft<32>{},
+                                    StaticTile<4, 8>{}))>);
 
 // --- 4b. Padded source, merged across the gap ------------------------------
 // (4,8) with a row pitch of 9 flattened to rank 1: no single stride can express
@@ -279,16 +289,48 @@ constexpr bool padded_ragged_offsets_match() noexcept {
 }
 static_assert(padded_ragged_offsets_match());
 
-// --- 4d. Arbitrary memory order, packed source ------------------------------
+// --- 4d. Arbitrary memory order ---------------------------------------------
 // Stride3D is {4,8,3} with dim 2 fastest, so its memory stream is
-// (3, s=1), (4, s=3), (8, s=12). Flattening to rank 1 merges all three: the
-// leaves are the stream itself, which no 2-D reinterpretation could express.
+// (3, s=1), (4, s=3), (8, s=12). Flattening to rank 1 merges all three, and
+// because the source is packed the three runs are contiguous end to end: the
+// merged mode is one leaf of extent 96 and stride 1, i.e. the reshape sees
+// through the permuted dimension order to the dense stream underneath.
 using ReshStride3D =
     decltype(reshape(Stride3D{}, StaticTile<96>{}, order<0>{}));
-static_assert(std::is_same_v<ReshStride3D,
-                             StaticLayout<DT<ext<3, 4, 8>>, DT<ext<1, 3, 12>>,
-                                          DT<ext<0, 1, 2>>>>);
-static_assert(ReshStride3D::mode_arity<0>() == 3);
+static_assert(std::is_same_v<ReshStride3D, StaticTileLayoutRight<96>>);
+static_assert(ReshStride3D::mode_arity<0>() == 1);
+static_assert(ReshStride3D::stride(0) == 1);
+
+constexpr bool stride3d_flat_offsets_match() noexcept {
+  // Element k of the source in memory order sits at offset k (it is packed),
+  // and element k of the result must sit at the same place.
+  for (int k = 0; k < 96; ++k)
+    if (static_cast<int>(ReshStride3D{}.flat(k)) != k) return false;
+  return true;
+}
+static_assert(stride3d_flat_offsets_match());
+
+// Padding is what makes an arbitrary-order source ragged. Padded3D has the same
+// dimension order but a row pitch of 16 on the middle axis, so its stream is
+// (3, s=1), (4, s=3), (8, s=16): the first two runs coalesce into 12 dense
+// slots, the third cannot follow them, and the flattened mode needs two leaves.
+using ReshPadded3D =
+    decltype(reshape(Padded3D{}, StaticTile<96>{}, order<0>{}));
+static_assert(
+    std::is_same_v<ReshPadded3D, StaticLayout<DT<ext<12, 8>>, DT<ext<1, 16>>,
+                                              DT<ext<0, 1>>>>);
+static_assert(ReshPadded3D::mode_arity<0>() == 2);
+
+constexpr bool padded3d_flat_offsets_match() noexcept {
+  // Element k of Padded3D in ITS memory order: the stream is dim 2 (extent 3,
+  // stride 1), then dim 0 (extent 4, stride 3), then dim 1 (extent 8, str 16).
+  for (int k = 0; k < 96; ++k) {
+    const int src = (k % 3) * 1 + ((k / 3) % 4) * 3 + (k / 12) * 16;
+    if (static_cast<int>(ReshPadded3D{}.flat(k)) != src) return false;
+  }
+  return true;
+}
+static_assert(padded3d_flat_offsets_match());
 
 // --- 4e. Identity ------------------------------------------------------------
 // Reshaping to the source's own shape and order returns the source type,

@@ -160,13 +160,13 @@ TEST(ReorderScratch, Permute3D_SwapWithFixedPoint) {
 // raw backing bytes are untouched, only the layout type changes.
 // ---------------------------------------------------------------------------
 
-TEST(RelabelScratchView, Transpose2DZeroCopy) {
+// The kernel launches live in free functions, not directly in the TEST bodies:
+// nvcc rejects an extended (KOKKOS_LAMBDA) lambda whose enclosing function has
+// private access within its class, and gtest's TestBody() is private.
+void run_relabel_transpose(Buf1D src_readback, Buf1D dst_readback) {
   using Tile              = StaticTile<4, 8>;
   using team_policy       = Kokkos::TeamPolicy<ExecSpace>;
   const std::size_t bytes = Impl::scratch_tile_bytes<float, ExecSpace>(Tile{});
-
-  Buf1D src_readback("src_readback", 32);  // raw backing after relabel
-  Buf1D dst_readback("dst_readback", 32);  // dst(i,j), dst is 8x4
 
   Kokkos::parallel_for(
       team_policy(1, Kokkos::AUTO).set_scratch_size(0, Kokkos::PerTeam(bytes)),
@@ -195,6 +195,13 @@ TEST(RelabelScratchView, Transpose2DZeroCopy) {
         });
       });
   Kokkos::fence();
+}
+
+TEST(RelabelScratchView, Transpose2DZeroCopy) {
+  Buf1D src_readback("src_readback", 32);  // raw backing after relabel
+  Buf1D dst_readback("dst_readback", 32);  // dst(i,j), dst is 8x4
+
+  run_relabel_transpose(src_readback, dst_readback);
 
   auto h_dst = Kokkos::create_mirror_view(dst_readback);
   auto h_src = Kokkos::create_mirror_view(src_readback);
@@ -213,12 +220,18 @@ TEST(RelabelScratchView, Transpose2DZeroCopy) {
           << "i=" << i << " j=" << j;
 }
 
-TEST(RelabelScratchView, AppliesSourceHook) {
+// A named functor rather than a KOKKOS_LAMBDA: the hook is built inside the
+// kernel lambda, and nvcc forbids defining an extended lambda inside another.
+struct AddIndexHook {
+  KOKKOS_FUNCTION void operator()(int i, int j, float& v) const {
+    v += 1000.f * static_cast<float>(i + 1) + static_cast<float>(j + 1);
+  }
+};
+
+void run_relabel_hook(Buf1D dst_readback) {
   using Tile              = StaticTile<2, 3>;
   using team_policy       = Kokkos::TeamPolicy<ExecSpace>;
   const std::size_t bytes = Impl::scratch_tile_bytes<float, ExecSpace>(Tile{});
-
-  Buf1D dst_readback("dst_readback", 6);  // dst is 3x2 after perm{1,0}
 
   Kokkos::parallel_for(
       team_policy(1, Kokkos::AUTO).set_scratch_size(0, Kokkos::PerTeam(bytes)),
@@ -231,10 +244,7 @@ TEST(RelabelScratchView, AppliesSourceHook) {
         });
         team.team_barrier();
 
-        auto hook = KOKKOS_LAMBDA(int i, int j, float& v) {
-          v += 1000.f * static_cast<float>(i + 1) + static_cast<float>(j + 1);
-        };
-        auto src    = make_interm_node(scratch, hook);
+        auto src    = make_interm_node(scratch, AddIndexHook{});
         using NodeT = decltype(src);
         using EvalT = Evaluator<TeamPolicyTag<ExecSpace>, NodeT,
                                 std::integer_sequence<int, 1, 0>>;
@@ -249,6 +259,12 @@ TEST(RelabelScratchView, AppliesSourceHook) {
         });
       });
   Kokkos::fence();
+}
+
+TEST(RelabelScratchView, AppliesSourceHook) {
+  Buf1D dst_readback("dst_readback", 6);  // dst is 3x2 after perm{1,0}
+
+  run_relabel_hook(dst_readback);
 
   auto h = Kokkos::create_mirror_view(dst_readback);
   Kokkos::deep_copy(h, dst_readback);
