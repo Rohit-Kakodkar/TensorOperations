@@ -671,6 +671,319 @@ TEST(CombineNodeTest, PermutedContractionOperandTeam) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Combine node AS AN OPERAND (phase 1: single-output combines).
+//
+//   P{i,k} = A{i,k} * D{i,k} + 100i + k        (combine, the fused operand)
+//   c{i,l} = sum_k P{i,k} * B{k,l}             (contraction consuming it)
+//
+// K = 16 against a k-tile of 8 deliberately gives the parent TWO contracted
+// tiles, so the combine evaluator is re-invoked per k-tile -- the path that
+// distinguishes a fused operand from a one-shot one, and the reason its
+// per-operand allocators are built once in the constructor.
+//
+// Register-kernel divisibility, both backends (CPU MT=8/NT=8/NR=2*W=32; GPU
+// MT=4/NT=2/NR=2): SA=16, SK=8, SB=32.
+//
+// Every array is index-dependent and non-symmetric, and I != L, so a dropped
+// relabel or a transposed index cannot pass.
+// ---------------------------------------------------------------------------
+namespace {
+struct CombineOperandData {
+  using View2            = Kokkos::View<float**, Kokkos::LayoutRight>;
+  static constexpr int I = 16, K = 16, L = 32;
+
+  // Tiles: the combine's own bundle (both its operands are inputs, so their
+  // tiles equal its output tile), nested into the contraction's A slot.
+  using OpTile   = StaticTile<16, 8>;  // combine output tile <i,k>
+  using CombTile = CombineTile<OpTile, OpTile, OpTile>;
+  using CBundle  = Tile<CombTile, StaticTile<8, 32>, StaticTile<16, 32>>;
+
+  View2                   A{"A", I, K};
+  View2                   D{"D", I, K};
+  View2                   B{"B", K, L};
+  View2::host_mirror_type Ah{Kokkos::create_mirror_view(A)};
+  View2::host_mirror_type Dh{Kokkos::create_mirror_view(D)};
+  View2::host_mirror_type Bh{Kokkos::create_mirror_view(B)};
+
+  CombineOperandData() {
+    for (int i = 0; i < I; ++i)
+      for (int k = 0; k < K; ++k) {
+        Ah(i, k) = static_cast<float>(((i * 7 + k * 3) % 5) + 1) * 0.25f;
+        Dh(i, k) = static_cast<float>(((i * 2 + k * 5) % 7) + 1) * 0.125f;
+      }
+    for (int k = 0; k < K; ++k)
+      for (int l = 0; l < L; ++l)
+        Bh(k, l) = static_cast<float>(((k * 5 + l * 2) % 4) + 1) * 0.5f;
+    Kokkos::deep_copy(A, Ah);
+    Kokkos::deep_copy(D, Dh);
+    Kokkos::deep_copy(B, Bh);
+  }
+
+  auto combine_node() const {
+    return make_combine_node<'i', 'k'>(
+        make_input_node(make_handle<'i', 'k'>(A)),
+        make_input_node(make_handle<'i', 'k'>(D)), MulPlusCoord{});
+  }
+  auto b_node() const { return make_input_node(make_handle<'k', 'l'>(B)); }
+
+  // c{i,l} = sum_k P{i,k} B{k,l}; canonical (freeA ++ freeB) == user <i,l>.
+  auto contraction_node() const {
+    return make_contraction_node<float, Kokkos::DefaultExecutionSpace, 'i',
+                                 'l'>(combine_node(), b_node());
+  }
+
+  float host_p(int i, int k) const {
+    return Ah(i, k) * Dh(i, k) + static_cast<float>(i) * 100.0f +
+           static_cast<float>(k);
+  }
+  float host_c(int i, int l) const {
+    float c = 0.0f;
+    for (int k = 0; k < K; ++k) c += host_p(i, k) * Bh(k, l);
+    return c;
+  }
+};
+
+// The staging rules over the exact node/tile/perm a fused combine operand
+// reaches them by -- the regression guard for the predicate fix this feature
+// turned on.
+//
+// operand_stageable_v used to answer "is it a contraction?" and so returned
+// TRUE for any combine operand, on the reasoning that everything else is
+// copied into a fresh staging buffer and therefore shape-unconstrained. That
+// is wrong: a combine produces its OWN scratch, so a consumer reorders it in
+// place, and a 16x8 tile cannot become 8x16 inside its own storage. Asserting
+// the false here pins the fix -- a hard error from inside an evaluator's class
+// body is otherwise unobservable to a test.
+using FusedCombineOp =
+    decltype(std::declval<CombineOperandData>().combine_node());
+using FusedCombineTile = CombineOperandData::CombTile;
+using FusedCombineSwap = std::integer_sequence<int, 1, 0>;
+static_assert(Impl::produces_own_scratch_v<FusedCombineOp>,
+              "a combine node hands back its own scratch, exactly as a fused "
+              "contraction does");
+static_assert(Impl::fusable_operand_v<FusedCombineOp>,
+              "and is therefore a legal operand");
+static_assert(!Impl::operand_stageable_v<FusedCombineOp, FusedCombineTile,
+                                         FusedCombineSwap>,
+              "a 16x8 fused combine operand tile must NOT be stageable under a "
+              "transposing perm -- it would be reordered in place");
+static_assert(Impl::operand_stageable_v<FusedCombineOp, FusedCombineTile,
+                                        std::integer_sequence<int, 0, 1>>,
+              "the identity perm is a true zero-copy passthrough and stays "
+              "stageable");
+static_assert(Impl::operand_relabelable_v<FusedCombineOp, FusedCombineSwap>,
+              "a permuted combine operand IS relabelable -- it carries no hook "
+              "at all, so the unhooked half of the rule is vacuous");
+static_assert(!Impl::operand_relabelable_v<FusedCombineOp,
+                                           std::integer_sequence<int, 0, 1>>,
+              "an unpermuted one stays on the zero-copy passthrough");
+
+// Phase-1 gate. A multi-output combine (SumDiff -> Kokkos::Array<float,2>) is
+// still a legal graph output but NOT a legal operand: instantiating an
+// evaluator over one fails in Impl::single_result with
+//   "a multi-output combine node cannot yet be consumed as an operand"
+// Left as prose rather than a test -- the repo has no negative-compilation
+// harness, and a live case would simply not build.
+}  // namespace
+
+// A combine node in the contraction's A slot.
+TEST(CombineNodeTest, ContractionOverCombineOperandTeam) {
+  const CombineOperandData  d;
+  CombineOperandData::View2 C("C", d.I, d.L);
+  Kokkos::deep_copy(C, 0.0f);
+
+  auto g        = make_graph();
+  auto [g1, o1] = g.ops(d.contraction_node());
+  const int wk =
+      g1.execute(TeamPolicyTag<>{}, CombineOperandData::CBundle{}, C);
+  EXPECT_EQ(wk, 1);  // one 16x32 output tile
+
+  auto Ch = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, C);
+  for (int i = 0; i < d.I; ++i)
+    for (int l = 0; l < d.L; ++l)
+      EXPECT_FLOAT_EQ(Ch(i, l), d.host_c(i, l)) << "i=" << i << " l=" << l;
+}
+
+// ---------------------------------------------------------------------------
+// The same combine in the contraction's B slot, since a fused operand may sit
+// in either position:
+//   Q{k,l} = E{k,l} * F{k,l} + 100k + l
+//   c{i,l} = sum_k A{i,k} * Q{k,l}
+// ---------------------------------------------------------------------------
+namespace {
+struct CombineOperandBData {
+  using View2            = Kokkos::View<float**, Kokkos::LayoutRight>;
+  static constexpr int I = 16, K = 16, L = 32;
+
+  using OpTile   = StaticTile<8, 32>;  // combine output tile <k,l>
+  using CombTile = CombineTile<OpTile, OpTile, OpTile>;
+  using CBundle  = Tile<StaticTile<16, 8>, CombTile, StaticTile<16, 32>>;
+
+  View2                   A{"A", I, K};
+  View2                   E{"E", K, L};
+  View2                   F{"F", K, L};
+  View2::host_mirror_type Ah{Kokkos::create_mirror_view(A)};
+  View2::host_mirror_type Eh{Kokkos::create_mirror_view(E)};
+  View2::host_mirror_type Fh{Kokkos::create_mirror_view(F)};
+
+  CombineOperandBData() {
+    for (int i = 0; i < I; ++i)
+      for (int k = 0; k < K; ++k)
+        Ah(i, k) = static_cast<float>(((i * 3 + k * 7) % 6) + 1) * 0.25f;
+    for (int k = 0; k < K; ++k)
+      for (int l = 0; l < L; ++l) {
+        Eh(k, l) = static_cast<float>(((k * 5 + l * 3) % 4) + 1) * 0.5f;
+        Fh(k, l) = static_cast<float>(((k + l * 2) % 5) + 1) * 0.125f;
+      }
+    Kokkos::deep_copy(A, Ah);
+    Kokkos::deep_copy(E, Eh);
+    Kokkos::deep_copy(F, Fh);
+  }
+
+  auto contraction_node() const {
+    return make_contraction_node<float, Kokkos::DefaultExecutionSpace, 'i',
+                                 'l'>(
+        make_input_node(make_handle<'i', 'k'>(A)),
+        make_combine_node<'k', 'l'>(make_input_node(make_handle<'k', 'l'>(E)),
+                                    make_input_node(make_handle<'k', 'l'>(F)),
+                                    MulPlusCoord{}));
+  }
+
+  float host_q(int k, int l) const {
+    return Eh(k, l) * Fh(k, l) + static_cast<float>(k) * 100.0f +
+           static_cast<float>(l);
+  }
+  float host_c(int i, int l) const {
+    float c = 0.0f;
+    for (int k = 0; k < K; ++k) c += Ah(i, k) * host_q(k, l);
+    return c;
+  }
+};
+}  // namespace
+
+TEST(CombineNodeTest, ContractionOverCombineOperandBTeam) {
+  const CombineOperandBData  d;
+  CombineOperandBData::View2 C("C", d.I, d.L);
+  Kokkos::deep_copy(C, 0.0f);
+
+  auto g        = make_graph();
+  auto [g1, o1] = g.ops(d.contraction_node());
+  g1.execute(TeamPolicyTag<>{}, CombineOperandBData::CBundle{}, C);
+
+  auto Ch = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, C);
+  for (int i = 0; i < d.I; ++i)
+    for (int l = 0; l < d.L; ++l)
+      EXPECT_FLOAT_EQ(Ch(i, l), d.host_c(i, l)) << "i=" << i << " l=" << l;
+}
+
+// ---------------------------------------------------------------------------
+// A combine consuming a combine (zero-copy passthrough -- identical modes, so
+// the label gather is the identity):
+//   P{i,j} = A{i,j} * B{i,j} + 100i + j
+//   Q{i,j} = P{i,j} + C{i,j}
+// ---------------------------------------------------------------------------
+TEST(CombineNodeTest, CombineOverCombineOperandTeam) {
+  using View2     = Kokkos::View<float**, Kokkos::LayoutRight>;
+  constexpr int I = 16, J = 32;
+  View2         A("A", I, J), B("B", I, J), C("C", I, J), Q("Q", I, J);
+  auto          Ah = Kokkos::create_mirror_view(A);
+  auto          Bh = Kokkos::create_mirror_view(B);
+  auto          Ch = Kokkos::create_mirror_view(C);
+  for (int i = 0; i < I; ++i)
+    for (int j = 0; j < J; ++j) {
+      Ah(i, j) = static_cast<float>(((i * 7 + j * 3) % 5) + 1) * 0.25f;
+      Bh(i, j) = static_cast<float>(((i * 2 + j * 5) % 7) + 1) * 0.125f;
+      Ch(i, j) = static_cast<float>(((i + j * 3) % 4) + 1) * 0.5f;
+    }
+  Kokkos::deep_copy(A, Ah);
+  Kokkos::deep_copy(B, Bh);
+  Kokkos::deep_copy(C, Ch);
+  Kokkos::deep_copy(Q, 0.0f);
+
+  using OutTile   = StaticTile<8, 16>;
+  using InnerTile = CombineTile<OutTile, OutTile, OutTile>;
+
+  auto inner = make_combine_node<'i', 'j'>(
+      make_input_node(make_handle<'i', 'j'>(A)),
+      make_input_node(make_handle<'i', 'j'>(B)), MulPlusCoord{});
+
+  auto g        = make_graph();
+  auto [g1, o1] = g.ops(make_combine_node<'i', 'j'>(
+      inner, make_input_node(make_handle<'i', 'j'>(C)), AddOp{}));
+  g1.execute(TeamPolicyTag<>{},
+             make_combine_tile(OutTile{}, InnerTile{}, OutTile{}), Q);
+
+  auto Qh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, Q);
+  for (int i = 0; i < I; ++i)
+    for (int j = 0; j < J; ++j) {
+      const float p = Ah(i, j) * Bh(i, j) + static_cast<float>(i) * 100.0f +
+                      static_cast<float>(j);
+      EXPECT_FLOAT_EQ(Qh(i, j), p + Ch(i, j)) << "i=" << i << " j=" << j;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A PERMUTED combine operand, consumed by the zero-copy relabel path:
+//   P{l,i} = E{l,i} * F{l,i} + 100l + i      (declared in <l,i> order)
+//   Q{i,l} = P{l,i} * D{i,l} + 100i + l      (consumed in <i,l> order)
+//
+// A combine node's modes ARE its canonical order, so there is no permC here --
+// the whole permutation is the outer combine's label gather. I != L, so the
+// tile is not square and the relabel (rather than an in-place reorder) is the
+// only path that can work; operand_relabelable_v is what selects it.
+// ---------------------------------------------------------------------------
+TEST(CombineNodeTest, PermutedCombineOperandTeam) {
+  using View2     = Kokkos::View<float**, Kokkos::LayoutRight>;
+  constexpr int I = 16, L = 32;
+  View2         E("E", L, I), F("F", L, I), D("D", I, L), Q("Q", I, L);
+  auto          Eh = Kokkos::create_mirror_view(E);
+  auto          Fh = Kokkos::create_mirror_view(F);
+  auto          Dh = Kokkos::create_mirror_view(D);
+  for (int l = 0; l < L; ++l)
+    for (int i = 0; i < I; ++i) {
+      Eh(l, i) = static_cast<float>(((l * 3 + i * 7) % 5) + 1) * 0.25f;
+      Fh(l, i) = static_cast<float>(((l * 5 + i * 2) % 7) + 1) * 0.125f;
+    }
+  for (int i = 0; i < I; ++i)
+    for (int l = 0; l < L; ++l)
+      Dh(i, l) = static_cast<float>(((i + 3 * l) % 7) + 1) * 0.5f;
+  Kokkos::deep_copy(E, Eh);
+  Kokkos::deep_copy(F, Fh);
+  Kokkos::deep_copy(D, Dh);
+  Kokkos::deep_copy(Q, 0.0f);
+
+  using OutTile     = StaticTile<16, 32>;  // <i,l>
+  using InnerTile   = StaticTile<32, 16>;  // <l,i> -- the transposition
+  using InnerBundle = CombineTile<InnerTile, InnerTile, InnerTile>;
+
+  auto inner = make_combine_node<'l', 'i'>(
+      make_input_node(make_handle<'l', 'i'>(E)),
+      make_input_node(make_handle<'l', 'i'>(F)), MulPlusCoord{});
+
+  // The operand really is reached by the relabel, not by a copy.
+  static_assert(Impl::operand_relabelable_v<decltype(inner),
+                                            std::integer_sequence<int, 1, 0>>);
+
+  auto g        = make_graph();
+  auto [g1, o1] = g.ops(make_combine_node<'i', 'l'>(
+      inner, make_input_node(make_handle<'i', 'l'>(D)), MulPlusCoord{}));
+  g1.execute(TeamPolicyTag<>{},
+             make_combine_tile(OutTile{}, InnerBundle{}, OutTile{}), Q);
+
+  auto Qh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, Q);
+  for (int i = 0; i < I; ++i)
+    for (int l = 0; l < L; ++l) {
+      // host_p is indexed in the OPERAND's order (l,i) while the output is
+      // (i,l): a missed relabel shows up here.
+      const float p = Eh(l, i) * Fh(l, i) + static_cast<float>(l) * 100.0f +
+                      static_cast<float>(i);
+      const float expected =
+          p * Dh(i, l) + static_cast<float>(i) * 100.0f + static_cast<float>(l);
+      EXPECT_FLOAT_EQ(Qh(i, l), expected) << "i=" << i << " l=" << l;
+    }
+}
+
 int main(int argc, char* argv[]) {
   ::testing::InitGoogleTest(&argc, argv);
   Kokkos::initialize(argc, argv);

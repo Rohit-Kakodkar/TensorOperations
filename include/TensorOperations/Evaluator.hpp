@@ -224,6 +224,33 @@ KOKKOS_FORCEINLINE_FUNCTION Kokkos::Array<T, M> as_result_array(
   return r;
 }
 
+// The inverse of as_result_array, for the one context that needs a SINGLE value
+// rather than a normalized pack: an operand's evaluated result, which a
+// consumer stages into one scratch slot. A single-output evaluator's interm
+// handle passes through; a combine's Kokkos::Array is unwrapped.
+//
+// This is where the phase-1 restriction on fused combine operands lives, and
+// the one place a phase-2 output selector would take an index instead of
+// asserting M == 1. Stated here rather than at the ScratchAllocator call site
+// so the restriction is one declaration, not a condition duplicated per
+// consumer.
+//
+// Returns BY VALUE for the same reason as_result_array does: the argument is
+// the temporary returned by eval(), so a const& pass-through would dangle.
+template <typename T>
+KOKKOS_FORCEINLINE_FUNCTION T single_result(const T& r) {
+  return r;
+}
+template <typename T, std::size_t M>
+KOKKOS_FORCEINLINE_FUNCTION T single_result(const Kokkos::Array<T, M>& r) {
+  static_assert(M == 1,
+                "a multi-output combine node cannot yet be consumed as an "
+                "operand: selecting one output of several is phase 2 (a bound "
+                "output handle as an operand). Register the multi-output "
+                "combine as its own graph output instead");
+  return r[0];
+}
+
 // --- node output order ------------------------------------------------------
 //
 // A contraction node's modes_seq, shape() and C scratch are all CANONICAL
@@ -267,14 +294,38 @@ template <typename Node, typename Tile>
 using operand_leaf_tile_t =
     decltype(canonical_c_tile<Node>(std::declval<Tile>()));
 
+// --- operand kinds ----------------------------------------------------------
+//
+// Does this node's evaluator hand back its OWN team-scratch tile, rather than
+// being read out of global memory into a staging buffer the consumer carves?
+//
+// This is the distinction every operand-staging decision below actually turns
+// on, and it is NOT "is it a contraction": a fused combine produces its output
+// scratch exactly like a fused contraction does, so a consumer stages both by
+// reordering that buffer in place (or consumes it zero-copy) and neither costs
+// a byte of the consumer's own scratch. Only an InputTag operand is copied.
+//
+// Spelled once, here, because the alternative -- open-coding the tag
+// disjunction at each site -- is what let the two predicates below silently
+// treat a combine operand as "copied, therefore unconstrained".
+template <typename Node>
+inline constexpr bool produces_own_scratch_v =
+    has_node_tag_v<ContractionTag, Node> || has_node_tag_v<CombineTag, Node>;
+
+// Every node kind an evaluator can consume as an operand: a leaf input, or a
+// fused node that produces its own scratch.
+template <typename Node>
+inline constexpr bool fusable_operand_v =
+    has_node_tag_v<InputTag, Node> || produces_own_scratch_v<Node>;
+
 // Can operand `Node`, tiled by `Tile`, be staged into the axis order `PermSeq`
 // gathers into?
 //
-// A fused (contraction) operand hands back its own C scratch and is reordered
-// IN PLACE, which is a self-map of that fixed buffer only when every transposed
-// axis pair has equal extents -- a 16x32 tile cannot be transposed inside its
-// own storage. Every other operand is copied into a fresh staging buffer on the
-// way in, so nothing constrains it.
+// A fused operand (contraction or combine) hands back its own output scratch
+// and is reordered IN PLACE, which is a self-map of that fixed buffer only when
+// every transposed axis pair has equal extents -- a 16x32 tile cannot be
+// transposed inside its own storage. An input operand is copied into a fresh
+// staging buffer on the way in, so nothing constrains it.
 //
 // Deliberately spelled with transpositions_equal_extent, the SAME predicate the
 // in-place reorder asserts on the scratch layout at its call site (see
@@ -291,7 +342,7 @@ using operand_leaf_tile_t =
 // the reorder.
 template <typename Node, typename Tile, typename PermSeq>
 inline constexpr bool operand_stageable_v = [] {
-  if constexpr (!has_node_tag_v<ContractionTag, Node>)
+  if constexpr (!produces_own_scratch_v<Node>)
     return true;  // copied into its own staging buffer; shape unconstrained
   else if constexpr (is_identity_seq(PermSeq{}))
     return true;  // zero-copy passthrough; nothing is reordered
@@ -309,11 +360,12 @@ inline constexpr bool operand_stageable_v = [] {
 // consumer's choice between them is otherwise buried in an evaluator class
 // body, where a test can only observe it by instantiating the whole evaluator.
 //
-// Only a contraction operand qualifies. Its storage is private per-team
-// scratch, so relabeling it aliases nothing observable -- unlike an input
-// operand, whose storage is the user's global tensor and whose reads would also
-// lose their coalescing if driven by the consumer's traversal order rather than
-// the source's memory order.
+// Only a fused operand (contraction or combine) qualifies -- exactly the nodes
+// produces_own_scratch_v names. Their storage is private per-team scratch, so
+// relabeling it aliases nothing observable -- unlike an input operand, whose
+// storage is the user's global tensor and whose reads would also lose their
+// coalescing if driven by the consumer's traversal order rather than the
+// source's memory order.
 //
 // Restricted further to the permuted, unhooked case:
 //   • an identity permutation already costs nothing on the staging path (true
@@ -326,12 +378,18 @@ inline constexpr bool operand_stageable_v = [] {
 // and must always stage. Only the combine evaluator consults this.
 //
 // hook_type is declared only on the ContractionTag node specialization, hence
-// the if constexpr rather than a `&&` chain.
+// the if constexpr chain rather than a `&&` one. A CombineTag node carries no
+// hook member at all (its fn already sees every coordinate and operand value,
+// so there is no separate store hook to apply), which is why its branch drops
+// the hook half of the rule as vacuously satisfied rather than naming a
+// hook_type it does not have.
 template <typename Node, typename PermSeq>
 inline constexpr bool operand_relabelable_v = [] {
   if constexpr (has_node_tag_v<ContractionTag, Node>)
     return !is_identity_seq(PermSeq{}) &&
            std::is_same_v<typename Node::hook_type, NoHook>;
+  else if constexpr (has_node_tag_v<CombineTag, Node>)
+    return !is_identity_seq(PermSeq{});
   else
     return false;
 }();

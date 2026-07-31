@@ -102,6 +102,17 @@ auto assemble_operand(const OpNode& op, const LeafTile& leaf,
         "sub-contraction's output tile (bundle.c)");
     return nested;
   } else {
+    // The flat form describes a pure contraction chain: one Tile<A,B,C> per
+    // ContractionTag node, and every other operand a leaf taking the parent
+    // bundle's .a/.b tile directly. A fused COMBINE operand breaks that -- it
+    // needs its own nested CombineTile, which no flat list of Tile<A,B,C>
+    // bundles can carry -- and would otherwise be silently handed the parent's
+    // leaf tile and mis-staged. Reject it here rather than downstream.
+    static_assert(has_node_tag_v<InputTag, OpNode>,
+                  "flat tile list: a non-contraction operand must be an input "
+                  "node. A fused combine operand needs its own nested tiling "
+                  "spec -- build the bundle explicitly (make_combine_tile) and "
+                  "use the Graph::execute overload taking one assembled tile");
     return leaf;
   }
 }
