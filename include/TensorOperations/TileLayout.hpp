@@ -7,6 +7,28 @@
 #include <Kokkos_Array.hpp>
 #include <Kokkos_Macros.hpp>
 
+// TENSOR_OPS_VERIFY_RESHAPE — compile-time static_assert that a generic
+// reshape's emitted strides reproduce the source's element→offset map, element
+// for element. Nothing else checks that: StaticLayout's own permutation and
+// positivity static_asserts all pass on a wrong plan, so a planner bug would
+// surface as silently wrong numerics rather than a compile error.
+//
+// The check is O(num_elements) constexpr work per instantiation, so it is a
+// debug-build check: on when NDEBUG is absent or Kokkos' bounds checking is on
+// (the same switch Tiling.hpp and TiledLayout.hpp already use), off in a
+// release build. Define it to 0 or 1 on the command line to override either
+// way.
+//
+// Lives here rather than in Macros.hpp because it reads a Kokkos macro, and
+// Macros.hpp is included before <Kokkos_Macros.hpp> by both its consumers.
+#if !defined(TENSOR_OPS_VERIFY_RESHAPE)
+#if defined(KOKKOS_ENABLE_DEBUG_BOUNDS_CHECK) || !defined(NDEBUG)
+#define TENSOR_OPS_VERIFY_RESHAPE 1
+#else
+#define TENSOR_OPS_VERIFY_RESHAPE 0
+#endif
+#endif
+
 namespace TensorOperations {
 
 struct LayoutRight {};
@@ -542,7 +564,8 @@ struct StaticLayout<StaticTile<Extents...>,
   // divisors (no reciprocal needed). Divides by the *packed* strides, not
   // stride(d): a linear index runs over [0, size()), which counts elements, so
   // a padded layout's pad slots must not enter the decode.
-  KOKKOS_FORCEINLINE_FUNCTION auto operator[](int linear) const noexcept {
+  KOKKOS_FORCEINLINE_FUNCTION constexpr auto operator[](
+      int linear) const noexcept {
     return decode_impl(linear, std::make_index_sequence<rank>{});
   }
 
@@ -576,7 +599,7 @@ struct StaticLayout<StaticTile<Extents...>,
   }
 
   template <std::size_t... Ds>
-  KOKKOS_FORCEINLINE_FUNCTION static auto decode_impl(
+  KOKKOS_FORCEINLINE_FUNCTION static constexpr auto decode_impl(
       int linear, std::index_sequence<Ds...>) noexcept {
     return Impl::Index<rank>{
         static_cast<int>((linear / packed_stride(static_cast<int>(Ds))) %
@@ -695,7 +718,8 @@ struct StaticLayout<DeviceTuple<ExtSeqs...>, DeviceTuple<StrSeqs...>,
   // leaf's *packed* stride — a linear index runs over [0, size()), which counts
   // elements, so a padded layout's gaps must not enter — then recombines the
   // leaves of a mode into that mode's collapsed index.
-  KOKKOS_FORCEINLINE_FUNCTION auto operator[](int linear) const noexcept {
+  KOKKOS_FORCEINLINE_FUNCTION constexpr auto operator[](
+      int linear) const noexcept {
     return decode_impl(linear, std::make_index_sequence<rank>{});
   }
 
@@ -748,7 +772,7 @@ struct StaticLayout<DeviceTuple<ExtSeqs...>, DeviceTuple<StrSeqs...>,
   }
 
   template <std::size_t... Ms>
-  KOKKOS_FORCEINLINE_FUNCTION static auto decode_impl(
+  KOKKOS_FORCEINLINE_FUNCTION static constexpr auto decode_impl(
       int linear, std::index_sequence<Ms...>) noexcept {
     return Impl::Index<rank>{
         mode_of<Ms>(linear, std::make_index_sequence<mode_t<Ms>::arity>{})...};
@@ -854,5 +878,475 @@ struct DynamicTileLayoutLeft : Impl::DynamicTileLayoutBase<Rank> {
     return Impl::Index<Rank>{idx};
   }
 };
+
+namespace Impl {
+
+// ---------------------------------------------------------------------------
+// Generic reshape: planner and materializer.
+//
+// Reinterprets a flat StaticLayout — packed or padded, any memory order — under
+// a new shape and a new memory order, with no data movement. The result is a
+// flat StaticLayout when every new mode maps to a single contiguous run of the
+// source, and the nested (hierarchical) StaticLayout when one does not.
+//
+// SEMANTICS (numpy, stated over MEMORY order on both sides): the k-th element
+// of the source in its own memory-order enumeration is the k-th element of the
+// result in its memory-order enumeration. That reduces to the existing packed
+// reshape(Right, tile) / reshape(Left, tile) overloads when the source and
+// target orders match — which is exactly why the target order has to be given
+// explicitly: Right lists new extents slowest-first and Left fastest-first, so
+// no rule inferred from the extents alone reproduces both.
+//
+// EVERYTHING HERE IS COMPILE-TIME ONLY and deliberately NOT KOKKOS_FUNCTION.
+// Marking a constexpr __host__ function __host__ __device__ trips nvcc warning
+// #20013 when it is called from device-side constant evaluation, and would need
+// --expt-relaxed-constexpr. A plan never exists at runtime, so host-only is
+// both correct and warning-free. Do not "fix" this by adding KOKKOS_FUNCTION.
+//
+// The user-facing entry points are the reshape() overloads in Tiling.hpp and
+// TiledLayout.hpp.
+// ---------------------------------------------------------------------------
+
+// Fixed capacities for the ragged plan below. A plan is a compile-time value,
+// so it cannot allocate; exceeding either bound is reported as CapacityExceeded
+// rather than silently truncated.
+inline constexpr int kReshapeMaxModes  = 8;
+inline constexpr int kReshapeMaxLeaves = 16;
+
+enum class ReshapeStatus : int {
+  Ok = 0,
+  CountMismatch,     // product(new extents) != source element count
+  BadOrder,          // the new order is not a permutation of [0, new rank)
+                     // — including having the wrong number of entries
+  NotFactorable,     // a new mode cannot be carved from the source's stream
+  CapacityExceeded,  // more modes / leaves than the plan can hold
+};
+
+// ---------------------------------------------------------------------------
+// ReshapePlan — the ragged descriptor the materializer turns into a layout
+// type.
+//
+// `nmodes` logical modes, each backed by `arity[m]` memory leaves. Leaves are
+// flattened MODE-MAJOR into ext/str (mode 0's leaves first), so mode m's leaves
+// occupy [base(m), base(m) + arity[m]). `ord` holds global leaf indices listed
+// in ascending MEMORY position — the flat form the nested StaticLayout wants.
+// ---------------------------------------------------------------------------
+struct ReshapePlan {
+  ReshapeStatus status  = ReshapeStatus::Ok;
+  int           nmodes  = 0;
+  int           nleaves = 0;
+  int           arity[kReshapeMaxModes]{};
+  int           ext[kReshapeMaxLeaves]{};
+  int           str[kReshapeMaxLeaves]{};
+  int           ord[kReshapeMaxLeaves]{};
+
+  constexpr bool ok() const noexcept { return status == ReshapeStatus::Ok; }
+
+  // Global index of mode m's first leaf.
+  constexpr int base(int m) const noexcept {
+    int b = 0;
+    for (int i = 0; i < m; ++i) b += arity[i];
+    return b;
+  }
+
+  // True when the result collapses to a flat layout: one leaf per mode.
+  constexpr bool all_arity_one() const noexcept {
+    for (int m = 0; m < nmodes; ++m)
+      if (arity[m] != 1) return false;
+    return true;
+  }
+};
+
+constexpr int reshape_gcd(int a, int b) noexcept {
+  while (b) {
+    const int t = a % b;
+    a           = b;
+    b           = t;
+  }
+  return a;
+}
+
+// order_is_permutation over an array rather than a pack, for the runtime-shaped
+// arrays the planner works with.
+template <int N>
+constexpr bool reshape_order_is_permutation(const int (&O)[N]) noexcept {
+  bool seen[N] = {};
+  for (int j = 0; j < N; ++j) {
+    if (O[j] < 0 || O[j] >= N || seen[O[j]]) return false;
+    seen[O[j]] = true;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// make_reshape_plan — greedy split/merge factorization, one constexpr pass.
+//
+//   E/S/O  source extents, strides, and memory order (O[j] = the dimension at
+//          memory position j, fastest-varying first)
+//   F/NO   new extents, and the new memory order (NO[jj] = the new mode at
+//          memory position jj, fastest first)
+//
+// Walks the source's memory-order mixed-radix stream and carves each new mode
+// out of it in memory order. Each carve takes gcd(what the mode still needs,
+// what is left of the current source dimension) as one leaf; a gcd of 1, or
+// running out of source, means the target shape is not an affine
+// reinterpretation of the source and the plan is rejected rather than
+// approximated.
+// ---------------------------------------------------------------------------
+template <int N, int M, int MO>
+constexpr ReshapePlan make_reshape_plan(const int (&E)[N], const int (&S)[N],
+                                        const int (&O)[N], const int (&F)[M],
+                                        const int (&NO)[MO]) noexcept {
+  ReshapePlan p{};
+  p.nmodes = M;
+
+  if (M > kReshapeMaxModes) return ReshapePlan{ReshapeStatus::CapacityExceeded};
+
+  // NO is validated FIRST and by the planner itself, not only by the caller's
+  // static_assert: the loop below indexes per-mode arrays by NO[jj], and a
+  // reshape's return type is computed before its body's static_asserts ever
+  // run, so a wrong-length or out-of-range order would be a constexpr
+  // out-of-bounds read — a hard error at the wrong place, with none of the
+  // intended diagnostics.
+  if (MO != M) return ReshapePlan{ReshapeStatus::BadOrder};
+  if (!reshape_order_is_permutation(NO))
+    return ReshapePlan{ReshapeStatus::BadOrder};
+
+  // Checked up front so a mismatch reports as itself rather than as whatever
+  // the carve loop happens to trip over first.
+  {
+    long long src = 1, dst = 1;
+    for (int d = 0; d < N; ++d) src *= E[d];
+    for (int m = 0; m < M; ++m) dst *= F[m];
+    if (src != dst) return ReshapePlan{ReshapeStatus::CountMismatch};
+  }
+
+  // The source's memory-order stream: extents and strides, fastest axis first.
+  int se[N]{}, ss[N]{};
+  for (int j = 0; j < N; ++j) {
+    se[j] = E[O[j]];
+    ss[j] = S[O[j]];
+  }
+
+  // Emission log, in memory order: which (mode, leaf) each emission was.
+  int em_mode[kReshapeMaxLeaves]{}, em_leaf[kReshapeMaxLeaves]{};
+  int nem = 0;
+
+  // Per-mode leaf staging.
+  int mode_ext[kReshapeMaxModes][kReshapeMaxLeaves]{};
+  int mode_str[kReshapeMaxModes][kReshapeMaxLeaves]{};
+
+  int i = 0, rem_e = (N > 0 ? se[0] : 1), rem_s = (N > 0 ? ss[0] : 1);
+
+  for (int jj = 0; jj < M; ++jj) {
+    const int m    = NO[jj];
+    int       need = F[m];
+
+    if (need == 1) {  // degenerate mode: one leaf of extent 1
+      mode_ext[m][0] = 1;
+      mode_str[m][0] = 1;
+      p.arity[m]     = 1;
+      if (nem >= kReshapeMaxLeaves)
+        return ReshapePlan{ReshapeStatus::CapacityExceeded};
+      em_mode[nem] = m;
+      em_leaf[nem] = 0;
+      ++nem;
+      continue;
+    }
+
+    while (need > 1) {
+      if (rem_e == 1) {  // current source dimension exhausted -> advance
+        ++i;
+        if (i >= N) return ReshapePlan{ReshapeStatus::NotFactorable};
+        rem_e = se[i];
+        rem_s = ss[i];
+        continue;
+      }
+      const int g = reshape_gcd(need, rem_e);
+      if (g == 1) return ReshapePlan{ReshapeStatus::NotFactorable};
+
+      const int l = p.arity[m];
+
+      // Coalesce with the mode's previous leaf when this carve continues it
+      // contiguously: a leaf (e0, s0) followed by (g, s0*e0) addresses exactly
+      // the same elements as the single leaf (e0*g, s0). Without this, any
+      // reshape that merges whole source dimensions -- collapsing a packed
+      // rank-3 tile to a matrix, say -- would emit one leaf per source
+      // dimension and land on the nested layout, when the flat one describes it
+      // exactly. That costs stride(d), the TensorLike concept, and a divide and
+      // modulo per access, all for nothing.
+      //
+      // Safe because a mode's leaves are emitted consecutively (each mode is
+      // carved once, to completion), so merging two of them cannot disturb any
+      // other mode's memory position; and the merged run is contiguous, so it
+      // keeps the position of the earlier leaf. No new emission is logged.
+      if (l > 0 && rem_s == mode_str[m][l - 1] * mode_ext[m][l - 1]) {
+        mode_ext[m][l - 1] *= g;
+        rem_s *= g;
+        rem_e /= g;
+        need /= g;
+        continue;
+      }
+
+      if (l >= kReshapeMaxLeaves || nem >= kReshapeMaxLeaves)
+        return ReshapePlan{ReshapeStatus::CapacityExceeded};
+      mode_ext[m][l] = g;
+      mode_str[m][l] = rem_s;
+      p.arity[m]     = l + 1;
+      em_mode[nem]   = m;
+      em_leaf[nem]   = l;
+      ++nem;
+
+      // The rest of this source dimension carries on at a stride g times wider,
+      // which is what lets a later mode pick up where this one stopped.
+      rem_s *= g;
+      rem_e /= g;
+      need /= g;
+    }
+  }
+
+  // Every source element must have been consumed. Trailing extent-1 dimensions
+  // are fine; anything else means the carve stopped short.
+  for (int j = i + 1; j < N; ++j)
+    if (se[j] != 1) return ReshapePlan{ReshapeStatus::NotFactorable};
+  if (rem_e != 1) return ReshapePlan{ReshapeStatus::NotFactorable};
+
+  // Flatten the staged leaves MODE-MAJOR.
+  p.nleaves = nem;
+  int w     = 0;
+  for (int m = 0; m < M; ++m)
+    for (int l = 0; l < p.arity[m]; ++l) {
+      p.ext[w] = mode_ext[m][l];
+      p.str[w] = mode_str[m][l];
+      ++w;
+    }
+
+  // Order: the global leaf index of each emission, in memory order.
+  for (int q = 0; q < nem; ++q) p.ord[q] = p.base(em_mode[q]) + em_leaf[q];
+
+  return p;
+}
+
+// ---------------------------------------------------------------------------
+// ReshapePlanFor — carries a plan as a TYPE.
+//
+// A tag functor rather than a class-type non-type template parameter. Both
+// forms compile under nvcc 13.2 for device, but this one does not require
+// ReshapePlan to remain a structural type, so the three 16-int arrays never end
+// up frozen into the mangled name of every intermediate alias.
+// ---------------------------------------------------------------------------
+template <typename SrcExt, typename SrcStr, typename SrcOrd, typename NewExt,
+          typename NewOrd>
+struct ReshapePlanFor;
+
+template <int... E, int... S, int... O, int... F, int... NO>
+struct ReshapePlanFor<StaticTile<E...>, std::integer_sequence<int, S...>,
+                      std::integer_sequence<int, O...>, StaticTile<F...>,
+                      std::integer_sequence<int, NO...>> {
+  constexpr ReshapePlan operator()() const noexcept {
+    constexpr int e[]  = {E...};
+    constexpr int s[]  = {S...};
+    constexpr int o[]  = {O...};
+    constexpr int f[]  = {F...};
+    constexpr int no[] = {NO...};
+    return make_reshape_plan(e, s, o, f, no);
+  }
+};
+
+// --- materializer ----------------------------------------------------------
+
+enum class ReshapeField : int { Ext = 0, Str = 1, Ord = 2 };
+
+constexpr int reshape_field(const ReshapePlan& p, ReshapeField f,
+                            int i) noexcept {
+  return f == ReshapeField::Ext
+             ? p.ext[i]
+             : (f == ReshapeField::Str ? p.str[i] : p.ord[i]);
+}
+
+// Mode M's leaves for one field, as an integer_sequence — the two-level pack
+// expansion whose INNER length varies per mode.
+//
+// ext/str are flattened mode-major, so mode M's leaves are at base(M)+L. `ord`
+// is a FLAT memory-position list and is sliced by those same arity groups,
+// which looks wrong and is not: the nested StaticLayout only requires that the
+// CONCATENATION of OrdSeqs be the memory-order list of global leaf indices (it
+// consumes concat_seq_t<OrdSeqs...>, see flat_packed_ above), and that the
+// grouping mirror the extents' arity shape. Slicing by arity satisfies both.
+template <typename Fn, ReshapeField F, int M, typename Ls>
+struct ReshapeModeSeq;
+template <typename Fn, ReshapeField F, int M, std::size_t... L>
+struct ReshapeModeSeq<Fn, F, M, std::index_sequence<L...>> {
+  static constexpr ReshapePlan P = Fn{}();
+  using type =
+      std::integer_sequence<int, reshape_field(
+                                     P, F, P.base(M) + static_cast<int>(L))...>;
+};
+
+template <typename Fn, ReshapeField F, int M>
+using reshape_mode_seq_t = typename ReshapeModeSeq<
+    Fn, F, M,
+    std::make_index_sequence<static_cast<std::size_t>(Fn{}().arity[M])>>::type;
+
+// A mode with more than one leaf: the nested specialisation.
+template <typename Fn, typename Ms>
+struct ReshapeNested;
+template <typename Fn, std::size_t... Ms>
+struct ReshapeNested<Fn, std::index_sequence<Ms...>> {
+  using type = StaticLayout<
+      DeviceTuple<
+          reshape_mode_seq_t<Fn, ReshapeField::Ext, static_cast<int>(Ms)>...>,
+      DeviceTuple<
+          reshape_mode_seq_t<Fn, ReshapeField::Str, static_cast<int>(Ms)>...>,
+      DeviceTuple<
+          reshape_mode_seq_t<Fn, ReshapeField::Ord, static_cast<int>(Ms)>...>>;
+};
+
+// Every mode arity 1: global leaf index == mode index, so ext/str ARE the
+// per-dimension extents and strides and ord IS the dimension order. Collapsing
+// to the flat specialisation is not about speed (an arity-1 nested mode already
+// compiles to exactly i*stride) — it is so the result keeps stride(d) and
+// satisfies the TensorLike concept whenever it possibly can.
+//
+// A packed result additionally recovers the NAMED layout —
+// StaticTileLayoutRight or StaticTileLayoutLeft rather than the StaticLayout
+// they derive from. Without that, this overload would not be a drop-in superset
+// of the packed two-argument ones: tile_layout() (and therefore tile_view()) is
+// overloaded on the four named types only, so handing it a base-class result is
+// a compile error, and the whole register-blocked GEMM path runs through
+// tile_view. Returning the same type the two-argument overload returns for the
+// same reshape also keeps the two families from disagreeing about what they
+// describe.
+template <typename Fn, typename Ms>
+struct ReshapeFlat;
+template <typename Fn, std::size_t... Ms>
+struct ReshapeFlat<Fn, std::index_sequence<Ms...>> {
+  static constexpr ReshapePlan P = Fn{}();
+
+  static constexpr int rank_ = static_cast<int>(sizeof...(Ms));
+  using tile_t               = StaticTile<P.ext[Ms]...>;
+  using str_t                = std::integer_sequence<int, P.str[Ms]...>;
+  using ord_t                = std::integer_sequence<int, P.ord[Ms]...>;
+
+  // Packed means: the declared strides are the gap-free ones for this order.
+  static constexpr bool packed_ =
+      std::is_same_v<str_t, packed_strides_t<tile_t, ord_t>>;
+
+  using type = std::conditional_t<
+      packed_ && std::is_same_v<ord_t, right_order_t<rank_>>,
+      StaticTileLayoutRight<P.ext[Ms]...>,
+      std::conditional_t<packed_ && std::is_same_v<ord_t, left_order_t<rank_>>,
+                         StaticTileLayoutLeft<P.ext[Ms]...>,
+                         StaticLayout<tile_t, str_t, ord_t>>>;
+};
+
+template <typename T>
+struct ReshapeIdentity {
+  using type = T;
+};
+
+// Stand-in return type for a rejected plan. The reshape overload's body
+// supplies the real diagnostic through a status-specific static_assert; this
+// only has to be a well-formed type, never a used one. Without it, a rejected
+// plan would reach StaticTileLayoutBase with zero modes and fail there instead,
+// burying the intended message under a cascade.
+using ReshapeErrorLayout =
+    StaticLayout<StaticTile<1>, std::integer_sequence<int, 1>,
+                 std::integer_sequence<int, 0>>;
+
+// conditional_t selects between the metafunctions themselves; naming one does
+// not instantiate it, only the chosen ::type does. That is what keeps a
+// rejected plan from instantiating a layout it cannot describe.
+template <typename Fn>
+struct ReshapeResult {
+  static constexpr ReshapePlan P = Fn{}();
+  using modes = std::make_index_sequence<static_cast<std::size_t>(P.nmodes)>;
+  using type  = typename std::conditional_t<
+      !P.ok(), ReshapeIdentity<ReshapeErrorLayout>,
+      std::conditional_t<P.all_arity_one(), ReshapeFlat<Fn, modes>,
+                         ReshapeNested<Fn, modes>>>::type;
+};
+
+template <typename Fn>
+using reshape_result_t = typename ReshapeResult<Fn>::type;
+
+// A plan's status as a constant, reachable without CALLING anything.
+//
+// reshape() is KOKKOS_FORCEINLINE_FUNCTION, i.e. __host__ __device__, and the
+// planner is deliberately host-only (see the note at the top of this section).
+// Invoking it from reshape()'s body — even in a static_assert, where it is only
+// ever constant-evaluated — trips nvcc warning #20013 and would need
+// --expt-relaxed-constexpr. Reading a variable template instead does not: the
+// evaluation happens here, at namespace scope, in host context.
+template <typename Fn>
+inline constexpr ReshapeStatus reshape_status_v = Fn{}().status;
+
+template <typename Fn>
+inline constexpr bool reshape_ok_v = reshape_status_v<Fn> == ReshapeStatus::Ok;
+
+// The layout reshape(src, tile, order) returns, named directly from the source
+// and target parameters. This is the spelling the reshape overloads use for
+// their trailing return type.
+template <typename SrcExt, typename SrcStr, typename SrcOrd, typename NewExt,
+          typename NewOrd>
+using reshaped_layout_t =
+    reshape_result_t<ReshapePlanFor<SrcExt, SrcStr, SrcOrd, NewExt, NewOrd>>;
+
+// --- verification (see TENSOR_OPS_VERIFY_RESHAPE at the top of this file) ----
+
+// The memory offset of the k-th element of a layout's memory-order enumeration,
+// computed straight from (extents, strides, order). Deliberately independent of
+// StaticLayout's own encode/decode, so comparing a result against it is an
+// oracle rather than a tautology.
+template <int N>
+constexpr int reshape_stream_offset(const int (&E)[N], const int (&S)[N],
+                                    const int (&O)[N], int k) noexcept {
+  int off = 0;
+  for (int j = 0; j < N; ++j) {  // fastest axis first
+    const int d = O[j];
+    off += (k % E[d]) * S[d];
+    k /= E[d];
+  }
+  return off;
+}
+
+// Does Result reproduce the source's element→offset map, element for element?
+// Exercises the real runtime path — Result's decode and Mode::offset — not just
+// the plan arrays.
+template <typename Result, typename SrcExt, typename SrcStr, typename SrcOrd>
+struct ReshapeReproducesSource;
+
+template <typename Result, int... E, int... S, int... O>
+struct ReshapeReproducesSource<Result, StaticTile<E...>,
+                               std::integer_sequence<int, S...>,
+                               std::integer_sequence<int, O...>> {
+  static constexpr bool check() noexcept {
+    constexpr int e[] = {E...};
+    constexpr int s[] = {S...};
+    constexpr int o[] = {O...};
+    const int     n   = static_cast<int>(Result::num_elements);
+    for (int k = 0; k < n; ++k)
+      if (Result::flat_offset(Result{}[k]) != reshape_stream_offset(e, s, o, k))
+        return false;
+    return true;
+  }
+  static constexpr bool value = check();
+};
+
+// Runs the check only for an accepted plan. A rejected plan's result type is
+// the ReshapeErrorLayout placeholder, which of course does not reproduce
+// anything — checking it would bury the status-specific diagnostic under a
+// second, wrong one. Partial specialisation rather than `||` because a
+// disjunction would still instantiate the right-hand ::value.
+template <bool Ok, typename Result, typename SrcExt, typename SrcStr,
+          typename SrcOrd>
+struct ReshapeVerifyIf {
+  static constexpr bool value = true;
+};
+template <typename Result, typename SrcExt, typename SrcStr, typename SrcOrd>
+struct ReshapeVerifyIf<true, Result, SrcExt, SrcStr, SrcOrd>
+    : ReshapeReproducesSource<Result, SrcExt, SrcStr, SrcOrd> {};
+
+}  // namespace Impl
 
 }  // namespace TensorOperations

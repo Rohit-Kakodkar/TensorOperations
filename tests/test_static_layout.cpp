@@ -177,6 +177,160 @@ static_assert(Ragged{}.flat(0, 20) == 120);  // j2 -> stride 120
 static_assert(Ragged{}.flat(5, 119) == 719);
 static_assert(Ragged::flat_offset(Impl::Index<2>{5, 119}) == 719);
 
+// ---------------------------------------------------------------------------
+// 4. The generic reshape — reshape(StaticLayout, Tile, Order).
+//
+// Reinterprets a flat StaticLayout (packed or padded, any memory order) under a
+// new shape and a new memory order, with no data movement. It is the producer
+// the nested layout above was built for.
+//
+// Every accepted case asserts the resulting TYPE *and* the offset map it
+// produces. Type equality alone is not enough: a planner that emits a plausible
+// shape with wrong strides would pass a type check and read the wrong memory.
+// ---------------------------------------------------------------------------
+
+// The k-th element of Padded2D in memory order, which is what a reshape of it
+// must reproduce. Padded2D is row-major over (4,8), so element k is (k/8, k%8).
+constexpr int padded2d_offset_at(int k) noexcept {
+  return static_cast<int>(Padded2D{}.flat(k / 8, k % 8));
+}
+
+// --- 4a. Packed source, flat result ----------------------------------------
+// Every new mode maps to a single contiguous run, so the result collapses to
+// the FLAT specialisation — which is what keeps stride(d) available.
+using ReshRight = decltype(reshape(StaticTileLayoutRight<32>{},
+                                   StaticTile<4, 8>{}, order<1, 0>{}));
+static_assert(
+    std::is_same_v<ReshRight,
+                   StaticLayout<StaticTile<4, 8>, strides<8, 1>, order<1, 0>>>);
+// ...and it is exactly the base of the named layout the 2-arg overload returns.
+static_assert(std::is_base_of_v<ReshRight, StaticTileLayoutRight<4, 8>>);
+static_assert(std::is_same_v<ReshRight, Manual2D>);
+static_assert(ReshRight::stride(0) == 8 && ReshRight::stride(1) == 1);
+static_assert(ReshRight::mode_arity<0>() == 1 &&
+              ReshRight::mode_arity<1>() == 1);
+
+// The same source under the opposite order gives the column-major answer, i.e.
+// the Order argument alone selects between the two conventions the packed
+// overloads hard-code.
+using ReshLeft = decltype(reshape(StaticTileLayoutRight<32>{},
+                                  StaticTile<4, 8>{}, order<0, 1>{}));
+static_assert(
+    std::is_same_v<ReshLeft,
+                   StaticLayout<StaticTile<4, 8>, strides<1, 4>, order<0, 1>>>);
+static_assert(std::is_base_of_v<ReshLeft, StaticTileLayoutLeft<4, 8>>);
+
+// The LayoutRight / LayoutLeft spellings are the same two results.
+static_assert(
+    std::is_same_v<decltype(reshape(StaticTileLayoutRight<32>{},
+                                    StaticTile<4, 8>{}, LayoutRight{})),
+                   ReshRight>);
+static_assert(
+    std::is_same_v<decltype(reshape(StaticTileLayoutRight<32>{},
+                                    StaticTile<4, 8>{}, LayoutLeft{})),
+                   ReshLeft>);
+
+// A named layout binds to the generic overload by base-class deduction, so the
+// three-argument form is a strict superset of the two-argument ones.
+static_assert(
+    std::is_base_of_v<decltype(reshape(StaticTileLayoutLeft<32>{},
+                                       StaticTile<4, 8>{}, LayoutLeft{})),
+                      StaticTileLayoutLeft<4, 8>>);
+
+// --- 4b. Padded source, merged across the gap ------------------------------
+// (4,8) with a row pitch of 9 flattened to rank 1: no single stride can express
+// it, so the result is one mode of two leaves — extents (8,4), strides (1,9).
+using ReshPaddedFlat =
+    decltype(reshape(Padded2D{}, StaticTile<32>{}, order<0>{}));
+static_assert(
+    std::is_same_v<ReshPaddedFlat,
+                   StaticLayout<DT<ext<8, 4>>, DT<ext<1, 9>>, DT<ext<0, 1>>>>);
+static_assert(ReshPaddedFlat::rank == 1);
+static_assert(ReshPaddedFlat::extent(0) == 32);
+static_assert(ReshPaddedFlat::mode_arity<0>() == 2);
+
+constexpr bool padded_flat_offsets_match() noexcept {
+  for (int k = 0; k < 32; ++k)
+    if (static_cast<int>(ReshPaddedFlat{}.flat(k)) != padded2d_offset_at(k))
+      return false;
+  return true;
+}
+static_assert(padded_flat_offsets_match());
+
+// --- 4c. Padded source, ragged result --------------------------------------
+// -> (2,16) with mode 1 fastest. Mode 0 is one leaf (stride 18, two whole
+// rows); mode 1 spans a row and a half, so it needs two.
+using ReshPaddedRagged =
+    decltype(reshape(Padded2D{}, StaticTile<2, 16>{}, order<1, 0>{}));
+static_assert(
+    std::is_same_v<ReshPaddedRagged,
+                   StaticLayout<DT<ext<2>, ext<8, 2>>, DT<ext<18>, ext<1, 9>>,
+                                DT<ext<1>, ext<2, 0>>>>);
+static_assert(ReshPaddedRagged::mode_arity<0>() == 1);
+static_assert(ReshPaddedRagged::mode_arity<1>() == 2);
+
+constexpr bool padded_ragged_offsets_match() noexcept {
+  for (int m0 = 0; m0 < 2; ++m0)
+    for (int m1 = 0; m1 < 16; ++m1)
+      if (static_cast<int>(ReshPaddedRagged{}.flat(m0, m1)) !=
+          padded2d_offset_at(m0 * 16 + m1))
+        return false;
+  return true;
+}
+static_assert(padded_ragged_offsets_match());
+
+// --- 4d. Arbitrary memory order, packed source ------------------------------
+// Stride3D is {4,8,3} with dim 2 fastest, so its memory stream is
+// (3, s=1), (4, s=3), (8, s=12). Flattening to rank 1 merges all three: the
+// leaves are the stream itself, which no 2-D reinterpretation could express.
+using ReshStride3D =
+    decltype(reshape(Stride3D{}, StaticTile<96>{}, order<0>{}));
+static_assert(std::is_same_v<ReshStride3D,
+                             StaticLayout<DT<ext<3, 4, 8>>, DT<ext<1, 3, 12>>,
+                                          DT<ext<0, 1, 2>>>>);
+static_assert(ReshStride3D::mode_arity<0>() == 3);
+
+// --- 4e. Identity ------------------------------------------------------------
+// Reshaping to the source's own shape and order returns the source type,
+// padding and all — the reshape is a no-op rather than a re-derivation.
+static_assert(std::is_same_v<decltype(reshape(Padded2D{}, StaticTile<4, 8>{},
+                                              order<1, 0>{})),
+                             Padded2D>);
+static_assert(std::is_same_v<decltype(reshape(Padded3D{}, StaticTile<4, 8, 3>{},
+                                              order<2, 0, 1>{})),
+                             Padded3D>);
+
+// --- 4f. Rejections ---------------------------------------------------------
+// The plan is inspectable without calling reshape(), so the negative cases are
+// testable without provoking the compile error they are supposed to provoke.
+template <typename SrcExt, typename SrcStr, typename SrcOrd, typename NewExt,
+          typename NewOrd>
+inline constexpr Impl::ReshapeStatus plan_status =
+    Impl::ReshapePlanFor<SrcExt, SrcStr, SrcOrd, NewExt, NewOrd>{}().status;
+
+// A radix-6 stream cannot yield a mode of 8: gcd(8, 6) == 2, then gcd(4, 3)
+// == 1.
+static_assert(plan_status<StaticTile<6, 4>, strides<4, 1>, order<1, 0>,
+                          StaticTile<8, 3>, order<1, 0>> ==
+              Impl::ReshapeStatus::NotFactorable);
+// Wrong element count.
+static_assert(plan_status<StaticTile<4, 8>, strides<9, 1>, order<1, 0>,
+                          StaticTile<2, 17>, order<1, 0>> ==
+              Impl::ReshapeStatus::CountMismatch);
+// Order is not a permutation...
+static_assert(plan_status<StaticTile<4, 8>, strides<9, 1>, order<1, 0>,
+                          StaticTile<2, 16>, order<1, 1>> ==
+              Impl::ReshapeStatus::BadOrder);
+// ...including the wrong number of entries, which would otherwise index out of
+// bounds inside the planner before any diagnostic could fire.
+static_assert(plan_status<StaticTile<4, 8>, strides<9, 1>, order<1, 0>,
+                          StaticTile<2, 16>, order<0>> ==
+              Impl::ReshapeStatus::BadOrder);
+
+// And the accepted cases above really are accepted, not silently degraded.
+static_assert(plan_status<StaticTile<4, 8>, strides<9, 1>, order<1, 0>,
+                          StaticTile<32>, order<0>> == Impl::ReshapeStatus::Ok);
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -442,6 +596,109 @@ TEST(NestedStaticLayout, ViewDecodeLoopRagged) {
   // Decode is a bijection onto the slots, so slot f holds exactly f.
   for (int f = 0; f < 720; ++f)
     EXPECT_FLOAT_EQ(buf(f), static_cast<float>(f)) << "f=" << f;
+}
+
+// ---------------------------------------------------------------------------
+// TEST: write-through on a reshaped padded layout. The rank-1 view merges
+// across the padding gap, so an offset map that ignored the pitch would still
+// produce a dense, plausible-looking result — the pad slots are what catch it.
+// Values are distinct per element, so a transposed map cannot pass either.
+// ---------------------------------------------------------------------------
+TEST(GenericReshape, ViewWriteThroughPaddedMerge) {
+  using Buf1D = Kokkos::View<float*, Kokkos::LayoutRight, Kokkos::HostSpace>;
+  Buf1D buf("buf", 36);  // 4 rows x pitch 9
+  Kokkos::deep_copy(buf, -1.f);
+
+  View<Buf1D, Padded2D> v{buf, Padded2D{}};
+  auto                  flat = reshape(v, StaticTile<32>{}, order<0>{});
+  static_assert(std::is_same_v<decltype(flat)::layout_t, ReshPaddedFlat>);
+  ASSERT_EQ(flat.extent(0), 32);
+
+  for (int k = 0; k < 32; ++k) flat(k) = static_cast<float>(100 + k);
+
+  // Element k of the reshaped view is element (k/8, k%8) of the source.
+  for (int k = 0; k < 32; ++k)
+    EXPECT_FLOAT_EQ(buf(9 * (k / 8) + (k % 8)), static_cast<float>(100 + k))
+        << "k=" << k;
+  for (int i = 0; i < 4; ++i)
+    EXPECT_FLOAT_EQ(buf(9 * i + 8), -1.f) << "pad of row " << i << " written";
+
+  // Reading back through the original 2-D view agrees element for element.
+  for (int i = 0; i < 4; ++i)
+    for (int j = 0; j < 8; ++j)
+      EXPECT_FLOAT_EQ(v(i, j), static_cast<float>(100 + i * 8 + j))
+          << "i=" << i << " j=" << j;
+}
+
+// ---------------------------------------------------------------------------
+// TEST: the ragged result decodes as a bijection onto the source's elements —
+// the decode path every tier kernel's flat loop uses.
+// ---------------------------------------------------------------------------
+TEST(GenericReshape, DecodeRoundTripRagged) {
+  ReshPaddedRagged l{};
+  ASSERT_EQ(l.size(), 32);
+
+  bool hit[35] = {};  // 32 elements spread over Padded2D's 35 slots
+  for (int f = 0; f < l.size(); ++f) {
+    const auto c = l[f];
+    ASSERT_GE(c[0], 0);
+    ASSERT_LT(c[0], 2) << "f=" << f;
+    ASSERT_GE(c[1], 0);
+    ASSERT_LT(c[1], 16) << "f=" << f;
+    const auto off = l.flat(c[0], c[1]);
+    ASSERT_LT(off, 35u) << "f=" << f;
+    EXPECT_FALSE(hit[off]) << "flat offset " << off << " reached twice";
+    hit[off] = true;
+  }
+  // Injective onto the source's elements, and the three pad slots are
+  // untouched.
+  EXPECT_FALSE(hit[8]);
+  EXPECT_FALSE(hit[17]);
+  EXPECT_FALSE(hit[26]);
+  for (int f = 0; f < 32; ++f)
+    EXPECT_TRUE(hit[padded2d_offset_at(f)]) << "element " << f << " missed";
+}
+
+// ---------------------------------------------------------------------------
+// TEST: the reshaped layout works inside a device kernel.
+//
+// The materializer is a two-level pack expansion whose inner length varies per
+// mode — the construct most at risk from nvcc's device frontend. Everything
+// else in this file is host-only, so without this the risk would be uncovered
+// in tree. On a host-only build this still exercises the Serial backend.
+// ---------------------------------------------------------------------------
+// Kernel body as a named functor: an extended __host__ __device__ lambda
+// (KOKKOS_LAMBDA) may not appear inside GoogleTest's private TestBody under
+// nvcc — the same reason test_device_tuple.cpp spells its kernel out.
+namespace {
+struct ReshapeDeviceKernel {
+  using BufD = Kokkos::View<float*, Kokkos::LayoutRight,
+                            Kokkos::DefaultExecutionSpace::memory_space>;
+  View<BufD, ReshPaddedFlat> flat;
+  KOKKOS_FUNCTION void       operator()(int k) const {
+    flat(k) = static_cast<float>(100 + k);
+  }
+};
+}  // namespace
+
+TEST(GenericReshape, NestedLayoutInDeviceKernel) {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  using BufD = ReshapeDeviceKernel::BufD;
+  BufD buf("buf", 36);
+  Kokkos::deep_copy(buf, -1.f);
+
+  Kokkos::parallel_for("reshape_device", Kokkos::RangePolicy<Exec>(0, 32),
+                       ReshapeDeviceKernel{{buf, ReshPaddedFlat{}}});
+  Kokkos::fence();
+
+  auto host = Kokkos::create_mirror_view(buf);
+  Kokkos::deep_copy(host, buf);
+
+  for (int k = 0; k < 32; ++k)
+    EXPECT_FLOAT_EQ(host(9 * (k / 8) + (k % 8)), static_cast<float>(100 + k))
+        << "k=" << k;
+  for (int i = 0; i < 4; ++i)
+    EXPECT_FLOAT_EQ(host(9 * i + 8), -1.f) << "pad of row " << i << " written";
 }
 
 // ---------------------------------------------------------------------------
