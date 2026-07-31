@@ -616,6 +616,97 @@ static_assert(plan_status<StaticTile<2, 3, 4, 5, 6>, strides<1, 8, 2, 24, 120>,
 // faster. Well inside it here; the ceiling itself is covered by 5e.
 static_assert(Impl::flat_view_t<Ragged>::rank == 5);
 
+// ---------------------------------------------------------------------------
+// 7. tile_layout on a NESTED source.
+//
+// The tile carries one extent per MODE — the rank the layout presents — not per
+// leaf. The extents follow the usual (size/T, T) split, but the ORDER cannot:
+// a nested mode is not one contiguous run, so no ordering of the modes
+// reproduces the tiled memory order. It is derived from the tiled modes' own
+// strides instead; see Impl::NestedTiled.
+// ---------------------------------------------------------------------------
+
+// --- 7a. The order derivation -----------------------------------------------
+// Interleave's modes are i = i0 + 5*i1 (strides 1, 25) and j = j0 + 5*j1
+// (strides 5, 125). Tiling by (5,5) splits each at its own leaf boundary, so
+// the four tiled modes step by 25 (outer i), 1 (inner i), 125 (outer j), 5
+// (inner j) — and sorting those ascending gives the memory order (1,3,0,2).
+using NT_Interleave = Impl::NestedTiled<false, Interleave, StaticTile<5, 5>>;
+static_assert(NT_Interleave::deltas()[0] == 25 &&   // outer i
+              NT_Interleave::deltas()[1] == 1 &&    // inner i
+              NT_Interleave::deltas()[2] == 125 &&  // outer j
+              NT_Interleave::deltas()[3] == 5);     // inner j
+static_assert(NT_Interleave::ord()[0] == 1 && NT_Interleave::ord()[1] == 3 &&
+              NT_Interleave::ord()[2] == 0 && NT_Interleave::ord()[3] == 2);
+// The naive "modes in memory order, inner before outer" rule would say
+// (1,0,3,2). Pinned so a regression to it is caught here rather than as a wrong
+// answer somewhere downstream.
+static_assert(!std::is_same_v<
+              Impl::nested_tiled_order_t<false, Interleave, StaticTile<5, 5>>,
+              order<1, 0, 3, 2>>);
+
+// --- 7b. The tiled layout ---------------------------------------------------
+using InterleaveTiled = decltype(tile_layout(Interleave{}, StaticTile<5, 5>{}));
+static_assert(
+    std::is_same_v<InterleaveTiled,
+                   StaticLayout<StaticTile<5, 5, 5, 5>, strides<25, 1, 125, 5>,
+                                order<1, 3, 0, 2>>>);
+// Flat, so stride(d) and TensorLike survive even though the source had neither.
+static_assert(InterleaveTiled::mode_arity<0>() == 1 &&
+              InterleaveTiled::mode_arity<3>() == 1);
+static_assert(InterleaveTiled::stride(1) == 1);
+
+// Position-preserving, which is the only thing that actually matters: tile
+// coordinate (o0,i0,o1,i1) must land where the source puts mode index
+// (o0*5+i0, o1*5+i1).
+constexpr bool interleave_tiling_preserves_positions() noexcept {
+  for (int o0 = 0; o0 < 5; ++o0)
+    for (int i0 = 0; i0 < 5; ++i0)
+      for (int o1 = 0; o1 < 5; ++o1)
+        for (int i1 = 0; i1 < 5; ++i1)
+          if (static_cast<int>(InterleaveTiled{}.flat(o0, i0, o1, i1)) !=
+              static_cast<int>(Interleave{}.flat(o0 * 5 + i0, o1 * 5 + i1)))
+            return false;
+  return true;
+}
+static_assert(interleave_tiling_preserves_positions());
+
+// --- 7c. Ragged arities -----------------------------------------------------
+// Modes of size 6 (leaves 2,3) and 120 (leaves 4,5,6). Tiling by (2,4) splits
+// each at a leaf boundary again, but with unequal arities and a two-leaf outer
+// half that the planner has to coalesce back into one run.
+using RaggedTiled = decltype(tile_layout(Ragged{}, StaticTile<2, 4>{}));
+static_assert(
+    std::is_same_v<RaggedTiled,
+                   StaticLayout<StaticTile<3, 2, 30, 4>, strides<8, 1, 24, 2>,
+                                order<1, 3, 0, 2>>>);
+static_assert(RaggedTiled::mode_arity<2>() == 1);  // the coalesced outer half
+
+constexpr bool ragged_tiling_preserves_positions() noexcept {
+  for (int o0 = 0; o0 < 3; ++o0)
+    for (int i0 = 0; i0 < 2; ++i0)
+      for (int o1 = 0; o1 < 30; ++o1)
+        for (int i1 = 0; i1 < 4; ++i1)
+          if (static_cast<int>(RaggedTiled{}.flat(o0, i0, o1, i1)) !=
+              static_cast<int>(Ragged{}.flat(o0 * 2 + i0, o1 * 4 + i1)))
+            return false;
+  return true;
+}
+static_assert(ragged_tiling_preserves_positions());
+
+// --- 7d. A tile that does not align with the mode's leaf structure ----------
+// Ragged's mode 0 is leaves (2,3), so its index splits cleanly at 1, 2 or 6 —
+// not at 3. A tile of 3 asks for an inner half of extent 3 and stride 1, which
+// cannot be carved from a stream whose fastest run has extent 2: rejected
+// rather than approximated. Checked through the plan so the diagnostic is not
+// provoked.
+static_assert(
+    plan_status<StaticTile<2, 3, 4, 5, 6>, strides<1, 8, 2, 24, 120>,
+                order<0, 2, 1, 3, 4>,
+                Impl::NestedTiled<false, Ragged, StaticTile<3, 4>>::tile_t,
+                Impl::nested_tiled_order_t<false, Ragged, StaticTile<3, 4>>> ==
+    Impl::ReshapeStatus::NotFactorable);
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -998,6 +1089,50 @@ TEST(NestedReshape, RaggedFlattensToDenseBijection) {
   for (int s = 0; s < 720; ++s) EXPECT_TRUE(hit[s]) << "slot " << s;
 }
 
+// ---------------------------------------------------------------------------
+// TEST: tile_view over a NESTED source, through the real View path.
+//
+// Interleave's two modes have their leaves interleaved in memory, which is the
+// case that defeats the naive order rule. Values are distinct per element and
+// checked against hand-computed backing offsets, so a mode-mixing order would
+// have to reproduce 625 addresses by accident to pass.
+// ---------------------------------------------------------------------------
+TEST(NestedTileLayout, ViewWriteThroughInterleaveTiling) {
+  using Buf1D = Kokkos::View<float*, Kokkos::LayoutRight, Kokkos::HostSpace>;
+  Buf1D buf("buf", 625);
+  Kokkos::deep_copy(buf, -1.f);
+
+  View<Buf1D, Interleave> v{buf, Interleave{}};
+  auto                    tiled = tile_view(v, StaticTile<5, 5>{});
+  static_assert(std::is_same_v<decltype(tiled)::layout_t, InterleaveTiled>);
+  ASSERT_EQ(tiled.extent(0), 5);
+  ASSERT_EQ(tiled.extent(3), 5);
+
+  for (int o0 = 0; o0 < 5; ++o0)
+    for (int i0 = 0; i0 < 5; ++i0)
+      for (int o1 = 0; o1 < 5; ++o1)
+        for (int i1 = 0; i1 < 5; ++i1)
+          tiled(o0, i0, o1, i1) =
+              static_cast<float>(25 * (o0 * 5 + i0) + (o1 * 5 + i1));
+
+  // Mode index i = i0 + 5*i1 at strides 1 and 25; j = j0 + 5*j1 at 5 and 125.
+  for (int i = 0; i < 25; ++i)
+    for (int j = 0; j < 25; ++j) {
+      const int slot = (i % 5) * 1 + (i / 5) * 25 + (j % 5) * 5 + (j / 5) * 125;
+      EXPECT_FLOAT_EQ(buf(slot), static_cast<float>(25 * i + j))
+          << "i=" << i << " j=" << j;
+    }
+
+  // Onto: every slot written, so no sentinel survives.
+  for (int s = 0; s < 625; ++s) EXPECT_NE(buf(s), -1.f) << "slot " << s;
+
+  // And reading back through the untiled nested view agrees.
+  for (int i = 0; i < 25; ++i)
+    for (int j = 0; j < 25; ++j)
+      EXPECT_FLOAT_EQ(v(i, j), static_cast<float>(25 * i + j));
+}
+
+// ---------------------------------------------------------------------------
 // TEST: tile_view over a PADDED source — the tiling no named layout could
 // express. The pad slots are the oracle: an offset map that ignored the row
 // pitch would still look dense and plausible, and would write over them.

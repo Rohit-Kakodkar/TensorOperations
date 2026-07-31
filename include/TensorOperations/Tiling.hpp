@@ -5,6 +5,7 @@
 
 #include <Kokkos_Core.hpp>
 
+#include <array>
 #include <type_traits>
 #include <utility>
 
@@ -277,6 +278,122 @@ template <bool InnerFirst, class Ext, class Ord, class Tile>
 using tiled_packed_plan_t =
     tiled_plan_t<InnerFirst, Ext, packed_strides_t<Ext, Ord>, Ord, Tile>;
 
+// ---------------------------------------------------------------------------
+// Tiling a NESTED source.
+//
+// The extents carry over unchanged — TiledExtentAt splits each MODE SIZE into
+// (size/T, T) exactly as it splits a flat dimension's extent. The ORDER does
+// not, and this is the whole difficulty:
+//
+// tiled_order_t reads the source's memory order over DIMENSIONS and works
+// because each flat dimension is one contiguous run, so a dimension's two
+// halves stay adjacent in memory. A nested mode is not one run — its leaves can
+// be interleaved with another mode's — so no ordering OF THE MODES reproduces
+// the tiled memory order. For the interleaved 25x25 (leaves (5,5),(5,5),
+// strides (1,25),(5,125)) tiled by (5,5), the naive "modes in memory order,
+// inner before outer" rule gives (1,0,3,2), which carves mode 0's outer half
+// out of mode 1's leaf: silently wrong.
+//
+// What DOES determine the order uniquely is each tiled mode's own stride.
+// Stepping a mode's inner half by one moves that source mode's index by 1 and
+// its outer half by T, and Mode::offset turns either into a memory offset. Each
+// tiled mode occupies one contiguous run, so sorting the 2N of them by that
+// offset ascending IS their memory order. For the example above the deltas are
+// outer0=25, inner0=1, outer1=125, inner1=5, giving (1,3,0,2) — each mode's
+// inner half first, then the outers — which is the position-preserving answer.
+//
+// If the sort ever got this wrong the TENSOR_OPS_VERIFY_RESHAPE oracle would
+// catch it: the result would not reproduce the source's element->offset map.
+// ---------------------------------------------------------------------------
+template <bool InnerFirst, class L, class Tile>
+struct NestedTiled;
+
+template <bool InnerFirst, typename... ExtSeqs, typename... StrSeqs,
+          typename... OrdSeqs, int... T>
+struct NestedTiled<
+    InnerFirst,
+    StaticLayout<DeviceTuple<ExtSeqs...>, DeviceTuple<StrSeqs...>,
+                 DeviceTuple<OrdSeqs...>>,
+    StaticTile<T...>> {
+  static constexpr int N = static_cast<int>(sizeof...(ExtSeqs));
+  static_assert(N == static_cast<int>(sizeof...(T)),
+                "tile_layout: source rank must match tile rank");
+
+  // The mode sizes, so TiledExtentAt can be reused verbatim on them.
+  using mode_sizes_t = StaticTile<Mode<ExtSeqs, StrSeqs>::mode_size...>;
+  using tile_t       = tiled_tile_t<InnerFirst, mode_sizes_t, StaticTile<T...>>;
+
+  // Memory offset reached by stepping each tiled mode once. Mode 2m and 2m+1
+  // are source mode m's two halves; InnerFirst says which of the pair is the
+  // inner.
+  static constexpr std::array<int, 2 * N> deltas() noexcept {
+    std::array<int, 2 * N> d{};
+    constexpr int          t[] = {T...};
+    int                    m   = 0;
+    ((d[2 * m + (InnerFirst ? 0 : 1)] =
+          static_cast<int>(Mode<ExtSeqs, StrSeqs>::offset(1)),
+      d[2 * m + (InnerFirst ? 1 : 0)] =
+          static_cast<int>(Mode<ExtSeqs, StrSeqs>::offset(t[m])),
+      ++m),
+     ...);
+    return d;
+  }
+
+  // Argsort ascending: ord[j] is the tiled mode at memory position j.
+  static constexpr std::array<int, 2 * N> ord() noexcept {
+    const auto             d = deltas();
+    std::array<int, 2 * N> o{};
+    for (int j = 0; j < 2 * N; ++j) o[j] = j;
+    for (int a = 0; a < 2 * N; ++a)
+      for (int b = a + 1; b < 2 * N; ++b)
+        if (d[o[b]] < d[o[a]]) {
+          const int tmp = o[a];
+          o[a]          = o[b];
+          o[b]          = tmp;
+        }
+    return o;
+  }
+};
+
+template <bool InnerFirst, class L, class Tile, class Js>
+struct NestedTiledOrderSeq;
+template <bool InnerFirst, class L, class Tile, std::size_t... J>
+struct NestedTiledOrderSeq<InnerFirst, L, Tile, std::index_sequence<J...>> {
+  using type =
+      std::integer_sequence<int, NestedTiled<InnerFirst, L, Tile>::ord()[J]...>;
+};
+
+template <bool InnerFirst, class L, class Tile>
+using nested_tiled_order_t = typename NestedTiledOrderSeq<
+    InnerFirst, L, Tile,
+    std::make_index_sequence<2 * static_cast<std::size_t>(
+                                     NestedTiled<InnerFirst, L, Tile>::N)>>::
+    type;
+
+// The source triple is the flat leaf view, exactly as for reshape.
+template <bool InnerFirst, class L, class Tile>
+struct NestedTiledLayout;
+template <bool InnerFirst, typename... ExtSeqs, typename... StrSeqs,
+          typename... OrdSeqs, class Tile>
+struct NestedTiledLayout<
+    InnerFirst,
+    StaticLayout<DeviceTuple<ExtSeqs...>, DeviceTuple<StrSeqs...>,
+                 DeviceTuple<OrdSeqs...>>,
+    Tile> {
+  using layout_t =
+      StaticLayout<DeviceTuple<ExtSeqs...>, DeviceTuple<StrSeqs...>,
+                   DeviceTuple<OrdSeqs...>>;
+  using type = reshaped_layout_t<
+      seq_to_tile_t<concat_seq_t<ExtSeqs...>>, concat_seq_t<StrSeqs...>,
+      concat_seq_t<OrdSeqs...>,
+      typename NestedTiled<InnerFirst, layout_t, Tile>::tile_t,
+      nested_tiled_order_t<InnerFirst, layout_t, Tile>>;
+};
+
+template <bool InnerFirst, class L, class Tile>
+using nested_tiled_layout_t =
+    typename NestedTiledLayout<InnerFirst, L, Tile>::type;
+
 // Build the interleaved (outer, inner)-per-dim extent array used by every
 // dynamic tile_layout overload. InnerFirst=true (Left layout): position 2*d
 // holds the inner (tile) extent, 2*d+1 holds the outer (src/tile) count.
@@ -416,6 +533,30 @@ KOKKOS_FUNCTION constexpr auto tile_layout(
                                    std::integer_sequence<int, Order...>,
                                    StaticTile<TileE...>> {
   static_assert(sizeof...(Extents) == sizeof...(TileE),
+                "tile_layout: source rank must match tile rank");
+  return {};
+}
+
+// A NESTED source. The tile has one extent per MODE (the layout's presented
+// rank), not per leaf — tiling is about the shape a layout presents, and a
+// mode's leaf structure is an implementation detail of how it reaches memory.
+// Outer-first, like the two above.
+//
+// Unlike every other overload here this one cannot borrow tiled_order_t; see
+// Impl::NestedTiled for why a nested source needs its order derived from the
+// tiled modes' strides instead.
+template <typename... ExtSeqs, typename... StrSeqs, typename... OrdSeqs,
+          int... TileE>
+KOKKOS_FUNCTION constexpr auto tile_layout(
+    StaticLayout<DeviceTuple<ExtSeqs...>, DeviceTuple<StrSeqs...>,
+                 DeviceTuple<OrdSeqs...>>,
+    StaticTile<TileE...>) noexcept
+    -> Impl::nested_tiled_layout_t<
+        false,
+        StaticLayout<DeviceTuple<ExtSeqs...>, DeviceTuple<StrSeqs...>,
+                     DeviceTuple<OrdSeqs...>>,
+        StaticTile<TileE...>> {
+  static_assert(sizeof...(ExtSeqs) == sizeof...(TileE),
                 "tile_layout: source rank must match tile rank");
   return {};
 }
