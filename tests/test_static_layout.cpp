@@ -373,6 +373,340 @@ static_assert(plan_status<StaticTile<4, 8>, strides<9, 1>, order<1, 0>,
 static_assert(plan_status<StaticTile<4, 8>, strides<9, 1>, order<1, 0>,
                           StaticTile<32>, order<0>> == Impl::ReshapeStatus::Ok);
 
+// ---------------------------------------------------------------------------
+// 5. tile_layout on top of the generic reshape.
+//
+// Tiling IS a reshape that splits each dimension E into (E/T, T), so the static
+// tile_layout overloads name Impl::tiled_layout_t instead of deriving strides a
+// second time. Two things need proving: the named overloads still produce
+// exactly what they produced before, and the sources that only reshape can
+// describe — arbitrary order, and padding — now tile as well.
+// ---------------------------------------------------------------------------
+
+// --- 5a. The named overloads are unchanged ---------------------------------
+// The load-bearing property of the whole refactor: same source, same tile, same
+// type as the hand-rolled interleaving produced. tests/test_tiling.cpp asserts
+// the literal types; this asserts the equivalence the implementation rests on.
+static_assert(
+    std::is_same_v<decltype(tile_layout(StaticTileLayoutRight<8, 12>{},
+                                        StaticTile<2, 4>{})),
+                   StaticTileLayoutRight<4, 2, 3, 4>>);
+static_assert(std::is_same_v<decltype(tile_layout(StaticTileLayoutLeft<8, 12>{},
+                                                  StaticTile<2, 4>{})),
+                             StaticTileLayoutLeft<2, 4, 4, 3>>);
+
+// ...and each is literally the reshape to the interleaved shape and order.
+static_assert(
+    std::is_same_v<decltype(tile_layout(StaticTileLayoutRight<8, 12>{},
+                                        StaticTile<2, 4>{})),
+                   decltype(reshape(StaticTileLayoutRight<8, 12>{},
+                                    StaticTile<4, 2, 3, 4>{}, LayoutRight{}))>);
+static_assert(
+    std::is_same_v<decltype(tile_layout(StaticTileLayoutLeft<8, 12>{},
+                                        StaticTile<2, 4>{})),
+                   decltype(reshape(StaticTileLayoutLeft<8, 12>{},
+                                    StaticTile<2, 4, 4, 3>{}, LayoutLeft{}))>);
+
+// --- 5b. Arbitrary memory order --------------------------------------------
+// 8x12 with dim 0 fastest (strides {1,8}). Tiled by (2,4) outer-first the modes
+// are <8/2, 2, 12/4, 4> = <4,2,3,4>; dim 0's pair stays fastest and within each
+// pair the inner mode leads, so the memory order is (1,0,3,2) and the strides
+// are outer0=2, inner0=1, outer1=32, inner1=8.
+using Src2DStride = StaticTileLayoutStride<StaticTile<8, 12>, 0, 1>;
+static_assert(Src2DStride::stride(0) == 1 && Src2DStride::stride(1) == 8);
+
+using StrideTiled = decltype(tile_layout(Src2DStride{}, StaticTile<2, 4>{}));
+static_assert(StrideTiled::rank == 4);
+static_assert(StrideTiled::extent(0) == 4 && StrideTiled::extent(1) == 2 &&
+              StrideTiled::extent(2) == 3 && StrideTiled::extent(3) == 4);
+static_assert(StrideTiled::stride(0) == 2 && StrideTiled::stride(1) == 1 &&
+              StrideTiled::stride(2) == 32 && StrideTiled::stride(3) == 8);
+// Flat, not nested: every mode is a single contiguous run, so stride(d) — and
+// therefore the TensorLike concept — survives.
+static_assert(StrideTiled::mode_arity<0>() == 1 &&
+              StrideTiled::mode_arity<1>() == 1 &&
+              StrideTiled::mode_arity<2>() == 1 &&
+              StrideTiled::mode_arity<3>() == 1);
+// Packed in its own order, but that order is neither Right's nor Left's, so
+// ReshapeFlat's named recovery does not fire and the result is the bare
+// StaticLayout the named Stride layout derives from.
+static_assert(
+    std::is_same_v<StrideTiled,
+                   StaticLayout<StaticTile<4, 2, 3, 4>, strides<2, 1, 32, 8>,
+                                order<1, 0, 3, 2>>>);
+static_assert(std::is_base_of_v<
+              StrideTiled,
+              StaticTileLayoutStride<StaticTile<4, 2, 3, 4>, 1, 0, 3, 2>>);
+
+// Position-preserving: mode (o0,i0,o1,i1) must land where the source puts
+// element (2*o0+i0, 4*o1+i1).
+constexpr bool stride_tiling_preserves_positions() noexcept {
+  for (int o0 = 0; o0 < 4; ++o0)
+    for (int i0 = 0; i0 < 2; ++i0)
+      for (int o1 = 0; o1 < 3; ++o1)
+        for (int i1 = 0; i1 < 4; ++i1) {
+          const int src = Src2DStride{}.flat(2 * o0 + i0, 4 * o1 + i1);
+          if (static_cast<int>(StrideTiled{}.flat(o0, i0, o1, i1)) != src)
+            return false;
+        }
+  return true;
+}
+static_assert(stride_tiling_preserves_positions());
+
+// --- 5c. Padded source — the case no named layout can express --------------
+// Padded2D is 4x8 at a row pitch of 9. Tiled by (2,4): modes <2,2,2,4>, order
+// (3,2,1,0), strides outer0=18 (two padded rows), inner0=9, outer1=4, inner1=1.
+using PaddedTiled = decltype(tile_layout(Padded2D{}, StaticTile<2, 4>{}));
+static_assert(
+    std::is_same_v<PaddedTiled,
+                   StaticLayout<StaticTile<2, 2, 2, 4>, strides<18, 9, 4, 1>,
+                                order<3, 2, 1, 0>>>);
+static_assert(PaddedTiled::mode_arity<0>() == 1 &&
+              PaddedTiled::mode_arity<3>() == 1);
+static_assert(PaddedTiled::stride(0) == 18 && PaddedTiled::stride(3) == 1);
+
+constexpr bool padded_tiling_preserves_positions() noexcept {
+  for (int o0 = 0; o0 < 2; ++o0)
+    for (int i0 = 0; i0 < 2; ++i0)
+      for (int o1 = 0; o1 < 2; ++o1)
+        for (int i1 = 0; i1 < 4; ++i1) {
+          const int src = Padded2D{}.flat(2 * o0 + i0, 4 * o1 + i1);
+          if (static_cast<int>(PaddedTiled{}.flat(o0, i0, o1, i1)) != src)
+            return false;
+        }
+  return true;
+}
+static_assert(padded_tiling_preserves_positions());
+
+// --- 5d. Rejections ---------------------------------------------------------
+// Same trick as 4f: the plan is inspectable without provoking the compile error
+// it is supposed to provoke.
+template <bool InnerFirst, typename SrcExt, typename SrcOrd, typename Tile>
+inline constexpr Impl::ReshapeStatus tiling_status =
+    Impl::tiled_packed_plan_t<InnerFirst, SrcExt, SrcOrd, Tile>{}().status;
+
+// A tile that does not divide the source extent. This used to truncate E/T and
+// silently drop the remainder; it is now a diagnosed compile error.
+static_assert(
+    tiling_status<false, StaticTile<8, 12>, order<1, 0>, StaticTile<5, 4>> ==
+    Impl::ReshapeStatus::CountMismatch);
+// The dividing tile next to it really is accepted.
+static_assert(
+    tiling_status<false, StaticTile<8, 12>, order<1, 0>, StaticTile<2, 4>> ==
+    Impl::ReshapeStatus::Ok);
+
+// --- 5e. Rank ceiling -------------------------------------------------------
+// A rank-N tiling needs 2N modes, so kReshapeMaxModes is what bounds the source
+// rank. At the old value of 8 a rank-5 source would have been rejected, where
+// the hand-rolled interleaving it replaced had no limit at all.
+static_assert(tiling_status<false, StaticTile<4, 4, 4, 4, 4>,
+                            order<4, 3, 2, 1, 0>, StaticTile<2, 2, 2, 2, 2>> ==
+              Impl::ReshapeStatus::Ok);
+static_assert(
+    std::is_same_v<decltype(tile_layout(StaticTileLayoutRight<4, 4, 4, 4, 4>{},
+                                        StaticTile<2, 2, 2, 2, 2>{})),
+                   StaticTileLayoutRight<2, 2, 2, 2, 2, 2, 2, 2, 2, 2>>);
+// Past the ceiling it is reported, not silently truncated: rank 9 needs 18.
+static_assert(tiling_status<false, StaticTile<2, 2, 2, 2, 2, 2, 2, 2, 2>,
+                            order<8, 7, 6, 5, 4, 3, 2, 1, 0>,
+                            StaticTile<1, 1, 1, 1, 1, 1, 1, 1, 1>> ==
+              Impl::ReshapeStatus::CapacityExceeded);
+
+// ---------------------------------------------------------------------------
+// 6. reshape with a NESTED source.
+//
+// reshape produces the nested layout, so it should consume one. It does so by
+// forwarding to the flat layout over the source's concatenated leaves
+// (Impl::flat_view_t), which rests on one claim: a nested layout's mode
+// grouping is purely logical, so its element->offset map is identical to that
+// flat view's. 6a proves exactly that; everything after it follows.
+// ---------------------------------------------------------------------------
+
+// --- 6a. The claim the whole overload rests on ------------------------------
+// ReshapeReproducesSource walks every element comparing a layout's real
+// decode-and-encode path against the mixed-radix stream of an (ext, str, order)
+// triple. Passing the NESTED layout as the "Result" turns the reshape oracle
+// into a proof that the flattening is offset-exact — for equal arities and for
+// ragged ones.
+static_assert(Impl::ReshapeReproducesSource<Interleave, StaticTile<5, 5, 5, 5>,
+                                            strides<1, 25, 5, 125>,
+                                            order<0, 2, 1, 3>>::value,
+              "flat_view_t<Interleave> is not offset-exact");
+static_assert(Impl::ReshapeReproducesSource<Ragged, StaticTile<2, 3, 4, 5, 6>,
+                                            strides<1, 8, 2, 24, 120>,
+                                            order<0, 2, 1, 3, 4>>::value,
+              "flat_view_t<Ragged> is not offset-exact");
+
+// ...and flat_view_t really does produce those triples from the type alone.
+static_assert(std::is_same_v<
+              Impl::flat_view_t<Ragged>,
+              StaticLayout<StaticTile<2, 3, 4, 5, 6>, strides<1, 8, 2, 24, 120>,
+                           order<0, 2, 1, 3, 4>>>);
+
+// --- 6b. Nested -> flat -----------------------------------------------------
+// Ragged is a dense mixed-radix bijection onto [0, 720), so flattening it to
+// rank 1 coalesces every leaf into one contiguous run and recovers the NAMED
+// layout — the same collapse a packed flat source would get.
+using NestedFlattened =
+    decltype(reshape(Ragged{}, StaticTile<720>{}, order<0>{}));
+static_assert(std::is_same_v<NestedFlattened, StaticTileLayoutRight<720>>);
+static_assert(NestedFlattened::mode_arity<0>() == 1);
+
+constexpr bool nested_flatten_is_dense() noexcept {
+  for (int k = 0; k < 720; ++k)
+    if (static_cast<int>(NestedFlattened{}.flat(k)) != k) return false;
+  return true;
+}
+static_assert(nested_flatten_is_dense());
+
+// --- 6c. Nested -> nested, and agreement with the equivalent flat source ----
+// Padded2D expressed as a nested layout: two modes, each of arity 1. Reshaping
+// it must give bit-for-bit what reshaping Padded2D itself gives (4b above) —
+// the source spelling cannot change the answer.
+using NestedPadded2D =
+    StaticLayout<DT<ext<4>, ext<8>>, DT<ext<9>, ext<1>>, DT<ext<1>, ext<0>>>;
+static_assert(Impl::ReshapeReproducesSource<NestedPadded2D, StaticTile<4, 8>,
+                                            strides<9, 1>, order<1, 0>>::value);
+
+static_assert(std::is_same_v<decltype(reshape(NestedPadded2D{},
+                                              StaticTile<32>{}, order<0>{})),
+                             ReshPaddedFlat>);
+static_assert(decltype(reshape(NestedPadded2D{}, StaticTile<32>{},
+                               order<0>{}))::mode_arity<0>() == 2);
+
+// --- 6d. Round trips are ASYMMETRIC -----------------------------------------
+// Reshaping to the source's LEAF shape and order is the identity: it returns
+// the flat view itself.
+static_assert(
+    std::is_same_v<decltype(reshape(Interleave{}, StaticTile<5, 5, 5, 5>{},
+                                    order<0, 2, 1, 3>{})),
+                   Impl::flat_view_t<Interleave>>);
+
+// Reshaping to the source's MODE shape is NOT. reshape is defined over memory
+// order and the planner carves each mode to completion in memory order, never
+// seeing the source's grouping — so Interleave's four leaves, whose memory
+// order is (mode0 leaf, mode1 leaf, mode0 leaf, mode1 leaf), get regrouped as
+// two contiguous runs. The result is a plain dense row-major 25x25: a valid
+// reshape of the same 625 elements in the same memory order, and a completely
+// different index map. This is the property callers must not assume; it is
+// pinned here so a future change to the carve loop cannot alter it silently.
+using InterleaveModeShape =
+    decltype(reshape(Interleave{}, StaticTile<25, 25>{}, LayoutRight{}));
+static_assert(
+    std::is_same_v<InterleaveModeShape, StaticTileLayoutRight<25, 25>>);
+static_assert(!std::is_same_v<InterleaveModeShape, Interleave>);
+static_assert(InterleaveModeShape::mode_arity<0>() == 1);  // flat, not nested
+static_assert(InterleaveModeShape{}.flat(1, 0) == 25);     // Interleave: 1
+static_assert(Interleave{}.flat(1, 0) == 1);
+static_assert(InterleaveModeShape{}.flat(5, 0) == 125);  // Interleave: 25
+static_assert(Interleave{}.flat(5, 0) == 25);
+
+// --- 6e. Diagnostics are inherited from the flat overload -------------------
+// The nested overload forwards rather than re-entering the planner, so the
+// rejection statuses are the same ones. Checked through the plan, as in 4f.
+static_assert(plan_status<StaticTile<2, 3, 4, 5, 6>, strides<1, 8, 2, 24, 120>,
+                          order<0, 2, 1, 3, 4>, StaticTile<719>, order<0>> ==
+              Impl::ReshapeStatus::CountMismatch);
+static_assert(plan_status<StaticTile<2, 3, 4, 5, 6>, strides<1, 8, 2, 24, 120>,
+                          order<0, 2, 1, 3, 4>, StaticTile<720>, order<0>> ==
+              Impl::ReshapeStatus::Ok);
+
+// A nested source arrives with more LEAVES than a flat source of the same rank
+// — Ragged is rank 2 but five leaves — so it eats the kReshapeMaxLeaves budget
+// faster. Well inside it here; the ceiling itself is covered by 5e.
+static_assert(Impl::flat_view_t<Ragged>::rank == 5);
+
+// ---------------------------------------------------------------------------
+// 7. tile_layout on a NESTED source.
+//
+// The tile carries one extent per MODE — the rank the layout presents — not per
+// leaf. The extents follow the usual (size/T, T) split, but the ORDER cannot:
+// a nested mode is not one contiguous run, so no ordering of the modes
+// reproduces the tiled memory order. It is derived from the tiled modes' own
+// strides instead; see Impl::NestedTiled.
+// ---------------------------------------------------------------------------
+
+// --- 7a. The order derivation -----------------------------------------------
+// Interleave's modes are i = i0 + 5*i1 (strides 1, 25) and j = j0 + 5*j1
+// (strides 5, 125). Tiling by (5,5) splits each at its own leaf boundary, so
+// the four tiled modes step by 25 (outer i), 1 (inner i), 125 (outer j), 5
+// (inner j) — and sorting those ascending gives the memory order (1,3,0,2).
+using NT_Interleave = Impl::NestedTiled<false, Interleave, StaticTile<5, 5>>;
+static_assert(NT_Interleave::deltas()[0] == 25 &&   // outer i
+              NT_Interleave::deltas()[1] == 1 &&    // inner i
+              NT_Interleave::deltas()[2] == 125 &&  // outer j
+              NT_Interleave::deltas()[3] == 5);     // inner j
+static_assert(NT_Interleave::ord()[0] == 1 && NT_Interleave::ord()[1] == 3 &&
+              NT_Interleave::ord()[2] == 0 && NT_Interleave::ord()[3] == 2);
+// The naive "modes in memory order, inner before outer" rule would say
+// (1,0,3,2). Pinned so a regression to it is caught here rather than as a wrong
+// answer somewhere downstream.
+static_assert(!std::is_same_v<
+              Impl::nested_tiled_order_t<false, Interleave, StaticTile<5, 5>>,
+              order<1, 0, 3, 2>>);
+
+// --- 7b. The tiled layout ---------------------------------------------------
+using InterleaveTiled = decltype(tile_layout(Interleave{}, StaticTile<5, 5>{}));
+static_assert(
+    std::is_same_v<InterleaveTiled,
+                   StaticLayout<StaticTile<5, 5, 5, 5>, strides<25, 1, 125, 5>,
+                                order<1, 3, 0, 2>>>);
+// Flat, so stride(d) and TensorLike survive even though the source had neither.
+static_assert(InterleaveTiled::mode_arity<0>() == 1 &&
+              InterleaveTiled::mode_arity<3>() == 1);
+static_assert(InterleaveTiled::stride(1) == 1);
+
+// Position-preserving, which is the only thing that actually matters: tile
+// coordinate (o0,i0,o1,i1) must land where the source puts mode index
+// (o0*5+i0, o1*5+i1).
+constexpr bool interleave_tiling_preserves_positions() noexcept {
+  for (int o0 = 0; o0 < 5; ++o0)
+    for (int i0 = 0; i0 < 5; ++i0)
+      for (int o1 = 0; o1 < 5; ++o1)
+        for (int i1 = 0; i1 < 5; ++i1)
+          if (static_cast<int>(InterleaveTiled{}.flat(o0, i0, o1, i1)) !=
+              static_cast<int>(Interleave{}.flat(o0 * 5 + i0, o1 * 5 + i1)))
+            return false;
+  return true;
+}
+static_assert(interleave_tiling_preserves_positions());
+
+// --- 7c. Ragged arities -----------------------------------------------------
+// Modes of size 6 (leaves 2,3) and 120 (leaves 4,5,6). Tiling by (2,4) splits
+// each at a leaf boundary again, but with unequal arities and a two-leaf outer
+// half that the planner has to coalesce back into one run.
+using RaggedTiled = decltype(tile_layout(Ragged{}, StaticTile<2, 4>{}));
+static_assert(
+    std::is_same_v<RaggedTiled,
+                   StaticLayout<StaticTile<3, 2, 30, 4>, strides<8, 1, 24, 2>,
+                                order<1, 3, 0, 2>>>);
+static_assert(RaggedTiled::mode_arity<2>() == 1);  // the coalesced outer half
+
+constexpr bool ragged_tiling_preserves_positions() noexcept {
+  for (int o0 = 0; o0 < 3; ++o0)
+    for (int i0 = 0; i0 < 2; ++i0)
+      for (int o1 = 0; o1 < 30; ++o1)
+        for (int i1 = 0; i1 < 4; ++i1)
+          if (static_cast<int>(RaggedTiled{}.flat(o0, i0, o1, i1)) !=
+              static_cast<int>(Ragged{}.flat(o0 * 2 + i0, o1 * 4 + i1)))
+            return false;
+  return true;
+}
+static_assert(ragged_tiling_preserves_positions());
+
+// --- 7d. A tile that does not align with the mode's leaf structure ----------
+// Ragged's mode 0 is leaves (2,3), so its index splits cleanly at 1, 2 or 6 —
+// not at 3. A tile of 3 asks for an inner half of extent 3 and stride 1, which
+// cannot be carved from a stream whose fastest run has extent 2: rejected
+// rather than approximated. Checked through the plan so the diagnostic is not
+// provoked.
+static_assert(
+    plan_status<StaticTile<2, 3, 4, 5, 6>, strides<1, 8, 2, 24, 120>,
+                order<0, 2, 1, 3, 4>,
+                Impl::NestedTiled<false, Ragged, StaticTile<3, 4>>::tile_t,
+                Impl::nested_tiled_order_t<false, Ragged, StaticTile<3, 4>>> ==
+    Impl::ReshapeStatus::NotFactorable);
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -699,6 +1033,170 @@ TEST(GenericReshape, DecodeRoundTripRagged) {
   EXPECT_FALSE(hit[26]);
   for (int f = 0; f < 32; ++f)
     EXPECT_TRUE(hit[padded2d_offset_at(f)]) << "element " << f << " missed";
+}
+
+// ---------------------------------------------------------------------------
+// TEST: reshape a View whose layout is NESTED. Same source memory and same
+// target as GenericReshape.ViewWriteThroughPaddedMerge, but reached through the
+// nested spelling of the source — so it proves two things at once: the View
+// wrapper picks the new overload up with no change of its own (its
+// requires-clause is just "reshape(l,t,o) is valid"), and the answer does not
+// depend on how the source was spelled. The pad slots are still the oracle.
+// ---------------------------------------------------------------------------
+TEST(NestedReshape, ViewWriteThroughFromNestedSource) {
+  using Buf1D = Kokkos::View<float*, Kokkos::LayoutRight, Kokkos::HostSpace>;
+  Buf1D buf("buf", 36);  // 4 rows x pitch 9
+  Kokkos::deep_copy(buf, -1.f);
+
+  View<Buf1D, NestedPadded2D> v{buf, NestedPadded2D{}};
+  auto                        flat = reshape(v, StaticTile<32>{}, order<0>{});
+  static_assert(std::is_same_v<decltype(flat)::layout_t, ReshPaddedFlat>);
+  ASSERT_EQ(flat.extent(0), 32);
+
+  for (int k = 0; k < 32; ++k) flat(k) = static_cast<float>(200 + k);
+
+  for (int k = 0; k < 32; ++k)
+    EXPECT_FLOAT_EQ(buf(9 * (k / 8) + (k % 8)), static_cast<float>(200 + k))
+        << "k=" << k;
+  for (int i = 0; i < 4; ++i)
+    EXPECT_FLOAT_EQ(buf(9 * i + 8), -1.f) << "pad of row " << i << " written";
+
+  // Reading back through the original nested view agrees element for element.
+  for (int i = 0; i < 4; ++i)
+    for (int j = 0; j < 8; ++j)
+      EXPECT_FLOAT_EQ(v(i, j), static_cast<float>(200 + i * 8 + j))
+          << "i=" << i << " j=" << j;
+}
+
+// ---------------------------------------------------------------------------
+// TEST: a nested source flattened to rank 1 decodes as a dense bijection.
+// Ragged has unequal mode arities (2 and 3) and no repeated extent, so a
+// mode- or leaf-order transposition in the flattening cannot pass.
+// ---------------------------------------------------------------------------
+TEST(NestedReshape, RaggedFlattensToDenseBijection) {
+  NestedFlattened l{};
+  ASSERT_EQ(l.size(), 720);
+
+  bool hit[720] = {};
+  for (int f = 0; f < l.size(); ++f) {
+    const auto off = l.flat(l[f][0]);
+    ASSERT_LT(off, 720u) << "f=" << f;
+    EXPECT_FALSE(hit[off]) << "flat offset " << off << " reached twice";
+    hit[off] = true;
+    // The nested source puts its f-th memory-order element at the same place.
+    EXPECT_EQ(static_cast<int>(off), f) << "f=" << f;
+  }
+  for (int s = 0; s < 720; ++s) EXPECT_TRUE(hit[s]) << "slot " << s;
+}
+
+// ---------------------------------------------------------------------------
+// TEST: tile_view over a NESTED source, through the real View path.
+//
+// Interleave's two modes have their leaves interleaved in memory, which is the
+// case that defeats the naive order rule. Values are distinct per element and
+// checked against hand-computed backing offsets, so a mode-mixing order would
+// have to reproduce 625 addresses by accident to pass.
+// ---------------------------------------------------------------------------
+TEST(NestedTileLayout, ViewWriteThroughInterleaveTiling) {
+  using Buf1D = Kokkos::View<float*, Kokkos::LayoutRight, Kokkos::HostSpace>;
+  Buf1D buf("buf", 625);
+  Kokkos::deep_copy(buf, -1.f);
+
+  View<Buf1D, Interleave> v{buf, Interleave{}};
+  auto                    tiled = tile_view(v, StaticTile<5, 5>{});
+  static_assert(std::is_same_v<decltype(tiled)::layout_t, InterleaveTiled>);
+  ASSERT_EQ(tiled.extent(0), 5);
+  ASSERT_EQ(tiled.extent(3), 5);
+
+  for (int o0 = 0; o0 < 5; ++o0)
+    for (int i0 = 0; i0 < 5; ++i0)
+      for (int o1 = 0; o1 < 5; ++o1)
+        for (int i1 = 0; i1 < 5; ++i1)
+          tiled(o0, i0, o1, i1) =
+              static_cast<float>(25 * (o0 * 5 + i0) + (o1 * 5 + i1));
+
+  // Mode index i = i0 + 5*i1 at strides 1 and 25; j = j0 + 5*j1 at 5 and 125.
+  for (int i = 0; i < 25; ++i)
+    for (int j = 0; j < 25; ++j) {
+      const int slot = (i % 5) * 1 + (i / 5) * 25 + (j % 5) * 5 + (j / 5) * 125;
+      EXPECT_FLOAT_EQ(buf(slot), static_cast<float>(25 * i + j))
+          << "i=" << i << " j=" << j;
+    }
+
+  // Onto: every slot written, so no sentinel survives.
+  for (int s = 0; s < 625; ++s) EXPECT_NE(buf(s), -1.f) << "slot " << s;
+
+  // And reading back through the untiled nested view agrees.
+  for (int i = 0; i < 25; ++i)
+    for (int j = 0; j < 25; ++j)
+      EXPECT_FLOAT_EQ(v(i, j), static_cast<float>(25 * i + j));
+}
+
+// ---------------------------------------------------------------------------
+// TEST: tile_view over a PADDED source — the tiling no named layout could
+// express. The pad slots are the oracle: an offset map that ignored the row
+// pitch would still look dense and plausible, and would write over them.
+// ---------------------------------------------------------------------------
+TEST(TiledStaticLayout, ViewWriteThroughPaddedTiling) {
+  using Buf1D = Kokkos::View<float*, Kokkos::LayoutRight, Kokkos::HostSpace>;
+  Buf1D buf("buf", 36);  // 4 rows x pitch 9
+  Kokkos::deep_copy(buf, -1.f);
+
+  View<Buf1D, Padded2D> v{buf, Padded2D{}};
+  auto                  tiled = tile_view(v, StaticTile<2, 4>{});
+  static_assert(std::is_same_v<decltype(tiled)::layout_t, PaddedTiled>);
+  ASSERT_EQ(tiled.extent(0), 2);
+  ASSERT_EQ(tiled.extent(1), 2);
+  ASSERT_EQ(tiled.extent(2), 2);
+  ASSERT_EQ(tiled.extent(3), 4);
+
+  // Distinct per element, so a transposed or collapsed map cannot pass.
+  for (int o0 = 0; o0 < 2; ++o0)
+    for (int i0 = 0; i0 < 2; ++i0)
+      for (int o1 = 0; o1 < 2; ++o1)
+        for (int i1 = 0; i1 < 4; ++i1)
+          tiled(o0, i0, o1, i1) =
+              static_cast<float>(100 + 8 * (2 * o0 + i0) + (4 * o1 + i1));
+
+  // Tile coordinate (o0,i0,o1,i1) is source element (2*o0+i0, 4*o1+i1), which
+  // the padded source puts at 9*row + col.
+  for (int o0 = 0; o0 < 2; ++o0)
+    for (int i0 = 0; i0 < 2; ++i0)
+      for (int o1 = 0; o1 < 2; ++o1)
+        for (int i1 = 0; i1 < 4; ++i1) {
+          const int row = 2 * o0 + i0, col = 4 * o1 + i1;
+          EXPECT_FLOAT_EQ(buf(9 * row + col),
+                          static_cast<float>(100 + 8 * row + col))
+              << "o0=" << o0 << " i0=" << i0 << " o1=" << o1 << " i1=" << i1;
+        }
+  for (int i = 0; i < 4; ++i)
+    EXPECT_FLOAT_EQ(buf(9 * i + 8), -1.f) << "pad of row " << i << " written";
+
+  // Reading back through the untiled view agrees element for element.
+  for (int i = 0; i < 4; ++i)
+    for (int j = 0; j < 8; ++j)
+      EXPECT_FLOAT_EQ(v(i, j), static_cast<float>(100 + 8 * i + j))
+          << "i=" << i << " j=" << j;
+}
+
+// ---------------------------------------------------------------------------
+// TEST: an arbitrary-order source tiles to a bijection onto its own slots —
+// the decode path every tier kernel's flat loop uses.
+// ---------------------------------------------------------------------------
+TEST(TiledStaticLayout, StrideTilingDecodeRoundTrip) {
+  StrideTiled layout{};
+  ASSERT_EQ(layout.size(), 96);
+
+  bool hit[96] = {};
+  for (int f = 0; f < layout.size(); ++f) {
+    const auto c   = layout[f];
+    const auto off = layout.flat(c[0], c[1], c[2], c[3]);
+    ASSERT_LT(off, 96u) << "f=" << f;
+    EXPECT_FALSE(hit[off]) << "flat offset " << off << " reached twice";
+    hit[off] = true;
+  }
+  // Onto: the source is packed, so every one of its 96 slots is covered.
+  for (int s = 0; s < 96; ++s) EXPECT_TRUE(hit[s]) << "slot " << s << " missed";
 }
 
 // ---------------------------------------------------------------------------
