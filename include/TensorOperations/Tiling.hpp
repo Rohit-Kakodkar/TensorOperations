@@ -681,6 +681,50 @@ KOKKOS_FORCEINLINE_FUNCTION auto reshape(
   return {};
 }
 
+// ---------------------------------------------------------------------------
+// reshape(nested StaticLayout, Tile, Order) — a NESTED source.
+//
+// reshape produces the nested layout, so it should be able to consume one. A
+// nested layout's mode grouping is purely logical: the offsets it addresses,
+// and their memory order, are fixed by its leaves alone. So reshaping it is
+// reshaping the flat layout over its concatenated leaves — see
+// Impl::flat_view_t, which is where that equivalence and the ordering
+// conventions behind it are written down.
+//
+// Forwarding to the flat overload rather than re-entering the planner directly
+// is what keeps this honest: the status-specific static_asserts, the
+// TENSOR_OPS_VERIFY_RESHAPE oracle, and ReshapeFlat's named-type recovery all
+// apply unchanged, because it is literally the same call.
+//
+// ROUND TRIPS ARE ASYMMETRIC, and the difference is not a bug. reshape is
+// defined over MEMORY order, and the planner carves each new mode to completion
+// in memory order without ever seeing the source's mode grouping. So reshaping
+// a nested source back to its LEAF shape and order is the identity, while
+// reshaping it to its MODE shape need not be: when a mode's leaves are
+// interleaved in memory with another mode's, the carve picks them up in memory
+// order and regroups them differently. The result still reproduces the source's
+// element->offset stream — it is a valid reshape — but it is not the layout you
+// started from. Do not assume the identity property the flat sources have.
+// ---------------------------------------------------------------------------
+
+template <typename... ExtSeqs, typename... StrSeqs, typename... OrdSeqs,
+          int... F, int... NO>
+KOKKOS_FORCEINLINE_FUNCTION auto reshape(
+    StaticLayout<DeviceTuple<ExtSeqs...>, DeviceTuple<StrSeqs...>,
+                 DeviceTuple<OrdSeqs...>>,
+    StaticTile<F...> tile, std::integer_sequence<int, NO...> order) noexcept
+    -> decltype(reshape(
+        Impl::flat_view_t<
+            StaticLayout<DeviceTuple<ExtSeqs...>, DeviceTuple<StrSeqs...>,
+                         DeviceTuple<OrdSeqs...>>>{},
+        tile, order)) {
+  return reshape(
+      Impl::flat_view_t<
+          StaticLayout<DeviceTuple<ExtSeqs...>, DeviceTuple<StrSeqs...>,
+                       DeviceTuple<OrdSeqs...>>>{},
+      tile, order);
+}
+
 // LayoutRight / LayoutLeft spellings of the new memory order, so the common
 // cases read like the rest of the API instead of spelling out an
 // integer_sequence. Same convention as make_tile_layout(tile, LayoutRight{}).
@@ -708,6 +752,36 @@ KOKKOS_FORCEINLINE_FUNCTION auto reshape(
                  Impl::left_order_t<static_cast<int>(sizeof...(F))>{});
 }
 
+// The same two spellings for a nested source. Needed separately because the two
+// above pattern-match the flat specialisation; without them a nested source
+// would be stuck with the explicit integer_sequence form.
+template <typename... ExtSeqs, typename... StrSeqs, typename... OrdSeqs,
+          int... F>
+KOKKOS_FORCEINLINE_FUNCTION auto reshape(
+    StaticLayout<DeviceTuple<ExtSeqs...>, DeviceTuple<StrSeqs...>,
+                 DeviceTuple<OrdSeqs...>>
+                     src,
+    StaticTile<F...> tile, LayoutRight) noexcept
+    -> decltype(reshape(
+        src, tile, Impl::right_order_t<static_cast<int>(sizeof...(F))>{})) {
+  return reshape(src, tile,
+                 Impl::right_order_t<static_cast<int>(sizeof...(F))>{});
+}
+
+template <typename... ExtSeqs, typename... StrSeqs, typename... OrdSeqs,
+          int... F>
+KOKKOS_FORCEINLINE_FUNCTION auto reshape(
+    StaticLayout<DeviceTuple<ExtSeqs...>, DeviceTuple<StrSeqs...>,
+                 DeviceTuple<OrdSeqs...>>
+                     src,
+    StaticTile<F...> tile, LayoutLeft) noexcept
+    -> decltype(reshape(src, tile,
+                        Impl::left_order_t<static_cast<int>(sizeof...(F))>{})) {
+  return reshape(src, tile,
+                 Impl::left_order_t<static_cast<int>(sizeof...(F))>{});
+}
+
+// ---------------------------------------------------------------------------
 // prefix_product — collapse a tile to a 2D [before, after] shape at a split.
 //
 // Given a split point S, returns a 2-extent tile whose first extent is the

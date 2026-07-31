@@ -283,6 +283,40 @@ struct SeqToTile<std::integer_sequence<int, E...>> {
 template <typename Seq>
 using seq_to_tile_t = typename SeqToTile<Seq>::type;
 
+// flat_view_t<NestedLayout> — the FLAT StaticLayout describing the same memory.
+//
+// A nested layout's mode grouping is a purely logical re-indexing: which
+// offsets exist, and in what memory order, is fixed by its leaves alone.
+// Concatenating the per-mode sequences therefore yields a flat layout with an
+// identical element→offset map, which is what lets reshape() accept a nested
+// source by forwarding rather than by growing a second planner.
+//
+// The three conventions line up with no translation, and the middle one is the
+// subtle one:
+//   • ext/str concatenate mode-major, so leaf i of the flat view is global leaf
+//     i of the nested one.
+//   • concat_seq_t<OrdSeqs...> is memory-position -> GLOBAL LEAF index, and a
+//     global leaf index IS the mode-major position — i.e. exactly the flat
+//     view's dimension index. See the comment above ReshapeModeSeq for why the
+//     per-mode slicing of `ord` looks wrong and is not; this alias is the
+//     second consumer of that invariant, so changing it breaks
+//     reshape-of-nested silently (the permutation static_assert below would
+//     still pass).
+//
+// Deliberately host-only, like everything else feeding the planner.
+template <typename L>
+struct FlatViewOf;
+
+template <typename... ExtSeqs, typename... StrSeqs, typename... OrdSeqs>
+struct FlatViewOf<StaticLayout<DeviceTuple<ExtSeqs...>, DeviceTuple<StrSeqs...>,
+                               DeviceTuple<OrdSeqs...>>> {
+  using type = StaticLayout<seq_to_tile_t<concat_seq_t<ExtSeqs...>>,
+                            concat_seq_t<StrSeqs...>, concat_seq_t<OrdSeqs...>>;
+};
+
+template <typename L>
+using flat_view_t = typename FlatViewOf<L>::type;
+
 // order_is_permutation, reached through a sequence rather than a loose pack.
 template <typename OrdSeq>
 struct OrderSeqIsPermutation;

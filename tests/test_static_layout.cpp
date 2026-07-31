@@ -512,6 +512,110 @@ static_assert(tiling_status<false, StaticTile<2, 2, 2, 2, 2, 2, 2, 2, 2>,
                             StaticTile<1, 1, 1, 1, 1, 1, 1, 1, 1>> ==
               Impl::ReshapeStatus::CapacityExceeded);
 
+// ---------------------------------------------------------------------------
+// 6. reshape with a NESTED source.
+//
+// reshape produces the nested layout, so it should consume one. It does so by
+// forwarding to the flat layout over the source's concatenated leaves
+// (Impl::flat_view_t), which rests on one claim: a nested layout's mode
+// grouping is purely logical, so its element->offset map is identical to that
+// flat view's. 6a proves exactly that; everything after it follows.
+// ---------------------------------------------------------------------------
+
+// --- 6a. The claim the whole overload rests on ------------------------------
+// ReshapeReproducesSource walks every element comparing a layout's real
+// decode-and-encode path against the mixed-radix stream of an (ext, str, order)
+// triple. Passing the NESTED layout as the "Result" turns the reshape oracle
+// into a proof that the flattening is offset-exact — for equal arities and for
+// ragged ones.
+static_assert(Impl::ReshapeReproducesSource<Interleave, StaticTile<5, 5, 5, 5>,
+                                            strides<1, 25, 5, 125>,
+                                            order<0, 2, 1, 3>>::value,
+              "flat_view_t<Interleave> is not offset-exact");
+static_assert(Impl::ReshapeReproducesSource<Ragged, StaticTile<2, 3, 4, 5, 6>,
+                                            strides<1, 8, 2, 24, 120>,
+                                            order<0, 2, 1, 3, 4>>::value,
+              "flat_view_t<Ragged> is not offset-exact");
+
+// ...and flat_view_t really does produce those triples from the type alone.
+static_assert(std::is_same_v<
+              Impl::flat_view_t<Ragged>,
+              StaticLayout<StaticTile<2, 3, 4, 5, 6>, strides<1, 8, 2, 24, 120>,
+                           order<0, 2, 1, 3, 4>>>);
+
+// --- 6b. Nested -> flat -----------------------------------------------------
+// Ragged is a dense mixed-radix bijection onto [0, 720), so flattening it to
+// rank 1 coalesces every leaf into one contiguous run and recovers the NAMED
+// layout — the same collapse a packed flat source would get.
+using NestedFlattened =
+    decltype(reshape(Ragged{}, StaticTile<720>{}, order<0>{}));
+static_assert(std::is_same_v<NestedFlattened, StaticTileLayoutRight<720>>);
+static_assert(NestedFlattened::mode_arity<0>() == 1);
+
+constexpr bool nested_flatten_is_dense() noexcept {
+  for (int k = 0; k < 720; ++k)
+    if (static_cast<int>(NestedFlattened{}.flat(k)) != k) return false;
+  return true;
+}
+static_assert(nested_flatten_is_dense());
+
+// --- 6c. Nested -> nested, and agreement with the equivalent flat source ----
+// Padded2D expressed as a nested layout: two modes, each of arity 1. Reshaping
+// it must give bit-for-bit what reshaping Padded2D itself gives (4b above) —
+// the source spelling cannot change the answer.
+using NestedPadded2D =
+    StaticLayout<DT<ext<4>, ext<8>>, DT<ext<9>, ext<1>>, DT<ext<1>, ext<0>>>;
+static_assert(Impl::ReshapeReproducesSource<NestedPadded2D, StaticTile<4, 8>,
+                                            strides<9, 1>, order<1, 0>>::value);
+
+static_assert(std::is_same_v<decltype(reshape(NestedPadded2D{},
+                                              StaticTile<32>{}, order<0>{})),
+                             ReshPaddedFlat>);
+static_assert(decltype(reshape(NestedPadded2D{}, StaticTile<32>{},
+                               order<0>{}))::mode_arity<0>() == 2);
+
+// --- 6d. Round trips are ASYMMETRIC -----------------------------------------
+// Reshaping to the source's LEAF shape and order is the identity: it returns
+// the flat view itself.
+static_assert(
+    std::is_same_v<decltype(reshape(Interleave{}, StaticTile<5, 5, 5, 5>{},
+                                    order<0, 2, 1, 3>{})),
+                   Impl::flat_view_t<Interleave>>);
+
+// Reshaping to the source's MODE shape is NOT. reshape is defined over memory
+// order and the planner carves each mode to completion in memory order, never
+// seeing the source's grouping — so Interleave's four leaves, whose memory
+// order is (mode0 leaf, mode1 leaf, mode0 leaf, mode1 leaf), get regrouped as
+// two contiguous runs. The result is a plain dense row-major 25x25: a valid
+// reshape of the same 625 elements in the same memory order, and a completely
+// different index map. This is the property callers must not assume; it is
+// pinned here so a future change to the carve loop cannot alter it silently.
+using InterleaveModeShape =
+    decltype(reshape(Interleave{}, StaticTile<25, 25>{}, LayoutRight{}));
+static_assert(
+    std::is_same_v<InterleaveModeShape, StaticTileLayoutRight<25, 25>>);
+static_assert(!std::is_same_v<InterleaveModeShape, Interleave>);
+static_assert(InterleaveModeShape::mode_arity<0>() == 1);  // flat, not nested
+static_assert(InterleaveModeShape{}.flat(1, 0) == 25);     // Interleave: 1
+static_assert(Interleave{}.flat(1, 0) == 1);
+static_assert(InterleaveModeShape{}.flat(5, 0) == 125);  // Interleave: 25
+static_assert(Interleave{}.flat(5, 0) == 25);
+
+// --- 6e. Diagnostics are inherited from the flat overload -------------------
+// The nested overload forwards rather than re-entering the planner, so the
+// rejection statuses are the same ones. Checked through the plan, as in 4f.
+static_assert(plan_status<StaticTile<2, 3, 4, 5, 6>, strides<1, 8, 2, 24, 120>,
+                          order<0, 2, 1, 3, 4>, StaticTile<719>, order<0>> ==
+              Impl::ReshapeStatus::CountMismatch);
+static_assert(plan_status<StaticTile<2, 3, 4, 5, 6>, strides<1, 8, 2, 24, 120>,
+                          order<0, 2, 1, 3, 4>, StaticTile<720>, order<0>> ==
+              Impl::ReshapeStatus::Ok);
+
+// A nested source arrives with more LEAVES than a flat source of the same rank
+// — Ragged is rank 2 but five leaves — so it eats the kReshapeMaxLeaves budget
+// faster. Well inside it here; the ceiling itself is covered by 5e.
+static_assert(Impl::flat_view_t<Ragged>::rank == 5);
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -838,6 +942,60 @@ TEST(GenericReshape, DecodeRoundTripRagged) {
   EXPECT_FALSE(hit[26]);
   for (int f = 0; f < 32; ++f)
     EXPECT_TRUE(hit[padded2d_offset_at(f)]) << "element " << f << " missed";
+}
+
+// ---------------------------------------------------------------------------
+// TEST: reshape a View whose layout is NESTED. Same source memory and same
+// target as GenericReshape.ViewWriteThroughPaddedMerge, but reached through the
+// nested spelling of the source — so it proves two things at once: the View
+// wrapper picks the new overload up with no change of its own (its
+// requires-clause is just "reshape(l,t,o) is valid"), and the answer does not
+// depend on how the source was spelled. The pad slots are still the oracle.
+// ---------------------------------------------------------------------------
+TEST(NestedReshape, ViewWriteThroughFromNestedSource) {
+  using Buf1D = Kokkos::View<float*, Kokkos::LayoutRight, Kokkos::HostSpace>;
+  Buf1D buf("buf", 36);  // 4 rows x pitch 9
+  Kokkos::deep_copy(buf, -1.f);
+
+  View<Buf1D, NestedPadded2D> v{buf, NestedPadded2D{}};
+  auto                        flat = reshape(v, StaticTile<32>{}, order<0>{});
+  static_assert(std::is_same_v<decltype(flat)::layout_t, ReshPaddedFlat>);
+  ASSERT_EQ(flat.extent(0), 32);
+
+  for (int k = 0; k < 32; ++k) flat(k) = static_cast<float>(200 + k);
+
+  for (int k = 0; k < 32; ++k)
+    EXPECT_FLOAT_EQ(buf(9 * (k / 8) + (k % 8)), static_cast<float>(200 + k))
+        << "k=" << k;
+  for (int i = 0; i < 4; ++i)
+    EXPECT_FLOAT_EQ(buf(9 * i + 8), -1.f) << "pad of row " << i << " written";
+
+  // Reading back through the original nested view agrees element for element.
+  for (int i = 0; i < 4; ++i)
+    for (int j = 0; j < 8; ++j)
+      EXPECT_FLOAT_EQ(v(i, j), static_cast<float>(200 + i * 8 + j))
+          << "i=" << i << " j=" << j;
+}
+
+// ---------------------------------------------------------------------------
+// TEST: a nested source flattened to rank 1 decodes as a dense bijection.
+// Ragged has unequal mode arities (2 and 3) and no repeated extent, so a
+// mode- or leaf-order transposition in the flattening cannot pass.
+// ---------------------------------------------------------------------------
+TEST(NestedReshape, RaggedFlattensToDenseBijection) {
+  NestedFlattened l{};
+  ASSERT_EQ(l.size(), 720);
+
+  bool hit[720] = {};
+  for (int f = 0; f < l.size(); ++f) {
+    const auto off = l.flat(l[f][0]);
+    ASSERT_LT(off, 720u) << "f=" << f;
+    EXPECT_FALSE(hit[off]) << "flat offset " << off << " reached twice";
+    hit[off] = true;
+    // The nested source puts its f-th memory-order element at the same place.
+    EXPECT_EQ(static_cast<int>(off), f) << "f=" << f;
+  }
+  for (int s = 0; s < 720; ++s) EXPECT_TRUE(hit[s]) << "slot " << s;
 }
 
 // TEST: tile_view over a PADDED source — the tiling no named layout could
