@@ -30,22 +30,43 @@
 // which is ~2.5x more because each force component's tree holds two F nodes,
 // each with all four gradients under it.
 //
-// MEASURED RESULT. The library is ~91x slower than the hand kernel on H100 --
-// but only ~3.5x slower on the Serial CPU backend, against a 2.52x recompute
-// floor. That asymmetry is the most informative number here: on a backend with
-// no team parallelism to waste, the fused graph lands near its theoretical
-// overhead, so the GPU gap is about how the tree uses a team, not about fusion.
+// MEASURED RESULT. The library is 4.26x slower than the hand kernel on H100
+// and 3.69x slower on Serial. Those two headline rows are NOT comparable on
+// their own: the library retires 2.52x the FLOPs and ~4x the auxiliary global
+// traffic, so a raw ratio conflates DOING MORE WORK with DOING WORK LESS
+// EFFICIENTLY. Separating the two is what the CONTROL rows below are for.
 //
-// Probes behind that:
-//   * one gradient contraction alone runs at ~1230 GF/s, so the [8x8]x[8x32]
-//     GEMM is healthy. The tree is 20 such GEMMs, which at that rate is ~120 ms
-//     against a measured 2.6 s -- ~95% of the runtime is neither GEMM work nor
-//     recompute.
-//   * halving TE halves scratch but DOUBLES the time (per-team cost is flat),
-//     so it is not occupancy.
-//   * the register kernel's work-item count is (SA/MT)*(SB/NR) = 32, while the
-//     team is 256 wide. Every one of ~20 barrier-separated stages leaves most
-//     of the team idle.
+// CONTROL is a hand-written kernel reproducing the library's EXACT work profile
+// -- 2 launches, 16 gradient sums, 4 stress evals, 4 divergences, 4x aux reads
+// -- at hand-written efficiency. CONTROL-B is the same with one constexpr flag
+// hoisting the gradient stage, which isolates gradient recompute from the rest
+// of the redundancy. Both validate against the host reference. The gap then
+// factors multiplicatively:
+//
+//            gap  =  redundancy (baseline -> CONTROL)  x  residual (-> library)
+//   H100     4.26x =            2.89x                  x        1.48x
+//   Serial   3.69x =            3.21x                  x        1.11x
+//
+// THE RESIDUALS DO NOT AGREE, and that is the most informative number here.
+// An earlier revision of this comment, and of SEM_STIFFNESS_GAP_ANALYSIS.md,
+// claimed they did (1.46x vs 1.47x) and concluded the whole remaining gap was
+// algorithmic and backend-independent. That rested on ESTIMATING the CPU's
+// redundancy as the 2.52x executed-FLOP ratio. Now that CONTROL actually runs
+// on Serial it MEASURES 3.21x -- redundancy costs more than its FLOPs, because
+// it also carries 4x the aux traffic. So the honest split is ~1.11x of
+// backend-independent library cost, times a further ~1.33x that appears only
+// on the GPU. Team utilisation is therefore back on the table, not ruled out.
+//
+// Probes behind that, all printed as [diag] rows:
+//   * one gradient contraction alone runs at ~1300 GF/s, so the [8x8]x[8x32]
+//     GEMM is healthy. The library's marginal gradient sweep is actually
+//     CHEAPER than the hand kernel's.
+//   * the fused-operand passthrough costs nothing: a divergence GEMM reading a
+//     materialized View operand is within noise of a gradient GEMM of the same
+//     shape. Fusion itself is not what is expensive.
+//   * 4x [1 F node] accounts for most, but not all, of the library's runtime;
+//     the remainder looks fixed-per-tree rather than proportional to work.
+//   * halving TE halves scratch but DOUBLES the time (per-team cost is flat).
 //
 // What already got fixed: the seven auxiliary arrays were originally combine
 // OPERANDS, which forced the library to stage all of them into scratch. Since
@@ -54,9 +75,10 @@
 // scratch 38760 -> 24312 bytes -- which is also what brought the Serial
 // backend under its hardcoded 32 KB cap and made a CPU number possible at all.
 //
-// What is left: each of the 8 gradient contractions per kernel stages its own
-// copy of u, where the hand kernel stages u once and reuses it for all four.
-// That is fan-out (Feature C) showing up as bandwidth rather than as FLOPs.
+// What is left, in order: the redundancy term is the larger one, and a
+// multi-output combine as a fused operand collapses 16 gradient sums to 8 and
+// 2 launches to 1. The residual is the subtler one -- see
+// SEM_STIFFNESS_GAP_ANALYSIS.md for the ordered statement of work.
 //
 // A library SLOWDOWN here is a valid deliverable: the point is the number and
 // what it points at, not a win.
@@ -339,6 +361,74 @@ void library_force(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m, V3 mu,
   g1.execute(TeamPolicyTag<>{}, library_tile(), force);
 }
 inline constexpr int kLibSrcEnd = __LINE__;
+// DIAG-B: one F node on its own -- 4 gradient contractions + StressIntegrand,
+// written to global. This is exactly one quarter of what the full library run
+// executes (2 kernels x 2 F nodes), so 4x this row is the whole gradient+stress
+// half of the tree, measured rather than extrapolated.
+void library_one_F(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m, V3 mu,
+                   V3 jac, V2 H, V3dyn out) {
+  auto g                        = make_graph();
+  [[maybe_unused]] auto [g1, o] = g.ops(make_combine_node<'q', 'e', 'j'>(
+      make_contraction_node<'q', 'e', 'j'>(
+          make_input_node(make_handle<'q', 'p'>(H)),
+          make_input_node(make_handle<'e', 'j', 'p'>(u0))),
+      make_contraction_node<'q', 'e', 'j'>(
+          make_input_node(make_handle<'q', 'p'>(H)),
+          make_input_node(make_handle<'e', 'j', 'p'>(u1))),
+      make_contraction_node<'j', 'e', 'q'>(
+          make_input_node(make_handle<'j', 'p'>(H)),
+          make_input_node(make_handle<'e', 'p', 'q'>(u0))),
+      make_contraction_node<'j', 'e', 'q'>(
+          make_input_node(make_handle<'j', 'p'>(H)),
+          make_input_node(make_handle<'e', 'p', 'q'>(u1))),
+      StressIntegrand<0, 0>{xix, xiz, gx, gz, l2m, mu, jac}));
+  g1.execute(TeamPolicyTag<>{},
+             make_combine_tile(TileQEJ{}, BGrad{}, BGrad{}, BGrad{}, BGrad{}),
+             out);
+}
+
+// DIAG-C: the same four gradients, but the combine does nothing but add them --
+// no auxiliary View reads at all. DIAG-B minus DIAG-C is the cost of the seven
+// global aux reads the StressIntegrand does; the remainder is the GEMMs.
+struct SumFour {
+  KOKKOS_FUNCTION float operator()(int, int, int, float a, float b, float c,
+                                   float d) const {
+    return a + b + c + d;
+  }
+};
+void library_four_gradients(V3 u0, V3 u1, V2 H, V3dyn out) {
+  auto g                        = make_graph();
+  [[maybe_unused]] auto [g1, o] = g.ops(make_combine_node<'q', 'e', 'j'>(
+      make_contraction_node<'q', 'e', 'j'>(
+          make_input_node(make_handle<'q', 'p'>(H)),
+          make_input_node(make_handle<'e', 'j', 'p'>(u0))),
+      make_contraction_node<'q', 'e', 'j'>(
+          make_input_node(make_handle<'q', 'p'>(H)),
+          make_input_node(make_handle<'e', 'j', 'p'>(u1))),
+      make_contraction_node<'j', 'e', 'q'>(
+          make_input_node(make_handle<'j', 'p'>(H)),
+          make_input_node(make_handle<'e', 'p', 'q'>(u0))),
+      make_contraction_node<'j', 'e', 'q'>(
+          make_input_node(make_handle<'j', 'p'>(H)),
+          make_input_node(make_handle<'e', 'p', 'q'>(u1))),
+      SumFour{}));
+  g1.execute(TeamPolicyTag<>{},
+             make_combine_tile(TileQEJ{}, BGrad{}, BGrad{}, BGrad{}, BGrad{}),
+             out);
+}
+
+// DIAG-D: the divergence contraction with a MATERIALIZED operand -- same GEMM
+// shape the tree runs, but B is a plain View instead of a fused combine node.
+// Compare against the tree's implied per-divergence cost to price the fused
+// operand path itself.
+void library_one_divergence(V3dyn Fin, V2 Hw, V3 out) {
+  auto g                        = make_graph();
+  [[maybe_unused]] auto [g1, o] = g.ops(make_contraction_node<'e', 'j', 'i'>(
+      make_input_node(make_handle<'q', 'i'>(Hw)),
+      make_input_node(make_handle<'q', 'e', 'j'>(Fin))));
+  g1.execute(TeamPolicyTag<>{}, Tile<TileH, TileQEJ, TileEJI>{}, out);
+}
+
 // DIAGNOSTIC (not part of the comparison): one gradient contraction on its own,
 // same tile shape the fused tree uses internally. This separates two very
 // different explanations for a slow fused path -- "the [8x8]x[8x32] GEMM is
@@ -474,6 +564,128 @@ void baseline_force(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m, V3 mu,
       });
 }
 inline constexpr int kBaseSrcEnd = __LINE__;
+
+// ===========================================================================
+// Implementation 3: THE CONTROL. A hand-written kernel that reproduces the
+// library's REDUNDANCY exactly, at hand-written efficiency.
+//
+// Per force component (2 launches, like the library):
+//   for each of the 2 F nodes:
+//       stage u0 and u1 (twice each -- the library's four contractions each
+//                        stage their own operand copy; fan-out isn't deduped)
+//       compute ALL FOUR reference gradients   <-- recomputed for both F nodes
+//       chain rule + stress -> ONE integrand slot (reads all 7 aux from global)
+//   2 divergence sums + the weighted combine
+//
+// That is 8 gradient sums, 2 stress evaluations and 2 divergence sums per
+// launch: the library's executed FLOP profile and the library's global-memory
+// traffic, byte for byte.
+//
+// baseline -> control  = the price of the redundancy itself.
+// control  -> library  = everything else the library costs.
+// ===========================================================================
+template <int Comp, bool DedupGrad = false>
+void control_recompute_force(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m,
+                             V3 mu, V3 jac, V2 H, V2 Hw,
+                             Kokkos::Array<float, cfg::N> w, V3 force, int E) {
+  using ExecSpace    = Kokkos::DefaultExecutionSpace;
+  using ScratchSpace = ExecSpace::scratch_memory_space;
+  using Sc3          = Kokkos::View<float***, ScratchSpace,
+                                    Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+  using member_t     = Kokkos::TeamPolicy<ExecSpace>::member_type;
+
+  constexpr int N = cfg::N, TE = cfg::TE, NP = cfg::N * cfg::N;
+  const size_t  bytes = 8 * Sc3::shmem_size(TE, N, N);
+
+  Kokkos::parallel_for(
+      "control_recompute",
+      Kokkos::TeamPolicy<ExecSpace>(E / TE, Kokkos::AUTO)
+          .set_scratch_size(0, Kokkos::PerTeam(bytes)),
+      KOKKOS_LAMBDA(const member_t& team) {
+        const int e0 = team.league_rank() * TE;
+        Sc3       us0(team.team_scratch(0), TE, N, N);
+        Sc3       us1(team.team_scratch(0), TE, N, N);
+        Sc3       a0v(team.team_scratch(0), TE, N, N);
+        Sc3       a1v(team.team_scratch(0), TE, N, N);
+        Sc3       g0v(team.team_scratch(0), TE, N, N);
+        Sc3       g1v(team.team_scratch(0), TE, N, N);
+        Sc3       F0(team.team_scratch(0), TE, N, N);
+        Sc3       F1(team.team_scratch(0), TE, N, N);
+
+        // Two F nodes; each redoes the staging and all four gradients --
+        // unless DedupGrad, in which case the gradient stage runs once and
+        // both F nodes read the same buffers. DedupGrad is the ONLY difference
+        // between the two control rows.
+        for (int f = 0; f < 2; ++f) {
+          if (!DedupGrad || f == 0) {
+            // Four operand stagings, matching the library's four contractions.
+            Kokkos::parallel_for(
+                Kokkos::TeamVectorRange(team, TE * NP), [&](int t) {
+                  const int de = t / NP, r = t % NP, j = r / N, i = r % N;
+                  us0(de, j, i) = u0(e0 + de, j, i);
+                  us1(de, j, i) = u1(e0 + de, j, i);
+                  if (!DedupGrad) {
+                    us0(de, j, i) = u0(e0 + de, j, i);
+                    us1(de, j, i) = u1(e0 + de, j, i);
+                  }
+                });
+            team.team_barrier();
+
+            Kokkos::parallel_for(
+                Kokkos::TeamVectorRange(team, TE * NP), [&](int t) {
+                  const int de = t / NP, r = t % NP, j = r / N, i = r % N;
+                  float     ax0 = 0.f, ax1 = 0.f, ag0 = 0.f, ag1 = 0.f;
+                  for (int p = 0; p < N; ++p) {
+                    const float hi = H(i, p), hj = H(j, p);
+                    ax0 += hi * us0(de, j, p);
+                    ax1 += hi * us1(de, j, p);
+                    ag0 += hj * us0(de, p, i);
+                    ag1 += hj * us1(de, p, i);
+                  }
+                  a0v(de, j, i) = ax0;
+                  a1v(de, j, i) = ax1;
+                  g0v(de, j, i) = ag0;
+                  g1v(de, j, i) = ag1;
+                });
+            team.team_barrier();
+          }
+
+          // ONE integrand slot per F node, from a freshly rebuilt stress.
+          Kokkos::parallel_for(
+              Kokkos::TeamVectorRange(team, TE * NP), [&](int t) {
+                const int   de = t / NP, r = t % NP, j = r / N, i = r % N;
+                const int   e = e0 + de;
+                const float v =
+                    (f == 0) ? integrand_slot<Comp, 0>(
+                                   a0v(de, j, i), a1v(de, j, i), g0v(de, j, i),
+                                   g1v(de, j, i), xix(e, j, i), xiz(e, j, i),
+                                   gx(e, j, i), gz(e, j, i), l2m(e, j, i),
+                                   mu(e, j, i), jac(e, j, i))
+                             : integrand_slot<Comp, 1>(
+                                   a0v(de, j, i), a1v(de, j, i), g0v(de, j, i),
+                                   g1v(de, j, i), xix(e, j, i), xiz(e, j, i),
+                                   gx(e, j, i), gz(e, j, i), l2m(e, j, i),
+                                   mu(e, j, i), jac(e, j, i));
+                if (f == 0)
+                  F0(de, j, i) = v;
+                else
+                  F1(de, j, i) = v;
+              });
+          team.team_barrier();
+        }
+
+        Kokkos::parallel_for(
+            Kokkos::TeamVectorRange(team, TE * NP), [&](int t) {
+              const int de = t / NP, r = t % NP, j = r / N, i = r % N;
+              float     s = 0.f, g = 0.f;
+              for (int q = 0; q < N; ++q) {
+                s += Hw(q, i) * F0(de, j, q);
+                g += Hw(q, j) * F1(de, q, i);
+              }
+              force(e0 + de, j, i) = w[j] * s + w[i] * g;
+            });
+      });
+}
 
 // ---------------------------------------------------------------------------
 // Inputs. Deterministic, bounded, index-dependent and non-symmetric -- an
@@ -742,6 +954,41 @@ int main(int argc, char* argv[]) {
         "%-30s %10.3f %14.1f %16.1f %8s\n", "library (fused, 2 kernels)",
         tl * 1e3, flopcount::kUseful * Ed / tl / 1e9,
         flopcount::kLibExec * Ed / tl / 1e9, dl < 1e-2 ? "PASS" : "FAIL");
+    // THE CONTROL: hand-written, but with the library's exact redundancy.
+    V3   fc0("fc0", E, cfg::N, cfg::N), fc1("fc1", E, cfg::N, cfg::N);
+    auto run_ctl = [&] {
+      control_recompute_force<0>(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H, Hw,
+                                 w, fc0, E);
+      control_recompute_force<1>(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H, Hw,
+                                 w, fc1, E);
+    };
+    run_ctl();
+    Kokkos::fence();
+    const double dc =
+        std::max(max_rel_diff(fc0, ref0, Echk), max_rel_diff(fc1, ref1, Echk));
+    const double tc = seconds_of(run_ctl, warmup, reps);
+    std::printf(
+        "%-30s %10.3f %14.1f %16.1f %8s\n", "CONTROL (hand, lib's redund.)",
+        tc * 1e3, flopcount::kUseful * Ed / tc / 1e9,
+        flopcount::kLibExec * Ed / tc / 1e9, dc < 1e-2 ? "PASS" : "FAIL");
+
+    // Same control, gradients computed ONCE per kernel. Isolates the gradient
+    // recompute from the rest of the redundancy (2 kernels, 4 stress evals).
+    auto run_ctl2 = [&] {
+      control_recompute_force<0, true>(u0, u1, xix, xiz, gx, gz, l2m, mu, jac,
+                                       H, Hw, w, fc0, E);
+      control_recompute_force<1, true>(u0, u1, xix, xiz, gx, gz, l2m, mu, jac,
+                                       H, Hw, w, fc1, E);
+    };
+    run_ctl2();
+    Kokkos::fence();
+    const double dc2 =
+        std::max(max_rel_diff(fc0, ref0, Echk), max_rel_diff(fc1, ref1, Echk));
+    const double tc2 = seconds_of(run_ctl2, warmup, reps);
+    std::printf("%-30s %10.3f %14.1f %16s %8s\n", "CONTROL-B (grads deduped)",
+                tc2 * 1e3, flopcount::kUseful * Ed / tc2 / 1e9, "-",
+                dc2 < 1e-2 ? "PASS" : "FAIL");
+
     // Diagnostic row: one gradient contraction, output modes {q,e,j}.
     V3dyn        go("go", cfg::N, E, cfg::N);
     auto         run_one = [&] { library_one_gradient(u0, H, go); };
@@ -749,13 +996,56 @@ int main(int argc, char* argv[]) {
     const double f1g     = flopcount::NP * cfg::N * 2.0 * Ed;  // one gradient
     std::printf("%-30s %10.3f %14.1f %16s %8s\n", "  [diag] 1 gradient only",
                 t1g * 1e3, f1g / t1g / 1e9, "-", "-");
+
+    auto         run_4g = [&] { library_four_gradients(u0, u1, H, go); };
+    const double t4g    = seconds_of(run_4g, warmup, reps);
+    std::printf("%-30s %10.3f %14.1f %16s %8s\n",
+                "  [diag] 4 gradients, no aux", t4g * 1e3,
+                4.0 * f1g / t4g / 1e9, "-", "-");
+
+    auto run_1F = [&] {
+      library_one_F(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H, go);
+    };
+    const double t1F = seconds_of(run_1F, warmup, reps);
+    std::printf("%-30s %10.3f %14.1f %16s %8s\n",
+                "  [diag] 1 F node (4grad+stress)", t1F * 1e3,
+                4.0 * f1g / t1F / 1e9, "-", "-");
+    // ONE force component: 1 launch, 8 gradient sums, 2 stress evals, 2
+    // divergences. This is the closest measurable proxy for what a 2-output
+    // fused combine operand would produce (which adds back 2 divergences and a
+    // second output, but shares everything below them).
+    auto run_lib1 = [&] {
+      library_force<0>(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H, Hw, w, fl0);
+    };
+    const double tl1 = seconds_of(run_lib1, warmup, reps);
+    std::printf("%-30s %10.3f %14s %16s %8s\n", "  [diag] library, 1 component",
+                tl1 * 1e3, "-", "-", "-");
+
+    auto         run_1d = [&] { library_one_divergence(go, Hw, fl0); };
+    const double t1d    = seconds_of(run_1d, warmup, reps);
+    std::printf("%-30s %10.3f %14.1f %16s %8s\n",
+                "  [diag] 1 divergence (mat. B)", t1d * 1e3, f1g / t1d / 1e9,
+                "-", "-");
+
     std::printf(
-        "  the fused tree runs 10 such GEMMs per kernel, serialized by team "
-        "barriers\n");
+        "\n  4 x [1 F node] = %.3f ms  (the tree holds 4 of them) vs library "
+        "%.3f ms\n"
+        "  aux-read cost per F node = %.3f ms; 4 grads vs 4 x 1 grad = %.3f / "
+        "%.3f ms\n",
+        4.0 * t1F * 1e3, tl * 1e3, (t1F - t4g) * 1e3, t4g * 1e3,
+        4.0 * t1g * 1e3);
 
     std::printf(
         "\nspeedup (base/lib): %.4fx   |   library recompute factor: %.2fx\n",
         tb / tl, flopcount::kLibExec / flopcount::kUseful);
+    std::printf(
+        "DECOMPOSITION of the %.2fx gap:\n"
+        "  redundancy    (baseline -> control): %.2fx\n"
+        "     of which gradient recompute:      %.2fx  (control-B -> control)\n"
+        "     of which 2 kernels + 4x stress:   %.2fx  (baseline  -> "
+        "control-B)\n"
+        "  library cost  (control  -> library): %.2fx\n",
+        tl / tb, tc / tb, tc / tc2, tc2 / tb, tl / tc);
     std::printf("source lines: library %d, hand-written %d\n",
                 kLibSrcEnd - kLibSrcBegin - 1, kBaseSrcEnd - kBaseSrcBegin - 1);
     std::printf("max rel diff vs host reference: baseline %.2e, library %.2e\n",

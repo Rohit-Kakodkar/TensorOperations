@@ -20,8 +20,8 @@ library ~2.6x slower than hand-written code.
 - [Method: the CONTROL kernel](#method-the-control-kernel)
 - [The decomposition](#the-decomposition)
 - [Factor 1 — redundancy (2.90x)](#factor-1--redundancy-290x)
-- [Factor 2 — library overhead (1.47x)](#factor-2--library-overhead-147x)
-- [Cross-backend confirmation](#cross-backend-confirmation)
+- [Factor 2 — library overhead (1.48x)](#factor-2--library-overhead-148x)
+- [Cross-backend comparison](#cross-backend-comparison)
 - [Corrections to the benchmark header](#corrections-to-the-benchmark-header)
 - [Statement of work](#statement-of-work)
 - [Caveats](#caveats)
@@ -50,11 +50,18 @@ CONTROL-B (grads deduped)          17.401         1526.4                -
 ### CPU (Serial / AVX-512, E = 16384)
 
 ```
-baseline (hand, 1 kernel)          41.764            4.2
-library (fused, 2 kernels)        154.291            1.1              2.8
+baseline (hand, 1 kernel)          41.861            4.2                -
+library (fused, 2 kernels)        154.539            1.1              2.8
+CONTROL   (hand, lib's redundancy) 134.453           1.3              3.3
+CONTROL-B (grads deduped)          91.814            1.9                -
 ```
 
-**3.69x slower**, against a 2.52x executed-FLOP recompute floor.
+**3.69x slower**, factoring as **3.21x redundancy x 1.11x residual**. The
+2.52x executed-FLOP ratio is a *floor* on the redundancy term, not an estimate
+of it: the measured 3.21x exceeds it because redundancy also carries ~4x the
+auxiliary global traffic. See [Cross-backend](#cross-backend-comparison) — an
+earlier revision of this document used 2.52x here as if it were the measurement,
+and drew a wrong conclusion from it.
 
 ---
 
@@ -94,9 +101,13 @@ The 4.26x gap factors into three multiplicative terms:
 |---|---|---|
 | 2 launches + 4x stress + cross-kernel gradient recompute | **1.79x** | `baseline -> CONTROL-B` |
 | intra-kernel gradient recompute | **1.62x** | `CONTROL-B -> CONTROL` |
-| library vs equivalent hand-written code | **1.47x** | `CONTROL -> library` |
+| library vs equivalent hand-written code | **1.48x** | `CONTROL -> library` |
 
-`1.79 x 1.62 x 1.47 = 4.26` ✓
+`1.79 x 1.62 x 1.48 = 4.26` ✓
+
+Only the third term is GPU-specific in any part: on Serial the same `CONTROL`
+construction gives a residual of just 1.11x. See
+[Cross-backend](#cross-backend-comparison).
 
 Gradient recompute is split across the first two terms: the library computes
 each gradient **16 times where the baseline computes it 4 times** — 2x across
@@ -152,7 +163,7 @@ preserved.
 
 ---
 
-## Factor 2 — library overhead (1.47x)
+## Factor 2 — library overhead (1.48x)
 
 `CONTROL` and the library execute the same FLOPs and move the same bytes, yet
 the library takes 28.19 ms -> 41.49 ms. **This term is not yet attributed.**
@@ -175,23 +186,44 @@ traffic that the hand kernel does not perform.
 
 ---
 
-## Cross-backend confirmation
+## Cross-backend comparison
 
-The CPU and GPU residuals agree almost exactly:
+> **CORRECTED 2026-08-01, after Task 1 landed.** An earlier revision of this
+> section claimed the CPU and GPU residuals agreed almost exactly (1.46x vs
+> 1.47x) and concluded the remaining gap was entirely algorithmic and
+> backend-independent. **That was wrong, and the error was methodological:** the
+> CPU redundancy figure was not measured, it was *assumed* to equal the 2.52x
+> executed-FLOP ratio, on the reasoning that Serial has no team parallelism to
+> waste so time should track FLOPs. Landing `CONTROL` on Serial (Task 1) made it
+> measurable, and it measures **3.21x**, not 2.52x — redundancy costs more than
+> its FLOPs alone, because it also carries ~4x the auxiliary global traffic.
 
-| backend | measured gap | redundancy | **residual** |
+| backend | measured gap | redundancy (**measured**) | **residual** |
 |---|---|---|---|
-| GPU (H100) | 4.26x | 2.90x (measured via CONTROL) | **1.47x** |
-| CPU (Serial) | 3.69x | 2.52x (executed-FLOP ratio) | **1.46x** |
+| GPU (H100) | 4.26x | 2.89x | **1.48x** |
+| CPU (Serial) | 3.69x | 3.21x | **1.11x** |
 
-On Serial there is no team parallelism to waste, so time tracks executed FLOPs
-and the redundancy factor is just the FLOP ratio. That the leftover term is
-1.46x on one backend and 1.47x on the other is strong evidence that **the gap is
-algorithmic and backend-independent** — it is about how the tree is shaped, not
-about how a team is used.
+Both columns are now `CONTROL`-measured on their own backend. Stability: the
+GPU residual reproduces at 1.48x across runs; the CPU residual sits in
+1.09–1.15x.
 
-This is the single most informative result here, and it is a change from what
-the benchmark header currently claims.
+**The residuals do not agree.** The honest reading is a product:
+
+```
+residual_GPU  =  1.11x  (backend-independent library cost)
+              x  1.33x  (appears only on the GPU)
+```
+
+So there really is a backend-independent term — it is just much smaller than
+claimed, and roughly a third of the GPU residual is something the Serial
+backend does not pay. **Team utilisation is back on the table.** It is not
+proven to be the cause, but the evidence that previously ruled it out has
+evaporated, and Task 2 must now check it rather than assume it away.
+
+Note the redundancy term is *larger* on CPU (3.21x vs 2.89x) — the CPU is
+relatively more sensitive to the extra work and less sensitive to whatever the
+GPU-specific residual is, which is consistent with the residual being a
+latency/occupancy effect rather than an instruction-count one.
 
 ---
 
@@ -206,11 +238,15 @@ places:
    ~30 of 41.5 ms is GEMM sweeps running at the standalone contraction rate.
    The large unexplained residual it describes has largely been paid off.
 3. **"the register kernel's work-item count is 32 while the team is 256 wide"**
-   as the leading explanation → superseded. The CPU/GPU residual agreement
-   (1.46x vs 1.47x) says team under-occupancy is not what is left.
+   as the leading explanation → *demoted, but NOT ruled out.* This document
+   originally superseded it outright on the strength of the CPU/GPU residual
+   agreement; that agreement was an artefact of estimating the CPU redundancy
+   (see [Cross-backend](#cross-backend-comparison)). With both backends now
+   measured, ~1.33x of the GPU residual is GPU-specific, and this is a live
+   candidate for it again.
 
-Item 3's *observation* is still true; it is the *attribution* that no longer
-holds.
+**Status: applied.** The header was rewritten when Task 1 landed and now states
+the corrected decomposition, including the non-agreement of the residuals.
 
 ---
 
@@ -219,28 +255,26 @@ holds.
 Ordered by expected value per unit effort. Each task states what it is worth in
 measured terms, so the ordering can be re-derived if a number moves.
 
-### Task 1 — Land the controls and correct the header  *(do first)*
+### Task 1 — Land the controls and correct the header  ✅ **DONE 2026-08-01**
 
-**Priority: HIGH — cheap, and it makes every claim below reproducible in-repo.**
+`CONTROL`, `CONTROL-B` and the four diagnostic rows are now in
+`bench_sem_stiffness.cpp`; it prints the full decomposition on both backends and
+the header has been rewritten. All rows validate (`max rel diff 0.00e+00`).
 
-Fold `CONTROL`, `CONTROL-B` and the four new diagnostic rows from
-`bench_diag.cpp` into `bench_sem_stiffness.cpp`, and rewrite the header comment
-per [Corrections](#corrections-to-the-benchmark-header).
+**It immediately paid for itself.** Running `CONTROL` on Serial — which was not
+possible while it lived in a scratchpad — is what exposed that this document's
+"cross-backend confirmation" was wrong: the CPU redundancy had been *assumed*
+equal to the 2.52x FLOP ratio, and measures 3.21x. The residuals do not agree
+(1.48x GPU vs 1.11x CPU), which reopens a hypothesis this document had closed.
 
-- **Effort:** ~half a day. The code exists and validates; it needs porting and
-  comment surgery.
-- **Depends on:** nothing.
-- **Risk:** none.
-- **Done when:** `bench_sem_stiffness` prints the full decomposition table and
-  no header claim contradicts a printed number.
-
-**Why first:** every task below is justified by a number that currently lives
-only in a scratchpad file. Until the controls are in the repo, the next
-regression silently invalidates this whole document.
+That is exactly the failure mode this task was meant to prevent, and it was
+already latent when the document was written. Numbers that live only in a
+scratchpad do not get re-run, and conclusions drawn from estimates treated as if
+they were measurements survive unchallenged.
 
 ---
 
-### Task 2 — Attribute the 1.47x residual  *(spike, before committing to Task 3)*
+### Task 2 — Attribute the 1.48x residual  *(spike, before committing to Task 3)*
 
 **Priority: HIGH — cheap, and it can reorder everything after it.**
 
@@ -256,7 +290,7 @@ kernel does not perform.
 - **Done when:** the ~11 ms is attributed to named mechanisms with a measured
   share each.
 
-**Why this early, ahead of the big feature:** the residual is 1.47x and it
+**Why this early, ahead of the big feature:** the residual is 1.48x and it
 applies *multiplicatively to every future improvement* — it does not shrink when
 the redundancy does. If it turns out to be one fixable staging or spill problem,
 it is worth more per unit effort than Task 3 and the order should swap. Spending
@@ -326,7 +360,7 @@ against a tree that Task 3 is about to restructure.
 
 **Priority: DEFERRED — scope unknown until Task 2 reports.**
 
-Whatever the residual turns out to be. Sized after Task 2. Note that at 1.47x
+Whatever the residual turns out to be. Sized after Task 2. Note that at 1.48x
 this is, after Task 3 and Task 4 land, the *largest remaining term*: a library
 at ~19 ms against a 9.7 ms baseline is ~1.95x off, and essentially all of that
 is this factor.
@@ -335,8 +369,11 @@ is this factor.
 
 ### Not recommended
 
-- **Chasing team occupancy / work-item count.** The CPU and GPU residuals agree
-  to within 1%, which says the remaining gap is not about team utilisation.
+- ~~**Chasing team occupancy / work-item count.**~~ **Retracted.** This entry
+  rested on the CPU and GPU residuals agreeing to within 1%. They do not — that
+  agreement came from estimating the CPU redundancy rather than measuring it.
+  With `CONTROL` now running on both backends, ~1.33x of the GPU residual is
+  GPU-specific, and occupancy is a legitimate candidate. Task 2 checks it.
 - **Reducing the recompute by shrinking `TE`.** Scratch is additive and per-team
   cost is flat; this trades one problem for another.
 - **A single 4-output combine.** See the mode-order constraint above.
@@ -370,5 +407,5 @@ cmake --build build --target bench_sem_stiffness -j 8
 ./build_serial/bench_sem_stiffness 16384 3 1   # CPU
 ```
 
-The decomposition rows currently require the scratchpad harness
-(`bench_diag.cpp`, a superset of this benchmark) until Task 1 lands.
+The decomposition rows are printed by the benchmark itself as of Task 1; the
+`bench_diag.cpp` scratchpad harness they came from is no longer needed.
