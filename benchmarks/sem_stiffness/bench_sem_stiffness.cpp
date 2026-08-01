@@ -154,10 +154,16 @@ inline constexpr int E_default = kIsGPU ? 12582912 : 16384;
 
 // Element-local tensors are [E, N, N] = (element, z, x). The user's framing:
 // 3D in 2D physics, 4D in 3D physics.
-using V3  = Kokkos::View<float***, Kokkos::LayoutRight>;
-using V2  = Kokkos::View<float**, Kokkos::LayoutRight>;
-using V3H = V3::host_mirror_type;
-using V2H = V2::host_mirror_type;
+// EXPERIMENT: static trailing extents. A Kokkos::View with fully dynamic rank
+// carries its extents at runtime (48 B); pinning the two GLL axes at compile
+// time shrinks it to a pointer plus the one dynamic extent. Every node handle
+// in the graph stores a View by value, and the evaluator tree duplicates each
+// one per nesting level, so this multiplies through the whole per-thread state.
+using V3    = Kokkos::View<float * [cfg::N][cfg::N], Kokkos::LayoutRight>;
+using V3dyn = Kokkos::View<float***, Kokkos::LayoutRight>;
+using V2    = Kokkos::View<float**, Kokkos::LayoutRight>;
+using V3H   = V3::host_mirror_type;
+using V2H   = V2::host_mirror_type;
 
 // ---------------------------------------------------------------------------
 // compute_stress -- THE BLACK BOX.
@@ -333,13 +339,12 @@ void library_force(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m, V3 mu,
   g1.execute(TeamPolicyTag<>{}, library_tile(), force);
 }
 inline constexpr int kLibSrcEnd = __LINE__;
-
 // DIAGNOSTIC (not part of the comparison): one gradient contraction on its own,
 // same tile shape the fused tree uses internally. This separates two very
 // different explanations for a slow fused path -- "the [8x8]x[8x32] GEMM is
 // simply small" versus "the fused tree's serialized stages are the cost". If
 // this row is also slow, the tile is the floor and fusion is not the culprit.
-void library_one_gradient(V3 u0, V2 H, V3 out) {
+void library_one_gradient(V3 u0, V2 H, V3dyn out) {
   auto g                        = make_graph();
   [[maybe_unused]] auto [g1, o] = g.ops(make_contraction_node<'q', 'e', 'j'>(
       make_input_node(make_handle<'q', 'p'>(H)),
@@ -653,6 +658,16 @@ int main(int argc, char* argv[]) {
     const std::size_t smax   = gpu ? 48u * 1024u : 32u * 1024u;
     std::printf("library scratch/team: %zu bytes (limit ~%zu)%s\n", sbytes,
                 smax, sbytes > smax ? "  <-- OVER" : "");
+    // Per-THREAD state, which is what actually limits this kernel on GPU. The
+    // whole node graph is stored BY VALUE inside the evaluator, and every
+    // nesting level stores its operands' nodes AGAIN: the parent keeps `node`,
+    // and its ScratchAllocator keeps an inner Evaluator holding another copy.
+    // A leaf View is therefore duplicated once per level of the tree.
+    std::printf(
+        "per-thread: node graph %zu B, evaluator %zu B (%zu regs if resident)"
+        " | one View = %zu B\n",
+        sizeof(decltype(node)), sizeof(LibEval), sizeof(LibEval) / 4,
+        sizeof(V3));
     if (sbytes > smax) {
       std::printf(
           "The fused graph does not fit. On CPU there is no valid TE at all:\n"
@@ -728,7 +743,7 @@ int main(int argc, char* argv[]) {
         tl * 1e3, flopcount::kUseful * Ed / tl / 1e9,
         flopcount::kLibExec * Ed / tl / 1e9, dl < 1e-2 ? "PASS" : "FAIL");
     // Diagnostic row: one gradient contraction, output modes {q,e,j}.
-    V3           go("go", cfg::N, E, cfg::N);
+    V3dyn        go("go", cfg::N, E, cfg::N);
     auto         run_one = [&] { library_one_gradient(u0, H, go); };
     const double t1g     = seconds_of(run_one, warmup, reps);
     const double f1g     = flopcount::NP * cfg::N * 2.0 * Ed;  // one gradient
