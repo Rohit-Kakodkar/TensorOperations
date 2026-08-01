@@ -397,12 +397,51 @@ combines**, one per reference direction:
 
 This collapses 16 gradient sums -> 8, 4 stress evals -> 2, and 2 launches -> 1.
 
-- **Projected payoff:** the measured 1-component run (20.969 ms) is the closest
-  available proxy — one launch, 8 gradient sums, 2 stress evals, 2 divergences.
-  Adding back 2 divergence sweeps (~1.2 ms each) and a second force write
-  (~0.4 ms) projects **~24 ms, a 1.75x speedup, gap 4.26x -> ~2.45x.**
+> ### ⚠ CORRECTED 2026-08-01 — the payoff below does NOT follow from this task alone.
+>
+> The projection assumes the two divergence contractions that consume `Cxi[0]`
+> and `Cxi[1]` **share one evaluation of `Cxi`**. They do not. `Graph` performs
+> no memoization, and each operand's `ScratchAllocator` holds its own
+> `inner_eval_t` by value (`ScratchAllocator.hpp:92`), so `Cxi` is instantiated
+> once per consumer — each copy recomputing all four of its gradients and its
+> own stress evaluation. The merged tree therefore still runs **16 gradient sums
+> and 4 stress evals**, exactly today's count. `plans/specfem-kernel-graph.md:187`
+> already recorded this ("phase 2 does not fix it"); this document lost it.
+>
+> **Measured, host-side, no kernel** (the spike this task's entry asked for):
+>
+> | shape | scratch/team | GPU cap 49,152 | CPU cap 32,768 | blocks/SM |
+> |---|---|---|---|---|
+> | today, 1 component × 2 launches | 24,312 B | fits | fits | **5** |
+> | this task as scoped | **48,624 B** (2.000×) | fits by **528 B** | **OVER** | **2** |
+> | with shared subtrees (below) | **27,408 B** (1.13×) | fits | fits | **4** |
+>
+> Scratch doubles *exactly*, which is the sharing failure made visible. The naive
+> merge clears the GPU cap by 1.1%, loses the Serial backend, and drops occupancy
+> from 30.8% to ~12% — while doing identical work, for one saved launch. It is a
+> regression. **Do not implement the selector on its own.**
+>
+> **What to build instead**, neither of which needs general memoization:
+> - **(B) multi-output contraction** — when a contraction's B operand is a
+>   multi-output combine, evaluate the combine **once** and run M GEMMs over it.
+>   `alloc_c_` (`Evaluator/Team.hpp:385`) becomes an array exactly as
+>   `out_allocs_` (`:975`) already is. This is what collapses 16 gradients → 8.
+> - **(C) multi-output operand expansion in a combine's operand pack** — an
+>   operand that is multi-output is evaluated once and contributes M values to
+>   `fn`'s arguments. Needed because after (B) the root combine would otherwise
+>   consume outputs 0 and 1 of the same contraction through two operand slots,
+>   reintroducing the duplication one level up. Touches `gather_vals` (`:1104`).
+>
+> Full analysis: `~/.claude/plans/feasibility-multi-output-combine-operand-2026-08-01.md`.
+
+- **Projected payoff (with B+C, not as scoped):** the measured 1-component run
+  (20.969 ms) is the closest available proxy — one launch, 8 gradient sums, 2
+  stress evals, 2 divergences. Adding back 2 divergence sweeps (~1.2 ms each)
+  and a second force write (~0.4 ms) projects **~24 ms, a 1.75x speedup, gap
+  4.26x -> ~2.45x.** As scoped, the payoff is one saved kernel launch, against
+  a large occupancy regression.
 - **Effort:** the substantial one. Multi-output selection, scratch layout for M
-  result tiles, and operand plumbing.
+  result tiles, and operand plumbing — plus (B) and (C) above.
 - **Depends on:** Task 2's verdict (see above). Task 1 for measurement.
 - **Risk:** medium. The mode-order constraint is a real trap — a single
   4-output node instead of two 2-output nodes would force a B-slot reorder and
