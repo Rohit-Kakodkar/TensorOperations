@@ -2,7 +2,8 @@
 
 **Status:** measured 2026-08-01 on `feat/fused-combine-operands`, H100 NVL (sm_80
 build, PTX JIT) and Serial/AVX-512. All numbers below are `min` of 3 reps after
-1 warmup, `E = 2500000` (GPU) / `E = 16384` (CPU).
+1 warmup, `E = 2500000` (GPU) / `E = 16384` (CPU). Tasks 1 and 2 are **done**;
+the controls now live in the benchmark and the residual is attributed.
 
 This document answers one question — *is redundant gradient recompute the
 bottleneck?* — and turns the answer into an ordered work plan.
@@ -11,6 +12,19 @@ bottleneck?* — and turns the answer into an ordered work plan.
 line item (~50% of library runtime, worth 1.62x), but it is one of three
 comparable factors that multiply together. Removing it entirely leaves the
 library ~2.6x slower than hand-written code.
+
+**The other two factors, in one line each.** The rest of the redundancy is 2
+launches and 4x stress evaluation (1.79x), fixable by multi-output combine
+(Task 3). The remaining 1.48x is **address arithmetic** — the library issues
+5.65x the integer instructions of an equivalent hand-written kernel for
+identical floating-point work (Task 2, now attributed; Task 5 acts on it).
+
+> **Two corrections to earlier revisions of this document, both from actually
+> running what it had only estimated.** (1) The CPU and GPU residuals do *not*
+> agree — that claim came from substituting a FLOP ratio for a measurement, and
+> it had wrongly closed the team-utilisation question. (2) The residual is *not*
+> diffuse, and it is *not* barriers, bank conflicts, or memory traffic — all
+> three were suspected here and all three are now ruled out by profile.
 
 ---
 
@@ -166,9 +180,9 @@ preserved.
 ## Factor 2 — library overhead (1.48x)
 
 `CONTROL` and the library execute the same FLOPs and move the same bytes, yet
-the library takes 28.19 ms -> 41.49 ms. **This term is not yet attributed.**
-
-What is known:
+the library takes 28.19 ms -> 41.49 ms. **Attributed as of Task 2: it is
+address arithmetic** — see [below](#attributed-2026-08-01-task-2-ncu-on-h100)
+for the profile. The timing-level evidence that framed the search:
 
 - It is **not** the GEMM kernel. A gradient contraction runs at 1290 GF/s
   standalone, and the library's marginal gradient sweep (1.19 ms) is *cheaper*
@@ -180,9 +194,86 @@ What is known:
   (divergences) `+ 4 x 0.78` (aux/stress) `≈ 30 ms` leaves **~11 ms
   unexplained**, which looks fixed-per-tree rather than proportional to work.
 
-Candidates, untested: per-thread state (the evaluator is 4600 B, ~1150 registers
-if resident), barrier count across ~20 serialized stages, and scratch staging
-traffic that the hand kernel does not perform.
+### Attributed 2026-08-01 (Task 2, `ncu` on H100)
+
+Profiled the library's fused force kernel against `CONTROL` — same FLOPs, same
+global traffic — at `E = 65536`. Both launch 16384 blocks of 128 threads.
+`ncu` needs `srun --account=rse --gres=gpu:1`, and the kernel filter must use
+`--kernel-name-base demangled` (the default matches only the Kokkos wrapper).
+
+| | library | CONTROL | ratio |
+|---|---|---|---|
+| duration | 994.5 us | 639.4 us | **1.56x** |
+| **warp instructions** | **278.5 M** | **82.6 M** | **3.37x** |
+| integer thread-inst | 4,517 M | 799 M | **5.65x** |
+| fp32 thread-inst | 870 M | 487 M | 1.79x |
+| **integer : fp32** | **5.19** | **1.64** | — |
+| registers/thread | 96 | 32 | 3.0x |
+| dynamic shared/block | 25,352 B | 9,296 B | 2.73x |
+| achieved occupancy | **30.8%** | **95.8%** | 0.32x |
+| L1/TEX throughput | 47.8% | **98.8%** | — |
+| SM (issue) throughput | **51.2%** | 26.2% | 1.96x |
+| barrier stall ratio | 1.73 | 12.64 | 0.14x |
+| shared bank conflicts | 18.7 M | 60.8 M | 0.31x |
+| local (spill) sectors | 50.1 M | **0** | ∞ |
+
+**The residual is address arithmetic.** The library issues **5.65x the integer
+instructions** — 3.7 *billion* extra thread-instructions — for identical
+floating-point work. It spends 5.19 integer instructions per fp32 instruction
+where the hand kernel spends 1.64. This is the tiled-layout index math
+(`subview_tile`, per-mode stride and offset computation) being re-evaluated at
+every element access instead of being strength-reduced into induction variables
+across the staging and GEMM loops.
+
+Instruction count is essentially the whole story: the library retires 3.37x the
+warp-instructions and takes only 1.56x the time, because its *issue efficiency
+is nearly twice CONTROL's* (51.2% vs 26.2% of peak). At equal instruction count
+and its own issue rate it would finish in ~295 us, comfortably beating CONTROL.
+
+**Three things it is NOT**, each previously suspected:
+
+- **Not barriers.** The library's barrier stall ratio is 1.73 against CONTROL's
+  12.64. The ~20 serialized stages are not what costs.
+- **Not bank conflicts.** The library has *one third* CONTROL's shared-memory
+  bank conflicts. Consistent with [[swizzle-not-bank-conflict-bound]].
+- **Not global memory.** 0.37x CONTROL's global load instructions, L1/TEX at
+  47.8% against CONTROL's 98.8%. **CONTROL is the one at a roofline** — it is
+  L1-throttled (`mio_throttle` stall ratio 32.1). The library has bandwidth to
+  spare and is issue-limited.
+
+**Two real but secondary mechanisms:**
+
+- **Occupancy, 30.8% vs 95.8%.** Registers (96/thread) and shared memory
+  (25,352 B/block) *each independently* cap residency at 5 blocks/SM — the two
+  limits bind at exactly the same number, so relieving only one moves nothing.
+  This caps the issue rate, but at 51.2% it is not the binding constraint.
+- **Register spills**, 50.1 M local-memory sectors against CONTROL's **zero** —
+  direct confirmation that per-thread state exceeds the register budget. Only
+  3.2% of warp instructions, so it is a symptom worth watching rather than the
+  cost itself.
+
+**Spilling does not compound with tree depth**, which was the going hypothesis.
+Across three library kernels of increasing depth, spill traffic stays a flat
+~8% of instructions; what grows is registers and shared memory, hence occupancy:
+
+| kernel | regs | shared/block | occupancy | inst | local ld sectors |
+|---|---|---|---|---|---|
+| 1 gradient / 1 divergence | 40 | 3,368 B | 70.7% | 43.0 M | 3.7 M |
+| 1 F node (4 grad + stress) | 39 | 11,384 B | 72.1% | 118.1 M | 9.2 M |
+| full force tree | 96 | 25,352 B | **30.8%** | 278.5 M | 21.2 M |
+
+**Why the CPU residual is only 1.11x** now follows: a CPU has far more integer
+throughput relative to its FP throughput, the scalar loops let the compiler
+hoist and strength-reduce the index math, and with `team_size == 1` there is no
+occupancy term at all. The GPU-specific ~1.33x is the part of the address
+arithmetic that the CUDA backend cannot hide.
+
+> **Caveat.** `CONTROL` reproduces the library's *work profile*, not its exact
+> instruction stream: it retires ~1.5x fewer FLOPs than the library
+> (876.7 M vs 1,315 M by ffma/fadd/fmul weighting), because the library routes
+> the divergence through the general GEMM. The headline comparison is unaffected
+> — the integer excess (5.65x) is more than three times the fp32 excess (1.79x)
+> — but do not read the fp32 row as a defect.
 
 ---
 
@@ -274,27 +365,20 @@ they were measurements survive unchallenged.
 
 ---
 
-### Task 2 — Attribute the 1.48x residual  *(spike, before committing to Task 3)*
+### Task 2 — Attribute the 1.48x residual  ✅ **DONE 2026-08-01**
 
-**Priority: HIGH — cheap, and it can reorder everything after it.**
+Attributed to **address arithmetic**: the library issues 5.65x the integer
+instructions and 3.37x the total warp-instructions of `CONTROL` for identical
+floating-point work, at an integer:fp32 ratio of 5.19 against 1.64. Occupancy
+(30.8% vs 95.8%, co-limited by 96 registers and 25,352 B shared) and register
+spills (50.1 M local sectors vs zero) are real but secondary. Barriers, bank
+conflicts and global-memory traffic are all ruled out — the library is *not* at
+any roofline, `CONTROL` is. Full evidence in
+[Factor 2](#factor-2--library-overhead-148x).
 
-Profile the fused kernel (`ncu`, via `srun --account=rse --gres=gpu:1`) and
-attribute the ~11 ms that the GEMM + aux budget does not explain. Check, in
-order: stall reasons on the staging loops, barrier count per team, register
-spills against the 4600 B evaluator, and scratch-write traffic that the hand
-kernel does not perform.
-
-- **Effort:** 1-2 days, measurement only, no library change.
-- **Depends on:** nothing (Task 1 in parallel).
-- **Risk:** low. Worst case it confirms the residual is diffuse.
-- **Done when:** the ~11 ms is attributed to named mechanisms with a measured
-  share each.
-
-**Why this early, ahead of the big feature:** the residual is 1.48x and it
-applies *multiplicatively to every future improvement* — it does not shrink when
-the redundancy does. If it turns out to be one fixable staging or spill problem,
-it is worth more per unit effort than Task 3 and the order should swap. Spending
-two days to find out before spending weeks is the cheap de-risking move.
+**This reorders the plan.** The residual is a *single named mechanism*, not the
+diffuse cost the "worst case" anticipated, and index math is attackable without
+touching the graph semantics. Task 5 is therefore promoted and scoped below.
 
 ---
 
@@ -356,14 +440,42 @@ against a tree that Task 3 is about to restructure.
 
 ---
 
-### Task 5 — Act on Task 2's findings
+### Task 5 — Strength-reduce the tiled-layout index arithmetic
 
-**Priority: DEFERRED — scope unknown until Task 2 reports.**
+**Priority: HIGH — promoted from DEFERRED now that Task 2 has named the cause.**
 
-Whatever the residual turns out to be. Sized after Task 2. Note that at 1.48x
-this is, after Task 3 and Task 4 land, the *largest remaining term*: a library
-at ~19 ms against a 9.7 ms baseline is ~1.95x off, and essentially all of that
-is this factor.
+The library spends 5.19 integer instructions per fp32 instruction; the hand
+kernel spends 1.64. The staging and GEMM loops recompute a full
+`TiledLayout` index→offset map per element access, where the hand kernel walks
+a pointer. Make the inner loops walk induction variables instead: hoist the
+per-tile base offset out of the loop and advance by a constant stride, so the
+per-element cost is an add rather than a multiply-accumulate chain over
+per-mode extents.
+
+- **Projected payoff:** not yet bounded, but the ceiling is large. Instruction
+  count is 3.37x CONTROL's while time is only 1.56x, so the library already
+  issues at ~2x CONTROL's efficiency; removing integer instructions converts
+  almost directly into time. Halving the integer count is worth roughly 1.25x
+  end-to-end on the residual.
+- **Effort:** medium, and *unlike Tasks 3 and 4 it does not touch graph
+  semantics* — it is a codegen change inside the evaluator's loops, verifiable
+  with the `cuobjdump -sass` discipline in [[team-perf-verify-sass-diff]].
+- **Depends on:** nothing. Can run in parallel with Task 3.
+- **Risk:** low-medium. The failure mode is that the index math is already as
+  hoisted as the type system permits and the excess is inherent to
+  `OrderedSubviewLayout` composition, in which case this becomes a layout
+  redesign and should stop.
+- **Done when:** the integer:fp32 ratio drops materially from 5.19 and the
+  benchmark shows it.
+
+**Secondary, cheaper:** the 96-register / 25,352-byte co-limit pins occupancy at
+5 blocks/SM. Both limits bind at exactly 5, so **both** must move to gain
+anything — a reason to treat this as one item and not two.
+
+**Sequencing note.** This is now arguably better value than Task 3: it is a
+smaller change, it does not risk the mode-order trap, and it applies
+multiplicatively to everything Tasks 3 and 4 deliver. Task 3 remains the larger
+single win in absolute terms.
 
 ---
 
@@ -409,3 +521,22 @@ cmake --build build --target bench_sem_stiffness -j 8
 
 The decomposition rows are printed by the benchmark itself as of Task 1; the
 `bench_diag.cpp` scratchpad harness they came from is no longer needed.
+
+**Reproduce the Task 2 profile with:**
+
+```
+srun --account=rse --gres=gpu:1 -t 25 ncu \
+  --kernel-name-base demangled \
+  -k "regex:execute_one_output_team|control_recompute_force" -c 6 \
+  --metrics smsp__inst_executed.sum,\
+sm__sass_thread_inst_executed_op_integer_pred_on.sum,\
+sm__sass_thread_inst_executed_op_fp32_pred_on.sum,\
+l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum \
+  --csv ./build/bench_sem_stiffness 65536 1 0
+```
+
+Two gotchas that cost time: `ncu` needs a real allocation (`srun`), even though
+plain GPU runs do not on the della-rse login node; and **`--kernel-name-base
+demangled` is required** — by default `-k` matches only the outer Kokkos wrapper
+`cuda_parallel_launch_local_memory`, so any regex on the inner kernel name
+silently profiles nothing and reports "No kernels were profiled".
