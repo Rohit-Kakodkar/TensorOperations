@@ -462,6 +462,23 @@ KOKKOS_FUNCTION auto make_evaluator(NodeType node, Tile tile,
   return Evaluator<PolicyTag, NodeType, Tile>(node, tile, team);
 }
 
+// Adopting overload: the evaluator writes its output into `adopted`, a buffer
+// the caller already carved, instead of taking one from the team cursor. A
+// contraction adopts a single scratch view; a multi-output combine adopts a
+// Kokkos::Array of them, one per output.
+//
+// The caller must then request the evaluator's operand_scratch_size_per_team()
+// -- NOT scratch_size_per_team() -- on top of whatever it allocated for
+// `adopted`, or the output is charged twice.
+template <typename PolicyTag, typename NodeType, typename Tile,
+          typename TeamMember, typename Adopted>
+KOKKOS_FUNCTION auto make_evaluator(NodeType node, Tile tile,
+                                    const TeamMember& team,
+                                    const Adopted&    adopted)
+    -> Evaluator<PolicyTag, NodeType, Tile> {
+  return Evaluator<PolicyTag, NodeType, Tile>(node, tile, team, adopted);
+}
+
 #include <TensorOperations/Evaluator/Team.hpp>
 
 }  // namespace TensorOperations
