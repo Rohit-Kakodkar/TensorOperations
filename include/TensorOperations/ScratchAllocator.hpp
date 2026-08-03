@@ -201,6 +201,22 @@ struct ScratchAllocator<TeamPolicyTag<ES>, OuterOpTag, NA, V, TileA, PermSeq> {
 // default by every instantiation) and no source to stage from, hence no
 // stage(). It carves its tile in the constructor like the InputTag form above.
 // Uniform across every OuterOpTag.
+//
+// ADOPTION. The second constructor takes an already-carved buffer and carves
+// nothing, so an evaluator can write into storage someone ELSE allocated. That
+// is what lets a DAG driver own every intermediate: it carves one buffer per
+// node up front and hands each evaluator its own, instead of each evaluator
+// bump-allocating from the team cursor at construction. Without it the driver
+// would have to carve a second buffer per node and copy.
+//
+// Adoption is a CONSTRUCTOR choice, not a type-level one, and deliberately so:
+// both forms produce the same scratch_view_t, so an adopting evaluator is
+// type-identical to a carving one and nothing downstream has to know which it
+// got. The one thing that cannot follow from the constructor is bytes(), which
+// is static and has no instance to ask -- an adopting evaluator must simply not
+// have its output charged, which is why the sizing split lives in the
+// evaluators (scratch_size_per_team vs operand_scratch_size_per_team) rather
+// than as a flag here.
 template <typename ES, typename OuterOpTag, typename V, typename CanonTile>
 struct ScratchAllocator<TeamPolicyTag<ES>, OuterOpTag, IntermTag, V,
                         CanonTile> {
@@ -213,6 +229,10 @@ struct ScratchAllocator<TeamPolicyTag<ES>, OuterOpTag, IntermTag, V,
   KOKKOS_FUNCTION ScratchAllocator(const CanonTile&     tile,
                                    const team_member_t& team)
       : scratch_(Impl::alloc_scratch_tile<V, ES>(team, tile)) {}
+
+  // Adopt a buffer carved elsewhere. Takes no team and bumps no cursor.
+  KOKKOS_FUNCTION explicit ScratchAllocator(const scratch_view_t& adopted)
+      : scratch_(adopted) {}
 
   static std::size_t bytes(const CanonTile& tile) {
     return Impl::scratch_tile_bytes<V, ES>(tile);
