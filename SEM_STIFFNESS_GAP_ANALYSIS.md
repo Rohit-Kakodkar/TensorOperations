@@ -480,43 +480,75 @@ This collapses 16 gradient sums -> 8, 4 stress evals -> 2, and 2 launches -> 1.
 
 ### Task 4 — Fan-out deduplication (CSE) of shared subtrees
 
-> ### ✅ DONE 2026-08-03. Built and measured. **The win is real but SMALLER than projected on GPU, and the reason is a new finding.**
+> ### ✅ DONE 2026-08-03. Built, measured, and its residual attributed by `ncu`.
 >
-> The SEM graph now runs as a 14-node DAG: 4 gradients, 4 stress integrands, 4 divergences,
-> 2 weighted sums, **one launch, both components**. Validates at `max rel diff 0.00e+00` on
-> both backends.
+> The SEM graph runs as a 14-node DAG: 4 gradients, 4 stress integrands, 4 divergences,
+> 2 weighted sums, **one launch, both components**. `max rel diff 0.00e+00` on both backends.
 >
 > | | tree | DAG | |
 > |---|---|---|---|
-> | GPU (E=2.5M) | 41.607 ms | **25.959 ms** | 1.60x faster |
-> | CPU (E=4096) | 37.683 ms | **18.832 ms** | 2.02x faster |
+> | GPU (E=2.5M) | 41.6 ms | **18.313 ms** | **2.27x faster** |
+> | CPU (E=4096) | 37.7 ms | **19.001 ms** | **1.98x faster** |
 > | scratch/team | 24,312 B *per component* | **20,688 B for both** | |
-> | gap to baseline, GPU | 4.27x | **2.66x** | |
-> | gap to baseline, CPU | 3.60x | **1.78x** | |
+> | gap to baseline, GPU | 4.26x | **1.88x** | |
+> | gap to baseline, CPU | 3.66x | **1.82x** | |
 >
-> **THE PROJECTION MISSED ON GPU, AND THAT IS THE INTERESTING RESULT.** It assumed the
-> measured residual survives the restructuring. It did not:
+> #### ⚠ RETRACTED: "the residual grew". It did not — that was a team-size artefact.
 >
-> | | tree residual | DAG residual |
-> |---|---|---|
-> | GPU (`CONTROL-C -> DAG`) | 1.48x | **2.06x** |
-> | CPU | 1.11x | 1.18x |
+> The first measurement of this task reported a GPU gap of 2.66x and a residual of 2.06x
+> against `CONTROL-C`, and concluded that the residual *grows* under restructuring, with
+> per-thread state (14 live evaluators) the suspect. **Both halves were wrong**, and `ncu`
+> disproved them:
 >
-> Projected 1.91x GPU, measured 2.66x. The DAG captured the algorithmic win in full — its work
-> profile IS `CONTROL-C`'s — but it executes that profile ~39% less efficiently than the tree
-> executed its own. The CPU barely moved (1.11 → 1.18), so this is GPU-specific, and the
-> obvious suspect is per-thread state: 14 evaluators are live at once, against a tree that held
-> one root and recursed. That is now a NAMED, measurable target rather than a projection, and
-> it is the same class of thing Task 2 attributed for the tree.
+> - **Registers are IDENTICAL to the hand-written control: 32 vs 32.** The tree's were 96. Far
+>   from having more per-thread state, the DAG has a third of the tree's.
+> - The 2.66x was **`Kokkos::AUTO` picking 512 threads for a tile of 256 points**, so every
+>   `TeamVectorRange` left half the team idle. Forcing 128 gives **18.31 ms** — a 1.42x swing
+>   from one parameter. Team size is now exposed as `DagOutputs::team_size(n)`.
 >
-> **This does not change the ordering conclusion.** Task 4 was the largest algorithmic item and
-> it delivered 1.60-2.02x. What it changes is what comes next: the DAG's own residual is now
-> larger than the tree's was, so [Task 5](#task-5--strength-reduce-the-tiled-layout-index-arithmetic)
-> applies more, not less.
+> With a sane team size the residual is **1.45x**, against the tree's 1.48x. **The projection
+> was right: the residual does survive the restructuring**, essentially unchanged.
 >
-> Remaining, unchanged by this: the four stress integrands still each rebuild the stress tensor
-> and re-read all seven auxiliary arrays. Only multi-output combine (Task 3) collapses that, and
-> a DAG node cannot yet be multi-output.
+> #### The attribution (`ncu`, H100, E=65536, DAG at team_size 128 vs `CONTROL-C`)
+>
+> | | DAG | CONTROL-C | ratio |
+> |---|---|---|---|
+> | duration | 1,156 us | 688 us | 1.68x |
+> | **warp instructions** | **232.8 M** | **110.4 M** | **2.11x** |
+> | **integer thread-inst** | **2,605 M** | **960 M** | **2.71x** |
+> | fp32 thread-inst | 854 M | 570 M | 1.50x |
+> | **integer : fp32** | **3.05** | **1.68** | — |
+> | registers/thread | **32** | **32** | **1.00x** |
+> | dynamic shared/block | 21,728 B | 12,384 B | 1.75x |
+> | achieved occupancy | 43.0% | 97.2% | 0.44x |
+> | local (spill) ld sectors | 20.4 M | **0** | ∞ |
+> | L1/TEX throughput | 58.5% | **98.6%** | — |
+> | SM issue throughput | **45.0%** | 35.1% | 1.28x |
+>
+> **It is instruction count, exactly as for the tree.** 2.71x the integer thread-instructions
+> for 1.50x the floating-point work, at an integer:fp32 ratio of 3.05 against 1.68 — the same
+> address-arithmetic mechanism Task 2 named. The DAG *improved* that ratio over the tree's 5.19
+> (fewer duplicated subtrees is less duplicated index math) without closing it.
+>
+> **Two things it is NOT, both of which the tree's profile had implicated:**
+>
+> - **Not registers.** 32 vs 32, identical to the hand-written control, and a third of the
+>   tree's 96. The occupancy co-limit Task 2 found is simply gone.
+> - **Not occupancy.** The DAG runs at **43%** and beats its own **98%**-occupancy configuration
+>   by 1.42x. Occupancy was never the objective; useful work per resident thread was, and
+>   `Kokkos::AUTO` optimises the wrong one.
+>
+> Spills persist (20.4 M local sectors against zero) at only 32 registers — the compiler has
+> capped registers and pushed the remainder to local memory. As with the tree, this is a symptom
+> of the instruction-count story rather than a separate mechanism.
+>
+> **What comes next is unchanged and now better-founded:** the residual is address arithmetic,
+> which is [Task 5](#task-5--strength-reduce-the-tiled-layout-index-arithmetic), and it is the
+> single remaining named mechanism on the GPU.
+>
+> Still not collapsed: the four stress integrands each rebuild the stress tensor and re-read all
+> seven auxiliary arrays. Only multi-output combine (Task 3) removes that, and a DAG node cannot
+> yet be multi-output.
 
 > ### ⬆ PROMOTED 2026-08-03, on two findings. **Now the highest-value algorithmic task, and it no longer depends on Task 3.**
 

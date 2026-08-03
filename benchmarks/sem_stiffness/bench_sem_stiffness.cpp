@@ -89,19 +89,26 @@
 // only the graph is spelled flat, with consumers NAMING earlier results instead
 // of nesting them.
 //
-//   GPU  41.607 -> 25.959 ms  (1.60x), gap to baseline 4.27x -> 2.66x
-//   CPU  37.683 -> 18.832 ms  (2.02x), gap to baseline 3.60x -> 1.78x
+//   GPU  41.6 -> 18.313 ms  (2.27x), gap to baseline 4.26x -> 1.88x
+//   CPU  37.7 -> 19.001 ms  (1.98x), gap to baseline 3.66x -> 1.82x
 //   scratch 24312 B PER COMPONENT -> 20688 B for BOTH
 //
-// It undershot its own projection on GPU (1.91x predicted, 2.66x measured), and
-// that is the informative part. The projection assumed the measured residual
-// survives the restructuring; it does not. CONTROL-C -> DAG is 2.06x where
-// CONTROL -> tree was 1.48x, while the CPU barely moved (1.11 -> 1.18). The DAG
-// captures the algorithmic win in full -- its work profile IS CONTROL-C's --
-// and then executes that profile less efficiently than the tree executed its
-// own. Fourteen evaluators are live at once where the tree held one root and
-// recursed, which makes per-thread state the obvious suspect and a measurable
-// target rather than a guess.
+// TEAM SIZE IS WORTH 1.42x HERE, AND Kokkos::AUTO GETS IT WRONG. AUTO sizes the
+// team from occupancy alone and picks 512 threads for a tile of TE*N*N = 256
+// points, so every TeamVectorRange leaves half the team idle: 25.94 ms at AUTO,
+// 26.05 at 256, 18.31 at 128. The DAG asks for 128 explicitly on GPU (Serial
+// caps team size at 1 and throws above it, so the choice is per backend). An
+// earlier revision of this comment reported the AUTO number as the DAG's result
+// and drew a wrong conclusion from it.
+//
+// THE RESIDUAL DOES SURVIVE THE RESTRUCTURING. CONTROL-C -> DAG is 1.45x
+// against the tree's CONTROL -> library 1.48x, so the projection was right.
+// ncu attributes it to instruction count, as for the tree: 2.71x CONTROL-C's
+// integer thread-instructions for 1.50x the fp32 work, at an integer:fp32 ratio
+// of 3.05 against 1.68. What it is NOT is per-thread state -- registers are 32,
+// the SAME as the hand-written control and a third of the tree's 96 -- nor
+// occupancy, since the DAG runs at 43% and beats its own 98%-occupancy
+// configuration by 1.42x. See SEM_STIFFNESS_GAP_ANALYSIS.md, Task 4.
 //
 // A library SLOWDOWN here is a valid deliverable: the point is the number and
 // what it points at, not a win.
@@ -521,7 +528,16 @@ void library_dag_force(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m,
                        V3 force1) {
   auto [g, r0, r1] =
       sem_dag_graph(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H, Hw, w);
-  g.outputs(r0, r1).execute(TeamPolicyTag<>{}, force0, force1);
+  // 128 on GPU, not Kokkos::AUTO: AUTO picks 512 threads for a tile of only
+  // TE*N*N = 256 points, and costs 1.42x for it (25.94 -> 18.31 ms). See
+  // DagGraph.hpp's execute_dag_team for the measurement.
+  //
+  // Serial caps team size at 1 and THROWS on anything larger, so the choice has
+  // to be per backend -- a negative value means Kokkos::AUTO, which is right
+  // there.
+  g.outputs(r0, r1)
+      .team_size(cfg::kIsGPU ? 128 : -1)
+      .execute(TeamPolicyTag<>{}, force0, force1);
 }
 inline constexpr int kDagSrcEnd = __LINE__;
 // DIAG-B: one F node on its own -- 4 gradient contractions + StressIntegrand,
