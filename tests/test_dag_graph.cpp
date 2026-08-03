@@ -200,6 +200,89 @@ std::size_t dag_diamond_bytes(View2 a, View2 b, View2 e, View2 f) {
   return g.scratch_bytes();
 }
 
+// --- a multi-output node: M outputs, M slots, ONE evaluation ---------------
+//
+// SplitPair emits two tensors from one pass over its operands. SplitP/SplitQ
+// are the same arithmetic as two separate single-output functors, defined
+// THROUGH SplitPair so the split spelling cannot drift from the merged one --
+// which is the whole basis of comparing them.
+
+using CombPair = CombineTile<TC0, TC0, TC0>;
+
+struct SplitPair {
+  KOKKOS_FUNCTION Kokkos::Array<float, 2> operator()(int, int, float g,
+                                                     float d) const {
+    return {2.0f * g - 0.5f * d, -3.0f * g + 1.25f * d};
+  }
+};
+struct SplitP {
+  KOKKOS_FUNCTION float operator()(int a, int b, float g, float d) const {
+    return SplitPair{}(a, b, g, d)[0];
+  }
+};
+struct SplitQ {
+  KOKKOS_FUNCTION float operator()(int a, int b, float g, float d) const {
+    return SplitPair{}(a, b, g, d)[1];
+  }
+};
+
+// Node 0 alone, so both spellings below start from the same gradient-like node.
+template <typename Dag>
+auto add_split_source(const Dag& d0, View2 a, View2 b) {
+  return d0.add(make_contraction_node<'i', 'l'>(
+                    make_input_node(make_handle<'i', 'k'>(a)),
+                    make_input_node(make_handle<'k', 'l'>(b))),
+                Bundle0{});
+}
+
+// MERGED: one node, two outputs, two slots. The pair is computed once.
+auto dag_pair_merged(View2 a, View2 b, View2 d) {
+  auto [g0, c0] = add_split_source(make_dag<float, ES>(), a, b);
+  auto [g1, p, q] =
+      g0.add(make_combine_node<'i', 'l'>(
+                 c0.template as<'i', 'l'>(),
+                 make_input_node(make_handle<'i', 'l'>(d)), SplitPair{}),
+             CombPair{});
+  return std::make_tuple(g1, p, q);
+}
+
+// SPLIT: two single-output nodes over the same shared source. Same numbers,
+// but the operand staging and the fn call happen twice.
+auto dag_pair_split(View2 a, View2 b, View2 d) {
+  auto [g0, c0] = add_split_source(make_dag<float, ES>(), a, b);
+  auto [g1, p] =
+      g0.add(make_combine_node<'i', 'l'>(
+                 c0.template as<'i', 'l'>(),
+                 make_input_node(make_handle<'i', 'l'>(d)), SplitP{}),
+             CombPair{});
+  auto [g2, q] =
+      g1.add(make_combine_node<'i', 'l'>(
+                 c0.template as<'i', 'l'>(),
+                 make_input_node(make_handle<'i', 'l'>(d)), SplitQ{}),
+             CombPair{});
+  return std::make_tuple(g2, p, q);
+}
+
+// Both outputs consumed by later nodes, then merged: the shape the SEM
+// stiffness graph actually uses. `p` feeds a contraction against E, `q` one
+// against F, and a root combine blends them.
+template <typename Dag, typename HP, typename HQ>
+auto dag_pair_tail(const Dag& g, HP p, HQ q, View2 e, View2 f) {
+  auto [g1, t0] = g.add(
+      make_contraction_node<'i', 'm'>(
+          p.template as<'i', 'l'>(), make_input_node(make_handle<'l', 'm'>(e))),
+      Bundle1{});
+  auto [g2, t1] = g1.add(
+      make_contraction_node<'i', 'm'>(
+          q.template as<'i', 'l'>(), make_input_node(make_handle<'l', 'm'>(f))),
+      Bundle1{});
+  auto [g3, r] =
+      g2.add(make_combine_node<'i', 'm'>(t0.template as<'i', 'm'>(),
+                                         t1.template as<'i', 'm'>(), Blend{}),
+             CombRoot{});
+  return std::make_tuple(g3, r);
+}
+
 }  // namespace
 
 // EQUIVALENCE. No sharing anywhere, so the DAG must be indistinguishable from
@@ -285,6 +368,104 @@ TEST(DagGraphTest, IndexConsistencyIsCheckable) {
   // carve once their outputs are adopted.
   EXPECT_EQ(gd.scratch_bytes(), gd.slot_bytes() + gd.operand_bytes());
   EXPECT_GT(gd.slot_bytes(), 0u);
+}
+
+// MULTI-OUTPUT, WRITTEN STRAIGHT OUT. Both slots of one node designated as
+// graph outputs -- which is also the case that proves a root is addressed by
+// SLOT and not by node index, since output 1 lives at slot 2 of a two-node
+// graph.
+TEST(DagGraphTest, MultiOutputSlotsAreBothGraphOutputs) {
+  const auto a = make_view("a", kI, kK, 0);
+  const auto b = make_view("b", kK, kL, 1);
+  const auto d = make_view("d", kI, kL, 4);
+
+  View2 mp("mp", kI, kL), mq("mq", kI, kL);
+  View2 sp("sp", kI, kL), sq("sq", kI, kL);
+  {
+    auto [g, p, q] = dag_pair_merged(a, b, d);
+    g.outputs(p, q).execute(TeamPolicyTag<ES>{}, mp, mq);
+  }
+  {
+    auto [g, p, q] = dag_pair_split(a, b, d);
+    g.outputs(p, q).execute(TeamPolicyTag<ES>{}, sp, sq);
+  }
+  Kokkos::fence();
+
+  const auto hmp = to_host(mp), hmq = to_host(mq);
+  const auto hsp = to_host(sp), hsq = to_host(sq);
+
+  // The two outputs must not be the same tensor, or this test would pass on an
+  // evaluator that wrote output 0 into both slots.
+  double spread = 0.0, mag = 0.0;
+  for (int i = 0; i < kI; ++i)
+    for (int l = 0; l < kL; ++l) {
+      spread += std::abs(static_cast<double>(hmp(i, l) - hmq(i, l)));
+      mag += std::abs(static_cast<double>(hmp(i, l)));
+    }
+  EXPECT_GT(mag, 1.0) << "the merged spelling produced nothing";
+  EXPECT_GT(spread, 1.0) << "the two outputs are indistinguishable";
+
+  for (int i = 0; i < kI; ++i)
+    for (int l = 0; l < kL; ++l) {
+      EXPECT_EQ(hmp(i, l), hsp(i, l))
+          << "output 0 at (" << i << "," << l << ")";
+      EXPECT_EQ(hmq(i, l), hsq(i, l))
+          << "output 1 at (" << i << "," << l << ")";
+    }
+}
+
+// MULTI-OUTPUT AS OPERANDS. Each output feeds a different consumer -- the SEM
+// stiffness shape. Same numbers as the split spelling, at no more scratch: the
+// slots are the same buffers either way, but the merged node stages its
+// operands and calls fn ONCE where the split one does it twice.
+TEST(DagGraphTest, MultiOutputFeedsTwoConsumersAndCostsLess) {
+  const auto a = make_view("a", kI, kK, 0);
+  const auto b = make_view("b", kK, kL, 1);
+  const auto d = make_view("d", kI, kL, 4);
+  const auto e = make_view("e", kL, kM, 2);
+  const auto f = make_view("f", kL, kM, 3);
+
+  View2       out_merged("out_merged", kI, kM), out_split("out_split", kI, kM);
+  std::size_t merged_b = 0, split_b = 0, merged_slots = 0, split_slots = 0;
+  {
+    auto [g0, p, q] = dag_pair_merged(a, b, d);
+    auto [g, r]     = dag_pair_tail(g0, p, q, e, f);
+    EXPECT_TRUE(g.index_consistent());
+    merged_b     = g.scratch_bytes();
+    merged_slots = g.slot_bytes();
+    g.outputs(r).execute(TeamPolicyTag<ES>{}, out_merged);
+  }
+  {
+    auto [g0, p, q] = dag_pair_split(a, b, d);
+    auto [g, r]     = dag_pair_tail(g0, p, q, e, f);
+    split_b         = g.scratch_bytes();
+    split_slots     = g.slot_bytes();
+    g.outputs(r).execute(TeamPolicyTag<ES>{}, out_split);
+  }
+  Kokkos::fence();
+
+  const auto hm = to_host(out_merged);
+  const auto hs = to_host(out_split);
+
+  double mag = 0.0;
+  for (int i = 0; i < kI; ++i)
+    for (int m = 0; m < kM; ++m) mag += std::abs(static_cast<double>(hs(i, m)));
+  EXPECT_GT(mag, 1.0);
+
+  for (int i = 0; i < kI; ++i)
+    for (int m = 0; m < kM; ++m)
+      EXPECT_EQ(hs(i, m), hm(i, m)) << "at (" << i << "," << m << ")";
+
+  // The slot store is the same size either way -- two outputs is two buffers
+  // however they are spelled -- so any saving is in what the second combine
+  // evaluator no longer carves. Stated as two assertions because a merged
+  // spelling that grew the STORE would be a bug this file should catch.
+  EXPECT_EQ(merged_slots, split_slots);
+  EXPECT_LE(merged_b, split_b);
+  std::printf(
+      "[   INFO   ] scratch/team: split %zu B, merged %zu B (slots %zu B "
+      "both)\n",
+      split_b, merged_b, merged_slots);
 }
 
 int main(int argc, char* argv[]) {

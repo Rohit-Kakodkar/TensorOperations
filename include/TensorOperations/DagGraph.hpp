@@ -22,9 +22,15 @@ namespace TensorOperations {
 // where 4 suffice, and it is the largest measured term in that benchmark's gap
 // (2.23x, measured by CONTROL-C).
 //
-// Here every node owns one slot in a driver-carved store. Node K writes into
-// slot K (adopting it), and any later node needing K's result NAMES slot K as
-// an operand. One buffer, one evaluation, N readers.
+// Here every node owns a CONTIGUOUS RUN of slots in a driver-carved store --
+// one per output, so one slot for all but a multi-output combine. Node K writes
+// into its own slots (adopting them), and any later node needing one of those
+// results NAMES that slot as an operand. One buffer, one evaluation, N readers.
+//
+// The slot index is therefore NOT the node index once any node emits more than
+// one output; Impl::dag_slot_base / dag_slot_owner are the prefix-sum that
+// relates them, and every `Roots...` pack and SlotTag operand carries a SLOT
+// index, never a node index.
 //
 // Nothing is deduplicated automatically. The CALLER declares the sharing by
 // naming a handle twice, and that is exactly what makes this tractable: no node
@@ -49,13 +55,86 @@ namespace TensorOperations {
 // Calling a host-only factory from a kernel instead is diagnosed ONLY as nvcc
 // warning #20011: it compiles, Serial stays green, and CUDA traps at runtime.
 //
+// MULTI-OUTPUT NODES. A combine whose fn returns Kokkos::Array<V,M> emits M
+// tensors, and add() hands back M handles:
+//
+//   auto [g, fxi_0, fxi_1] = g0.add(two_output_combine, tile);
+//
+// All M share one shape, one tile and one layout (make_out_allocs builds every
+// slot from the same output_tile), so they differ only in which buffer they
+// name -- which is exactly why M consumers of M different outputs still cost
+// ONE evaluation of everything underneath them. That is the redundancy a DAG
+// cannot remove by sharing alone: sharing collapses duplicate SUBTREES, and
+// multi-output collapses duplicate WORK INSIDE ONE NODE (in the SEM stiffness
+// kernel, four stress-tensor evaluations down to two).
+//
 // V1 RESTRICTIONS, each static_asserted or checked where it is relied on:
-//   * every node emits ONE output (NumOut == 1), since a node owns one slot;
 //   * a node's modes that the root does not carry must be single-tiled;
 //   * shared modes must be tiled identically in node and root.
 // ---------------------------------------------------------------------------
 
 namespace Impl {
+
+// --- slot arithmetic -------------------------------------------------------
+//
+// Node K owns output_arity<Node_K> consecutive slots. These three functions are
+// the whole of the node-index <-> slot-index relation; nothing else may assume
+// the two coincide. They mirror Graph.hpp's node_arities/node_offset, restated
+// over a DeviceTuple because that is what a DagGraph stores its nodes in.
+
+template <typename NodesT, std::size_t... Ks>
+constexpr std::array<std::size_t, sizeof...(Ks)> dag_arities_impl(
+    std::index_sequence<Ks...>) {
+  return {static_cast<std::size_t>(
+      output_arity<tuple_element_t<Ks, NodesT>>::value)...};
+}
+template <typename NodesT>
+constexpr auto dag_arities() {
+  return dag_arities_impl<NodesT>(
+      std::make_index_sequence<tuple_size_v<NodesT>>{});
+}
+
+// Total slots the store must carve.
+template <typename NodesT>
+constexpr std::size_t dag_num_slots() {
+  std::size_t n = 0;
+  for (std::size_t a : dag_arities<NodesT>()) n += a;
+  return n;
+}
+
+// First slot owned by node K.
+template <typename NodesT>
+constexpr std::size_t dag_slot_base(std::size_t k) {
+  const auto  a   = dag_arities<NodesT>();
+  std::size_t off = 0;
+  for (std::size_t i = 0; i < k; ++i) off += a[i];
+  return off;
+}
+
+// The node that owns slot S -- the inverse of dag_slot_base, needed wherever a
+// slot index arrives from outside (a designated output) and the producing
+// node's type is what the work requires.
+template <typename NodesT>
+constexpr std::size_t dag_slot_owner(std::size_t slot) {
+  const auto  a   = dag_arities<NodesT>();
+  std::size_t end = 0;
+  for (std::size_t k = 0; k < a.size(); ++k) {
+    end += a[k];
+    if (slot < end) return k;
+  }
+  return a.size();  // unreachable for a slot minted by add()
+}
+
+// Variable-template forms, and they are not a convenience. The three functions
+// above are constexpr but HOST-only (std::array is), so naming one inside a
+// KOKKOS_FUNCTION -- even to initialize a constexpr local -- draws nvcc warning
+// #20013 and would need --expt-relaxed-constexpr. As namespace-scope variable
+// templates the initializer runs on the host at instantiation and device code
+// only ever names a constant.
+template <typename NodesT, std::size_t K>
+inline constexpr std::size_t dag_slot_base_v = dag_slot_base<NodesT>(K);
+template <typename NodesT, std::size_t S>
+inline constexpr std::size_t dag_slot_owner_v = dag_slot_owner<NodesT>(S);
 
 // For each of Node's modes, the position of that label among the ROOT's modes,
 // or -1 if the root does not carry it. This is how every node's own tile index
@@ -181,18 +260,22 @@ struct SlotHandle {
 namespace Impl {
 
 // The shape the adopting constructor wants. A combine owns one buffer PER
-// OUTPUT and takes an array; a contraction takes the bare view. v1 pins
-// NumOut == 1, so the array is always one element -- but the two constructors
-// still differ in type, and this is the one place that has to know.
-template <typename Node, typename View>
-KOKKOS_FUNCTION auto dag_adopted_arg(const View& v) {
-  if constexpr (has_node_tag_v<CombineTag, Node>)
-    return Kokkos::Array<View, 1>{v};
-  else
-    return v;
+// OUTPUT and takes an array of its M consecutive slots; a contraction owns one
+// and takes the bare view. The two constructors differ in type, and this is the
+// one place that has to know.
+template <typename Node, std::size_t Base, typename Store, std::size_t... Ms>
+KOKKOS_FUNCTION auto dag_adopted_arg(const Store& store,
+                                     std::index_sequence<Ms...>) {
+  if constexpr (has_node_tag_v<CombineTag, Node>) {
+    using View = std::decay_t<decltype(store.template get<Base>())>;
+    return Kokkos::Array<View, sizeof...(Ms)>{
+        store.template get<Base + Ms>()...};
+  } else {
+    return store.template get<Base>();
+  }
 }
 
-// Evaluate node K: bind its slot operands, adopt its own slot, run it at the
+// Evaluate node K: bind its slot operands, adopt its own slots, run it at the
 // index gathered from the root's.
 template <std::size_t K, typename ES, typename RootNode, typename Team,
           typename NodesT, typename TilesT, typename Store, std::size_t RootR>
@@ -202,12 +285,14 @@ KOKKOS_FUNCTION void dag_run_node(const Team& team, const NodesT& nodes,
   using Node = tuple_element_t<K, NodesT>;
   using Gather =
       dag_gather_seq_t<typename Node::modes_seq, typename RootNode::modes_seq>;
+  constexpr std::size_t Base = dag_slot_base_v<NodesT, K>;
+  constexpr std::size_t M    = output_arity<Node>::value;
 
   const auto idx   = dag_node_index<Node::Rank, RootR>(root_idx, Gather{});
   auto       bound = bind_slots(nodes.template get<K>(), store);
   auto       eval  = make_evaluator<TeamPolicyTag<ES>>(
       bound, tiles.template get<K>(), team,
-      dag_adopted_arg<Node>(store.template get<K>()));
+      dag_adopted_arg<Node, Base>(store, std::make_index_sequence<M>{}));
   eval(team, idx);
   // Node K's result must be visible before any later node reads it. The
   // contraction evaluator ends its k-loop with a barrier, but the combine
@@ -224,28 +309,36 @@ KOKKOS_FUNCTION void dag_run_all(const Team& team, const NodesT& nodes,
   (dag_run_node<Ks, ES, RootNode>(team, nodes, tiles, store, root_idx), ...);
 }
 
-// Write one root slot out to its global view, through the existing store
+// Write one root SLOT out to its global view, through the existing store
 // evaluator (Specialization 6) -- unchanged from the tree path.
-template <std::size_t R, typename ES, typename Team, typename NodesT,
-          typename TilesT, typename Store, typename ViewT, std::size_t RootR>
+//
+// R is a slot index, so the producing node has to be looked up: a multi-output
+// combine's outputs 0 and 1 are two different slots of the SAME node, sharing
+// its tile, its modes and its output permutation.
+template <std::size_t R, typename ES, typename RootNode, typename Team,
+          typename NodesT, typename TilesT, typename Store, typename ViewT,
+          std::size_t RootR>
 KOKKOS_FUNCTION void dag_store_root(const Team& team, const TilesT& tiles,
                                     const Store&                     store,
                                     const Kokkos::Array<int, RootR>& root_idx,
                                     const ViewT&                     view) {
-  using Node = tuple_element_t<R, NodesT>;
-  static_assert(
-      output_arity<Node>::value == 1,
-      "DagGraph: a node owns exactly one slot, so a multi-output combine "
-      "cannot yet be a DAG node. Register it through the tree driver instead");
+  constexpr std::size_t K = dag_slot_owner_v<NodesT, R>;
+  using Node              = tuple_element_t<K, NodesT>;
+  // Gathered, not passed through: an output need not be the grid node, and the
+  // index it is written at is its own. Identity whenever it carries the grid
+  // node's modes in the grid node's order, which is every case today.
+  using Gather =
+      dag_gather_seq_t<typename Node::modes_seq, typename RootNode::modes_seq>;
+  const auto idx = dag_node_index<Node::Rank, RootR>(root_idx, Gather{});
 
   auto seval = make_evaluator<TeamPolicyTag<ES>>(
       make_interm_node(store.template get<R>()),
-      output_tile(tiles.template get<R>()));
-  seval(team, root_idx, view, output_perm_seq<Node>());
+      output_tile(tiles.template get<K>()));
+  seval(team, idx, view, output_perm_seq<Node>());
 }
 
-template <typename ES, typename Team, typename NodesT, typename TilesT,
-          typename Store, typename ViewArr, std::size_t RootR,
+template <typename ES, typename RootNode, typename Team, typename NodesT,
+          typename TilesT, typename Store, typename ViewArr, std::size_t RootR,
           std::size_t... Rs>
 KOKKOS_FUNCTION void dag_store_roots(const Team& team, const TilesT& tiles,
                                      const Store&                     store,
@@ -253,19 +346,21 @@ KOKKOS_FUNCTION void dag_store_roots(const Team& team, const TilesT& tiles,
                                      const ViewArr&                   views,
                                      std::index_sequence<Rs...>) {
   int i = 0;
-  ((dag_store_root<Rs, ES, Team, NodesT>(team, tiles, store, root_idx,
-                                         views[i++])),
+  ((dag_store_root<Rs, ES, RootNode, Team, NodesT>(team, tiles, store, root_idx,
+                                                   views[i++])),
    ...);
 }
 
-// Carve one slot per node, sized by that node's CANONICAL output tile.
+// Carve one slot per node OUTPUT, sized by the owning node's CANONICAL output
+// tile -- which every one of its outputs shares.
 template <typename V, typename ES, typename NodesT, typename Team,
-          typename TilesT, std::size_t... Ks>
+          typename TilesT, std::size_t... Ss>
 KOKKOS_FUNCTION auto dag_carve_store(const Team& team, const TilesT& tiles,
-                                     std::index_sequence<Ks...>) {
-  return carve_slot_store<V, ES>(team,
-                                 canonical_c_tile<tuple_element_t<Ks, NodesT>>(
-                                     tiles.template get<Ks>())...);
+                                     std::index_sequence<Ss...>) {
+  return carve_slot_store<V, ES>(
+      team,
+      canonical_c_tile<tuple_element_t<dag_slot_owner_v<NodesT, Ss>, NodesT>>(
+          tiles.template get<dag_slot_owner_v<NodesT, Ss>>())...);
 }
 
 // Launch the whole graph. A FREE function template whose parameters are all
@@ -283,8 +378,9 @@ int execute_dag_team(const NodesT& nodes, const TilesT& tiles,
   using member_t               = team_member_t<ES>;
   constexpr std::size_t NNodes = tuple_size_v<NodesT>;
   using all_seq                = std::make_index_sequence<NNodes>;
-  using GridNode               = dag_grid_node_t<NodesT>;
-  constexpr int RootR          = GridNode::Rank;
+  using slots_seq     = std::make_index_sequence<dag_num_slots<NodesT>()>;
+  using GridNode      = dag_grid_node_t<NodesT>;
+  constexpr int RootR = GridNode::Rank;
 
   // Copies, not references into the caller's graph: a device lambda capturing a
   // reference would dereference a host pointer on the device.
@@ -297,12 +393,27 @@ int execute_dag_team(const NodesT& nodes, const TilesT& tiles,
   const int wk = work_items(grid_node, grid_tile);
 
   // Kokkos::AUTO is a poor default HERE and measurably so. It sizes the team
-  // from occupancy alone, and on an H100 picks 512 threads for a tile of
-  // TE*N*N = 256 points -- so every TeamVectorRange leaves half the team idle,
+  // from OCCUPANCY alone, which is the wrong objective for a graph whose work
+  // per team is a fixed small tile: on an H100 it picks 512 threads for a tile
+  // of TE*N*N = 256 points, so every TeamVectorRange leaves half the team idle,
   // and the GEMM's TeamThreadRange (a few dozen work items) leaves far more.
-  // Measured on the SEM graph: AUTO 25.94 ms, 256 threads 26.05 ms, **128
-  // threads 18.32 ms** -- a 1.42x swing from this parameter alone, which is
-  // larger than most of what the DAG itself bought.
+  //
+  // Measured on the SEM graph (E=2.5M): AUTO 25.94 ms, 512 -> 42.5, 256
+  // -> 24.0, 128 -> 16.8, **64 -> 15.0**, 32 -> 18.3. The optimum is interior
+  // and it is LOW-occupancy, which is the counterintuitive part and is worth
+  // stating outright because "raise occupancy" is the reflex this defeats:
+  //
+  //   block   occupancy   warp-inst   fp32-inst   barrier stall   time
+  //      64      21.6%      143.9 M      574 M        1.01       800.8 us
+  //     128      42.8%      190.3 M      577 M        3.61       843.8 us
+  //
+  // (ncu, H100, E=65536.) Doubling the team doubles resident warps and buys
+  // 0.5% more FLOATING-POINT work -- the fp32 count is flat because the useful
+  // work is fixed by the tile. What the extra warps do is execute the loop
+  // scaffolding and the index arithmetic anyway (+32% warp-instructions) and
+  // participate in every one of the graph's ~14 team_barrier()s (3.6x the
+  // barrier stall ratio). Occupancy is a measure of RESIDENT warps, not of
+  // useful ones, and past the tile's parallelism the two diverge.
   //
   // Not hardcoded, because the right size depends on the tile and a library
   // cannot know the caller's: exposed as DagOutputs::team_size(n), defaulting
@@ -326,11 +437,11 @@ int execute_dag_team(const NodesT& nodes, const TilesT& tiles,
         // Every node's output buffer, carved once and owned here rather than by
         // the evaluators that fill them.
         const auto store =
-            dag_carve_store<ValueType, ES, NodesT>(team, td, all_seq{});
+            dag_carve_store<ValueType, ES, NodesT>(team, td, slots_seq{});
 
         dag_run_all<ES, GridNode>(team, nd, td, store, grid_idx, all_seq{});
-        dag_store_roots<ES, member_t, NodesT>(team, td, store, grid_idx, varr,
-                                              roots);
+        dag_store_roots<ES, GridNode, member_t, NodesT>(team, td, store,
+                                                        grid_idx, varr, roots);
       });
   return wk;
 }
@@ -370,22 +481,20 @@ struct DagGraph {
   NodesT nodes;
   TilesT tiles;
 
-  // Append a node. Returns the new graph and a handle naming its slot, so
+  // Append a node. Returns the new graph followed by ONE HANDLE PER OUTPUT, so
   // DEFINITION ORDER IS THE TOPOLOGICAL ORDER -- the caller never writes an
   // index, and a node can only name slots that already exist.
+  //
+  //   auto [g, c]      = g0.add(contraction, tile);   // single output
+  //   auto [g, f0, f1] = g0.add(two_out_combine, tile);
+  //
+  // The structured binding's arity is the node's output arity; getting it wrong
+  // is a compile error at the binding, which is where a reader is looking.
   template <typename Node, typename Tile>
   auto add(const Node& node, const Tile& tile) const {
-    static_assert(Impl::output_arity<Node>::value == 1,
-                  "DagGraph: a node owns exactly one slot, so a multi-output "
-                  "combine cannot yet be a DAG node");
-    using NewNodes = decltype(tuple_append(nodes, node));
-    using NewTiles = decltype(tuple_append(tiles, tile));
-    using Handle =
-        SlotHandle<N, Impl::dag_slot_view_t<ExecSpace, Node, Tile>, Node::Rank>;
-    return std::make_tuple(
-        DagGraph<ValueType, ExecSpace, NewNodes, NewTiles>{
-            tuple_append(nodes, node), tuple_append(tiles, tile)},
-        Handle{node.shape()});
+    constexpr std::size_t M =
+        static_cast<std::size_t>(Impl::output_arity<Node>::value);
+    return add_impl<Node, Tile>(node, tile, std::make_index_sequence<M>{});
   }
 
   // Designate graph outputs. Order matches the views passed to execute().
@@ -400,7 +509,7 @@ struct DagGraph {
   // every mode that is tiled more than once.
   // See Impl::dag_grid_node_t for why it is not a member typedef.
 
-  // Team scratch for the slot store: one canonical output tile per node.
+  // Team scratch for the slot store: one canonical output tile per node OUTPUT.
   std::size_t slot_bytes() const {
     return slot_bytes_impl(std::make_index_sequence<N>{});
   }
@@ -450,12 +559,31 @@ struct DagGraph {
   }
 
  private:
+  // The handle pack is minted here rather than in add() so the M-fold expansion
+  // has an index_sequence to expand over.
+  template <typename Node, typename Tile, std::size_t... Ms>
+  auto add_impl(const Node& node, const Tile& tile,
+                std::index_sequence<Ms...>) const {
+    using NewNodes             = decltype(tuple_append(nodes, node));
+    using NewTiles             = decltype(tuple_append(tiles, tile));
+    constexpr std::size_t Base = Impl::dag_num_slots<NodesT>();
+    return std::make_tuple(
+        DagGraph<ValueType, ExecSpace, NewNodes, NewTiles>{
+            tuple_append(nodes, node), tuple_append(tiles, tile)},
+        SlotHandle<Base + Ms, Impl::dag_slot_view_t<ExecSpace, Node, Tile>,
+                   Node::Rank>{node.shape()}...);
+  }
+
+  // One slot per node OUTPUT; all of a node's outputs share its canonical
+  // output tile, so the size is that tile's bytes times the arity.
   template <std::size_t... Ks>
   std::size_t slot_bytes_impl(std::index_sequence<Ks...>) const {
     return (std::size_t{0} + ... +
-            Impl::scratch_tile_bytes<ValueType, ExecSpace>(
-                Impl::canonical_c_tile<tuple_element_t<Ks, NodesT>>(
-                    tiles.template get<Ks>())));
+            (static_cast<std::size_t>(
+                 Impl::output_arity<tuple_element_t<Ks, NodesT>>::value) *
+             Impl::scratch_tile_bytes<ValueType, ExecSpace>(
+                 Impl::canonical_c_tile<tuple_element_t<Ks, NodesT>>(
+                     tiles.template get<Ks>()))));
   }
   template <std::size_t... Ks>
   std::size_t operand_bytes_impl(std::index_sequence<Ks...>) const {

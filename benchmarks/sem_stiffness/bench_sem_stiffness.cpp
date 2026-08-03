@@ -30,8 +30,9 @@
 // which is ~2.5x more because each force component's tree holds two F nodes,
 // each with all four gradients under it.
 //
-// MEASURED RESULT. The library is 4.26x slower than the hand kernel on H100
-// and 3.69x slower on Serial. Those two headline rows are NOT comparable on
+// MEASURED RESULT. The library TREE is 3.41x slower than the hand kernel on
+// H100 and 2.56x slower on Serial (it was 4.26x / 3.69x before the index-math
+// work of task 5). Those two headline rows are NOT comparable on
 // their own: the library retires 2.52x the FLOPs and ~4x the auxiliary global
 // traffic, so a raw ratio conflates DOING MORE WORK with DOING WORK LESS
 // EFFICIENTLY. Separating the two is what the CONTROL rows below are for.
@@ -47,8 +48,12 @@
 // reference. The gap factors multiplicatively:
 //
 //            gap  =  redundancy (baseline -> CONTROL)  x  residual (-> library)
-//   H100     4.26x =            2.89x                  x        1.48x
-//   Serial   3.69x =            3.21x                  x        1.11x
+//   H100     3.41x =            2.89x                  x        1.18x
+//   Serial   2.56x =            3.22x                  x        0.80x
+//
+// (Was 1.48x / 1.11x on the residual before task 5. On Serial the residual is
+// now BELOW one: the library is faster than the hand-written kernel doing its
+// exact work profile.)
 //
 // THE RESIDUALS DO NOT AGREE, and that is the most informative number here.
 // An earlier revision of this comment, and of SEM_STIFFNESS_GAP_ANALYSIS.md,
@@ -78,10 +83,10 @@
 // scratch 38760 -> 24312 bytes -- which is also what brought the Serial
 // backend under its hardcoded 32 KB cap and made a CPU number possible at all.
 //
-// What is left, in order: the redundancy term is the larger one, and a
-// multi-output combine as a fused operand collapses 16 gradient sums to 8 and
-// 2 launches to 1. The residual is the subtler one -- see
-// SEM_STIFFNESS_GAP_ANALYSIS.md for the ordered statement of work.
+// What is left is the residual -- see SEM_STIFFNESS_GAP_ANALYSIS.md for the
+// ordered statement of work. Both halves of the redundancy term have now been
+// paid off: fan-out deduplication by the DAG row, and per-node duplicated work
+// by the DAG-MO row below.
 //
 // THE DAG ROW, added 2026-08-03, is the library with fan-out deduplicated: the
 // four DISTINCT gradients computed once, both components in one launch, 14
@@ -89,22 +94,45 @@
 // only the graph is spelled flat, with consumers NAMING earlier results instead
 // of nesting them.
 //
-//   GPU  33.2 -> 16.548 ms  (2.01x), gap to baseline 3.40x -> 1.70x
-//   CPU  26.7 -> 14.597 ms  (1.83x), gap to baseline 2.55x -> 1.40x
+//   GPU  33.2 -> 14.979 ms  (2.22x), gap to baseline 3.41x -> 1.53x
+//   CPU  107.1 -> 58.486 ms (1.83x), gap to baseline 2.57x -> 1.40x
 //   scratch 24312 B PER COMPONENT -> 20688 B for BOTH
+//
+// THE DAG-MO ROW, added 2026-08-03, is the same DAG with a MULTI-OUTPUT F
+// stage: the four stress integrands merged into two 2-output combine nodes, one
+// per reference direction, each emitting both force components from one chain
+// rule and one compute_stress. 12 nodes owning the same 14 slots.
+//
+//   GPU  14.979 -> 12.068 ms  (1.24x), gap to baseline 1.53x -> 1.24x
+//   CPU  58.486 -> 45.204 ms  (1.29x), gap to baseline 1.40x -> 1.08x
+//   scratch 20688 B, UNCHANGED (two outputs are two buffers either way)
+//
+// This is the redundancy SHARING COULD NOT REACH, and the distinction is worth
+// keeping straight: the DAG collapses duplicated SUBTREES, and the four F nodes
+// were never that -- they were four different functions of one shared gradient
+// set, each rebuilding the same stress tensor and re-reading all seven
+// auxiliary arrays. Only a node that emits more than one tensor removes it.
+// CONTROL-C still carries four stress evals, so it is no longer this row's
+// floor: on both backends DAG-MO is FASTER than the hand-written kernel with
+// the DAG's work profile (0.72x on CPU, 0.96x on GPU).
 //
 // (Both library rows moved again when the subview delinearize was given
 // compile-time extents -- see SEM_STIFFNESS_GAP_ANALYSIS.md task 5. The tree
 // gained 1.25x on GPU and 1.41x on CPU from that alone, so the DAG's speedup
 // over it reads smaller here than the 2.27x first measured.)
 //
-// TEAM SIZE IS WORTH 1.42x HERE, AND Kokkos::AUTO GETS IT WRONG. AUTO sizes the
+// TEAM SIZE IS WORTH 1.7x HERE, AND Kokkos::AUTO GETS IT WRONG. AUTO sizes the
 // team from occupancy alone and picks 512 threads for a tile of TE*N*N = 256
-// points, so every TeamVectorRange leaves half the team idle: 25.94 ms at AUTO,
-// 26.05 at 256, 18.31 at 128. The DAG asks for 128 explicitly on GPU (Serial
-// caps team size at 1 and throws above it, so the choice is per backend). An
-// earlier revision of this comment reported the AUTO number as the DAG's result
-// and drew a wrong conclusion from it.
+// points, so every TeamVectorRange leaves half the team idle: 42.5 ms at 512,
+// 24.0 at 256, 16.8 at 128, **15.0 at 64**, 18.3 at 32. The optimum is interior
+// and it is LOW occupancy (21.6%), because doubling the team to 128 doubles
+// resident warps and buys 0.5% more fp32 work while adding 32% more
+// warp-instructions and 3.6x the barrier stall -- see DagGraph.hpp's
+// execute_dag_team for the ncu table. An earlier revision of this comment
+// reported the AUTO number as the DAG's result and drew a wrong conclusion.
+//
+// It is SWEPT in every run rather than trusted, which is how 128 (tuned before
+// the multi-output F stage existed) was caught as stale.
 //
 // THE RESIDUAL DOES SURVIVE THE RESTRUCTURING. CONTROL-C -> DAG measured 1.45x
 // against the tree's CONTROL -> library 1.48x, so the projection was right.
@@ -249,14 +277,19 @@ KOKKOS_INLINE_FUNCTION Mat2 compute_stress(const Mat2& ds, float l2m,
   return s;
 }
 
-// Chain rule + stress + one integrand slot, shared by both paths so neither
-// can drift from the other.
+// Chain rule + stress + BOTH integrand slots for one reference direction,
+// shared by every path so none can drift from the others.
 //   Dir 0 = xi (uses xix, xiz), Dir 1 = gamma (uses gammax, gammaz)
-template <int Comp, int Dir>
-KOKKOS_INLINE_FUNCTION float integrand_slot(float dxi0, float dxi1, float dgm0,
-                                            float dgm1, float xix, float xiz,
-                                            float gx, float gz, float l2m,
-                                            float mu, float jac) {
+//
+// Both components come out of ONE chain rule and ONE compute_stress: that is
+// the physical fact a 2-output combine expresses and four single-output nodes
+// throw away. integrand_slot below selects one component from it, so the
+// scalar callers pay nothing extra -- the discarded half is dead code at a
+// compile-time index.
+template <int Dir>
+KOKKOS_INLINE_FUNCTION Kokkos::Array<float, 2> integrand_slots(
+    float dxi0, float dxi1, float dgm0, float dgm1, float xix, float xiz,
+    float gx, float gz, float l2m, float mu, float jac) {
   Mat2 ds{};
   ds.m[0][0]      = dxi0 * xix + dgm0 * gx;  // du_x/dx
   ds.m[0][1]      = dxi0 * xiz + dgm0 * gz;  // du_x/dz
@@ -265,7 +298,17 @@ KOKKOS_INLINE_FUNCTION float integrand_slot(float dxi0, float dxi1, float dgm0,
   const Mat2  sig = compute_stress(ds, l2m, mu);
   const float dx  = (Dir == 0) ? xix : gx;
   const float dz  = (Dir == 0) ? xiz : gz;
-  return jac * (sig.m[Comp][0] * dx + sig.m[Comp][1] * dz);
+  return {jac * (sig.m[0][0] * dx + sig.m[0][1] * dz),
+          jac * (sig.m[1][0] * dx + sig.m[1][1] * dz)};
+}
+
+template <int Comp, int Dir>
+KOKKOS_INLINE_FUNCTION float integrand_slot(float dxi0, float dxi1, float dgm0,
+                                            float dgm1, float xix, float xiz,
+                                            float gx, float gz, float l2m,
+                                            float mu, float jac) {
+  return integrand_slots<Dir>(dxi0, dxi1, dgm0, dgm1, xix, xiz, gx, gz, l2m, mu,
+                              jac)[Comp];
 }
 
 // ---------------------------------------------------------------------------
@@ -306,6 +349,37 @@ struct StressIntegrand {
     return integrand_slot<Comp, Dir>(dxi0, dxi1, dgm0, dgm1, xix(e, z, x),
                                      xiz(e, z, x), gx(e, z, x), gz(e, z, x),
                                      l2m(e, z, x), mu(e, z, x), jac(e, z, x));
+  }
+};
+
+// The SAME node, emitting BOTH force components for one reference direction.
+//
+// Returning Kokkos::Array<float,2> makes this a multi-output combine: NumOut is
+// deduced from fn's return type, the node owns two slots, and one pass over the
+// four gradients produces both. Against StressIntegrand that halves the stress
+// evaluations (4 -> 2) and the auxiliary global traffic (4x -> 2x) for the
+// whole graph, which is the redundancy fan-out deduplication cannot touch --
+// the four F nodes are not a shared subtree, they are four different functions
+// of one.
+//
+// Both components share modes by construction (they differ only in which row of
+// the stress tensor they contract), which is what makes them legal outputs of
+// ONE node. The xi and gamma directions do NOT -- {q,e,j} vs {q,e,i} -- so they
+// stay two nodes. A single 4-output node would force a reorder on the B slot of
+// the divergence contraction; see THE LOAD-BEARING RULE in the header.
+template <int Dir>
+struct StressIntegrand2 {
+  V3              xix, xiz, gx, gz, l2m, mu, jac;
+  KOKKOS_FUNCTION Kokkos::Array<float, 2> operator()(int c0, int c1, int c2,
+                                                     float dxi0, float dxi1,
+                                                     float dgm0,
+                                                     float dgm1) const {
+    const int e = c1;
+    const int z = (Dir == 0) ? c2 : c0;
+    const int x = (Dir == 0) ? c0 : c2;
+    return integrand_slots<Dir>(dxi0, dxi1, dgm0, dgm1, xix(e, z, x),
+                                xiz(e, z, x), gx(e, z, x), gz(e, z, x),
+                                l2m(e, z, x), mu(e, z, x), jac(e, z, x));
   }
 };
 
@@ -428,28 +502,21 @@ inline constexpr int kLibSrcEnd = __LINE__;
 //
 // WHAT THIS DOES NOT COLLAPSE. The four F nodes still each rebuild the stress
 // tensor and re-read all seven auxiliary arrays, because they are four separate
-// single-output combines. Deduplicating THAT needs multi-output combine (Task
-// 3), which a DAG node cannot yet be. CONTROL-C measures exactly this profile
-// -- 4 gradient sums, 4 stress evals, one launch -- so it is the floor this row
-// is aimed at, not the baseline.
+// single-output combines. Deduplicating THAT needs multi-output combine -- see
+// the MULTI-OUTPUT F STAGE below, which is the same graph with those four nodes
+// merged into two 2-output ones. CONTROL-C measures the 4-stress profile -- 4
+// gradient sums, 4 stress evals, one launch -- so it is the floor THIS row is
+// aimed at, and the multi-output row is expected to go below it.
 // ===========================================================================
 inline constexpr int kDagSrcBegin = __LINE__;
 using CombF2 = CombineTile<TileQEJ, TileQEJ, TileQEJ, TileQEJ, TileQEJ>;
 using BDiv2  = Tile<TileH, TileQEJ, TileEJI>;
 using CombR2 = CombineTile<TileEJI, TileEJI, TileEJI>;
 
-// Builds the graph and hands back its two roots. Separate from the launch so
-// the host can size it without running it -- scratch is the number that decided
-// against the previous attempt at this, so it must be printable.
-inline auto sem_dag_graph(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m,
-                          V3 mu, V3 jac, V2 H, V2 Hw,
-                          const Kokkos::Array<float, cfg::N>& w) {
-  const StressIntegrand<0, 0> si00{xix, xiz, gx, gz, l2m, mu, jac};
-  const StressIntegrand<0, 1> si01{xix, xiz, gx, gz, l2m, mu, jac};
-  const StressIntegrand<1, 0> si10{xix, xiz, gx, gz, l2m, mu, jac};
-  const StressIntegrand<1, 1> si11{xix, xiz, gx, gz, l2m, mu, jac};
-
-  // --- the four distinct gradients, each computed once --------------------
+// --- the four distinct gradients, each computed once -----------------------
+// Shared by both F-stage spellings, so a difference between the two rows can
+// only come from the F stage.
+inline auto sem_dag_gradients(V3 u0, V3 u1, V2 H) {
   auto [d0, gxu0] = make_dag<float>().add(
       make_contraction_node<'q', 'e', 'j'>(
           make_input_node(make_handle<'q', 'p'>(H)),
@@ -467,6 +534,64 @@ inline auto sem_dag_graph(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m,
                                make_input_node(make_handle<'j', 'p'>(H)),
                                make_input_node(make_handle<'e', 'p', 'q'>(u1))),
                            BGrad{});
+  return std::make_tuple(d3, gxu0, gxu1, gzu0, gzu1);
+}
+
+// --- four divergences and two weighted sums --------------------------------
+// Also shared. f<Comp><Dir> is the xi-direction (Dir 0) or gamma-direction
+// (Dir 1) integrand for component Comp, whichever node produced it.
+template <typename Dag, typename F00, typename F01, typename F10, typename F11>
+auto sem_dag_tail(const Dag& d7, F00 f00, F01 f01, F10 f10, F11 f11, V2 Hw,
+                  const Kokkos::Array<float, cfg::N>& w) {
+  // Each F slot is named in its consumer's canonical B order (contracted ++
+  // freeB), so the operand is an identity permutation and stays zero-copy --
+  // the LOAD-BEARING RULE, unchanged by the DAG.
+  auto [d8, t10]  = d7.add(make_contraction_node<'e', 'j', 'i'>(
+                               make_input_node(make_handle<'q', 'i'>(Hw)),
+                               f00.template as<'q', 'e', 'j'>()),
+                           BDiv2{});
+  auto [d9, t20]  = d8.add(make_contraction_node<'e', 'j', 'i'>(
+                               make_input_node(make_handle<'q', 'j'>(Hw)),
+                               f01.template as<'q', 'e', 'i'>()),
+                           BDiv2{});
+  auto [d10, t11] = d9.add(make_contraction_node<'e', 'j', 'i'>(
+                               make_input_node(make_handle<'q', 'i'>(Hw)),
+                               f10.template as<'q', 'e', 'j'>()),
+                           BDiv2{});
+  auto [d11, t21] = d10.add(make_contraction_node<'e', 'j', 'i'>(
+                                make_input_node(make_handle<'q', 'j'>(Hw)),
+                                f11.template as<'q', 'e', 'i'>()),
+                            BDiv2{});
+
+  // A divergence's canonical output is freeA ++ freeB: {i,e,j} for the xi
+  // slots, {j,e,i} for the gamma ones. That is the order its buffer is
+  // written in, so that is how the slot is named.
+  auto [d12, r0] =
+      d11.add(make_combine_node<'e', 'j', 'i'>(t10.template as<'i', 'e', 'j'>(),
+                                               t20.template as<'j', 'e', 'i'>(),
+                                               WeightedSum{w}),
+              CombR2{});
+  auto [d13, r1] =
+      d12.add(make_combine_node<'e', 'j', 'i'>(t11.template as<'i', 'e', 'j'>(),
+                                               t21.template as<'j', 'e', 'i'>(),
+                                               WeightedSum{w}),
+              CombR2{});
+
+  return std::make_tuple(d13, r0, r1);
+}
+
+// Builds the graph and hands back its two roots. Separate from the launch so
+// the host can size it without running it -- scratch is the number that decided
+// against the previous attempt at this, so it must be printable.
+inline auto sem_dag_graph(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m,
+                          V3 mu, V3 jac, V2 H, V2 Hw,
+                          const Kokkos::Array<float, cfg::N>& w) {
+  const StressIntegrand<0, 0> si00{xix, xiz, gx, gz, l2m, mu, jac};
+  const StressIntegrand<0, 1> si01{xix, xiz, gx, gz, l2m, mu, jac};
+  const StressIntegrand<1, 0> si10{xix, xiz, gx, gz, l2m, mu, jac};
+  const StressIntegrand<1, 1> si11{xix, xiz, gx, gz, l2m, mu, jac};
+
+  auto [d3, gxu0, gxu1, gzu0, gzu1] = sem_dag_gradients(u0, u1, H);
 
   // --- four stress integrands, all four naming the SAME four gradients ----
   // The xi-direction nodes read them as {q,e,j}/{j,e,q}; the gamma-direction
@@ -492,59 +617,80 @@ inline auto sem_dag_graph(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m,
                  gzu0.as<'q', 'e', 'i'>(), gzu1.as<'q', 'e', 'i'>(), si11),
              CombF2{});
 
-  // --- four divergences ---------------------------------------------------
-  // Each F node is declared in its consumer's canonical B order (contracted ++
-  // freeB), so the operand is an identity permutation and stays zero-copy --
-  // the LOAD-BEARING RULE, unchanged by the DAG.
-  auto [d8, t10] = d7.add(
-      make_contraction_node<'e', 'j', 'i'>(
-          make_input_node(make_handle<'q', 'i'>(Hw)), f00.as<'q', 'e', 'j'>()),
-      BDiv2{});
-  auto [d9, t20] = d8.add(
-      make_contraction_node<'e', 'j', 'i'>(
-          make_input_node(make_handle<'q', 'j'>(Hw)), f01.as<'q', 'e', 'i'>()),
-      BDiv2{});
-  auto [d10, t11] = d9.add(
-      make_contraction_node<'e', 'j', 'i'>(
-          make_input_node(make_handle<'q', 'i'>(Hw)), f10.as<'q', 'e', 'j'>()),
-      BDiv2{});
-  auto [d11, t21] = d10.add(
-      make_contraction_node<'e', 'j', 'i'>(
-          make_input_node(make_handle<'q', 'j'>(Hw)), f11.as<'q', 'e', 'i'>()),
-      BDiv2{});
-
-  // --- two weighted sums, both graph outputs ------------------------------
-  // A divergence's canonical output is freeA ++ freeB: {i,e,j} for the xi
-  // slots, {j,e,i} for the gamma ones. That is the order its buffer is
-  // written in, so that is how the slot is named.
-  auto [d12, r0] = d11.add(
-      make_combine_node<'e', 'j', 'i'>(t10.as<'i', 'e', 'j'>(),
-                                       t20.as<'j', 'e', 'i'>(), WeightedSum{w}),
-      CombR2{});
-  auto [d13, r1] = d12.add(
-      make_combine_node<'e', 'j', 'i'>(t11.as<'i', 'e', 'j'>(),
-                                       t21.as<'j', 'e', 'i'>(), WeightedSum{w}),
-      CombR2{});
-
-  return std::make_tuple(d13, r0, r1);
+  return sem_dag_tail(d7, f00, f01, f10, f11, Hw, w);
 }
 
+// --- MULTI-OUTPUT F STAGE --------------------------------------------------
+//
+// The same 4 gradients and the same tail, with the four single-output F nodes
+// merged into TWO 2-output ones -- one per reference direction, each emitting
+// both force components from one chain rule and one compute_stress.
+//
+// 12 nodes owning 14 slots, against 14 nodes owning 14 slots. The store is
+// unchanged (two outputs are two buffers however they are spelled); what falls
+// is the WORK: 4 stress evaluations -> 2, and 4x auxiliary global traffic ->
+// 2x. Sharing could never have removed it, because the four F nodes were not a
+// duplicated subtree -- they were four different functions of one.
+//
+// Two 2-output nodes and not one 4-output node: the xi slots are {q,e,j} and
+// the gamma slots {q,e,i}, and all outputs of a combine necessarily share its
+// modes. Merging across directions would force a reorder on the B slot of the
+// divergence contraction, which the header's LOAD-BEARING RULE exists to avoid.
+inline auto sem_dag_graph_mo(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m,
+                             V3 mu, V3 jac, V2 H, V2 Hw,
+                             const Kokkos::Array<float, cfg::N>& w) {
+  const StressIntegrand2<0> si0{xix, xiz, gx, gz, l2m, mu, jac};
+  const StressIntegrand2<1> si1{xix, xiz, gx, gz, l2m, mu, jac};
+
+  auto [d3, gxu0, gxu1, gzu0, gzu1] = sem_dag_gradients(u0, u1, H);
+
+  // add() hands back one handle PER OUTPUT: [component 0, component 1].
+  auto [d4, f00, f10] =
+      d3.add(make_combine_node<'q', 'e', 'j'>(
+                 gxu0.as<'q', 'e', 'j'>(), gxu1.as<'q', 'e', 'j'>(),
+                 gzu0.as<'j', 'e', 'q'>(), gzu1.as<'j', 'e', 'q'>(), si0),
+             CombF2{});
+  auto [d5, f01, f11] =
+      d4.add(make_combine_node<'q', 'e', 'i'>(
+                 gxu0.as<'i', 'e', 'q'>(), gxu1.as<'i', 'e', 'q'>(),
+                 gzu0.as<'q', 'e', 'i'>(), gzu1.as<'q', 'e', 'i'>(), si1),
+             CombF2{});
+
+  return sem_dag_tail(d5, f00, f01, f10, f11, Hw, w);
+}
+
+// 64 on GPU, not Kokkos::AUTO, which picks 512 for a tile of only TE*N*N = 256
+// points. Swept in main() rather than assumed; see the sweep block there and
+// DagGraph.hpp's execute_dag_team for what the parameter is actually trading.
+//
+// This was 128 until the multi-output F stage landed, and re-sweeping is what
+// found it: 64 is 1.11x on the DAG and 1.15x on DAG-MO. 32 is worse again, so
+// the optimum is interior.
+//
+// Serial caps team size at 1 and THROWS on anything larger, so the choice has
+// to be per backend -- a negative value means Kokkos::AUTO, which is right
+// there.
+inline constexpr int kDagTeam = cfg::kIsGPU ? 64 : -1;
+
+// `team` is a parameter and not just kDagTeam so main() can SWEEP it: a value
+// that was optimal for one graph is not automatically optimal for the next, and
+// this one is worth 1.4x when it is wrong.
 void library_dag_force(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m,
                        V3 mu, V3 jac, V2 H, V2 Hw,
                        const Kokkos::Array<float, cfg::N>& w, V3 force0,
-                       V3 force1) {
+                       V3 force1, int team = kDagTeam) {
   auto [g, r0, r1] =
       sem_dag_graph(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H, Hw, w);
-  // 128 on GPU, not Kokkos::AUTO: AUTO picks 512 threads for a tile of only
-  // TE*N*N = 256 points, and costs 1.42x for it (25.94 -> 18.31 ms). See
-  // DagGraph.hpp's execute_dag_team for the measurement.
-  //
-  // Serial caps team size at 1 and THROWS on anything larger, so the choice has
-  // to be per backend -- a negative value means Kokkos::AUTO, which is right
-  // there.
-  g.outputs(r0, r1)
-      .team_size(cfg::kIsGPU ? 128 : -1)
-      .execute(TeamPolicyTag<>{}, force0, force1);
+  g.outputs(r0, r1).team_size(team).execute(TeamPolicyTag<>{}, force0, force1);
+}
+
+void library_dag_mo_force(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m,
+                          V3 mu, V3 jac, V2 H, V2 Hw,
+                          const Kokkos::Array<float, cfg::N>& w, V3 force0,
+                          V3 force1, int team = kDagTeam) {
+  auto [g, r0, r1] =
+      sem_dag_graph_mo(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H, Hw, w);
+  g.outputs(r0, r1).team_size(team).execute(TeamPolicyTag<>{}, force0, force1);
 }
 inline constexpr int kDagSrcEnd = __LINE__;
 // DIAG-B: one F node on its own -- 4 gradient contractions + StressIntegrand,
@@ -1159,6 +1305,8 @@ inline constexpr double kStressShared =
     32.0 * NP;  // chain 12 + stress 8 + 4 slots
 inline constexpr double kStressPerF =
     23.0 * NP;  // chain 12 + stress 8 + 1 slot
+inline constexpr double kStressPer2F =
+    26.0 * NP;  // chain 12 + stress 8 + 2 slots
 
 inline constexpr double kUseful = kGrad + kStressShared + kDiv + kSum;
 inline constexpr double kLibExec =
@@ -1166,6 +1314,11 @@ inline constexpr double kLibExec =
 // What a fan-out-deduplicated graph would retire: the gradient stage once
 // (shared by every consumer) but still four single-output F nodes.
 inline constexpr double kDagExec = kGrad + 4.0 * kStressPerF + kDiv + kSum;
+// The same with the F stage merged into two 2-output nodes: the chain rule and
+// the stress tensor are evaluated twice instead of four times. This is the
+// closest the library gets to kUseful -- the remaining excess is that the two
+// reference directions cannot share a node (their modes differ).
+inline constexpr double kDagMoExec = kGrad + 2.0 * kStressPer2F + kDiv + kSum;
 }  // namespace flopcount
 
 int main(int argc, char* argv[]) {
@@ -1225,6 +1378,20 @@ int main(int argc, char* argv[]) {
       std::printf(
           "DAG scratch/team:     %zu bytes (both components, one launch)%s\n",
           dg.scratch_bytes(),
+          dg.index_consistent() ? "" : "  <-- INCONSISTENT");
+    }
+    // The multi-output F stage owns the same 14 slots from 12 nodes, so the
+    // store is unchanged and only the operand side can move. Printed next to
+    // the row above because "did merging the F nodes cost scratch?" is the
+    // question that killed the previous attempt at this.
+    {
+      auto [dg, dr0, dr1] =
+          sem_dag_graph_mo(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H, Hw, w);
+      (void)dr0;
+      (void)dr1;
+      std::printf(
+          "DAG-MO scratch/team:  %zu bytes (slots %zu, operands %zu)%s\n",
+          dg.scratch_bytes(), dg.slot_bytes(), dg.operand_bytes(),
           dg.index_consistent() ? "" : "  <-- INCONSISTENT");
     }
     // Per-THREAD state, which is what actually limits this kernel on GPU. The
@@ -1327,6 +1494,50 @@ int main(int argc, char* argv[]) {
                 tdag * 1e3, flopcount::kUseful * Ed / tdag / 1e9,
                 flopcount::kDagExec * Ed / tdag / 1e9,
                 dd < 1e-2 ? "PASS" : "FAIL");
+
+    // THE DAG WITH A MULTI-OUTPUT F STAGE: the same graph, the four stress
+    // integrands merged into two 2-output nodes. 2 stress evals instead of 4,
+    // 2x auxiliary traffic instead of 4x. Same slots, same launch count.
+    V3   fm0("fm0", E, cfg::N, cfg::N), fm1("fm1", E, cfg::N, cfg::N);
+    auto run_mo = [&] {
+      library_dag_mo_force(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H, Hw, w,
+                           fm0, fm1);
+    };
+    run_mo();
+    Kokkos::fence();
+    const double dm =
+        std::max(max_rel_diff(fm0, ref0, Echk), max_rel_diff(fm1, ref1, Echk));
+    const double tmo = seconds_of(run_mo, warmup, reps);
+    std::printf("%-30s %10.3f %14.1f %16.1f %8s\n", "library DAG-MO (2-out F)",
+                tmo * 1e3, flopcount::kUseful * Ed / tmo / 1e9,
+                flopcount::kDagMoExec * Ed / tmo / 1e9,
+                dm < 1e-2 ? "PASS" : "FAIL");
+
+    // TEAM SIZE IS NOT A CONSTANT OF THE PROBLEM. It is worth 1.42x on this
+    // kernel and the optimum moves with the graph, so it is swept here rather
+    // than inherited: a value tuned for one node list is evidence about that
+    // node list only. Cheap enough (2 reps, no warmup) to leave in every run,
+    // which is the point -- a stale hardcoded team size is invisible otherwise.
+    if (cfg::kIsGPU) {
+      std::printf("\nteam-size sweep (2 reps):        DAG      DAG-MO\n");
+      for (int ts : {32, 64, 96, 128, 256, 512}) {
+        const double a = seconds_of(
+            [&] {
+              library_dag_force(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H, Hw,
+                                w, fd0, fd1, ts);
+            },
+            1, 2);
+        const double b = seconds_of(
+            [&] {
+              library_dag_mo_force(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H,
+                                   Hw, w, fm0, fm1, ts);
+            },
+            1, 2);
+        std::printf("  %4d threads            %10.3f  %10.3f ms%s\n", ts,
+                    a * 1e3, b * 1e3, ts == kDagTeam ? "   <-- in use" : "");
+      }
+      std::printf("\n");
+    }
 
     // THE CONTROL: hand-written, but with the library's exact redundancy.
     V3   fc0("fc0", E, cfg::N, cfg::N), fc1("fc1", E, cfg::N, cfg::N);
@@ -1460,7 +1671,8 @@ int main(int argc, char* argv[]) {
           tl / tb);
     }
     std::printf(
-        "source lines: library tree %d, library DAG %d, hand-written %d\n",
+        "source lines: library tree %d, library DAG %d (BOTH F spellings, "
+        "which share the gradient and tail stages), hand-written %d\n",
         kLibSrcEnd - kLibSrcBegin - 1, kDagSrcEnd - kDagSrcBegin - 1,
         kBaseSrcEnd - kBaseSrcBegin - 1);
     std::printf(
@@ -1470,11 +1682,21 @@ int main(int argc, char* argv[]) {
         "  CONTROL-C is the floor for this work profile: %.3f ms vs DAG %.3f "
         "ms = %.2fx of library overhead left\n",
         tl / tdag, tdag / tb, tl / tb, tc3 * 1e3, tdag * 1e3, tdag / tc3);
+    // MULTI-OUTPUT F STAGE. CONTROL-C carries FOUR stress evals, so it is no
+    // longer the floor for this row -- the DAG-MO does strictly less work than
+    // any hand-written control here, and the baseline is the only bound left.
+    std::printf(
+        "\nMULTI-OUTPUT F STAGE (4 stress evals -> 2, 4x aux -> 2x):\n"
+        "  DAG -> DAG-MO:                  %.2fx faster\n"
+        "  gap to hand-written baseline:   %.2fx  (was %.2fx)\n"
+        "  vs CONTROL-C (which still does 4 stress evals): %.3f ms vs %.3f ms "
+        "= %.2fx\n",
+        tdag / tmo, tmo / tb, tdag / tb, tc3 * 1e3, tmo * 1e3, tmo / tc3);
     std::printf(
         "max rel diff vs host reference: baseline %.2e, library %.2e, "
-        "control-C %.2e, DAG %.2e\n",
-        db, dl, dc3, dd);
-    if (db >= 1e-2 || dl >= 1e-2 || dd >= 1e-2) rc = 1;
+        "control-C %.2e, DAG %.2e, DAG-MO %.2e\n",
+        db, dl, dc3, dd, dm);
+    if (db >= 1e-2 || dl >= 1e-2 || dd >= 1e-2 || dm >= 1e-2) rc = 1;
   }
   Kokkos::finalize();
   return rc;
