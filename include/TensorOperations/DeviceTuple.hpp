@@ -45,7 +45,11 @@ struct TupleImpl;
 template <std::size_t... Is, typename... Ts>
 struct TupleImpl<std::index_sequence<Is...>, Ts...> : TupleLeaf<Is, Ts>... {
   KOKKOS_DEFAULTED_FUNCTION TupleImpl() = default;
+  // Constrained so the EMPTY tuple's variadic constructor does not collide with
+  // its defaulted one -- DeviceTuple<> is a real case: it is what an empty
+  // graph builder starts from.
   KOKKOS_FUNCTION explicit TupleImpl(const Ts&... ts)
+    requires(sizeof...(Ts) > 0)
       : TupleLeaf<Is, Ts>(ts)... {}
 };
 }  // namespace Impl
@@ -74,7 +78,9 @@ struct DeviceTuple : Impl::TupleImpl<std::index_sequence_for<Ts...>, Ts...> {
   static constexpr std::size_t size = sizeof...(Ts);
 
   KOKKOS_DEFAULTED_FUNCTION DeviceTuple() = default;
-  KOKKOS_FUNCTION explicit DeviceTuple(const Ts&... ts) : base_t(ts...) {}
+  KOKKOS_FUNCTION explicit DeviceTuple(const Ts&... ts)
+    requires(sizeof...(Ts) > 0)
+      : base_t(ts...) {}
 
   template <std::size_t I>
   KOKKOS_FUNCTION auto& get() {
@@ -85,6 +91,25 @@ struct DeviceTuple : Impl::TupleImpl<std::index_sequence_for<Ts...>, Ts...> {
     return TensorOperations::get<I>(*this);
   }
 };
+
+// Append one element, yielding DeviceTuple<Ts..., T>.
+//
+// The builder for a flat node list grows its pack one node at a time, and the
+// pack has to end up in a DeviceTuple because it is captured into a kernel by
+// value. Returning a new tuple rather than mutating matches how Graph::ops
+// already threads its output pack, and keeps a partially-built graph immutable.
+namespace Impl {
+template <typename T, typename... Ts, std::size_t... Is>
+KOKKOS_FUNCTION auto tuple_append_impl(const DeviceTuple<Ts...>& t, const T& v,
+                                       std::index_sequence<Is...>) {
+  return DeviceTuple<Ts..., T>{t.template get<Is>()..., v};
+}
+}  // namespace Impl
+
+template <typename T, typename... Ts>
+KOKKOS_FUNCTION auto tuple_append(const DeviceTuple<Ts...>& t, const T& v) {
+  return Impl::tuple_append_impl(t, v, std::index_sequence_for<Ts...>{});
+}
 
 // std-like element-count trait.
 template <typename Tuple>

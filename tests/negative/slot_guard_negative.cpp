@@ -62,8 +62,8 @@ int main() {
 #if SLOT_NEG_CASE == 0
   // CONTROL: slot labelled {i,k} in the A slot of C{i,l} = A{i,k} B{k,l}.
   // permA is the identity, so the guard permits it and this MUST build.
-  auto slot = make_slot_node<'i', 'k'>(SlotView<TileIK>{},
-                                       Kokkos::Array<int, 2>{kI, kK});
+  auto slot = make_slot_node<0, 'i', 'k'>(SlotView<TileIK>{},
+                                          Kokkos::Array<int, 2>{kI, kK});
   auto node = make_contraction_node<'i', 'l'>(
       slot, make_input_node(make_handle<'k', 'l'>(View2{})));
   instantiate<decltype(node), Tile<TileIK, TileKL, TileIL>>();
@@ -72,8 +72,8 @@ int main() {
   // A-slot violation. The slot is labelled {k,i} but the contraction's
   // canonical A order is freeA ++ contracted = {i,k}, so permA = (1,0). Staging
   // that would reorder the shared buffer in place.
-  auto slot = make_slot_node<'k', 'i'>(SlotView<TileKI>{},
-                                       Kokkos::Array<int, 2>{kK, kI});
+  auto slot = make_slot_node<0, 'k', 'i'>(SlotView<TileKI>{},
+                                          Kokkos::Array<int, 2>{kK, kI});
   auto node = make_contraction_node<'i', 'l'>(
       slot, make_input_node(make_handle<'k', 'l'>(View2{})));
   instantiate<decltype(node), Tile<TileKI, TileKL, TileIL>>();
@@ -81,8 +81,8 @@ int main() {
 #elif SLOT_NEG_CASE == 2
   // B-slot violation. Canonical B order is contracted ++ freeB = {k,l}; the
   // slot is labelled {l,k}, so permB = (1,0).
-  auto slot = make_slot_node<'l', 'k'>(SlotView<TileLK>{},
-                                       Kokkos::Array<int, 2>{kL, kK});
+  auto slot = make_slot_node<0, 'l', 'k'>(SlotView<TileLK>{},
+                                          Kokkos::Array<int, 2>{kL, kK});
   auto node = make_contraction_node<'i', 'l'>(
       make_input_node(make_handle<'i', 'k'>(View2{})), slot);
   instantiate<decltype(node), Tile<TileIK, TileLK, TileIL>>();

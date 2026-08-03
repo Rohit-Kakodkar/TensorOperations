@@ -65,7 +65,7 @@ static_assert(std::is_same_v<SlotViewIK, ProducerCOut>,
               "producer hands over, or Specialization 8's zero-copy "
               "passthrough will not fire and the DAG design does not hold");
 
-using SlotIK = decltype(make_slot_node<'i', 'k'>(
+using SlotIK = decltype(make_slot_node<0, 'i', 'k'>(
     std::declval<SlotViewIK>(), std::declval<Kokkos::Array<int, 2>>()));
 
 // Does this node carry a hook? Spelled as a concept rather than a bare
@@ -163,7 +163,7 @@ void run_slot(View2 a, View2 b, View2 out) {
   // Host-side: a slot node over a PLACEHOLDER view, carrying the producer's
   // real shape and labels. Everything the type system needs is here.
   const auto slot0 =
-      make_slot_node<'i', 'k'>(SlotViewIK{}, Kokkos::Array<int, 2>{kI, kK});
+      make_slot_node<0, 'i', 'k'>(SlotViewIK{}, Kokkos::Array<int, 2>{kI, kK});
   const auto node = make_contraction_node<'i', 'l'>(
       slot0, make_input_node(make_handle<'k', 'l'>(b)));
 
@@ -224,7 +224,7 @@ void run_combine_relabel(View2 src_ki, View2 x_ik, View2 out) {
   using CTile = CombineTile<TileIK, TileIK, TileIK>;
 
   const auto slot0 =
-      make_slot_node<'k', 'i'>(SlotViewKI{}, Kokkos::Array<int, 2>{kK, kI});
+      make_slot_node<0, 'k', 'i'>(SlotViewKI{}, Kokkos::Array<int, 2>{kK, kI});
   const auto node = make_combine_node<'i', 'k'>(
       slot0, make_input_node(make_handle<'i', 'k'>(x_ik)), SlotCombine{});
 
@@ -390,7 +390,7 @@ TEST(SlotNodeTest, SlotOperandMatchesNestedSpelling) {
 // by a consumer wanting the transpose (non-identity, relabel path).
 // ---------------------------------------------------------------------------
 TEST(SlotNodeTest, TwoSlotNodesMayAliasOneBuffer) {
-  using SlotKI = decltype(make_slot_node<'k', 'i'>(
+  using SlotKI = decltype(make_slot_node<0, 'k', 'i'>(
       std::declval<SlotViewIK>(), std::declval<Kokkos::Array<int, 2>>()));
 
   // Same storage type, different labels -- so they can name one buffer.
@@ -457,7 +457,7 @@ TEST(SlotNodeTest, CombineReadsRelabeledSlot) {
 TEST(SlotNodeTest, GuardBAcceptsSingleContractedTile) {
   // Slot {i,k} with shape [16,8] and a [16,8] tile: one contracted tile.
   const auto slot =
-      make_slot_node<'i', 'k'>(SlotViewIK{}, Kokkos::Array<int, 2>{kI, kK});
+      make_slot_node<0, 'i', 'k'>(SlotViewIK{}, Kokkos::Array<int, 2>{kI, kK});
   const auto node = make_contraction_node<'i', 'l'>(
       slot, make_input_node(make_handle<'k', 'l'>(View2{})));
   using Eval = Evaluator<TeamPolicyTag<ES>, std::decay_t<decltype(node)>,
@@ -474,8 +474,8 @@ TEST(SlotNodeTest, GuardBRejectsMultipleContractedTiles) {
   //
   // The shape is what varies, not the tile, which is exactly why this is a
   // runtime check: both configurations have identical types.
-  const auto bad =
-      make_slot_node<'i', 'k'>(SlotViewIK{}, Kokkos::Array<int, 2>{kI, 2 * kK});
+  const auto bad = make_slot_node<0, 'i', 'k'>(
+      SlotViewIK{}, Kokkos::Array<int, 2>{kI, 2 * kK});
   const auto node = make_contraction_node<'i', 'l'>(
       bad, make_input_node(make_handle<'k', 'l'>(View2{})));
   using Eval = Evaluator<TeamPolicyTag<ES>, std::decay_t<decltype(node)>,
