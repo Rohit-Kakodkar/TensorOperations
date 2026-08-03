@@ -15,8 +15,9 @@
 //   OuterOpTag     — containing operation: ContractionTag, CombineTag
 //   NodeTypeOrTag  — either:
 //     • IntermTag                    — the output (C) slot; no operand node
-//     • a full operand NodeHandle    — an InputTag leaf, or a fused node that
-//       produces its own scratch (ContractionTag / CombineTag)
+//     • a full operand NodeHandle    — an InputTag leaf, a fused node that
+//       produces its own scratch, or a SlotTag naming a buffer another node
+//       owns (ContractionTag / CombineTag)
 //   ValueType      — the scalar the slot's scratch is typed on. Chosen by the
 //     consuming evaluator (its own value_type), never derived per operand: a
 //     staging buffer holds the consumer's scalar regardless of the input
@@ -102,6 +103,53 @@ struct ScratchAllocator<TeamPolicyTag<ES>, OuterOpTag, NA, V, TileA, PermSeq> {
   template <typename Team, typename Idx>
   KOKKOS_FUNCTION auto stage(const Team& team, const Idx& idx) const {
     return Impl::single_result(eval_(team, idx));
+  }
+};
+
+// SlotTag operand: names a buffer some OTHER node owns and already filled.
+// Carves nothing, evaluates nothing, and costs nothing -- bytes() is 0, because
+// the buffer is charged once by whoever allocates the slot store, not once per
+// consumer. That zero is the whole point of the node kind: the fused form above
+// charges its operand's full recursive scratch_size_per_team PER CONSUMER, and
+// holds a whole inner Evaluator by value to do it, which is what makes a shared
+// subtree cost N times over.
+//
+// stage() hands back an IntermTag node over that same buffer rather than the
+// slot node itself, for a specific reason: Specialization 8 dispatches on
+// whether the SOURCE's storage_type equals the destination scratch type
+// (Evaluator/Team.hpp), and equality is what selects its zero-copy passthrough
+// branch over its copy branch. A slot's storage IS a destination-typed scratch
+// view -- alloc_scratch_tile builds both -- so the passthrough fires and no
+// data moves. The NoHook is not a default but a guarantee: see NodeHandle.hpp
+// on why a slot carries no hook, and Impl::operand_stageable_v on the matching
+// prohibition against reordering one in place.
+//
+// PermSeq is accepted and ignored, as in the fused form. A slot is only ever
+// presented in its own order -- a differently-ordered consumer takes the
+// relabel path (Impl::operand_relabelable_v) or names the buffer through a
+// second slot node -- and operand_stageable_v rejects anything else before it
+// reaches here.
+template <typename ES, typename OuterOpTag, typename NA, typename V,
+          typename TileA, typename PermSeq>
+  requires(Impl::has_node_tag_v<SlotTag, NA>)
+struct ScratchAllocator<TeamPolicyTag<ES>, OuterOpTag, NA, V, TileA, PermSeq> {
+  using team_member_t  = Impl::team_member_t<ES>;
+  using scratch_view_t = typename NA::storage_type;
+  using interm_type =
+      NodeHandle<IntermTag, scratch_view_t,
+                 std::integral_constant<int, NA::Rank>, ES, NoHook>;
+
+  scratch_view_t storage_;
+
+  KOKKOS_FUNCTION ScratchAllocator(const NA& node, const TileA&,
+                                   const team_member_t&)
+      : storage_(node.storage_) {}
+
+  static std::size_t             bytes(const TileA&) { return 0; }
+  KOKKOS_FUNCTION scratch_view_t get() const { return storage_; }
+  template <typename Team, typename Idx>
+  KOKKOS_FUNCTION interm_type stage(const Team&, const Idx&) const {
+    return {storage_, NoHook{}};
   }
 };
 
