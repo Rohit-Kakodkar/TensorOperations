@@ -480,6 +480,44 @@ This collapses 16 gradient sums -> 8, 4 stress evals -> 2, and 2 launches -> 1.
 
 ### Task 4 — Fan-out deduplication (CSE) of shared subtrees
 
+> ### ✅ DONE 2026-08-03. Built and measured. **The win is real but SMALLER than projected on GPU, and the reason is a new finding.**
+>
+> The SEM graph now runs as a 14-node DAG: 4 gradients, 4 stress integrands, 4 divergences,
+> 2 weighted sums, **one launch, both components**. Validates at `max rel diff 0.00e+00` on
+> both backends.
+>
+> | | tree | DAG | |
+> |---|---|---|---|
+> | GPU (E=2.5M) | 41.607 ms | **25.959 ms** | 1.60x faster |
+> | CPU (E=4096) | 37.683 ms | **18.832 ms** | 2.02x faster |
+> | scratch/team | 24,312 B *per component* | **20,688 B for both** | |
+> | gap to baseline, GPU | 4.27x | **2.66x** | |
+> | gap to baseline, CPU | 3.60x | **1.78x** | |
+>
+> **THE PROJECTION MISSED ON GPU, AND THAT IS THE INTERESTING RESULT.** It assumed the
+> measured residual survives the restructuring. It did not:
+>
+> | | tree residual | DAG residual |
+> |---|---|---|
+> | GPU (`CONTROL-C -> DAG`) | 1.48x | **2.06x** |
+> | CPU | 1.11x | 1.18x |
+>
+> Projected 1.91x GPU, measured 2.66x. The DAG captured the algorithmic win in full — its work
+> profile IS `CONTROL-C`'s — but it executes that profile ~39% less efficiently than the tree
+> executed its own. The CPU barely moved (1.11 → 1.18), so this is GPU-specific, and the
+> obvious suspect is per-thread state: 14 evaluators are live at once, against a tree that held
+> one root and recursed. That is now a NAMED, measurable target rather than a projection, and
+> it is the same class of thing Task 2 attributed for the tree.
+>
+> **This does not change the ordering conclusion.** Task 4 was the largest algorithmic item and
+> it delivered 1.60-2.02x. What it changes is what comes next: the DAG's own residual is now
+> larger than the tree's was, so [Task 5](#task-5--strength-reduce-the-tiled-layout-index-arithmetic)
+> applies more, not less.
+>
+> Remaining, unchanged by this: the four stress integrands still each rebuild the stress tensor
+> and re-read all seven auxiliary arrays. Only multi-output combine (Task 3) collapses that, and
+> a DAG node cannot yet be multi-output.
+
 > ### ⬆ PROMOTED 2026-08-03, on two findings. **Now the highest-value algorithmic task, and it no longer depends on Task 3.**
 
 **Priority: HIGH.** Previously "MEDIUM — real, but smaller and much harder than
