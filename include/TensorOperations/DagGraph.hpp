@@ -278,7 +278,7 @@ KOKKOS_FUNCTION auto dag_carve_store(const Team& team, const TilesT& tiles,
 template <typename ValueType, typename ES, typename NodesT, typename TilesT,
           typename RootsSeq, typename... ViewTs>
 int execute_dag_team(const NodesT& nodes, const TilesT& tiles,
-                     std::size_t bytes, RootsSeq roots,
+                     std::size_t bytes, int team_size, RootsSeq roots,
                      const ViewTs&... views) {
   using member_t               = team_member_t<ES>;
   constexpr std::size_t NNodes = tuple_size_v<NodesT>;
@@ -296,7 +296,20 @@ int execute_dag_team(const NodesT& nodes, const TilesT& tiles,
 
   const int wk = work_items(grid_node, grid_tile);
 
-  Kokkos::TeamPolicy<ES> policy(wk, Kokkos::AUTO);
+  // Kokkos::AUTO is a poor default HERE and measurably so. It sizes the team
+  // from occupancy alone, and on an H100 picks 512 threads for a tile of
+  // TE*N*N = 256 points -- so every TeamVectorRange leaves half the team idle,
+  // and the GEMM's TeamThreadRange (a few dozen work items) leaves far more.
+  // Measured on the SEM graph: AUTO 25.94 ms, 256 threads 26.05 ms, **128
+  // threads 18.32 ms** -- a 1.42x swing from this parameter alone, which is
+  // larger than most of what the DAG itself bought.
+  //
+  // Not hardcoded, because the right size depends on the tile and a library
+  // cannot know the caller's: exposed as DagOutputs::team_size(n), defaulting
+  // to AUTO so nothing changes for a caller that does not care.
+  Kokkos::TeamPolicy<ES> policy =
+      team_size > 0 ? Kokkos::TeamPolicy<ES>(wk, team_size)
+                    : Kokkos::TeamPolicy<ES>(wk, Kokkos::AUTO);
   policy.set_scratch_size(0, Kokkos::PerTeam(static_cast<int>(bytes)));
 
   using ViewT = std::tuple_element_t<0, std::tuple<ViewTs...>>;
@@ -330,10 +343,15 @@ int execute_dag_team(const NodesT& nodes, const TilesT& tiles,
 template <typename Dag, std::size_t... Roots>
 struct DagOutputs {
   Dag dag;
+  // Threads per team; <= 0 means Kokkos::AUTO. See execute_dag_team for why
+  // AUTO is worth overriding on a graph whose tiles are small.
+  int team = -1;
+
+  DagOutputs team_size(int n) const { return {dag, n}; }
 
   template <typename ES, TensorLike... Ts>
   int execute(const TeamPolicyTag<ES>&, const Ts&... ts) const {
-    return dag.template launch<ES, Roots...>(ts...);
+    return dag.template launch<ES, Roots...>(team, ts...);
   }
 };
 
@@ -415,7 +433,7 @@ struct DagGraph {
   // execute_one_output_team -- decode a tile index per team, evaluate, store --
   // with the recursion replaced by a fold over the flat node list.
   template <typename ES, std::size_t... Roots, typename... ViewTs>
-  int launch(const ViewTs&... views) const {
+  int launch(int team_size, const ViewTs&... views) const {
     static_assert(sizeof...(Roots) == sizeof...(ViewTs),
                   "DagGraph::execute needs one view per designated output");
     static_assert(std::is_same_v<ES, ExecSpace>,
@@ -427,8 +445,8 @@ struct DagGraph {
            "cannot be gathered from the grid node's. Retile so every shared "
            "mode matches and every unshared mode has one tile.");
     return Impl::execute_dag_team<ValueType, ES>(
-        nodes, tiles, scratch_bytes(), std::index_sequence<Roots...>{},
-        views...);
+        nodes, tiles, scratch_bytes(), team_size,
+        std::index_sequence<Roots...>{}, views...);
   }
 
  private:
