@@ -13,6 +13,14 @@ line item (~50% of library runtime, worth 1.62x), but it is one of three
 comparable factors that multiply together. Removing it entirely leaves the
 library ~2.6x slower than hand-written code.
 
+**Updated 2026-08-03.** `CONTROL-C` now measures the broader change that
+*subsumes* gradient recompute — full fan-out deduplication, i.e. computing each
+distinct gradient once and merging both components into one launch. That is
+worth **2.23x on GPU / 2.19x on CPU**, taking the projected gap to ~1.90x /
+~1.64x. It is the largest measured algorithmic item, it does not depend on
+Task 3, and the feasibility work re-sized it from XL to L. See
+[Task 4](#task-4--fan-out-deduplication-cse-of-shared-subtrees).
+
 **The other two factors, in one line each.** The rest of the redundancy is 2
 launches and 4x stress evaluation (1.79x), fixable by multi-output combine
 (Task 3). The remaining 1.48x is **address arithmetic** — the library issues
@@ -52,6 +60,7 @@ baseline (hand, 1 kernel)           9.737         2727.8                -
 library (fused, 2 kernels)         41.487          640.2           1612.1
 CONTROL   (hand, lib's redundancy) 28.190          942.2           2372.5
 CONTROL-B (grads deduped)          17.401         1526.4                -
+CONTROL-C (DAG work profile)       12.626         2103.6           2863.9
   [diag] 1 gradient only            1.984         1290.2
   [diag] 4 gradients, no aux        5.551         1844.6
   [diag] 1 F node (4grad+stress)    6.335         1616.5
@@ -68,7 +77,12 @@ baseline (hand, 1 kernel)          41.861            4.2                -
 library (fused, 2 kernels)        154.539            1.1              2.8
 CONTROL   (hand, lib's redundancy) 134.453           1.3              3.3
 CONTROL-B (grads deduped)          91.814            1.9                -
+CONTROL-C (DAG work profile)       62.726            2.8              3.8
 ```
+
+> `CONTROL-C` was added 2026-08-03; the other rows in both tables are the
+> 2026-08-01 figures and reproduced within noise on the same run
+> (GPU: 9.748 / 41.538 / 28.123 / 17.443).
 
 **3.69x slower**, factoring as **3.21x redundancy x 1.11x residual**. The
 2.52x executed-FLOP ratio is a *floor* on the redundancy term, not an estimate
@@ -93,17 +107,29 @@ library's **exact work profile** at hand-written efficiency:
 | baseline | 1 | 4 | 1 | 4 | 1x |
 | **CONTROL** | 2 | **16** | **4** | 4 | **4x** |
 | **CONTROL-B** | 2 | **8** | **4** | 4 | 4x |
+| **CONTROL-C** | **1** | **4** | **4** | 4 | 4x |
 | library | 2 | 16 | 4 | 4 | 4x |
 
 `CONTROL-B` is the identical kernel with one `constexpr bool` flipped, hoisting
 the gradient stage out of the F-node loop so it runs once per launch instead of
 twice. That single difference isolates the intra-kernel gradient recompute.
 
-Both controls validate against the host reference (`max rel diff 0.00e+00`), so
-they are doing the real physics, not a stripped-down imitation.
+`CONTROL-C` goes one step further and is a separate kernel: the four *distinct*
+gradients computed once and shared by every consumer, both force components in
+one launch — the work profile a **fan-out-deduplicating (DAG) evaluator** would
+produce. It still runs four single-output F nodes, because sharing a subtree
+does not merge four combines into one multi-output node, so the 4x stress and
+4x aux traffic survive. Its four F passes are deliberately four separate
+`parallel_for`s: fusing them would let the compiler share one stress tensor
+across the slots, which is the redundancy the row exists to preserve.
+
+All three controls validate against the host reference (`max rel diff
+0.00e+00`), so they are doing the real physics, not a stripped-down imitation.
 
 - `baseline -> CONTROL` = the price of the redundancy itself.
 - `CONTROL -> library` = everything else the library costs.
+- `CONTROL-C -> CONTROL` = **the ceiling on what fan-out dedup can buy.**
+- `baseline -> CONTROL-C` = the redundancy dedup *cannot* remove on its own.
 
 ---
 
@@ -454,28 +480,62 @@ This collapses 16 gradient sums -> 8, 4 stress evals -> 2, and 2 launches -> 1.
 
 ### Task 4 — Fan-out deduplication (CSE) of shared subtrees
 
-**Priority: MEDIUM — real, but smaller and much harder than Task 3.**
+> ### ⬆ PROMOTED 2026-08-03, on two findings. **Now the highest-value algorithmic task, and it no longer depends on Task 3.**
 
-After Task 3 the two direction combines still each compute all four gradients,
-because the chain rule mixes them — 8 sums where 4 suffice. Deduplicating
-requires recognising that `Cxi`'s `d(u0)/dxi` (modes `{q,e,j}`) and `Cgm`'s
-(modes `{i,e,q}`) are the same tensor under alpha-renaming: both are
-`(x-role, e, z-role)`.
+**Priority: HIGH.** Previously "MEDIUM — real, but smaller and much harder than
+Task 3". Both halves of that were wrong.
 
-- **Projected payoff:** removes 4 gradient sweeps at 1.19 ms → **~4.8 ms, gap
-  ~2.45x -> ~1.95x.**
-- **Effort:** large. Needs node identity up to label renaming, a DAG rather than
-  a tree evaluator, and shared (non-additive) scratch.
-- **Depends on:** Task 3. Doing it first buys only 8 of the 12 redundant sweeps
-  and leaves the 2-launch split in place.
-- **Risk:** high — this is the architectural change, and scratch is currently
-  additive down the whole tree with no recycling.
-- **Done when:** the SEM graph runs 4 gradient sums, matching the hand kernel.
+The four gradients are shared across the whole tree: `Cxi`'s `d(u0)/dxi` (modes
+`{q,e,j}`) and `Cgm`'s (modes `{i,e,q}`) are the same tensor under
+alpha-renaming — both are `(x-role, e, z-role)`, in the same axis order, under
+the same tile. Computing them once collapses 16 gradient sums to **4** and
+2 launches to 1.
 
-**Why after Task 3:** Task 3 subsumes part of this (the cross-kernel half of the
-gradient redundancy) at a fraction of the cost, and it changes the shape of what
-Task 4 has to deduplicate. Doing Task 4 first means solving the harder problem
-against a tree that Task 3 is about to restructure.
+**Finding 1 — the payoff is measured, not projected.** `CONTROL-C` (added
+2026-08-03) is exactly this work profile at hand-written efficiency:
+
+| | GPU | CPU |
+|---|---|---|
+| removable by sharing (`CONTROL-C -> CONTROL`) | **2.23x** | **2.19x** |
+| *not* removable by sharing (`baseline -> CONTROL-C`) | 1.30x | 1.50x |
+| projected library on a DAG (`CONTROL-C x residual`) | 18.65 ms | 68.6 ms |
+| projected gap | **1.90x** (from 4.26x) | **1.64x** (from 3.69x) |
+
+The last two rows are a projection — they assume the measured residual (1.48x
+GPU / 1.11x CPU) survives the restructuring unchanged. The first two rows are
+measurements, and they are the ones that decide the ordering.
+
+**Finding 2 — the effort is L, not XL, if the sharing is DECLARED.** The XL
+sizing came from "needs node identity up to label renaming". It does not, if
+the *caller* names the slot each operand reads: the user asserts the identity
+and the library never infers it. That turns the hard half of this task into an
+API question. Full analysis, including the two invariants it breaks, in
+`~/.claude/plans/feasibility-dag-topological-evaluator-2026-08-03.md`.
+
+- **Effort:** L (XL only if sharing must be inferred). New: a slot-reference
+  node kind, a relabel node, a flat topologically-ordered driver.
+- **Depends on:** nothing. `CONTROL-C` carries *four* stress evals, i.e. it
+  measures the DAG **without** Task 3 — the 2.23x is standalone.
+- **Risk:** medium. Two invariants break, both nameable: (1) three sites
+  (`Evaluator/Team.hpp:1380`, `:1382`, `:1299`) mutate a producer's own scratch
+  in place, safe today only because each fused operand has exactly one consumer;
+  (2) a shared slot is sound only if every consumer demands it at the same tile
+  index, which holds in the SEM graph only because every contracted axis fits in
+  one k-tile. Both are enforceable at compile time; neither is checked today.
+- **Done when:** the SEM graph runs 4 gradient sums in one launch, still `PASS`
+  against the host reference, at scratch ≤ 24,312 B.
+
+**Relationship to Task 3, inverted.** Task 3 (multi-output combine, options
+B+C) collapses 16 gradients → 8; Task 4 collapses them → 4, and subsumes the
+launch merge. What Task 3 still uniquely buys is the *other* factor: `baseline
+-> CONTROL-C` is 1.30x on GPU, and that residue is 4x stress + 4x aux traffic —
+exactly what multi-output combine removes and sharing cannot. **The two are
+complementary and independent; Task 4 is the larger and should go first.**
+
+Also worth correcting: `plans/specfem-kernel-graph.md:23-43` argues that
+relabeling is free *because* `Graph` performs no memoization. Landing this task
+invalidates that reasoning and makes a relabel node necessary. Fix that section
+in place rather than leaving it to mislead.
 
 ---
 

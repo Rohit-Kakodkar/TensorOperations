@@ -40,8 +40,11 @@
 // -- 2 launches, 16 gradient sums, 4 stress evals, 4 divergences, 4x aux reads
 // -- at hand-written efficiency. CONTROL-B is the same with one constexpr flag
 // hoisting the gradient stage, which isolates gradient recompute from the rest
-// of the redundancy. Both validate against the host reference. The gap then
-// factors multiplicatively:
+// of the redundancy. CONTROL-C goes further: 4 gradient sums shared by every
+// consumer and one launch for both components -- the work profile a fan-out
+// deduplicating (DAG) evaluator would produce, which bounds that change's
+// payoff before any library work is done. All three validate against the host
+// reference. The gap factors multiplicatively:
 //
 //            gap  =  redundancy (baseline -> CONTROL)  x  residual (-> library)
 //   H100     4.26x =            2.89x                  x        1.48x
@@ -687,6 +690,162 @@ void control_recompute_force(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m,
       });
 }
 
+// ===========================================================================
+// Implementation 4: CONTROL-C. The DAG's work profile, at hand-written
+// efficiency.
+//
+// The spike for "would a topologically-ordered DAG evaluator pay?". This is
+// what the library would execute if fan-out were deduplicated: the four
+// DISTINCT reference gradients computed once and shared by every consumer, and
+// both force components in ONE launch -- but still four separate F nodes, each
+// rebuilding the stress tensor from scratch and re-reading all seven auxiliary
+// arrays. Deduplicating shared subtrees does not merge the four single-output
+// combines into one multi-output node, so the 4x stress and 4x aux traffic
+// survive.
+//
+//              launches  grad sums  stress evals  div sums  aux reads
+//   baseline       1          4           1           4        1x
+//   CONTROL-C      1          4           4           4        4x
+//   CONTROL-B      2          8           4           4        4x
+//   CONTROL        2         16           4           4        4x
+//   library        2         16           4           4        4x
+//
+// So CONTROL-C sits between the baseline and CONTROL-B:
+//   baseline  -> CONTROL-C  = the redundancy a DAG evaluator CANNOT remove on
+//                             its own (4x stress + 4x aux traffic); closing it
+//                             needs multi-output combine, not sharing.
+//   CONTROL-C -> CONTROL    = the redundancy it CAN remove. That ratio is the
+//                             ceiling on the DAG's payoff, measured rather
+//                             than extrapolated from the marginal-sweep fit.
+//
+// The four F passes are deliberately four separate parallel_for's separated by
+// barriers rather than one pass calling integrand_slot four times: fusing them
+// would let the compiler share one stress tensor across the four slots, which
+// is exactly the redundancy this row exists to preserve.
+//
+// Scratch is 10 tiles -- the same as the baseline. A DAG needs 4 gradient
+// slots and 4 F slots live at once, which is what the baseline already holds;
+// sharing does not add storage here, it removes duplicates.
+// ===========================================================================
+void control_dag_force(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m,
+                       V3 mu, V3 jac, V2 H, V2 Hw,
+                       Kokkos::Array<float, cfg::N> w, V3 force0, V3 force1,
+                       int E) {
+  using ExecSpace    = Kokkos::DefaultExecutionSpace;
+  using ScratchSpace = ExecSpace::scratch_memory_space;
+  using Sc3          = Kokkos::View<float***, ScratchSpace,
+                                    Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+  using member_t     = Kokkos::TeamPolicy<ExecSpace>::member_type;
+
+  constexpr int N = cfg::N, TE = cfg::TE, NP = cfg::N * cfg::N;
+  const size_t  bytes = 10 * Sc3::shmem_size(TE, N, N);
+
+  Kokkos::parallel_for(
+      "control_dag",
+      Kokkos::TeamPolicy<ExecSpace>(E / TE, Kokkos::AUTO)
+          .set_scratch_size(0, Kokkos::PerTeam(bytes)),
+      KOKKOS_LAMBDA(const member_t& team) {
+        const int e0 = team.league_rank() * TE;
+        Sc3       us0(team.team_scratch(0), TE, N, N);
+        Sc3       us1(team.team_scratch(0), TE, N, N);
+        Sc3       a0v(team.team_scratch(0), TE, N, N);
+        Sc3       a1v(team.team_scratch(0), TE, N, N);
+        Sc3       g0v(team.team_scratch(0), TE, N, N);
+        Sc3       g1v(team.team_scratch(0), TE, N, N);
+        Sc3       Fxi0(team.team_scratch(0), TE, N, N);
+        Sc3       Fgm0(team.team_scratch(0), TE, N, N);
+        Sc3       Fxi1(team.team_scratch(0), TE, N, N);
+        Sc3       Fgm1(team.team_scratch(0), TE, N, N);
+
+        // Four operand stagings, matching the library's four gradient
+        // contractions -- sharing a node does not merge its operands' staging
+        // buffers, so this cost survives the DAG exactly as in CONTROL.
+        Kokkos::parallel_for(
+            Kokkos::TeamVectorRange(team, TE * NP), [&](int t) {
+              const int de = t / NP, r = t % NP, j = r / N, i = r % N;
+              us0(de, j, i) = u0(e0 + de, j, i);
+              us1(de, j, i) = u1(e0 + de, j, i);
+              us0(de, j, i) = u0(e0 + de, j, i);
+              us1(de, j, i) = u1(e0 + de, j, i);
+            });
+        team.team_barrier();
+
+        // The four distinct gradients, computed ONCE for the whole graph. This
+        // is the line the DAG buys: CONTROL runs this block four times (twice
+        // per launch, two launches), CONTROL-B twice, the baseline once.
+        Kokkos::parallel_for(
+            Kokkos::TeamVectorRange(team, TE * NP), [&](int t) {
+              const int de = t / NP, r = t % NP, j = r / N, i = r % N;
+              float     ax0 = 0.f, ax1 = 0.f, ag0 = 0.f, ag1 = 0.f;
+              for (int p = 0; p < N; ++p) {
+                const float hi = H(i, p), hj = H(j, p);
+                ax0 += hi * us0(de, j, p);
+                ax1 += hi * us1(de, j, p);
+                ag0 += hj * us0(de, p, i);
+                ag1 += hj * us1(de, p, i);
+              }
+              a0v(de, j, i) = ax0;
+              a1v(de, j, i) = ax1;
+              g0v(de, j, i) = ag0;
+              g1v(de, j, i) = ag1;
+            });
+        team.team_barrier();
+
+        // Four F nodes, one integrand slot each, every one rebuilding the
+        // stress tensor and re-reading all seven auxiliary arrays. Separate
+        // passes so the stress cannot be shared between them.
+        for (int f = 0; f < 4; ++f) {
+          Kokkos::parallel_for(
+              Kokkos::TeamVectorRange(team, TE * NP), [&](int t) {
+                const int   de = t / NP, r = t % NP, j = r / N, i = r % N;
+                const int   e  = e0 + de;
+                const float a0 = a0v(de, j, i), a1 = a1v(de, j, i);
+                const float G0 = g0v(de, j, i), G1 = g1v(de, j, i);
+                const float ax = xix(e, j, i), az = xiz(e, j, i);
+                const float px = gx(e, j, i), pz = gz(e, j, i);
+                const float lm = l2m(e, j, i), m = mu(e, j, i);
+                const float J = jac(e, j, i);
+                switch (f) {
+                  case 0:
+                    Fxi0(de, j, i) = integrand_slot<0, 0>(a0, a1, G0, G1, ax,
+                                                          az, px, pz, lm, m, J);
+                    break;
+                  case 1:
+                    Fgm0(de, j, i) = integrand_slot<0, 1>(a0, a1, G0, G1, ax,
+                                                          az, px, pz, lm, m, J);
+                    break;
+                  case 2:
+                    Fxi1(de, j, i) = integrand_slot<1, 0>(a0, a1, G0, G1, ax,
+                                                          az, px, pz, lm, m, J);
+                    break;
+                  default:
+                    Fgm1(de, j, i) = integrand_slot<1, 1>(a0, a1, G0, G1, ax,
+                                                          az, px, pz, lm, m, J);
+                    break;
+                }
+              });
+          team.team_barrier();
+        }
+
+        // A7: both components' divergences and weighted sums, one launch.
+        Kokkos::parallel_for(Kokkos::TeamVectorRange(team, TE * NP),
+                             [&](int t) {
+                               const int de = t / NP, r = t % NP;
+                               const int j = r / N, i = r % N;
+                               float s0 = 0.0f, s1 = 0.0f, g0 = 0.0f, g1 = 0.0f;
+                               for (int q = 0; q < N; ++q) {
+                                 const float wi = Hw(q, i), wj = Hw(q, j);
+                                 s0 += wi * Fxi0(de, j, q);
+                                 s1 += wi * Fxi1(de, j, q);
+                                 g0 += wj * Fgm0(de, q, i);
+                                 g1 += wj * Fgm1(de, q, i);
+                               }
+                               force0(e0 + de, j, i) = w[j] * s0 + w[i] * g0;
+                               force1(e0 + de, j, i) = w[j] * s1 + w[i] * g1;
+                             });
+      });
+}
+
 // ---------------------------------------------------------------------------
 // Inputs. Deterministic, bounded, index-dependent and non-symmetric -- an
 // all-ones fill cannot catch a transposed index, and this pipeline is nothing
@@ -821,6 +980,9 @@ inline constexpr double kStressPerF =
 inline constexpr double kUseful = kGrad + kStressShared + kDiv + kSum;
 inline constexpr double kLibExec =
     4.0 * kGrad + 4.0 * kStressPerF + kDiv + kSum;
+// What a fan-out-deduplicated graph would retire: the gradient stage once
+// (shared by every consumer) but still four single-output F nodes.
+inline constexpr double kDagExec = kGrad + 4.0 * kStressPerF + kDiv + kSum;
 }  // namespace flopcount
 
 int main(int argc, char* argv[]) {
@@ -989,6 +1151,23 @@ int main(int argc, char* argv[]) {
                 tc2 * 1e3, flopcount::kUseful * Ed / tc2 / 1e9, "-",
                 dc2 < 1e-2 ? "PASS" : "FAIL");
 
+    // CONTROL-C: the DAG's work profile. Fan-out deduplicated (4 gradient sums
+    // shared by every consumer) and both components in one launch, but still
+    // four single-output F nodes with 4x stress and 4x aux traffic.
+    auto run_ctl3 = [&] {
+      control_dag_force(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H, Hw, w, fc0,
+                        fc1, E);
+    };
+    run_ctl3();
+    Kokkos::fence();
+    const double dc3 =
+        std::max(max_rel_diff(fc0, ref0, Echk), max_rel_diff(fc1, ref1, Echk));
+    const double tc3 = seconds_of(run_ctl3, warmup, reps);
+    std::printf("%-30s %10.3f %14.1f %16.1f %8s\n", "CONTROL-C (DAG profile)",
+                tc3 * 1e3, flopcount::kUseful * Ed / tc3 / 1e9,
+                flopcount::kDagExec * Ed / tc3 / 1e9,
+                dc3 < 1e-2 ? "PASS" : "FAIL");
+
     // Diagnostic row: one gradient contraction, output modes {q,e,j}.
     V3dyn        go("go", cfg::N, E, cfg::N);
     auto         run_one = [&] { library_one_gradient(u0, H, go); };
@@ -1046,10 +1225,34 @@ int main(int argc, char* argv[]) {
         "control-B)\n"
         "  library cost  (control  -> library): %.2fx\n",
         tl / tb, tc / tb, tc / tc2, tc2 / tb, tl / tc);
+
+    // What a fan-out-deduplicating DAG evaluator would be worth. The first two
+    // rows are MEASURED (CONTROL-C is a real kernel validated against the host
+    // reference); the third is a PROJECTION that assumes the library's measured
+    // residual carries over unchanged to a restructured evaluator, which is
+    // exactly the kind of assumption this benchmark exists to stop trusting.
+    {
+      const double residual = tl / tc;         // library / CONTROL, measured
+      const double proj     = tc3 * residual;  // projected library-on-a-DAG
+      std::printf(
+          "\nDAG PAYOFF (CONTROL-C = 4 grad sums, 4 stress, 1 launch):\n"
+          "  removable by sharing  (control-C -> control): %.2fx  <- the "
+          "ceiling\n"
+          "  NOT removable by sharing (baseline -> control-C): %.2fx  (4x "
+          "stress + 4x aux)\n"
+          "  PROJECTED library on a DAG = %.3f ms x %.2f residual = %.3f ms"
+          "  -> gap %.2fx (from %.2fx)\n"
+          "  [projection only: assumes the residual is unchanged by the "
+          "restructuring]\n",
+          tc / tc3, tc3 / tb, tc3 * 1e3, residual, proj * 1e3, proj / tb,
+          tl / tb);
+    }
     std::printf("source lines: library %d, hand-written %d\n",
                 kLibSrcEnd - kLibSrcBegin - 1, kBaseSrcEnd - kBaseSrcBegin - 1);
-    std::printf("max rel diff vs host reference: baseline %.2e, library %.2e\n",
-                db, dl);
+    std::printf(
+        "max rel diff vs host reference: baseline %.2e, library %.2e, "
+        "control-C %.2e\n",
+        db, dl, dc3);
     if (db >= 1e-2 || dl >= 1e-2) rc = 1;
   }
   Kokkos::finalize();
