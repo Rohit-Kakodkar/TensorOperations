@@ -312,11 +312,33 @@ template <typename Node>
 inline constexpr bool produces_own_scratch_v =
     has_node_tag_v<ContractionTag, Node> || has_node_tag_v<CombineTag, Node>;
 
-// Every node kind an evaluator can consume as an operand: a leaf input, or a
-// fused node that produces its own scratch.
+// Does this node READ a team-scratch buffer that some OTHER node owns, rather
+// than producing one itself or being copied out of global memory into a staging
+// buffer the consumer carves?
+//
+// Exactly the SlotTag nodes, and the distinction is a third thing, not a
+// rewording of either predicate beside it. A slot is consumed ZERO-COPY, like a
+// fused operand -- but unlike a fused operand its buffer may have OTHER
+// consumers, so nothing may write to it. Both halves matter: treating a slot as
+// "produces its own scratch" would charge it that subtree's recursive bytes and
+// try to evaluate it, and treating it as "not produces_own_scratch, therefore
+// copied, therefore shape-unconstrained" is exactly the mistake
+// operand_stageable_v's comment below warns about, now with a shared buffer
+// behind it.
+//
+// produces_own_scratch_v deliberately does NOT admit it: that predicate means
+// "hands back its own scratch BY EVALUATING A SUBTREE", and a slot evaluates
+// nothing -- its buffer is already filled by the time any consumer runs.
+template <typename Node>
+inline constexpr bool reads_foreign_scratch_v = has_node_tag_v<SlotTag, Node>;
+
+// Every node kind an evaluator can consume as an operand: a leaf input, a fused
+// node that produces its own scratch, or a slot naming a buffer some other node
+// already filled.
 template <typename Node>
 inline constexpr bool fusable_operand_v =
-    has_node_tag_v<InputTag, Node> || produces_own_scratch_v<Node>;
+    has_node_tag_v<InputTag, Node> || produces_own_scratch_v<Node> ||
+    reads_foreign_scratch_v<Node>;
 
 // Can operand `Node`, tiled by `Tile`, be staged into the axis order `PermSeq`
 // gathers into?
@@ -326,6 +348,16 @@ inline constexpr bool fusable_operand_v =
 // every transposed axis pair has equal extents -- a 16x32 tile cannot be
 // transposed inside its own storage. An input operand is copied into a fresh
 // staging buffer on the way in, so nothing constrains it.
+//
+// A SLOT operand is the case the equal-extent rule does not cover, because the
+// question there is not whether the reorder FITS but whether it is permitted at
+// all: the buffer may have other consumers, and an in-place reorder would
+// permute it under them. So a slot admits ONLY the identity -- the true
+// zero-copy passthrough -- and a differently-ordered consumer must take the
+// relabel path (operand_relabelable_v, below) or name the buffer through a
+// second slot node carrying its own labels. This is why the branch leads: the
+// `!produces_own_scratch_v` test that follows would otherwise answer
+// "unconstrained" for a slot, on the reasoning that it is copied. It is not.
 //
 // Deliberately spelled with transpositions_equal_extent, the SAME predicate the
 // in-place reorder asserts on the scratch layout at its call site (see
@@ -342,7 +374,9 @@ inline constexpr bool fusable_operand_v =
 // the reorder.
 template <typename Node, typename Tile, typename PermSeq>
 inline constexpr bool operand_stageable_v = [] {
-  if constexpr (!produces_own_scratch_v<Node>)
+  if constexpr (reads_foreign_scratch_v<Node>)
+    return is_identity_seq(PermSeq{});  // shared: never reordered in place
+  else if constexpr (!produces_own_scratch_v<Node>)
     return true;  // copied into its own staging buffer; shape unconstrained
   else if constexpr (is_identity_seq(PermSeq{}))
     return true;  // zero-copy passthrough; nothing is reordered
@@ -360,12 +394,18 @@ inline constexpr bool operand_stageable_v = [] {
 // consumer's choice between them is otherwise buried in an evaluator class
 // body, where a test can only observe it by instantiating the whole evaluator.
 //
-// Only a fused operand (contraction or combine) qualifies -- exactly the nodes
-// produces_own_scratch_v names. Their storage is private per-team scratch, so
-// relabeling it aliases nothing observable -- unlike an input operand, whose
-// storage is the user's global tensor and whose reads would also lose their
-// coalescing if driven by the consumer's traversal order rather than the
-// source's memory order.
+// A fused operand (contraction or combine) qualifies, and so does a SLOT: what
+// they have in common is that their storage is per-team scratch, so relabeling
+// it aliases nothing observable -- unlike an input operand, whose storage is
+// the user's global tensor and whose reads would also lose their coalescing if
+// driven by the consumer's traversal order rather than the source's memory
+// order.
+//
+// For a slot this path is not merely permitted but REQUIRED: it is the only way
+// a differently-ordered consumer can read a shared buffer at all, since
+// operand_stageable_v forbids reordering one in place. It stays zero-copy and
+// read-only -- reorder_view retypes the layout and touches no data -- which is
+// exactly what sharing needs.
 //
 // Restricted further to the permuted, unhooked case:
 //   • an identity permutation already costs nothing on the staging path (true
@@ -380,15 +420,19 @@ inline constexpr bool operand_stageable_v = [] {
 // hook_type is declared only on the ContractionTag node specialization, hence
 // the if constexpr chain rather than a `&&` one. A CombineTag node carries no
 // hook member at all (its fn already sees every coordinate and operand value,
-// so there is no separate store hook to apply), which is why its branch drops
+// so there is no separate store hook to apply), and a SlotTag node carries none
+// by deliberate design (NodeHandle.hpp: a hook writes back into the buffer it
+// rides on, which a shared buffer cannot allow). Both branches therefore drop
 // the hook half of the rule as vacuously satisfied rather than naming a
-// hook_type it does not have.
+// hook_type they do not have.
 template <typename Node, typename PermSeq>
 inline constexpr bool operand_relabelable_v = [] {
   if constexpr (has_node_tag_v<ContractionTag, Node>)
     return !is_identity_seq(PermSeq{}) &&
            std::is_same_v<typename Node::hook_type, NoHook>;
   else if constexpr (has_node_tag_v<CombineTag, Node>)
+    return !is_identity_seq(PermSeq{});
+  else if constexpr (has_node_tag_v<SlotTag, Node>)
     return !is_identity_seq(PermSeq{});
   else
     return false;
