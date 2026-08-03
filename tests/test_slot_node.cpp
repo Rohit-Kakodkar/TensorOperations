@@ -440,6 +440,67 @@ TEST(SlotNodeTest, CombineReadsRelabeledSlot) {
           << "at (" << i << "," << k << ")";
 }
 
+// ---------------------------------------------------------------------------
+// GUARD B — a slot operand must be demanded at ONE tile index.
+//
+// A slot's stage() ignores the index it is handed and returns the producer's
+// buffer, which holds one tile. The contraction's k-loop re-invokes each
+// operand once per contracted tile at a DIFFERENT index. Compatible only when
+// there is a single contracted tile; otherwise every iteration re-reads the
+// same data and the sum is silently wrong.
+//
+// This one cannot be a static_assert -- the tile extent is compile-time but the
+// operand's SHAPE is a runtime value, so the tile count is not formable at
+// compile time. It is therefore a runtime predicate that a driver is expected
+// to ask host-side, before launching. These tests are the reason it is public.
+// ---------------------------------------------------------------------------
+TEST(SlotNodeTest, GuardBAcceptsSingleContractedTile) {
+  // Slot {i,k} with shape [16,8] and a [16,8] tile: one contracted tile.
+  const auto slot =
+      make_slot_node<'i', 'k'>(SlotViewIK{}, Kokkos::Array<int, 2>{kI, kK});
+  const auto node = make_contraction_node<'i', 'l'>(
+      slot, make_input_node(make_handle<'k', 'l'>(View2{})));
+  using Eval = Evaluator<TeamPolicyTag<ES>, std::decay_t<decltype(node)>,
+                         Tile<TileIK, TileKL, TileIL>>;
+
+  static_assert(Eval::kHasSlotOperand);
+  EXPECT_TRUE(
+      Eval::slot_operands_single_k_tile(node, Tile<TileIK, TileKL, TileIL>{}));
+}
+
+TEST(SlotNodeTest, GuardBRejectsMultipleContractedTiles) {
+  // Same tile, but the slot claims a contracted extent of 2*kK -- so the k-loop
+  // would run twice and demand two different tiles from a buffer holding one.
+  //
+  // The shape is what varies, not the tile, which is exactly why this is a
+  // runtime check: both configurations have identical types.
+  const auto bad =
+      make_slot_node<'i', 'k'>(SlotViewIK{}, Kokkos::Array<int, 2>{kI, 2 * kK});
+  const auto node = make_contraction_node<'i', 'l'>(
+      bad, make_input_node(make_handle<'k', 'l'>(View2{})));
+  using Eval = Evaluator<TeamPolicyTag<ES>, std::decay_t<decltype(node)>,
+                         Tile<TileIK, TileKL, TileIL>>;
+
+  EXPECT_FALSE(
+      Eval::slot_operands_single_k_tile(node, Tile<TileIK, TileKL, TileIL>{}));
+}
+
+// Guard B applies only where there is a k-loop to disagree with. A contraction
+// with no slot operand is unconstrained -- the fused-operand recompute the
+// k-loop performs is exactly what it is for.
+TEST(SlotNodeTest, GuardBIgnoresNonSlotOperands) {
+  const auto node = make_contraction_node<'i', 'l'>(
+      make_input_node(make_handle<'i', 'k'>(View2{})),
+      make_input_node(make_handle<'k', 'l'>(View2{})));
+  using Eval = Evaluator<TeamPolicyTag<ES>, std::decay_t<decltype(node)>,
+                         Tile<TileIK, TileKL, TileIL>>;
+
+  static_assert(!Eval::kHasSlotOperand);
+  // Vacuously true even for a shape that WOULD span several contracted tiles.
+  EXPECT_TRUE(
+      Eval::slot_operands_single_k_tile(node, Tile<TileIK, TileKL, TileIL>{}));
+}
+
 int main(int argc, char* argv[]) {
   ::testing::InitGoogleTest(&argc, argv);
   Kokkos::initialize(argc, argv);
