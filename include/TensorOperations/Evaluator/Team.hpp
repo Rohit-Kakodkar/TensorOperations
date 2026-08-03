@@ -337,10 +337,37 @@ struct Evaluator<TeamPolicyTag<ES>,
   // type that no longer matches the one alloc_a_.get()/alloc_b_.get() produces
   // -- which would silently take the COPY branch, whose source and destination
   // are the very same buffer for a fused operand.
-  static_assert(Impl::operand_stageable_v<NA, TileA, permA_seq>,
+  // GUARD A. Two different rules share operand_stageable_v, and they fail for
+  // different reasons, so each gets its own message. A FUSED operand is
+  // rejected when the permutation would not fit back into its own buffer (an
+  // extent question). A SLOT is rejected for ANY non-identity permutation,
+  // however well it would fit (an aliasing question): the buffer may have other
+  // consumers, and reordering it in place would permute it under them. Telling
+  // a slot author to "preserve the tile extents" would send them off to fix a
+  // shape that is not the problem.
+  //
+  // Spelled as a PAIR of asserts per operand rather than one assert with a
+  // conditional message, because a static_assert message must be a string
+  // literal through C++20. Each is disabled for the case it does not describe,
+  // so exactly one can fire and their conjunction is the original condition.
+  static_assert(!Impl::reads_foreign_scratch_v<NA> ||
+                    Impl::operand_stageable_v<NA, TileA, permA_seq>,
+                "operand A is a SLOT and permA is not the identity: a shared "
+                "buffer must never be reordered in place. Declare a second "
+                "slot node carrying this consumer's labels, or consume it from "
+                "a combine (which relabels zero-copy)");
+  static_assert(Impl::reads_foreign_scratch_v<NA> ||
+                    Impl::operand_stageable_v<NA, TileA, permA_seq>,
                 "permA must preserve fused operand A's tile extents (it is "
                 "staged in place); see Impl::operand_stageable_v");
-  static_assert(Impl::operand_stageable_v<NB, TileB, permB_seq>,
+  static_assert(!Impl::reads_foreign_scratch_v<NB> ||
+                    Impl::operand_stageable_v<NB, TileB, permB_seq>,
+                "operand B is a SLOT and permB is not the identity: a shared "
+                "buffer must never be reordered in place. Declare a second "
+                "slot node carrying this consumer's labels, or consume it from "
+                "a combine (which relabels zero-copy)");
+  static_assert(Impl::reads_foreign_scratch_v<NB> ||
+                    Impl::operand_stageable_v<NB, TileB, permB_seq>,
                 "permB must preserve fused operand B's tile extents (it is "
                 "staged in place); see Impl::operand_stageable_v");
 
@@ -399,6 +426,72 @@ struct Evaluator<TeamPolicyTag<ES>,
         alloc_c_(c_tile_, team) {
     result_.hook_op  = n.hook_op;
     result_.storage_ = alloc_c_.get();
+    // GUARD B, checked once per team rather than once per evaluation. See
+    // slot_operands_single_k_tile for why this is an assert and not a
+    // static_assert, and for the host-callable form a driver should prefer.
+    assert(
+        slot_operands_single_k_tile(n, t) &&
+        "slot operand: the contracted modes must be covered by a SINGLE "
+        "tile. A slot's buffer holds one tile and its stage() ignores the "
+        "tile index, but the k-loop demands a different index per contracted "
+        "tile -- so every iteration would re-read the same data and the sum "
+        "would be silently wrong. Enlarge the contracted tile to span the "
+        "operand's full contracted extent, or feed this operand as a fused "
+        "node rather than a slot.");
+  }
+
+  // Does either operand name a buffer another node owns? Public because it
+  // gates GUARD B below, and a driver deciding whether it must ask that
+  // question needs to be able to see this one.
+  static constexpr bool kHasSlotOperand =
+      Impl::reads_foreign_scratch_v<NA> || Impl::reads_foreign_scratch_v<NB>;
+
+  // GUARD B — does every SLOT operand see only one contracted tile?
+  //
+  // A slot's ScratchAllocator::stage() ignores the tile index it is handed --
+  // it returns the producing node's buffer, which holds exactly ONE tile. The
+  // k-loop in operator(), by contrast, re-invokes each operand once per
+  // contracted tile at a DIFFERENT index. Those two are compatible only when
+  // there is a single contracted tile; otherwise every iteration reads the same
+  // buffer, the accumulation is wrong, and nothing anywhere says so.
+  //
+  // WHY THIS IS NOT A static_assert, which is the obvious thing to want: the
+  // tile extent is compile-time for a StaticTile, but the operand's SHAPE comes
+  // from node.shape() and is a runtime value, so the tile count cannot be
+  // formed at compile time even in the fully static case. Hence a runtime
+  // predicate -- and hence a release build does NOT check it, since the
+  // constructor's assert compiles out under NDEBUG.
+  //
+  // That is why this is public and KOKKOS_FUNCTION rather than a bare assert
+  // inline: a driver assembling a DAG knows every shape and tile on the HOST
+  // and should ask here, before it ever launches, where a false answer is a
+  // clear error instead of a wrong number. The device-side assert is the
+  // backstop, not the primary check.
+  //
+  // Only A's tiles are examined because only A's need be: the node factory
+  // already asserts that A's and B's contracted extents agree pairwise
+  // (make_contraction_node_impl), and operator() derives the k-tile counts from
+  // A alone for that same reason.
+  //
+  // The COMBINE evaluator needs no equivalent. It has no k-loop -- it stages
+  // each operand exactly once per evaluation -- so a slot operand there is
+  // demanded at one index by construction.
+  KOKKOS_FUNCTION static bool slot_operands_single_k_tile(
+      const node_type& n, const tiling_type& t) {
+    if constexpr (!kHasSlotOperand) {
+      (void)n;
+      (void)t;
+      return true;
+    } else {
+      const auto a_leaf  = Impl::canonical_c_tile<NA>(t.a);
+      const auto a_shape = n.node_a.shape();
+      const auto pA      = Impl::seq_to_karray(permA_seq{});
+      for (int i = 0; i < NumK; ++i) {
+        const int d = pA[FreeA + i];
+        if (Impl::tile_count_along(a_leaf, d, a_shape[d]) != 1) return false;
+      }
+      return true;
+    }
   }
 
   // This evaluator's output (C) scratch tile. Read by a PARENT contraction or

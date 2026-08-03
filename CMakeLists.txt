@@ -118,6 +118,46 @@ add_executable(test_slot_node tests/test_slot_node.cpp)
 target_link_libraries(test_slot_node PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_slot_node)
 
+# ---------------------------------------------------------------------------
+# Negative-compilation tests for the slot guards.
+#
+# Asserting a guard predicate is false proves the predicate; it does NOT prove
+# the evaluator consults it, and a guard that is defined but never read looks
+# identical from inside a static_assert. These targets build a configuration the
+# guard forbids and ctest asserts the BUILD fails.
+#
+# EXCLUDE_FROM_ALL so `make` stays green; each is built on demand by its test.
+# Case 0 is the control -- the same shape without the violation -- and must
+# build, so a file that breaks for unrelated reasons cannot masquerade as every
+# guard passing.
+#
+# NOTE: unlike every other test here, these INVOKE THE COMPILER AT TEST TIME.
+# On the CUDA build that means `module load cudatoolkit/<ver>` must be in effect
+# when ctest runs, not merely when cmake --build ran; without it nvcc_wrapper
+# fails with "nvcc: command not found" and the cases report as failures that
+# have nothing to do with the guards.
+# ---------------------------------------------------------------------------
+foreach(case 0 1 2)
+  add_executable(slot_guard_neg_${case} EXCLUDE_FROM_ALL
+                 tests/negative/slot_guard_negative.cpp)
+  target_link_libraries(slot_guard_neg_${case} PRIVATE tensor)
+  target_compile_definitions(slot_guard_neg_${case}
+                             PRIVATE SLOT_NEG_CASE=${case})
+  add_test(NAME SlotGuardNegative.Case${case}
+           COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}
+                   --target slot_guard_neg_${case} --config $<CONFIG>)
+endforeach()
+# Case 0 must compile. Cases 1 and 2 must fail, and must fail FOR THE RIGHT
+# REASON: WILL_FAIL alone is satisfied by any nonzero exit, so an unrelated
+# breakage in the file would masquerade as both guards working. Matching the
+# guard's own diagnostic pins it to the intended static_assert -- in particular
+# to the slot-specific message rather than the fused-operand extent one, which
+# is the mistake a reader of a bare failure would most likely make.
+# PASS_REGULAR_EXPRESSION supersedes the exit code, so WILL_FAIL is not also set.
+set_tests_properties(SlotGuardNegative.Case1 SlotGuardNegative.Case2
+                     PROPERTIES PASS_REGULAR_EXPRESSION
+                     "operand [AB] is a SLOT and perm[AB] is not the identity")
+
 # Benchmarks (opt-in: -DTENSOR_OPS_BUILD_BENCHMARKS=ON). No gtest; own main().
 if(TENSOR_OPS_BUILD_BENCHMARKS)
   # KokkosKernels — needed for bench_matrix_multiply's BLAS3 GEMM path.
