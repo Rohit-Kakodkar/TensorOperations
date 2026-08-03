@@ -89,9 +89,14 @@
 // only the graph is spelled flat, with consumers NAMING earlier results instead
 // of nesting them.
 //
-//   GPU  41.6 -> 18.313 ms  (2.27x), gap to baseline 4.26x -> 1.88x
-//   CPU  37.7 -> 19.001 ms  (1.98x), gap to baseline 3.66x -> 1.82x
+//   GPU  33.2 -> 16.548 ms  (2.01x), gap to baseline 3.40x -> 1.70x
+//   CPU  26.7 -> 14.597 ms  (1.83x), gap to baseline 2.55x -> 1.40x
 //   scratch 24312 B PER COMPONENT -> 20688 B for BOTH
+//
+// (Both library rows moved again when the subview delinearize was given
+// compile-time extents -- see SEM_STIFFNESS_GAP_ANALYSIS.md task 5. The tree
+// gained 1.25x on GPU and 1.41x on CPU from that alone, so the DAG's speedup
+// over it reads smaller here than the 2.27x first measured.)
 //
 // TEAM SIZE IS WORTH 1.42x HERE, AND Kokkos::AUTO GETS IT WRONG. AUTO sizes the
 // team from occupancy alone and picks 512 threads for a tile of TE*N*N = 256
@@ -101,8 +106,10 @@
 // earlier revision of this comment reported the AUTO number as the DAG's result
 // and drew a wrong conclusion from it.
 //
-// THE RESIDUAL DOES SURVIVE THE RESTRUCTURING. CONTROL-C -> DAG is 1.45x
+// THE RESIDUAL DOES SURVIVE THE RESTRUCTURING. CONTROL-C -> DAG measured 1.45x
 // against the tree's CONTROL -> library 1.48x, so the projection was right.
+// (Task 5 has since taken it to 1.31x on GPU and 0.93x on CPU -- on Serial the
+// library now beats the hand-written kernel of the same work profile.)
 // ncu attributes it to instruction count, as for the tree: 2.71x CONTROL-C's
 // integer thread-instructions for 1.50x the fp32 work, at an integer:fp32 ratio
 // of 3.05 against 1.68. What it is NOT is per-thread state -- registers are 32,
