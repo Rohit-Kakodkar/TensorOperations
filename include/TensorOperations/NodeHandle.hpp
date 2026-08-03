@@ -172,15 +172,27 @@ struct NodeHandle<IntermTag, Storage, IntRank, ExecSpace, HookOp> {
 // so a slot is typeable from the tile alone, with no recursion into whatever
 // computed it.
 // ---------------------------------------------------------------------------
-template <typename Storage, typename IntRank, typename ExecSpace,
-          typename ModesSeq>
-struct NodeHandle<SlotTag, Storage, IntRank, ExecSpace, ModesSeq> {
+// WHICH buffer it names is a TEMPLATE parameter, not a member. A driver reads
+// the store with `store.get<SlotIdx>()`, and the store is a heterogeneous tuple
+// -- its element types differ per slot -- so the index has to be available at
+// compile time. Carrying it in the node rather than in a table beside the node
+// is what keeps the two from desynchronising: there is no second structure to
+// get wrong.
+//
+// Two slot nodes may share an index and differ in their labels. That is the
+// relabel mechanism (see make_slot_node), and it is why the index alone does
+// not determine the type.
+template <typename IntSlotIdx, typename Storage, typename IntRank,
+          typename ExecSpace, typename ModesSeq>
+struct NodeHandle<SlotTag, IntSlotIdx, Storage, IntRank, ExecSpace, ModesSeq> {
   using node_tag            = SlotTag;
   static constexpr int Rank = IntRank::value;
-  using storage_type        = Storage;
-  using value_type          = typename Storage::value_type;
-  using exec_space          = ExecSpace;
-  using modes_seq           = ModesSeq;
+  // Index of the buffer this node names, within the driver's slot store.
+  static constexpr std::size_t SlotIdx = IntSlotIdx::value;
+  using storage_type                   = Storage;
+  using value_type                     = typename Storage::value_type;
+  using exec_space                     = ExecSpace;
+  using modes_seq                      = ModesSeq;
 
   Storage                  storage_;
   Kokkos::Array<int, Rank> shape_;  // the PRODUCER's full output extents
@@ -231,7 +243,10 @@ KOKKOS_FUNCTION auto make_interm_node(Storage storage, HookOp hook = {}) {
 // differing canonical orders, declare it twice rather than moving data; the
 // consumer whose labels do not match the storage order resolves the difference
 // through its own gather permutation, zero-copy (Impl::operand_relabelable_v).
-template <int32_t... Modes, typename Storage>
+// `SlotIdx` names the buffer within the driver's slot store. Standalone uses --
+// binding a buffer by hand, outside any driver -- can pass 0 and ignore it; it
+// only means something to a DagGraph.
+template <std::size_t SlotIdx, int32_t... Modes, typename Storage>
 KOKKOS_FUNCTION auto make_slot_node(
     Storage storage, Kokkos::Array<int, sizeof...(Modes)> shape) {
   constexpr int Rank = static_cast<int>(sizeof...(Modes));
@@ -239,8 +254,9 @@ KOKKOS_FUNCTION auto make_slot_node(
   using ModesSeq     = std::integer_sequence<int32_t, Modes...>;
   static_assert(static_cast<int>(Storage::rank) == Rank,
                 "slot node: one label per storage mode");
-  return NodeHandle<SlotTag, Storage, std::integral_constant<int, Rank>,
-                    ExecSpace, ModesSeq>{std::move(storage), shape};
+  return NodeHandle<SlotTag, std::integral_constant<std::size_t, SlotIdx>,
+                    Storage, std::integral_constant<int, Rank>, ExecSpace,
+                    ModesSeq>{std::move(storage), shape};
 }
 
 // ---------------------------------------------------------------------------
