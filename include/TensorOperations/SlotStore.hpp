@@ -107,4 +107,33 @@ KOKKOS_FUNCTION auto carve_slot_store(const Team& team, const Tiles&... tiles)
       Impl::alloc_scratch_tile<ValueType, ExecSpace>(team, tiles)...}};
 }
 
+// ---------------------------------------------------------------------------
+// place_slot_store<V, ES>(base, seq, tiles...) — the same store, over buffers
+// the CALLER chose.
+//
+// This is carve_slot_store with the bump allocator taken out. A bump allocator
+// cannot express reuse: every call must advance the cursor, so every slot must
+// get fresh memory. Here slot I is built at base[I], and NOTHING requires those
+// pointers to be distinct -- a liveness plan (DagGraph.hpp) may point two slots
+// at one buffer when their live ranges do not overlap.
+//
+// THE INVARIANT IS THEREFORE WEAKER THAN carve_slot_store's, and deliberately.
+// carve_slot_store guarantees the buffers are pairwise disjoint; this
+// guarantees only what its caller's plan guarantees, which is that slots whose
+// live ranges OVERLAP are disjoint. A plan that got that wrong would not crash
+// -- it would silently feed one node another node's data -- so the plan is
+// checked directly in tests/test_slot_liveness.cpp rather than trusted.
+//
+// The returned type is identical to carve_slot_store's for the same tiles: a
+// slot's view type is a function of its tile alone, never of where it lives.
+template <typename ValueType, typename ExecSpace, typename... Tiles,
+          std::size_t... Is>
+KOKKOS_FUNCTION auto place_slot_store(
+    const Kokkos::Array<ValueType*, sizeof...(Tiles)>& base,
+    std::index_sequence<Is...>, const Tiles&... tiles)
+    -> SlotStore<SlotView<ValueType, ExecSpace, Tiles>...> {
+  return {DeviceTuple<SlotView<ValueType, ExecSpace, Tiles>...>{
+      Impl::alloc_scratch_tile_at<ValueType, ExecSpace>(base[Is], tiles)...}};
+}
+
 }  // namespace TensorOperations

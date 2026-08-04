@@ -133,6 +133,11 @@ add_executable(test_dag_graph tests/test_dag_graph.cpp)
 target_link_libraries(test_dag_graph PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_dag_graph)
 
+# test_slot_liveness — custom main() wraps Kokkos init/finalize
+add_executable(test_slot_liveness tests/test_slot_liveness.cpp)
+target_link_libraries(test_slot_liveness PRIVATE tensor GTest::gtest)
+gtest_discover_tests(test_slot_liveness)
+
 # ---------------------------------------------------------------------------
 # Negative-compilation tests for the slot guards.
 #

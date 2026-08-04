@@ -136,6 +136,157 @@ inline constexpr std::size_t dag_slot_base_v = dag_slot_base<NodesT>(K);
 template <typename NodesT, std::size_t S>
 inline constexpr std::size_t dag_slot_owner_v = dag_slot_owner<NodesT>(S);
 
+// --- liveness --------------------------------------------------------------
+//
+// A slot's LIVE RANGE is [the node that writes it, the last node that reads
+// it]. Both ends are compile-time: definition order IS topological order, and
+// an operand naming a slot carries that slot's index in its TYPE
+// (SlotTag::SlotIdx). So the whole analysis is a constexpr pass over the node
+// list and the device only ever sees integer constants.
+//
+// Two slots whose ranges do not overlap can share one buffer, which is what
+// takes the SEM stiffness graph from 14 buffers to 8 -- the four gradients and
+// four integrands that are genuinely live at once, and nothing more. Without
+// this every node's output is allocated for the whole kernel, including the
+// four divergences and two weighted sums that die immediately into their
+// consumers.
+//
+// RANGES ARE CLOSED AT BOTH ENDS, and that is what makes reuse safe at a single
+// node rather than merely likely: a node reads its operands and writes its own
+// outputs during ONE evaluation, so a slot last read at node K and a slot
+// defined at node K overlap at K and can never be pooled together.
+
+// The slot an operand names, or -1 for an operand that is not a slot.
+template <typename Op>
+constexpr int dag_operand_slot() {
+  if constexpr (has_node_tag_v<SlotTag, Op>)
+    return static_cast<int>(Op::SlotIdx);
+  else
+    return -1;
+}
+
+// Record node k as a reader of slot s. Callers walk k in ascending order, so a
+// plain assignment leaves the LAST reader behind and no max() is needed.
+template <std::size_t NS>
+constexpr void dag_note_read(std::array<std::size_t, NS>& last, int s,
+                             std::size_t k) {
+  if (s >= 0) last[static_cast<std::size_t>(s)] = k;
+}
+
+template <typename Node, std::size_t NS, std::size_t... Is>
+constexpr void dag_note_combine_reads(std::array<std::size_t, NS>& last,
+                                      std::size_t                  k,
+                                      std::index_sequence<Is...>) {
+  (dag_note_read<NS>(
+       last,
+       dag_operand_slot<tuple_element_t<Is, typename Node::ops_tuple_t>>(), k),
+   ...);
+}
+
+// One node's readers. A SCAN of its operands, not a traversal: in the flat form
+// an operand is a leaf input or a NAME, never a subtree.
+template <typename Node, std::size_t NS>
+constexpr void dag_note_node_reads(std::array<std::size_t, NS>& last,
+                                   std::size_t                  k) {
+  if constexpr (has_node_tag_v<ContractionTag, Node>) {
+    dag_note_read<NS>(last, dag_operand_slot<typename Node::node_a_type>(), k);
+    dag_note_read<NS>(last, dag_operand_slot<typename Node::node_b_type>(), k);
+  } else if constexpr (has_node_tag_v<CombineTag, Node>) {
+    dag_note_combine_reads<Node, NS>(
+        last, k,
+        std::make_index_sequence<static_cast<std::size_t>(Node::NumOps)>{});
+  }
+}
+
+template <typename NodesT, std::size_t NS, std::size_t... Ks>
+constexpr void dag_note_all_reads(std::array<std::size_t, NS>& last,
+                                  std::index_sequence<Ks...>) {
+  (dag_note_node_reads<tuple_element_t<Ks, NodesT>, NS>(last, Ks), ...);
+}
+
+// Which pool each slot lives in: the lowest-numbered pool whose occupants all
+// have live ranges disjoint from this slot's.
+//
+// Slots are visited in index order, which IS ascending definition order because
+// dag_slot_base is a prefix sum over the node list. That makes this the
+// LEFT-EDGE algorithm on an interval graph, and left-edge is OPTIMAL in the
+// number of pools there -- not a heuristic that happens to do well.
+//
+// A pool costs the MAX of its occupants, so a graph whose nodes all emit one
+// tile of the same shape (the common case, and the SEM graph exactly) wastes
+// nothing. Where sizes differ, a small slot sharing a pool with a large one
+// leaves a tail that no other slot can enter unless the coloring puts it there.
+// Ordering by DECREASING SIZE packs that better and is the generalization to
+// reach for if a real graph ever shows the spread; it also gives up left-edge's
+// optimality guarantee, and it needs sizes as compile-time constants, which is
+// why it is not what is here.
+template <typename NodesT, std::size_t... Roots>
+constexpr auto dag_pool_of_slot() {
+  constexpr std::size_t NS = dag_num_slots<NodesT>();
+  constexpr std::size_t NN = tuple_size_v<NodesT>;
+
+  std::array<std::size_t, NS> def{}, last{}, pool{};
+  for (std::size_t s = 0; s < NS; ++s) {
+    def[s] = dag_slot_owner<NodesT>(s);
+    // A slot nobody reads is still live where it is written.
+    last[s] = def[s];
+  }
+  dag_note_all_reads<NodesT, NS>(last, std::make_index_sequence<NN>{});
+
+  // A designated output is read by dag_store_roots AFTER every node has run, so
+  // it outlives the whole list. NN is one past the last node index.
+  const std::array<std::size_t, sizeof...(Roots)> roots{Roots...};
+  for (std::size_t i = 0; i < sizeof...(Roots); ++i) last[roots[i]] = NN;
+
+  for (std::size_t s = 0; s < NS; ++s) {
+    std::size_t p = 0;
+    while (true) {
+      bool clash = false;
+      for (std::size_t t = 0; t < s; ++t)
+        if (pool[t] == p && def[s] <= last[t] && def[t] <= last[s]) {
+          clash = true;
+          break;
+        }
+      if (!clash) break;
+      ++p;
+    }
+    pool[s] = p;
+  }
+  return pool;
+}
+
+template <typename NodesT, std::size_t... Roots>
+constexpr std::size_t dag_pool_count() {
+  const auto  p = dag_pool_of_slot<NodesT, Roots...>();
+  std::size_t n = 0;
+  for (std::size_t s = 0; s < p.size(); ++s)
+    if (p[s] + 1 > n) n = p[s] + 1;
+  return n;
+}
+
+// Variable-template forms, for the same reason dag_slot_base_v exists: the
+// functions above are HOST-only constexpr (std::array is), so device code must
+// name a constant rather than call one. Keyed on an index_sequence of the roots
+// so the root set travels as one type.
+template <typename NodesT, typename RootsSeq>
+struct dag_plan;
+template <typename NodesT, std::size_t... Roots>
+struct dag_plan<NodesT, std::index_sequence<Roots...>> {
+  static constexpr auto of_slot() {
+    return dag_pool_of_slot<NodesT, Roots...>();
+  }
+  static constexpr std::size_t count() {
+    return dag_pool_count<NodesT, Roots...>();
+  }
+};
+
+template <typename NodesT, typename RootsSeq, std::size_t S>
+inline constexpr std::size_t dag_slot_pool_v =
+    dag_plan<NodesT, RootsSeq>::of_slot()[S];
+template <typename NodesT, typename RootsSeq>
+inline constexpr std::size_t dag_pool_count_v =
+    dag_plan<NodesT, RootsSeq>::count();
+
 // For each of Node's modes, the position of that label among the ROOT's modes,
 // or -1 if the root does not carry it. This is how every node's own tile index
 // is derived from the ONE index the team actually decodes.
@@ -351,16 +502,90 @@ KOKKOS_FUNCTION void dag_store_roots(const Team& team, const TilesT& tiles,
    ...);
 }
 
-// Carve one slot per node OUTPUT, sized by the owning node's CANONICAL output
-// tile -- which every one of its outputs shares.
-template <typename V, typename ES, typename NodesT, typename Team,
-          typename TilesT, std::size_t... Ss>
+// The tile slot S's buffer has: its owning node's CANONICAL output tile, which
+// every one of that node's outputs shares.
+template <typename NodesT, typename TilesT, std::size_t S>
+KOKKOS_FUNCTION auto dag_slot_tile(const TilesT& tiles) {
+  constexpr std::size_t K = dag_slot_owner_v<NodesT, S>;
+  return canonical_c_tile<tuple_element_t<K, NodesT>>(tiles.template get<K>());
+}
+
+template <typename NodesT, typename TilesT, std::size_t S>
+KOKKOS_FUNCTION std::size_t dag_slot_elems(const TilesT& tiles) {
+  return static_cast<std::size_t>(
+      make_tile_layout(dag_slot_tile<NodesT, TilesT, S>(tiles), LayoutRight{})
+          .size());
+}
+
+// A pool is as big as its largest occupant. Sizes come from the TILES, which
+// are runtime values, so this is a runtime max over a compile-time membership
+// test -- the plan is constexpr, the sizing is not.
+template <typename NodesT, typename RootsSeq, typename TilesT, std::size_t S>
+KOKKOS_FUNCTION void dag_pool_accum(std::size_t& m, std::size_t p,
+                                    const TilesT& tiles) {
+  if (dag_slot_pool_v<NodesT, RootsSeq, S> == p) {
+    const std::size_t n = dag_slot_elems<NodesT, TilesT, S>(tiles);
+    if (n > m) m = n;
+  }
+}
+
+template <typename NodesT, typename RootsSeq, typename TilesT,
+          std::size_t... Ss>
+KOKKOS_FUNCTION std::size_t dag_pool_elems(const TilesT& tiles, std::size_t p,
+                                           std::index_sequence<Ss...>) {
+  std::size_t m = 0;
+  (dag_pool_accum<NodesT, RootsSeq, TilesT, Ss>(m, p, tiles), ...);
+  return m;
+}
+
+// Team scratch the POOLED store needs: the sum of the pool maxima, against
+// slot_store_bytes()'s sum over every slot. This is the number the launcher
+// requests, and it must be computed the same way on the host (to size the
+// policy) and on the device (to carve), which is why both go through
+// dag_pool_elems.
+template <typename V, typename ES, typename NodesT, typename RootsSeq,
+          typename TilesT, std::size_t... Ps>
+std::size_t dag_pool_bytes(const TilesT& tiles, std::index_sequence<Ps...>) {
+  using slots_seq = std::make_index_sequence<dag_num_slots<NodesT>()>;
+  return (
+      std::size_t{0} + ... +
+      scratch_backing_t<V, ES>::shmem_size(
+          dag_pool_elems<NodesT, RootsSeq, TilesT>(tiles, Ps, slots_seq{})));
+}
+
+// Carve the pools, then place every slot in the one its live range earned it.
+//
+// Two bump allocations where there used to be one per slot: the POOLS come off
+// the team cursor (so they are disjoint from each other and from the operand
+// scratch the evaluators still carve), and the slots are then placed inside
+// them at no further cost. A slot's view type is unchanged -- only where it
+// points is.
+template <typename V, typename ES, typename NodesT, typename RootsSeq,
+          typename Team, typename TilesT, std::size_t... Ps>
+KOKKOS_FUNCTION auto dag_carve_pools(const Team& team, const TilesT& tiles,
+                                     std::index_sequence<Ps...>) {
+  using slots_seq = std::make_index_sequence<dag_num_slots<NodesT>()>;
+  // Braces, not parentheses: each backing view bumps the team cursor and the
+  // elements of a braced-init-list are evaluated left to right, so the pools
+  // land at predictable offsets. Same guarantee carve_slot_store relies on.
+  return Kokkos::Array<V*, sizeof...(Ps)>{
+      scratch_backing_t<V, ES>(
+          team.team_scratch(0),
+          dag_pool_elems<NodesT, RootsSeq, TilesT>(tiles, Ps, slots_seq{}))
+          .data()...};
+}
+
+template <typename V, typename ES, typename NodesT, typename RootsSeq,
+          typename Team, typename TilesT, std::size_t... Ss>
 KOKKOS_FUNCTION auto dag_carve_store(const Team& team, const TilesT& tiles,
                                      std::index_sequence<Ss...>) {
-  return carve_slot_store<V, ES>(
-      team,
-      canonical_c_tile<tuple_element_t<dag_slot_owner_v<NodesT, Ss>, NodesT>>(
-          tiles.template get<dag_slot_owner_v<NodesT, Ss>>())...);
+  constexpr std::size_t P     = dag_pool_count_v<NodesT, RootsSeq>;
+  const auto            pools = dag_carve_pools<V, ES, NodesT, RootsSeq>(
+      team, tiles, std::make_index_sequence<P>{});
+  const Kokkos::Array<V*, sizeof...(Ss)> base{
+      pools[dag_slot_pool_v<NodesT, RootsSeq, Ss>]...};
+  return place_slot_store<V, ES>(base, std::index_sequence<Ss...>{},
+                                 dag_slot_tile<NodesT, TilesT, Ss>(tiles)...);
 }
 
 // Launch the whole graph. A FREE function template whose parameters are all
@@ -436,8 +661,8 @@ int execute_dag_team(const NodesT& nodes, const TilesT& tiles,
 
         // Every node's output buffer, carved once and owned here rather than by
         // the evaluators that fill them.
-        const auto store =
-            dag_carve_store<ValueType, ES, NodesT>(team, td, slots_seq{});
+        const auto store = dag_carve_store<ValueType, ES, NodesT, RootsSeq>(
+            team, td, slots_seq{});
 
         dag_run_all<ES, GridNode>(team, nd, td, store, grid_idx, all_seq{});
         dag_store_roots<ES, GridNode, member_t, NodesT>(team, td, store,
@@ -460,6 +685,24 @@ struct DagOutputs {
 
   DagOutputs team_size(int n) const { return {dag, n}; }
 
+  // What the launch actually requests. These live HERE and not on DagGraph
+  // because the liveness plan needs the root set: a designated output is read
+  // after every node has run, so it is live to the end of the kernel and cannot
+  // share a pool with anything.
+  std::size_t slot_bytes() const {
+    return dag.template pooled_slot_bytes<Roots...>();
+  }
+  std::size_t operand_bytes() const { return dag.operand_bytes(); }
+  std::size_t scratch_bytes() const { return slot_bytes() + operand_bytes(); }
+
+  // Pools the store carves, against dag.slot_bytes()'s one-per-slot. The ratio
+  // of the two is what liveness bought, and both are printable before anything
+  // runs -- scratch is the number that decides whether a tile size is viable at
+  // all, so it must be answerable on the host.
+  static constexpr std::size_t num_pools =
+      Impl::dag_pool_count_v<typename Dag::nodes_type,
+                             std::index_sequence<Roots...>>;
+
   template <typename ES, TensorLike... Ts>
   int execute(const TeamPolicyTag<ES>&, const Ts&... ts) const {
     return dag.template launch<ES, Roots...>(team, ts...);
@@ -477,6 +720,8 @@ template <typename ValueType, typename ExecSpace, typename NodesT,
           typename TilesT>
 struct DagGraph {
   static constexpr std::size_t N = tuple_size_v<NodesT>;
+  using nodes_type               = NodesT;
+  using tiles_type               = TilesT;
 
   NodesT nodes;
   TilesT tiles;
@@ -509,9 +754,25 @@ struct DagGraph {
   // every mode that is tiled more than once.
   // See Impl::dag_grid_node_t for why it is not a member typedef.
 
-  // Team scratch for the slot store: one canonical output tile per node OUTPUT.
+  // Team scratch for the slot store WITHOUT liveness: one canonical output tile
+  // per node OUTPUT, every one of them allocated for the whole kernel. This is
+  // the upper bound the launcher used to request; it is kept because it is the
+  // honest denominator for "what did liveness buy", and pooled_slot_bytes is
+  // what actually gets requested. See DagOutputs::slot_bytes.
   std::size_t slot_bytes() const {
     return slot_bytes_impl(std::make_index_sequence<N>{});
+  }
+
+  // The same store with slots POOLED by live range: the sum of the pool maxima.
+  // Depends on the root set -- a designated output outlives every node, so
+  // which slots are roots changes the plan -- hence a template rather than the
+  // plain member above.
+  template <std::size_t... Roots>
+  std::size_t pooled_slot_bytes() const {
+    using RootsSeq = std::index_sequence<Roots...>;
+    return Impl::dag_pool_bytes<ValueType, ExecSpace, NodesT, RootsSeq>(
+        tiles,
+        std::make_index_sequence<Impl::dag_pool_count_v<NodesT, RootsSeq>>{});
   }
   // What the evaluators still carve once their outputs are adopted -- the
   // complement of the store, never scratch_size_per_team(), which would charge
@@ -554,8 +815,8 @@ struct DagGraph {
            "cannot be gathered from the grid node's. Retile so every shared "
            "mode matches and every unshared mode has one tile.");
     return Impl::execute_dag_team<ValueType, ES>(
-        nodes, tiles, scratch_bytes(), team_size,
-        std::index_sequence<Roots...>{}, views...);
+        nodes, tiles, pooled_slot_bytes<Roots...>() + operand_bytes(),
+        team_size, std::index_sequence<Roots...>{}, views...);
   }
 
  private:
