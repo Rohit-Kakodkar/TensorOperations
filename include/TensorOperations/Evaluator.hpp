@@ -479,6 +479,21 @@ KOKKOS_FUNCTION auto make_evaluator(NodeType node, Tile tile,
   return Evaluator<PolicyTag, NodeType, Tile>(node, tile, team, adopted);
 }
 
+// Adopting overload with an OPERAND ARENA: the output is adopted as above, and
+// the operand staging comes from a driver-owned region instead of the team
+// cursor. A driver using this requests the arena ONCE, sized by its largest
+// node, rather than operand_scratch_size_per_team() summed over every node --
+// operand staging is dead at the node's own barrier, so no two nodes' buffers
+// are ever live together. See Impl::OperandArena.
+template <typename PolicyTag, typename NodeType, typename Tile,
+          typename TeamMember, typename Adopted, typename Arena>
+KOKKOS_FUNCTION auto make_evaluator(NodeType node, Tile tile,
+                                    const TeamMember& team,
+                                    const Adopted& adopted, Arena& arena)
+    -> Evaluator<PolicyTag, NodeType, Tile> {
+  return Evaluator<PolicyTag, NodeType, Tile>(node, tile, team, adopted, arena);
+}
+
 #include <TensorOperations/Evaluator/Team.hpp>
 
 }  // namespace TensorOperations
