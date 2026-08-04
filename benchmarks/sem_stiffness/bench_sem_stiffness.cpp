@@ -194,9 +194,27 @@ inline constexpr bool kIsGPU =
     !Kokkos::SpaceAccessibility<Kokkos::DefaultExecutionSpace,
                                 Kokkos::HostSpace>::accessible;
 
-inline constexpr int N  = 8;  // GLL points per direction
-inline constexpr int C  = 2;  // displacement components (unrolled, see below)
-inline constexpr int TE = 4;  // elements per team
+inline constexpr int N = 8;  // GLL points per direction
+inline constexpr int C = 2;  // displacement components (unrolled, see below)
+// Elements per team. PER BACKEND, because the two have different scratch
+// ceilings and the optimum is nowhere near the same: see the block below.
+// Each implementation runs at ITS OWN best tile, because they do not share one.
+// Forcing a single TE on all of them does not just leave performance on the
+// table -- it distorts the comparison. At TE=16 the hand-written baseline
+// degrades to 12.768 ms from its own best of 9.719, so a single-TE run at 16
+// would report DAG-MO as 1.42x faster than "the baseline" when the honest
+// best-against-best figure is 1.08x. Measured bests (H100 NVL, E=2.5M,
+// best-of-7 with warmup): baseline TE=8, tree TE=8, DAG TE=16, DAG-MO TE=16.
+//
+// Serial's 32 KB scratch cap rejects anything above TE=4 for the DAG, so the
+// CPU side stays at 4 throughout.
+inline constexpr int TE_ctl  = kIsGPU ? 8 : 4;   // baseline + CONTROL family
+inline constexpr int TE_tree = kIsGPU ? 8 : 4;   // library, fused tree
+inline constexpr int TE_dag  = kIsGPU ? 16 : 4;  // library DAG and DAG-MO
+
+// The legacy single knob, kept only for E's divisibility check and the header
+// line. Every kernel now names the constant it actually uses.
+inline constexpr int TE = TE_dag;
 
 // N=8 is padding-free for the register kernel: every GEMM below is
 //   SA = N = 8            (free-A: the hprime output index)
@@ -208,15 +226,39 @@ static_assert(N % 8 == 0, "SA/SK must satisfy CPU MT=NT=8 and GPU MT=4,NT=2");
 static_assert((TE * N) % 32 == 0,
               "SB must satisfy CPU NR=2*simd_width (32 on AVX-512)");
 
-// TE=4, not 32. Scratch is additive down the whole tree with no recycling, and
-// every intermediate is live at once. Per force-component kernel, in floats:
+// GPU TE=16, CPU TE=4, and the split is forced -- there is no value that is
+// both legal on Serial and good on an H100.
+//
+// The TREE's scratch is additive with no recycling, every intermediate live at
+// once. Per force-component kernel, in floats:
 //   gradient contraction = 128*TE + 64      (A stage, B stage, C out)
 //   F combine            = 576*TE + 256      (out + 4 gradients)
 //   divergence           = 640*TE + 320
 //   force combine        = 1344*TE + 640     => 5376*TE + 2560 bytes
-// TE=4 -> 24312 B measured. TE=8 would be ~46 KB: fits the GPU's 48 KB but not
-// the Serial backend's hardcoded 32 KB, and TE=2 fails the CPU SB % NR rule
-// above -- so TE=4 is the only value that runs on both.
+// So the tree is 24312 B at TE=4 and 88824 B at TE=16 -- over the 48 KB every
+// generation before Hopper had, which is why this file used to say TE=4 was
+// "the only value that runs on both". That is now false in both halves:
+//
+//   * the DAG does NOT scale that way any more. Slots are pooled by live range
+//     (8 buffers, not 14) and operand staging is one arena sized by the largest
+//     node, not the sum over nodes, so the DAG needs 37208 B at TE=16 where the
+//     tree needs 88824.
+//   * an H100 accepts opt-in shared memory to 227 KB and Kokkos honours it, so
+//     even the tree fits. See the smax guard in main().
+//
+// Serial is the real constraint, and it is unmoved: its 32 KB cap rejects the
+// DAG's 37208 B outright, so the CPU side stays at TE=4. TE=2 fails the CPU
+// SB % NR rule above, so 4 is still the CPU's only option.
+//
+// GPU TE=16 with team 128 is the measured optimum over TE in {4,8,16,32} x team
+// in {32..1024}, best-of-7 with warmup, uncontended H100 NVL, E=2.5M:
+//
+//   TE      4      8     16     32     (DAG-MO at its own best team size)
+//   best 10.009  9.248  8.981 10.023 ms
+//   team     64     96    128    256
+//
+// The optimum holds ~8 tile points per thread at every TE, so team size must
+// scale with TE -- see kDagTeam.
 
 // Element count, per backend. Must be a multiple of TE.
 //
@@ -404,25 +446,33 @@ struct WeightedSum {
 // node declared in user order, and GLL-major (.,e,.) for a fused node declared
 // in its consumer's canonical order.
 // ===========================================================================
-using TileH   = StaticTile<cfg::N, cfg::N>;           // H / Hw        [8,8]
-using TileEJI = StaticTile<cfg::TE, cfg::N, cfg::N>;  // (e,.,.)     [4,8,8]
-using TileQEJ = StaticTile<cfg::N, cfg::TE, cfg::N>;  // (.,e,.)     [8,4,8]
-using BGrad   = Tile<TileH, TileEJI, TileQEJ>;        // one gradient
+using TileH = StaticTile<cfg::N, cfg::N>;  // H / Hw        [8,8]
+template <int TE>
+using TileEJI = StaticTile<TE, cfg::N, cfg::N>;  // (e,.,.)     [4,8,8]
+template <int TE>
+using TileQEJ = StaticTile<cfg::N, TE, cfg::N>;  // (.,e,.)     [8,4,8]
+template <int TE>
+using BGrad = Tile<TileH, TileEJI<TE>, TileQEJ<TE>>;  // one gradient
 inline constexpr int kLibSrcBegin = __LINE__;
 // The F combine takes FOUR operands -- the gradients. Everything else the
 // physics needs is captured by StressIntegrand (see above).
-using CombF   = CombineTile<TileQEJ, BGrad, BGrad, BGrad, BGrad>;
-using BDiv    = Tile<TileH, CombF, TileEJI>;
-using CombFrc = CombineTile<TileEJI, BDiv, BDiv>;
+template <int TE>
+using CombF =
+    CombineTile<TileQEJ<TE>, BGrad<TE>, BGrad<TE>, BGrad<TE>, BGrad<TE>>;
+template <int TE>
+using BDiv = Tile<TileH, CombF<TE>, TileEJI<TE>>;
+template <int TE>
+using CombFrc = CombineTile<TileEJI<TE>, BDiv<TE>, BDiv<TE>>;
 
-inline CombFrc library_tile() {
-  const auto cf =
-      make_combine_tile(TileQEJ{}, BGrad{}, BGrad{}, BGrad{}, BGrad{});
-  const auto bd = BDiv{TileH{}, cf, TileEJI{}};
-  return make_combine_tile(TileEJI{}, bd, bd);
+template <int TE>
+CombFrc<TE> library_tile() {
+  const auto cf = make_combine_tile(TileQEJ<TE>{}, BGrad<TE>{}, BGrad<TE>{},
+                                    BGrad<TE>{}, BGrad<TE>{});
+  const auto bd = BDiv<TE>{TileH{}, cf, TileEJI<TE>{}};
+  return make_combine_tile(TileEJI<TE>{}, bd, bd);
 }
 
-template <int Comp>
+template <int Comp, int TE>
 auto library_node(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m, V3 mu,
                   V3 jac, V2 H, V2 Hw, const Kokkos::Array<float, cfg::N>& w) {
   auto F0 = make_combine_node<'q', 'e', 'j'>(
@@ -463,14 +513,14 @@ auto library_node(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m, V3 mu,
       WeightedSum{w});
 }
 
-template <int Comp>
+template <int Comp, int TE>
 void library_force(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m, V3 mu,
                    V3 jac, V2 H, V2 Hw, const Kokkos::Array<float, cfg::N>& w,
                    V3 force) {
   auto g                          = make_graph();
   [[maybe_unused]] auto [g1, out] = g.ops(
-      library_node<Comp>(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H, Hw, w));
-  g1.execute(TeamPolicyTag<>{}, library_tile(), force);
+      library_node<Comp, TE>(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H, Hw, w));
+  g1.execute(TeamPolicyTag<>{}, library_tile<TE>(), force);
 }
 inline constexpr int kLibSrcEnd = __LINE__;
 
@@ -509,38 +559,44 @@ inline constexpr int kLibSrcEnd = __LINE__;
 // aimed at, and the multi-output row is expected to go below it.
 // ===========================================================================
 inline constexpr int kDagSrcBegin = __LINE__;
-using CombF2 = CombineTile<TileQEJ, TileQEJ, TileQEJ, TileQEJ, TileQEJ>;
-using BDiv2  = Tile<TileH, TileQEJ, TileEJI>;
-using CombR2 = CombineTile<TileEJI, TileEJI, TileEJI>;
+template <int TE>
+using CombF2 = CombineTile<TileQEJ<TE>, TileQEJ<TE>, TileQEJ<TE>, TileQEJ<TE>,
+                           TileQEJ<TE>>;
+template <int TE>
+using BDiv2 = Tile<TileH, TileQEJ<TE>, TileEJI<TE>>;
+template <int TE>
+using CombR2 = CombineTile<TileEJI<TE>, TileEJI<TE>, TileEJI<TE>>;
 
 // --- the four distinct gradients, each computed once -----------------------
 // Shared by both F-stage spellings, so a difference between the two rows can
 // only come from the F stage.
-inline auto sem_dag_gradients(V3 u0, V3 u1, V2 H) {
+template <int TE>
+auto sem_dag_gradients(V3 u0, V3 u1, V2 H) {
   auto [d0, gxu0] = make_dag<float>().add(
       make_contraction_node<'q', 'e', 'j'>(
           make_input_node(make_handle<'q', 'p'>(H)),
           make_input_node(make_handle<'e', 'j', 'p'>(u0))),
-      BGrad{});
+      BGrad<TE>{});
   auto [d1, gxu1] = d0.add(make_contraction_node<'q', 'e', 'j'>(
                                make_input_node(make_handle<'q', 'p'>(H)),
                                make_input_node(make_handle<'e', 'j', 'p'>(u1))),
-                           BGrad{});
+                           BGrad<TE>{});
   auto [d2, gzu0] = d1.add(make_contraction_node<'j', 'e', 'q'>(
                                make_input_node(make_handle<'j', 'p'>(H)),
                                make_input_node(make_handle<'e', 'p', 'q'>(u0))),
-                           BGrad{});
+                           BGrad<TE>{});
   auto [d3, gzu1] = d2.add(make_contraction_node<'j', 'e', 'q'>(
                                make_input_node(make_handle<'j', 'p'>(H)),
                                make_input_node(make_handle<'e', 'p', 'q'>(u1))),
-                           BGrad{});
+                           BGrad<TE>{});
   return std::make_tuple(d3, gxu0, gxu1, gzu0, gzu1);
 }
 
 // --- four divergences and two weighted sums --------------------------------
 // Also shared. f<Comp><Dir> is the xi-direction (Dir 0) or gamma-direction
 // (Dir 1) integrand for component Comp, whichever node produced it.
-template <typename Dag, typename F00, typename F01, typename F10, typename F11>
+template <int TE, typename Dag, typename F00, typename F01, typename F10,
+          typename F11>
 auto sem_dag_tail(const Dag& d7, F00 f00, F01 f01, F10 f10, F11 f11, V2 Hw,
                   const Kokkos::Array<float, cfg::N>& w) {
   // Each F slot is named in its consumer's canonical B order (contracted ++
@@ -549,19 +605,19 @@ auto sem_dag_tail(const Dag& d7, F00 f00, F01 f01, F10 f10, F11 f11, V2 Hw,
   auto [d8, t10]  = d7.add(make_contraction_node<'e', 'j', 'i'>(
                                make_input_node(make_handle<'q', 'i'>(Hw)),
                                f00.template as<'q', 'e', 'j'>()),
-                           BDiv2{});
+                           BDiv2<TE>{});
   auto [d9, t20]  = d8.add(make_contraction_node<'e', 'j', 'i'>(
                                make_input_node(make_handle<'q', 'j'>(Hw)),
                                f01.template as<'q', 'e', 'i'>()),
-                           BDiv2{});
+                           BDiv2<TE>{});
   auto [d10, t11] = d9.add(make_contraction_node<'e', 'j', 'i'>(
                                make_input_node(make_handle<'q', 'i'>(Hw)),
                                f10.template as<'q', 'e', 'j'>()),
-                           BDiv2{});
+                           BDiv2<TE>{});
   auto [d11, t21] = d10.add(make_contraction_node<'e', 'j', 'i'>(
                                 make_input_node(make_handle<'q', 'j'>(Hw)),
                                 f11.template as<'q', 'e', 'i'>()),
-                            BDiv2{});
+                            BDiv2<TE>{});
 
   // A divergence's canonical output is freeA ++ freeB: {i,e,j} for the xi
   // slots, {j,e,i} for the gamma ones. That is the order its buffer is
@@ -570,12 +626,12 @@ auto sem_dag_tail(const Dag& d7, F00 f00, F01 f01, F10 f10, F11 f11, V2 Hw,
       d11.add(make_combine_node<'e', 'j', 'i'>(t10.template as<'i', 'e', 'j'>(),
                                                t20.template as<'j', 'e', 'i'>(),
                                                WeightedSum{w}),
-              CombR2{});
+              CombR2<TE>{});
   auto [d13, r1] =
       d12.add(make_combine_node<'e', 'j', 'i'>(t11.template as<'i', 'e', 'j'>(),
                                                t21.template as<'j', 'e', 'i'>(),
                                                WeightedSum{w}),
-              CombR2{});
+              CombR2<TE>{});
 
   return std::make_tuple(d13, r0, r1);
 }
@@ -583,41 +639,45 @@ auto sem_dag_tail(const Dag& d7, F00 f00, F01 f01, F10 f10, F11 f11, V2 Hw,
 // Builds the graph and hands back its two roots. Separate from the launch so
 // the host can size it without running it -- scratch is the number that decided
 // against the previous attempt at this, so it must be printable.
-inline auto sem_dag_graph(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m,
-                          V3 mu, V3 jac, V2 H, V2 Hw,
-                          const Kokkos::Array<float, cfg::N>& w) {
+template <int TE>
+auto sem_dag_graph(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m, V3 mu,
+                   V3 jac, V2 H, V2 Hw, const Kokkos::Array<float, cfg::N>& w) {
   const StressIntegrand<0, 0> si00{xix, xiz, gx, gz, l2m, mu, jac};
   const StressIntegrand<0, 1> si01{xix, xiz, gx, gz, l2m, mu, jac};
   const StressIntegrand<1, 0> si10{xix, xiz, gx, gz, l2m, mu, jac};
   const StressIntegrand<1, 1> si11{xix, xiz, gx, gz, l2m, mu, jac};
 
-  auto [d3, gxu0, gxu1, gzu0, gzu1] = sem_dag_gradients(u0, u1, H);
+  auto [d3, gxu0, gxu1, gzu0, gzu1] = sem_dag_gradients<TE>(u0, u1, H);
 
   // --- four stress integrands, all four naming the SAME four gradients ----
   // The xi-direction nodes read them as {q,e,j}/{j,e,q}; the gamma-direction
   // nodes read the identical buffers as {i,e,q}/{q,e,i}.
-  auto [d4, f00] =
-      d3.add(make_combine_node<'q', 'e', 'j'>(
-                 gxu0.as<'q', 'e', 'j'>(), gxu1.as<'q', 'e', 'j'>(),
-                 gzu0.as<'j', 'e', 'q'>(), gzu1.as<'j', 'e', 'q'>(), si00),
-             CombF2{});
-  auto [d5, f01] =
-      d4.add(make_combine_node<'q', 'e', 'i'>(
-                 gxu0.as<'i', 'e', 'q'>(), gxu1.as<'i', 'e', 'q'>(),
-                 gzu0.as<'q', 'e', 'i'>(), gzu1.as<'q', 'e', 'i'>(), si01),
-             CombF2{});
-  auto [d6, f10] =
-      d5.add(make_combine_node<'q', 'e', 'j'>(
-                 gxu0.as<'q', 'e', 'j'>(), gxu1.as<'q', 'e', 'j'>(),
-                 gzu0.as<'j', 'e', 'q'>(), gzu1.as<'j', 'e', 'q'>(), si10),
-             CombF2{});
-  auto [d7, f11] =
-      d6.add(make_combine_node<'q', 'e', 'i'>(
-                 gxu0.as<'i', 'e', 'q'>(), gxu1.as<'i', 'e', 'q'>(),
-                 gzu0.as<'q', 'e', 'i'>(), gzu1.as<'q', 'e', 'i'>(), si11),
-             CombF2{});
+  auto [d4, f00] = d3.add(
+      make_combine_node<'q', 'e', 'j'>(gxu0.template as<'q', 'e', 'j'>(),
+                                       gxu1.template as<'q', 'e', 'j'>(),
+                                       gzu0.template as<'j', 'e', 'q'>(),
+                                       gzu1.template as<'j', 'e', 'q'>(), si00),
+      CombF2<TE>{});
+  auto [d5, f01] = d4.add(
+      make_combine_node<'q', 'e', 'i'>(gxu0.template as<'i', 'e', 'q'>(),
+                                       gxu1.template as<'i', 'e', 'q'>(),
+                                       gzu0.template as<'q', 'e', 'i'>(),
+                                       gzu1.template as<'q', 'e', 'i'>(), si01),
+      CombF2<TE>{});
+  auto [d6, f10] = d5.add(
+      make_combine_node<'q', 'e', 'j'>(gxu0.template as<'q', 'e', 'j'>(),
+                                       gxu1.template as<'q', 'e', 'j'>(),
+                                       gzu0.template as<'j', 'e', 'q'>(),
+                                       gzu1.template as<'j', 'e', 'q'>(), si10),
+      CombF2<TE>{});
+  auto [d7, f11] = d6.add(
+      make_combine_node<'q', 'e', 'i'>(gxu0.template as<'i', 'e', 'q'>(),
+                                       gxu1.template as<'i', 'e', 'q'>(),
+                                       gzu0.template as<'q', 'e', 'i'>(),
+                                       gzu1.template as<'q', 'e', 'i'>(), si11),
+      CombF2<TE>{});
 
-  return sem_dag_tail(d7, f00, f01, f10, f11, Hw, w);
+  return sem_dag_tail<TE>(d7, f00, f01, f10, f11, Hw, w);
 }
 
 // --- MULTI-OUTPUT F STAGE --------------------------------------------------
@@ -636,60 +696,82 @@ inline auto sem_dag_graph(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m,
 // the gamma slots {q,e,i}, and all outputs of a combine necessarily share its
 // modes. Merging across directions would force a reorder on the B slot of the
 // divergence contraction, which the header's LOAD-BEARING RULE exists to avoid.
-inline auto sem_dag_graph_mo(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m,
-                             V3 mu, V3 jac, V2 H, V2 Hw,
-                             const Kokkos::Array<float, cfg::N>& w) {
+template <int TE>
+auto sem_dag_graph_mo(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m, V3 mu,
+                      V3 jac, V2 H, V2 Hw,
+                      const Kokkos::Array<float, cfg::N>& w) {
   const StressIntegrand2<0> si0{xix, xiz, gx, gz, l2m, mu, jac};
   const StressIntegrand2<1> si1{xix, xiz, gx, gz, l2m, mu, jac};
 
-  auto [d3, gxu0, gxu1, gzu0, gzu1] = sem_dag_gradients(u0, u1, H);
+  auto [d3, gxu0, gxu1, gzu0, gzu1] = sem_dag_gradients<TE>(u0, u1, H);
 
   // add() hands back one handle PER OUTPUT: [component 0, component 1].
-  auto [d4, f00, f10] =
-      d3.add(make_combine_node<'q', 'e', 'j'>(
-                 gxu0.as<'q', 'e', 'j'>(), gxu1.as<'q', 'e', 'j'>(),
-                 gzu0.as<'j', 'e', 'q'>(), gzu1.as<'j', 'e', 'q'>(), si0),
-             CombF2{});
-  auto [d5, f01, f11] =
-      d4.add(make_combine_node<'q', 'e', 'i'>(
-                 gxu0.as<'i', 'e', 'q'>(), gxu1.as<'i', 'e', 'q'>(),
-                 gzu0.as<'q', 'e', 'i'>(), gzu1.as<'q', 'e', 'i'>(), si1),
-             CombF2{});
+  auto [d4, f00, f10] = d3.add(
+      make_combine_node<'q', 'e', 'j'>(gxu0.template as<'q', 'e', 'j'>(),
+                                       gxu1.template as<'q', 'e', 'j'>(),
+                                       gzu0.template as<'j', 'e', 'q'>(),
+                                       gzu1.template as<'j', 'e', 'q'>(), si0),
+      CombF2<TE>{});
+  auto [d5, f01, f11] = d4.add(
+      make_combine_node<'q', 'e', 'i'>(gxu0.template as<'i', 'e', 'q'>(),
+                                       gxu1.template as<'i', 'e', 'q'>(),
+                                       gzu0.template as<'q', 'e', 'i'>(),
+                                       gzu1.template as<'q', 'e', 'i'>(), si1),
+      CombF2<TE>{});
 
-  return sem_dag_tail(d5, f00, f01, f10, f11, Hw, w);
+  return sem_dag_tail<TE>(d5, f00, f01, f10, f11, Hw, w);
 }
 
-// 64 on GPU, not Kokkos::AUTO, which picks 512 for a tile of only TE*N*N = 256
-// points. Swept in main() rather than assumed; see the sweep block there and
-// DagGraph.hpp's execute_dag_team for what the parameter is actually trading.
+// 128 on GPU, and it is TIED TO TE -- re-sweep both together or neither.
 //
-// This was 128 until the multi-output F stage landed, and re-sweeping is what
-// found it: 64 is 1.11x on the DAG and 1.15x on DAG-MO. 32 is worse again, so
-// the optimum is interior.
+// The optimum holds roughly 8 tile points per thread, so it scales with the
+// tile. Measured best-of-7 with warmup on an uncontended H100 NVL, E=2.5M:
+//
+//   TE            4     8    16    32
+//   tile points 256   512  1024  2048
+//   best team    64    96   128   256      (~8 points/thread throughout)
+//   DAG-MO   10.009 9.248 8.981 10.023 ms
+//
+// This value has now been 128, then 64, then 128 again, each time because
+// something else moved: the multi-output F stage, then the slot pool and the
+// operand arena, which cut the DAG's scratch enough that a larger tile became
+// affordable and dragged the team size up with it. That history is the argument
+// for the sweep in main() being unconditional rather than something to run once
+// -- a hardcoded team size is invisible when it goes stale.
+//
+// NOT Kokkos::AUTO, which is 2-4x too large at every TE and gets worse as TE
+// grows. Measured against the real functor (team_size_recommended), it picks
+// 128/256/512/1024 for TE=4/8/16/32 -- consistently tile_points/2, about 2
+// points per thread. At the shipping TE=16 that costs ~1.25-1.34x. AUTO's
+// answer also MOVES when scratch changes, so it is not even a stable property
+// of the kernel: it gave the DAG 256 at TE=4 before the slot pool and 128
+// after.
 //
 // Serial caps team size at 1 and THROWS on anything larger, so the choice has
 // to be per backend -- a negative value means Kokkos::AUTO, which is right
 // there.
-inline constexpr int kDagTeam = cfg::kIsGPU ? 64 : -1;
+inline constexpr int kDagTeam = cfg::kIsGPU ? 128 : -1;
 
 // `team` is a parameter and not just kDagTeam so main() can SWEEP it: a value
 // that was optimal for one graph is not automatically optimal for the next, and
 // this one is worth 1.4x when it is wrong.
+template <int TE>
 void library_dag_force(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m,
                        V3 mu, V3 jac, V2 H, V2 Hw,
                        const Kokkos::Array<float, cfg::N>& w, V3 force0,
                        V3 force1, int team = kDagTeam) {
-  auto [g, r0, r1] =
-      sem_dag_graph(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H, Hw, w);
+  auto [g, r0, r1] = sem_dag_graph<cfg::TE_dag>(u0, u1, xix, xiz, gx, gz, l2m,
+                                                mu, jac, H, Hw, w);
   g.outputs(r0, r1).team_size(team).execute(TeamPolicyTag<>{}, force0, force1);
 }
 
+template <int TE>
 void library_dag_mo_force(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m,
                           V3 mu, V3 jac, V2 H, V2 Hw,
                           const Kokkos::Array<float, cfg::N>& w, V3 force0,
                           V3 force1, int team = kDagTeam) {
-  auto [g, r0, r1] =
-      sem_dag_graph_mo(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H, Hw, w);
+  auto [g, r0, r1] = sem_dag_graph_mo<cfg::TE_dag>(u0, u1, xix, xiz, gx, gz,
+                                                   l2m, mu, jac, H, Hw, w);
   g.outputs(r0, r1).team_size(team).execute(TeamPolicyTag<>{}, force0, force1);
 }
 inline constexpr int kDagSrcEnd = __LINE__;
@@ -697,6 +779,7 @@ inline constexpr int kDagSrcEnd = __LINE__;
 // written to global. This is exactly one quarter of what the full library run
 // executes (2 kernels x 2 F nodes), so 4x this row is the whole gradient+stress
 // half of the tree, measured rather than extrapolated.
+template <int TE>
 void library_one_F(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m, V3 mu,
                    V3 jac, V2 H, V3dyn out) {
   auto g                        = make_graph();
@@ -715,7 +798,8 @@ void library_one_F(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m, V3 mu,
           make_input_node(make_handle<'e', 'p', 'q'>(u1))),
       StressIntegrand<0, 0>{xix, xiz, gx, gz, l2m, mu, jac}));
   g1.execute(TeamPolicyTag<>{},
-             make_combine_tile(TileQEJ{}, BGrad{}, BGrad{}, BGrad{}, BGrad{}),
+             make_combine_tile(TileQEJ<TE>{}, BGrad<TE>{}, BGrad<TE>{},
+                               BGrad<TE>{}, BGrad<TE>{}),
              out);
 }
 
@@ -728,6 +812,7 @@ struct SumFour {
     return a + b + c + d;
   }
 };
+template <int TE>
 void library_four_gradients(V3 u0, V3 u1, V2 H, V3dyn out) {
   auto g                        = make_graph();
   [[maybe_unused]] auto [g1, o] = g.ops(make_combine_node<'q', 'e', 'j'>(
@@ -745,7 +830,8 @@ void library_four_gradients(V3 u0, V3 u1, V2 H, V3dyn out) {
           make_input_node(make_handle<'e', 'p', 'q'>(u1))),
       SumFour{}));
   g1.execute(TeamPolicyTag<>{},
-             make_combine_tile(TileQEJ{}, BGrad{}, BGrad{}, BGrad{}, BGrad{}),
+             make_combine_tile(TileQEJ<TE>{}, BGrad<TE>{}, BGrad<TE>{},
+                               BGrad<TE>{}, BGrad<TE>{}),
              out);
 }
 
@@ -753,12 +839,13 @@ void library_four_gradients(V3 u0, V3 u1, V2 H, V3dyn out) {
 // shape the tree runs, but B is a plain View instead of a fused combine node.
 // Compare against the tree's implied per-divergence cost to price the fused
 // operand path itself.
+template <int TE>
 void library_one_divergence(V3dyn Fin, V2 Hw, V3 out) {
   auto g                        = make_graph();
   [[maybe_unused]] auto [g1, o] = g.ops(make_contraction_node<'e', 'j', 'i'>(
       make_input_node(make_handle<'q', 'i'>(Hw)),
       make_input_node(make_handle<'q', 'e', 'j'>(Fin))));
-  g1.execute(TeamPolicyTag<>{}, Tile<TileH, TileQEJ, TileEJI>{}, out);
+  g1.execute(TeamPolicyTag<>{}, Tile<TileH, TileQEJ<TE>, TileEJI<TE>>{}, out);
 }
 
 // DIAGNOSTIC (not part of the comparison): one gradient contraction on its own,
@@ -766,12 +853,13 @@ void library_one_divergence(V3dyn Fin, V2 Hw, V3 out) {
 // different explanations for a slow fused path -- "the [8x8]x[8x32] GEMM is
 // simply small" versus "the fused tree's serialized stages are the cost". If
 // this row is also slow, the tile is the floor and fusion is not the culprit.
+template <int TE>
 void library_one_gradient(V3 u0, V2 H, V3dyn out) {
   auto g                        = make_graph();
   [[maybe_unused]] auto [g1, o] = g.ops(make_contraction_node<'q', 'e', 'j'>(
       make_input_node(make_handle<'q', 'p'>(H)),
       make_input_node(make_handle<'e', 'j', 'p'>(u0))));
-  g1.execute(TeamPolicyTag<>{}, BGrad{}, out);
+  g1.execute(TeamPolicyTag<>{}, BGrad<TE>{}, out);
 }
 
 // ===========================================================================
@@ -788,6 +876,7 @@ void library_one_gradient(V3 u0, V2 H, V3dyn out) {
 // budget is ~40% aux staging.
 // ===========================================================================
 inline constexpr int kBaseSrcBegin = __LINE__;
+template <int TE>
 void baseline_force(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m, V3 mu,
                     V3 jac, V2 H, V2 Hw, Kokkos::Array<float, cfg::N> w,
                     V3 force0, V3 force1, int E) {
@@ -797,7 +886,7 @@ void baseline_force(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m, V3 mu,
                                     Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
   using member_t     = Kokkos::TeamPolicy<ExecSpace>::member_type;
 
-  constexpr int N = cfg::N, TE = cfg::TE, NP = cfg::N * cfg::N;
+  constexpr int N = cfg::N, NP = cfg::N * cfg::N;
 
   // u0,u1 staged; 4 reference gradients; 4 integrand slots.
   const size_t bytes = 10 * Sc3::shmem_size(TE, N, N);
@@ -916,7 +1005,7 @@ inline constexpr int kBaseSrcEnd = __LINE__;
 // baseline -> control  = the price of the redundancy itself.
 // control  -> library  = everything else the library costs.
 // ===========================================================================
-template <int Comp, bool DedupGrad = false>
+template <int Comp, int TE, bool DedupGrad = false>
 void control_recompute_force(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m,
                              V3 mu, V3 jac, V2 H, V2 Hw,
                              Kokkos::Array<float, cfg::N> w, V3 force, int E) {
@@ -926,7 +1015,7 @@ void control_recompute_force(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m,
                                     Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
   using member_t     = Kokkos::TeamPolicy<ExecSpace>::member_type;
 
-  constexpr int N = cfg::N, TE = cfg::TE, NP = cfg::N * cfg::N;
+  constexpr int N = cfg::N, NP = cfg::N * cfg::N;
   const size_t  bytes = 8 * Sc3::shmem_size(TE, N, N);
 
   Kokkos::parallel_for(
@@ -1056,6 +1145,7 @@ void control_recompute_force(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m,
 // slots and 4 F slots live at once, which is what the baseline already holds;
 // sharing does not add storage here, it removes duplicates.
 // ===========================================================================
+template <int TE>
 void control_dag_force(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m,
                        V3 mu, V3 jac, V2 H, V2 Hw,
                        Kokkos::Array<float, cfg::N> w, V3 force0, V3 force1,
@@ -1066,7 +1156,7 @@ void control_dag_force(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m,
                                     Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
   using member_t     = Kokkos::TeamPolicy<ExecSpace>::member_type;
 
-  constexpr int N = cfg::N, TE = cfg::TE, NP = cfg::N * cfg::N;
+  constexpr int N = cfg::N, NP = cfg::N * cfg::N;
   const size_t  bytes = 10 * Sc3::shmem_size(TE, N, N);
 
   Kokkos::parallel_for(
@@ -1335,8 +1425,11 @@ int main(int argc, char* argv[]) {
 
     const bool gpu = cfg::kIsGPU;
     std::printf(
-        "SEM stiffness (K&T 1999 A2/A7), 2D P-SV | N=%d C=%d TE=%d E=%d | %s\n",
-        cfg::N, cfg::C, cfg::TE, E, gpu ? "GPU" : "CPU (Serial)");
+        "SEM stiffness (K&T 1999 A2/A7), 2D P-SV | N=%d C=%d E=%d | %s\n"
+        "TE per implementation: baseline/CONTROL %d, tree %d, DAG %d "
+        "(each at its own measured best)\n",
+        cfg::N, cfg::C, E, gpu ? "GPU" : "CPU (Serial)", cfg::TE_ctl,
+        cfg::TE_tree, cfg::TE_dag);
 
     V3 u0("u0", E, cfg::N, cfg::N), u1("u1", E, cfg::N, cfg::N);
     V3 xix("xix", E, cfg::N, cfg::N), xiz("xiz", E, cfg::N, cfg::N);
@@ -1361,19 +1454,26 @@ int main(int argc, char* argv[]) {
     Kokkos::fence();
 
     // Scratch, measured rather than estimated: the fused tree's real cost.
-    auto node =
-        library_node<0>(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H, Hw, w);
-    using LibEval = Evaluator<TeamPolicyTag<>, decltype(node), CombFrc>;
-    const std::size_t sbytes = LibEval::scratch_size_per_team(library_tile());
-    const std::size_t smax   = gpu ? 48u * 1024u : 32u * 1024u;
+    auto node = library_node<0, cfg::TE_tree>(u0, u1, xix, xiz, gx, gz, l2m, mu,
+                                              jac, H, Hw, w);
+    using LibEval =
+        Evaluator<TeamPolicyTag<>, decltype(node), CombFrc<cfg::TE_tree>>;
+    const std::size_t sbytes =
+        LibEval::scratch_size_per_team(library_tile<cfg::TE_tree>());
+    // 227 KB, not 48: an H100 accepts opt-in shared memory to that and Kokkos
+    // honours it. The old 48 KB constant was not describing the machine, and at
+    // the shipping TE=16 it would bail this benchmark out before a single
+    // kernel ran -- the TREE needs 88824 B there (the DAG needs 37208).
+    // Serial's 32 KB is a real hardcoded cap and stays.
+    const std::size_t smax = gpu ? 227u * 1024u : 32u * 1024u;
     std::printf("library scratch/team: %zu bytes (limit ~%zu)%s\n", sbytes,
                 smax, sbytes > smax ? "  <-- OVER" : "");
     // The DAG covers BOTH components in one launch, so this is against the
     // tree's PER-COMPONENT figure -- it is doing twice the work for less.
     {
-      auto [dg, dr0, dr1] =
-          sem_dag_graph(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H, Hw, w);
-      const auto outs = dg.outputs(dr0, dr1);
+      auto [dg, dr0, dr1] = sem_dag_graph<cfg::TE_dag>(u0, u1, xix, xiz, gx, gz,
+                                                       l2m, mu, jac, H, Hw, w);
+      const auto outs     = dg.outputs(dr0, dr1);
       std::printf(
           "DAG scratch/team:     %zu bytes (both components, one launch)%s\n",
           outs.scratch_bytes(),
@@ -1384,8 +1484,8 @@ int main(int argc, char* argv[]) {
     // the row above because "did merging the F nodes cost scratch?" is the
     // question that killed the previous attempt at this.
     {
-      auto [dg, dr0, dr1] =
-          sem_dag_graph_mo(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H, Hw, w);
+      auto [dg, dr0, dr1] = sem_dag_graph_mo<cfg::TE_dag>(
+          u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H, Hw, w);
       const auto outs = dg.outputs(dr0, dr1);
       // Slots are POOLED by live range, so the store is no longer one buffer
       // per node output. The unpooled figure is printed beside it because the
@@ -1454,12 +1554,14 @@ int main(int argc, char* argv[]) {
                    Echk);
 
     auto run_base = [&] {
-      baseline_force(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H, Hw, w, fb0, fb1,
-                     E);
+      baseline_force<cfg::TE_ctl>(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H, Hw,
+                                  w, fb0, fb1, E);
     };
     auto run_lib = [&] {
-      library_force<0>(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H, Hw, w, fl0);
-      library_force<1>(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H, Hw, w, fl1);
+      library_force<0, cfg::TE_tree>(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H,
+                                     Hw, w, fl0);
+      library_force<1, cfg::TE_tree>(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H,
+                                     Hw, w, fl1);
     };
     run_base();
     run_lib();
@@ -1487,8 +1589,8 @@ int main(int argc, char* argv[]) {
     // components, 4 gradient sums instead of 16.
     V3   fd0("fd0", E, cfg::N, cfg::N), fd1("fd1", E, cfg::N, cfg::N);
     auto run_dag = [&] {
-      library_dag_force(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H, Hw, w, fd0,
-                        fd1);
+      library_dag_force<cfg::TE_dag>(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H,
+                                     Hw, w, fd0, fd1);
     };
     run_dag();
     Kokkos::fence();
@@ -1505,8 +1607,8 @@ int main(int argc, char* argv[]) {
     // 2x auxiliary traffic instead of 4x. Same slots, same launch count.
     V3   fm0("fm0", E, cfg::N, cfg::N), fm1("fm1", E, cfg::N, cfg::N);
     auto run_mo = [&] {
-      library_dag_mo_force(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H, Hw, w,
-                           fm0, fm1);
+      library_dag_mo_force<cfg::TE_dag>(u0, u1, xix, xiz, gx, gz, l2m, mu, jac,
+                                        H, Hw, w, fm0, fm1);
     };
     run_mo();
     Kokkos::fence();
@@ -1524,20 +1626,22 @@ int main(int argc, char* argv[]) {
     // node list only. Cheap enough (2 reps, no warmup) to leave in every run,
     // which is the point -- a stale hardcoded team size is invisible otherwise.
     if (cfg::kIsGPU) {
-      std::printf("\nteam-size sweep (2 reps):        DAG      DAG-MO\n");
-      for (int ts : {32, 64, 96, 128, 256, 512}) {
+      std::printf("\nteam-size sweep (%d warmup, %d reps):  DAG      DAG-MO\n",
+                  warmup, reps);
+      for (int ts : {32, 64, 96, 128, 192, 256, 384, 512, 768, 1024}) {
         const double a = seconds_of(
             [&] {
-              library_dag_force(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H, Hw,
-                                w, fd0, fd1, ts);
+              library_dag_force<cfg::TE_dag>(u0, u1, xix, xiz, gx, gz, l2m, mu,
+                                             jac, H, Hw, w, fd0, fd1, ts);
             },
-            1, 2);
+            warmup, reps);
         const double b = seconds_of(
             [&] {
-              library_dag_mo_force(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H,
-                                   Hw, w, fm0, fm1, ts);
+              library_dag_mo_force<cfg::TE_dag>(u0, u1, xix, xiz, gx, gz, l2m,
+                                                mu, jac, H, Hw, w, fm0, fm1,
+                                                ts);
             },
-            1, 2);
+            warmup, reps);
         std::printf("  %4d threads            %10.3f  %10.3f ms%s\n", ts,
                     a * 1e3, b * 1e3, ts == kDagTeam ? "   <-- in use" : "");
       }
@@ -1547,10 +1651,10 @@ int main(int argc, char* argv[]) {
     // THE CONTROL: hand-written, but with the library's exact redundancy.
     V3   fc0("fc0", E, cfg::N, cfg::N), fc1("fc1", E, cfg::N, cfg::N);
     auto run_ctl = [&] {
-      control_recompute_force<0>(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H, Hw,
-                                 w, fc0, E);
-      control_recompute_force<1>(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H, Hw,
-                                 w, fc1, E);
+      control_recompute_force<0, cfg::TE_ctl>(u0, u1, xix, xiz, gx, gz, l2m, mu,
+                                              jac, H, Hw, w, fc0, E);
+      control_recompute_force<1, cfg::TE_ctl>(u0, u1, xix, xiz, gx, gz, l2m, mu,
+                                              jac, H, Hw, w, fc1, E);
     };
     run_ctl();
     Kokkos::fence();
@@ -1565,10 +1669,10 @@ int main(int argc, char* argv[]) {
     // Same control, gradients computed ONCE per kernel. Isolates the gradient
     // recompute from the rest of the redundancy (2 kernels, 4 stress evals).
     auto run_ctl2 = [&] {
-      control_recompute_force<0, true>(u0, u1, xix, xiz, gx, gz, l2m, mu, jac,
-                                       H, Hw, w, fc0, E);
-      control_recompute_force<1, true>(u0, u1, xix, xiz, gx, gz, l2m, mu, jac,
-                                       H, Hw, w, fc1, E);
+      control_recompute_force<0, cfg::TE_ctl, true>(
+          u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H, Hw, w, fc0, E);
+      control_recompute_force<1, cfg::TE_ctl, true>(
+          u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H, Hw, w, fc1, E);
     };
     run_ctl2();
     Kokkos::fence();
@@ -1583,8 +1687,8 @@ int main(int argc, char* argv[]) {
     // shared by every consumer) and both components in one launch, but still
     // four single-output F nodes with 4x stress and 4x aux traffic.
     auto run_ctl3 = [&] {
-      control_dag_force(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H, Hw, w, fc0,
-                        fc1, E);
+      control_dag_force<cfg::TE_ctl>(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H,
+                                     Hw, w, fc0, fc1, E);
     };
     run_ctl3();
     Kokkos::fence();
@@ -1597,21 +1701,22 @@ int main(int argc, char* argv[]) {
                 dc3 < 1e-2 ? "PASS" : "FAIL");
 
     // Diagnostic row: one gradient contraction, output modes {q,e,j}.
-    V3dyn        go("go", cfg::N, E, cfg::N);
-    auto         run_one = [&] { library_one_gradient(u0, H, go); };
-    const double t1g     = seconds_of(run_one, warmup, reps);
-    const double f1g     = flopcount::NP * cfg::N * 2.0 * Ed;  // one gradient
+    V3dyn go("go", cfg::N, E, cfg::N);
+    auto  run_one    = [&] { library_one_gradient<cfg::TE_tree>(u0, H, go); };
+    const double t1g = seconds_of(run_one, warmup, reps);
+    const double f1g = flopcount::NP * cfg::N * 2.0 * Ed;  // one gradient
     std::printf("%-30s %10.3f %14.1f %16s %8s\n", "  [diag] 1 gradient only",
                 t1g * 1e3, f1g / t1g / 1e9, "-", "-");
 
-    auto         run_4g = [&] { library_four_gradients(u0, u1, H, go); };
-    const double t4g    = seconds_of(run_4g, warmup, reps);
+    auto run_4g = [&] { library_four_gradients<cfg::TE_tree>(u0, u1, H, go); };
+    const double t4g = seconds_of(run_4g, warmup, reps);
     std::printf("%-30s %10.3f %14.1f %16s %8s\n",
                 "  [diag] 4 gradients, no aux", t4g * 1e3,
                 4.0 * f1g / t4g / 1e9, "-", "-");
 
     auto run_1F = [&] {
-      library_one_F(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H, go);
+      library_one_F<cfg::TE_tree>(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H,
+                                  go);
     };
     const double t1F = seconds_of(run_1F, warmup, reps);
     std::printf("%-30s %10.3f %14.1f %16s %8s\n",
@@ -1622,14 +1727,15 @@ int main(int argc, char* argv[]) {
     // fused combine operand would produce (which adds back 2 divergences and a
     // second output, but shares everything below them).
     auto run_lib1 = [&] {
-      library_force<0>(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H, Hw, w, fl0);
+      library_force<0, cfg::TE_tree>(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H,
+                                     Hw, w, fl0);
     };
     const double tl1 = seconds_of(run_lib1, warmup, reps);
     std::printf("%-30s %10.3f %14s %16s %8s\n", "  [diag] library, 1 component",
                 tl1 * 1e3, "-", "-", "-");
 
-    auto         run_1d = [&] { library_one_divergence(go, Hw, fl0); };
-    const double t1d    = seconds_of(run_1d, warmup, reps);
+    auto run_1d = [&] { library_one_divergence<cfg::TE_tree>(go, Hw, fl0); };
+    const double t1d = seconds_of(run_1d, warmup, reps);
     std::printf("%-30s %10.3f %14.1f %16s %8s\n",
                 "  [diag] 1 divergence (mat. B)", t1d * 1e3, f1g / t1d / 1e9,
                 "-", "-");

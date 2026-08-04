@@ -145,6 +145,13 @@ struct ScratchAllocator<TeamPolicyTag<ES>, OuterOpTag, NA, V, TileA, PermSeq> {
                                    const team_member_t&)
       : storage_(node.storage_) {}
 
+  // Arena form. A slot NAMES a buffer another node owns, so there is nothing to
+  // carve and the arena is deliberately untouched -- it must not be advanced,
+  // or a node with a slot operand would reserve space it never uses.
+  KOKKOS_FUNCTION ScratchAllocator(const NA& node, const TileA&,
+                                   const team_member_t&, Impl::OperandArena<V>&)
+      : storage_(node.storage_) {}
+
   static std::size_t             bytes(const TileA&) { return 0; }
   KOKKOS_FUNCTION scratch_view_t get() const { return storage_; }
   template <typename Team, typename Idx>
@@ -185,6 +192,17 @@ struct ScratchAllocator<TeamPolicyTag<ES>, OuterOpTag, NA, V, TileA, PermSeq> {
       : eval_(make_evaluator<TeamPolicyTag<ES>>(node, tile, team)),
         scratch_(Impl::alloc_scratch_tile<V, ES>(
             team, axes_t::to_canon_tile(tile))) {}
+
+  // Arena form: the staging buffer comes from a region the DRIVER owns and
+  // hands out fresh per node, instead of from the team cursor which never
+  // rewinds. Same type, same contents, same bytes(); only the provenance
+  // differs -- see Impl::OperandArena for why that is worth a constructor.
+  KOKKOS_FUNCTION ScratchAllocator(const NA& node, const TileA& tile,
+                                   const team_member_t&   team,
+                                   Impl::OperandArena<V>& arena)
+      : eval_(make_evaluator<TeamPolicyTag<ES>>(node, tile, team)),
+        scratch_(Impl::alloc_scratch_tile_from<V, ES>(
+            arena, axes_t::to_canon_tile(tile))) {}
 
   static std::size_t bytes(const TileA& tile) {
     return Impl::scratch_tile_bytes<V, ES>(axes_t::to_canon_tile(tile));
