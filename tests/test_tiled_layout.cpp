@@ -458,6 +458,87 @@ TEST(TiledLayout, ReorderOrderedSubviewLayout2D) {
 // Main
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// The compile-time memory orders vs. the stride sort they replaced.
+//
+// tile_view stopped sorting strides on device and now takes the order from the
+// view's layout type (Impl::memory_order_of), because the sort indexes arrays
+// by loop variables and therefore runs out of LOCAL memory -- it was the
+// largest single long_scoreboard line in the SEM DAG kernel (17.9%).
+//
+// WHAT MUST HOLD, stated precisely, because the two are NOT identical:
+//   * with DISTINCT strides the closed form equals the sort exactly;
+//   * with TIED strides they may differ, and that is sound. A tie means two
+//     dimensions share a stride, which for LayoutRight/LayoutLeft can only
+//     happen when one has extent 1, so which of them is called "faster" is
+//     immaterial. Both remain valid ascending-stride orders, which is the
+//     property anything downstream actually needs -- asserted below.
+//   * and it is moot for exactly these layouts anyway: all four
+//     LayoutRight/LayoutLeft subview_tile overloads use right_order_seq /
+//     left_order_seq -- the SAME closed form -- and never read inner_order().
+//     Only the generic fallback reads it, and that is unreachable for a layout
+//     the closed forms claim. The change makes the stored order agree with the
+//     consumed one; previously a tied LayoutRight view stored [1,2,0] while
+//     subview_tile used [2,1,0].
+// ---------------------------------------------------------------------------
+namespace {
+
+template <int N>
+bool ascending_by_stride(const Kokkos::Array<int, N>& order,
+                         const Kokkos::Array<int, N>& strides) {
+  for (int i = 1; i < N; ++i)
+    if (strides[order[i - 1]] > strides[order[i]]) return false;
+  return true;
+}
+
+}  // namespace
+
+TEST(TiledLayout, CompileTimeOrderMatchesTheStrideSortWhenStridesAreDistinct) {
+  using TensorOperations::Impl::argsort_by_stride;
+  using TensorOperations::Impl::left_order_array;
+  using TensorOperations::Impl::right_order_array;
+
+  const Kokkos::Array<int, 3> r3{64, 8, 1};  // LayoutRight, extents (E,8,8)
+  const Kokkos::Array<int, 2> r2{8, 1};
+  const Kokkos::Array<int, 3> l3{1, 8, 64};  // LayoutLeft
+  const Kokkos::Array<int, 2> l2{1, 8};
+
+  for (int i = 0; i < 3; ++i) {
+    EXPECT_EQ(argsort_by_stride<3>(r3)[i], right_order_array<3>()[i]) << i;
+    EXPECT_EQ(argsort_by_stride<3>(l3)[i], left_order_array<3>()[i]) << i;
+  }
+  for (int i = 0; i < 2; ++i) {
+    EXPECT_EQ(argsort_by_stride<2>(r2)[i], right_order_array<2>()[i]) << i;
+    EXPECT_EQ(argsort_by_stride<2>(l2)[i], left_order_array<2>()[i]) << i;
+  }
+}
+
+TEST(TiledLayout, CompileTimeOrderIsAValidMemoryOrderUnderTiedStrides) {
+  using TensorOperations::Impl::left_order_array;
+  using TensorOperations::Impl::right_order_array;
+
+  // Ties come from a unit extent: (E,1,8) -> {8,8,1}; (E,8,1) -> {64,1,1}.
+  const Kokkos::Array<int, 3> tied_lead{8, 8, 1};
+  const Kokkos::Array<int, 3> tied_trail{64, 1, 1};
+  EXPECT_TRUE(ascending_by_stride<3>(right_order_array<3>(), tied_lead));
+  EXPECT_TRUE(ascending_by_stride<3>(right_order_array<3>(), tied_trail));
+
+  const Kokkos::Array<int, 3> l_tied{1, 1, 8};
+  EXPECT_TRUE(ascending_by_stride<3>(left_order_array<3>(), l_tied));
+}
+
+TEST(TiledLayout, StrideSortStillHandlesAGenuinelyPermutedLayout) {
+  using TensorOperations::Impl::argsort_by_stride;
+  // A LayoutStride-like vector that neither closed form claims: it must still
+  // go through the sort, so the sort has to stay correct.
+  const Kokkos::Array<int, 3> strided{8, 64, 1};
+  const auto                  got = argsort_by_stride<3>(strided);
+  EXPECT_EQ(got[0], 2);
+  EXPECT_EQ(got[1], 0);
+  EXPECT_EQ(got[2], 1);
+  EXPECT_TRUE(ascending_by_stride<3>(got, strided));
+}
+
 int main(int argc, char* argv[]) {
   ::testing::InitGoogleTest(&argc, argv);
   Kokkos::initialize(argc, argv);
