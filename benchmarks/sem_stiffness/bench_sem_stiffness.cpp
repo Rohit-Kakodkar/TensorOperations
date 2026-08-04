@@ -1373,11 +1373,10 @@ int main(int argc, char* argv[]) {
     {
       auto [dg, dr0, dr1] =
           sem_dag_graph(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H, Hw, w);
-      (void)dr0;
-      (void)dr1;
+      const auto outs = dg.outputs(dr0, dr1);
       std::printf(
           "DAG scratch/team:     %zu bytes (both components, one launch)%s\n",
-          dg.scratch_bytes(),
+          outs.scratch_bytes(),
           dg.index_consistent() ? "" : "  <-- INCONSISTENT");
     }
     // The multi-output F stage owns the same 14 slots from 12 nodes, so the
@@ -1387,11 +1386,17 @@ int main(int argc, char* argv[]) {
     {
       auto [dg, dr0, dr1] =
           sem_dag_graph_mo(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H, Hw, w);
-      (void)dr0;
-      (void)dr1;
+      const auto outs = dg.outputs(dr0, dr1);
+      // Slots are POOLED by live range, so the store is no longer one buffer
+      // per node output. The unpooled figure is printed beside it because the
+      // ratio is what liveness bought, and because "14 slots" is still the
+      // right way to read the graph even when they occupy 8 buffers.
       std::printf(
-          "DAG-MO scratch/team:  %zu bytes (slots %zu, operands %zu)%s\n",
-          dg.scratch_bytes(), dg.slot_bytes(), dg.operand_bytes(),
+          "DAG-MO scratch/team:  %zu bytes (slots %zu in %zu pools, was %zu, "
+          "operands %zu)%s\n",
+          outs.scratch_bytes(), outs.slot_bytes(),
+          static_cast<std::size_t>(decltype(outs)::num_pools), dg.slot_bytes(),
+          outs.operand_bytes(),
           dg.index_consistent() ? "" : "  <-- INCONSISTENT");
     }
     // Per-THREAD state, which is what actually limits this kernel on GPU. The

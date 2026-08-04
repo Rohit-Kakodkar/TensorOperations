@@ -117,6 +117,24 @@ KOKKOS_FORCEINLINE_FUNCTION auto alloc_scratch_tile(const Team& team,
   return ScratchView<ValueType, ES, tile_layout_t>{backing, layout};
 }
 
+// The same tile, over a buffer the CALLER chose instead of a fresh bump of the
+// team cursor. Returns the identical type to alloc_scratch_tile, which is what
+// lets a pooled slot store (SlotStore.hpp) place two slots with disjoint live
+// ranges on one pointer without any node, evaluator or store type changing.
+//
+// The pointer must have room for make_tile_layout(tile).size() elements and the
+// alignment of a team_scratch allocation -- both guaranteed when it comes from
+// a pool carved by alloc_scratch_tile's own backing type.
+template <typename ValueType, typename ES, typename Tile>
+KOKKOS_FORCEINLINE_FUNCTION auto alloc_scratch_tile_at(ValueType*  ptr,
+                                                       const Tile& tile) {
+  const auto layout   = make_tile_layout(tile, LayoutRight{});
+  using tile_layout_t = std::decay_t<decltype(layout)>;
+  scratch_backing_t<ValueType, ES> backing(
+      ptr, static_cast<std::size_t>(layout.size()));
+  return ScratchView<ValueType, ES, tile_layout_t>{backing, layout};
+}
+
 template <typename ValueType, typename ES, typename Tile>
 std::size_t scratch_tile_bytes(const Tile& tile) {
   return scratch_backing_t<ValueType, ES>::shmem_size(
