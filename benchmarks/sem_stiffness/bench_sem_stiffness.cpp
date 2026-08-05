@@ -739,22 +739,32 @@ auto sem_dag_graph_mo(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m, V3 mu,
   return sem_dag_tail<TE>(d5, f00, f01, f10, f11, Hw, w);
 }
 
-// 128 on GPU, and it is TIED TO TE -- re-sweep both together or neither.
+// 192 on GPU, and it is TIED TO TE -- re-sweep both together or neither.
 //
-// The optimum holds roughly 8 tile points per thread, so it scales with the
-// tile. Measured best-of-7 with warmup on an uncontended H100 NVL, E=2.5M:
+// THE "~8 TILE POINTS PER THREAD" RULE THAT USED TO LIVE HERE IS RETRACTED.
+// It was never a property of the tiling: it was the per-thread LOCAL MEMORY
+// tax. WeightedSum held its weights in a Kokkos::Array, and a dynamically
+// indexed array member cannot live in registers, so every thread materialized
+// the enclosing node struct on its own stack. That cost scales with threads per
+// team, which penalized exactly the large teams -- and made a sharp optimum out
+// of what is really a plateau. With the weights as a View (see WeightedSum) the
+// local traffic is gone and the curve flattens right out. Removing the
+// contraction's C-zeroing pass then moved it once more, in the same direction.
 //
-//   TE            4     8    16    32
-//   tile points 256   512  1024  2048
-//   best team    64    96   128   256      (~8 points/thread throughout)
-//   DAG-MO   10.009 9.248 8.981 10.023 ms
+// Measured best-of-7 with warmup on an uncontended H100 NVL, E=2.5M, TE=16,
+// three runs each, after both changes:
 //
-// This value has now been 128, then 64, then 128 again, each time because
-// something else moved: the multi-output F stage, then the slot pool and the
-// operand arena, which cut the DAG's scratch enough that a larger tile became
-// affordable and dragged the team size up with it. That history is the argument
-// for the sweep in main() being unconditional rather than something to run once
-// -- a hardcoded team size is invisible when it goes stale.
+//   threads      128     192     256     384     512
+//   DAG       11.362   9.508   9.621  10.714   9.775 ms
+//   DAG-MO     7.398   7.009   7.471   7.796   7.209 ms
+//
+// 192 is best for both and is the tightest (+-0.2% across runs). Note 128 --
+// the value this constant held until the two changes above -- now costs the DAG
+// 6.3% and DAG-MO 5.5%. That is the whole argument for the sweep in main()
+// being unconditional rather than something to run once: this constant has been
+// 128, then 64, then 128, now 192, and every single move was caused by
+// something else changing. A hardcoded team size is invisible when it goes
+// stale, and it goes stale constantly.
 //
 // NOT Kokkos::AUTO, which is 2-4x too large at every TE and gets worse as TE
 // grows. Measured against the real functor (team_size_recommended), it picks
@@ -767,7 +777,7 @@ auto sem_dag_graph_mo(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m, V3 mu,
 // Serial caps team size at 1 and THROWS on anything larger, so the choice has
 // to be per backend -- a negative value means Kokkos::AUTO, which is right
 // there.
-inline constexpr int kDagTeam = cfg::kIsGPU ? 128 : -1;
+inline constexpr int kDagTeam = cfg::kIsGPU ? 192 : -1;
 
 // `team` is a parameter and not just kDagTeam so main() can SWEEP it: a value
 // that was optimal for one graph is not automatically optimal for the next, and
