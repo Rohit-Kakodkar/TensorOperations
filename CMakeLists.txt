@@ -220,4 +220,32 @@ if(TENSOR_OPS_BUILD_BENCHMARKS)
   add_executable(bench_matrix_multiply
     benchmarks/matrix_multiply/bench_matrix_multiply.cpp)
   target_link_libraries(bench_matrix_multiply PRIVATE tensor Kokkos::kokkoskernels)
+
+  # --- 3D SEM stiffness, NGLL=5 --------------------------------------------
+  # The order is fixed at 5 (production NGLL) in the source, not a build
+  # option: it sets every tile extent in the graph AND the register blocking
+  # below, and the two have to agree.
+  add_executable(bench_sem_stiffness_3d
+    benchmarks/sem_stiffness_3d/bench_sem_stiffness_3d.cpp)
+  target_link_libraries(bench_sem_stiffness_3d PRIVATE tensor)
+
+  # THE REGISTER BLOCKING IS PART OF THIS TARGET, NOT A TUNING PREFERENCE.
+  #
+  # The team GEMM register-blocks by (MT, NT, NR) and has NO REMAINDER PATH:
+  # validate_gemm_tile_dims requires each staged extent to be a multiple of its
+  # factor. This kernel stages SA = SK = N = 5 and SB = TE*N*N.
+  #
+  # 5 is prime, so the library defaults (MT=4, NT=2) divide neither SA nor SK
+  # and the benchmark DOES NOT COMPILE without these overrides. 5/5/2 is the
+  # measured best of the legal blockings (one 3D gradient, H100, E=262144,
+  # TE=16: 5/5/2 = 1792 GF/s, 5/1/2 = 1784, 1/5/2 = 1747, 5/5/4 = 1565), so the
+  # spread is small and there is no cliff being tuned around.
+  #
+  # Read that as the finding it is: as shipped, this library cannot express a
+  # production-order SEM kernel without retuning its GEMM per target. The
+  # general fix is a GEMM remainder path, which does not exist yet.
+  #
+  # NR=2 is also what forbids TE=1 in the benchmark's sweep -- SB = 25 is odd.
+  target_compile_definitions(bench_sem_stiffness_3d PRIVATE
+    TENSOR_GEMM_MT=5 TENSOR_GEMM_NT=5 TENSOR_GEMM_NR=2)
 endif()
