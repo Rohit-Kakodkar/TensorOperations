@@ -264,6 +264,67 @@ TEST(GraphTest, NonSquareNonSymmetricTeam) {
     }
 }
 
+TEST(GraphTest, MultiKTileNonSymmetricTeam) {
+  // The k-tile REDUCTION LOOP checked against a host reference on non-uniform
+  // data. MultiTileExecutionTeam already splits the contracted mode into two
+  // accumulation blocks, but fills A and B with 1.0 -- and all-ones data cannot
+  // distinguish a block that accumulated from one that overwrote, once the
+  // per-block sums happen to agree. This is the pairing that catches it:
+  // multiple contracted tiles AND values that differ per block.
+  //
+  // Specifically guards accumulate_block<First>: C is initialized by the FIRST
+  // block's store rather than by a zeroing pass, so a First flag applied to the
+  // wrong block silently drops or double-counts a contribution. Here j=8 splits
+  // into 2 tiles of 4 whose partial sums differ, so either mistake changes the
+  // result.
+  using View2     = Kokkos::View<float**, Kokkos::LayoutRight>;
+  using View3     = Kokkos::View<float***, Kokkos::LayoutRight>;
+  constexpr int I = 128, J = 8, K = 4, L = 32;
+  View3         A("A", I, J, K);
+  View3         B("B", J, K, L);
+  View2         C("C", I, L);
+
+  auto Ah = Kokkos::create_mirror_view(A);
+  auto Bh = Kokkos::create_mirror_view(B);
+  for (int i = 0; i < I; ++i)
+    for (int j = 0; j < J; ++j)
+      for (int k = 0; k < K; ++k)
+        Ah(i, j, k) = static_cast<float>((i + 2 * j + 3 * k) % 5 + 1) * 0.5f;
+  for (int j = 0; j < J; ++j)
+    for (int k = 0; k < K; ++k)
+      for (int l = 0; l < L; ++l)
+        Bh(j, k, l) = static_cast<float>((3 * j + k + 2 * l) % 4 + 1) * 0.25f;
+  Kokkos::deep_copy(A, Ah);
+  Kokkos::deep_copy(B, Bh);
+  // Seeded with a value the contraction must OVERWRITE, not add to: the first
+  // block stores, so a stale C is a bug the all-ones test cannot see either.
+  Kokkos::deep_copy(C, -7.5f);
+
+  auto hA       = make_input_node(make_handle<'i', 'j', 'k'>(A));
+  auto hB       = make_input_node(make_handle<'j', 'k', 'l'>(B));
+  auto g        = make_graph();
+  auto [g1, T1] = g.ops(make_contraction_node<'i', 'l'>(hA, hB));
+
+  // A[i=128,j=8,k=4] tiled (64,4,4): i -> 2 output tiles, j -> 2 CONTRACTED
+  // tiles. Per block SK = 4*4 = 16 and SB = 32, both multiples of the register
+  // block factors on either backend.
+  g1.execute(
+      TeamPolicyTag<>{},
+      Tile<StaticTile<64, 4, 4>, StaticTile<4, 4, 32>, StaticTile<64, 32>>{},
+      C);
+
+  auto Ch = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, C);
+  for (int i = 0; i < I; ++i)
+    for (int l = 0; l < L; ++l) {
+      double acc = 0.0;
+      for (int j = 0; j < J; ++j)
+        for (int k = 0; k < K; ++k)
+          acc += static_cast<double>(Ah(i, j, k)) * Bh(j, k, l);
+      EXPECT_NEAR(Ch(i, l), static_cast<float>(acc), 1e-3f)
+          << "i=" << i << " l=" << l;
+    }
+}
+
 TEST(GraphTest, PermutedInputOutputTeam) {
   // A[j,i,k] * B[j,k,l] -> C[l,i]: the free mode 'i' sits in the middle of A
   // and the output is reversed. Exercises permA (canonicalize A to [i,j,k]) and
