@@ -208,9 +208,17 @@ inline constexpr int C = 2;  // displacement components (unrolled, see below)
 //
 // Serial's 32 KB scratch cap rejects anything above TE=4 for the DAG, so the
 // CPU side stays at 4 throughout.
-inline constexpr int TE_ctl  = kIsGPU ? 8 : 4;   // baseline + CONTROL family
-inline constexpr int TE_tree = kIsGPU ? 8 : 4;   // library, fused tree
-inline constexpr int TE_dag  = kIsGPU ? 16 : 4;  // library DAG and DAG-MO
+inline constexpr int TE_ctl  = kIsGPU ? 8 : 4;  // baseline + CONTROL family
+inline constexpr int TE_tree = kIsGPU ? 8 : 4;  // library, fused tree
+// -DTENSOR_BENCH_TE_DAG=<n> re-sweeps the DAG's tile without editing this file.
+// TE is the SHARED-MEMORY knob (slot pools are TE*N*N*4 bytes each), so it sets
+// blocks/SM; team size sets warps per block. The two are independent and have
+// to be swept together -- see kDagTeam.
+#ifndef TENSOR_BENCH_TE_DAG
+#define TENSOR_BENCH_TE_DAG 16
+#endif
+inline constexpr int TE_dag =
+    kIsGPU ? TENSOR_BENCH_TE_DAG : 4;  // library DAG and DAG-MO
 
 // The legacy single knob, kept only for E's divisibility check and the header
 // line. Every kernel now names the constant it actually uses.

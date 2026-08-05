@@ -813,15 +813,43 @@ struct Evaluator<TeamPolicyTag<ES>,
     constexpr int W = static_cast<int>(simd_t::size());
 
 #if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
-    constexpr int MT = 4;  // output rows / item
-    constexpr int NT = 2;  // output cols / item
+    // -DTENSOR_GEMM_MT/NT/NR override these for a re-sweep without editing
+    // here. They are not free parameters of the kernel alone: the register
+    // blocking sets the TeamThreadRange work-item count to (SA/MT)*(SB/NR),
+    // which is the largest team size the GEMM can keep busy. MT and NR are
+    // therefore coupled to the team size and to the tile.
+// MT stays 4 even though 8 is faster on the SEM DAG (1.8%), because MT is NOT
+// a global constant of the kernel -- it trades shared-load traffic against
+// per-thread parallelism and the balance moves with SA. Measured 2026-08-05,
+// H100 NVL, best-of-7 x 3:
+//
+//   MT              2       4       8
+//   SEM DAG-MO   7.436   7.020   6.914 ms   (SA=8, so MT=8 is ONE row block)
+//   matmul  N=512  --   2288    1929 G/s    (SA=TI=64)
+//   matmul N=1024  --   7182    6707 G/s
+//   matmul N=2048  --   9948   11279 G/s
+//
+// So MT=8 wins the SEM graph and large matmul and LOSES 16% at N=512. A fixed
+// default cannot serve both; picking MT from SA at compile time is the real
+// fix. Until then 4 is the value that regresses nothing.
+#ifndef TENSOR_GEMM_MT
+#define TENSOR_GEMM_MT 4
+#endif
+#ifndef TENSOR_GEMM_NT
+#define TENSOR_GEMM_NT 2
+#endif
+#ifndef TENSOR_GEMM_NR
+#define TENSOR_GEMM_NR 2
+#endif
+    constexpr int MT = TENSOR_GEMM_MT;  // output rows / item
+    constexpr int NT = TENSOR_GEMM_NT;  // output cols / item
     // NR=2 (not 4): the shared-load bank is (col_block*NR + n) mod 32, so a
     // power-of-two NR > 2 makes register-blocked lanes alias banks on rows
     // wider than 32 elems. NR=2 halves the conflicts AND drops register
     // pressure (64->48 regs, occupancy 48->60%): measured +20% matmul / +28%
     // contraction on A100 vs NR=4. (Tuning NR beats address swizzling, which
     // only regressed.)
-    constexpr int NR = 2;  // C columns / item
+    constexpr int NR = TENSOR_GEMM_NR;  // C columns / item
 #else
     constexpr int MT = 8;  // output rows / item
     constexpr int NT = 8;  // output cols / item
