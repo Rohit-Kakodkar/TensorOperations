@@ -294,6 +294,10 @@ using V3dyn = Kokkos::View<float***, Kokkos::LayoutRight>;
 using V2    = Kokkos::View<float**, Kokkos::LayoutRight>;
 using V3H   = V3::host_mirror_type;
 using V2H   = V2::host_mirror_type;
+// The GLL weights as a device View. See WeightedSum for why this is not a
+// Kokkos::Array. `const` so the read is known non-aliasing; the hand-written
+// implementations keep the Array, which makes them the control for the change.
+using V1 = Kokkos::View<const float*, Kokkos::LayoutRight>;
 
 // ---------------------------------------------------------------------------
 // compute_stress -- THE BLACK BOX.
@@ -431,11 +435,26 @@ struct StressIntegrand2 {
 // operand -- every operand must carry the output's exact label set. They ride
 // inside the functor instead, indexed off the coordinates fn already receives.
 // This is the general answer for rank-deficient auxiliaries.
+// A VIEW, not a Kokkos::Array, and the difference is worth 28% of this kernel's
+// L1TEX sectors. An Array member indexed dynamically (j and i are runtime
+// coordinates) cannot live in registers, so nvcc copies the whole enclosing
+// node-handle struct out of the kernel parameter bank onto the per-thread LOCAL
+// stack -- ~23 STL per node -- and then reads w back with LDL at 18 sectors per
+// warp. Profiled: 100% of the kernel's local loads were these two reads.
+//
+// As a View, w is a pointer: `w(j)` is an LDG off the param bank with no object
+// to materialize. And it costs almost nothing to read -- the output is (e,j,i)
+// traversed i-fastest, so a warp spans i=0..7 and 4 values of j, which puts
+// BOTH reads inside a single 32 B sector. The same 32 bytes are read by every
+// warp of every block, so they sit in L1 permanently.
+//
+// This is the general answer for a rank-deficient auxiliary that has to ride
+// inside the functor: hand it in as a View, never as a value member you index.
 struct WeightedSum {
-  Kokkos::Array<float, cfg::N> w;
-  KOKKOS_FUNCTION float        operator()(int, int j, int i, float t1,
-                                          float t2) const {
-    return w[j] * t1 + w[i] * t2;
+  V1                    w;
+  KOKKOS_FUNCTION float operator()(int, int j, int i, float t1,
+                                   float t2) const {
+    return w(j) * t1 + w(i) * t2;
   }
 };
 
@@ -474,7 +493,7 @@ CombFrc<TE> library_tile() {
 
 template <int Comp, int TE>
 auto library_node(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m, V3 mu,
-                  V3 jac, V2 H, V2 Hw, const Kokkos::Array<float, cfg::N>& w) {
+                  V3 jac, V2 H, V2 Hw, V1 w) {
   auto F0 = make_combine_node<'q', 'e', 'j'>(
       make_contraction_node<'q', 'e', 'j'>(
           make_input_node(make_handle<'q', 'p'>(H)),
@@ -515,8 +534,7 @@ auto library_node(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m, V3 mu,
 
 template <int Comp, int TE>
 void library_force(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m, V3 mu,
-                   V3 jac, V2 H, V2 Hw, const Kokkos::Array<float, cfg::N>& w,
-                   V3 force) {
+                   V3 jac, V2 H, V2 Hw, V1 w, V3 force) {
   auto g                          = make_graph();
   [[maybe_unused]] auto [g1, out] = g.ops(
       library_node<Comp, TE>(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H, Hw, w));
@@ -598,7 +616,7 @@ auto sem_dag_gradients(V3 u0, V3 u1, V2 H) {
 template <int TE, typename Dag, typename F00, typename F01, typename F10,
           typename F11>
 auto sem_dag_tail(const Dag& d7, F00 f00, F01 f01, F10 f10, F11 f11, V2 Hw,
-                  const Kokkos::Array<float, cfg::N>& w) {
+                  V1 w) {
   // Each F slot is named in its consumer's canonical B order (contracted ++
   // freeB), so the operand is an identity permutation and stays zero-copy --
   // the LOAD-BEARING RULE, unchanged by the DAG.
@@ -641,7 +659,7 @@ auto sem_dag_tail(const Dag& d7, F00 f00, F01 f01, F10 f10, F11 f11, V2 Hw,
 // against the previous attempt at this, so it must be printable.
 template <int TE>
 auto sem_dag_graph(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m, V3 mu,
-                   V3 jac, V2 H, V2 Hw, const Kokkos::Array<float, cfg::N>& w) {
+                   V3 jac, V2 H, V2 Hw, V1 w) {
   const StressIntegrand<0, 0> si00{xix, xiz, gx, gz, l2m, mu, jac};
   const StressIntegrand<0, 1> si01{xix, xiz, gx, gz, l2m, mu, jac};
   const StressIntegrand<1, 0> si10{xix, xiz, gx, gz, l2m, mu, jac};
@@ -698,8 +716,7 @@ auto sem_dag_graph(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m, V3 mu,
 // divergence contraction, which the header's LOAD-BEARING RULE exists to avoid.
 template <int TE>
 auto sem_dag_graph_mo(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m, V3 mu,
-                      V3 jac, V2 H, V2 Hw,
-                      const Kokkos::Array<float, cfg::N>& w) {
+                      V3 jac, V2 H, V2 Hw, V1 w) {
   const StressIntegrand2<0> si0{xix, xiz, gx, gz, l2m, mu, jac};
   const StressIntegrand2<1> si1{xix, xiz, gx, gz, l2m, mu, jac};
 
@@ -757,9 +774,8 @@ inline constexpr int kDagTeam = cfg::kIsGPU ? 128 : -1;
 // this one is worth 1.4x when it is wrong.
 template <int TE>
 void library_dag_force(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m,
-                       V3 mu, V3 jac, V2 H, V2 Hw,
-                       const Kokkos::Array<float, cfg::N>& w, V3 force0,
-                       V3 force1, int team = kDagTeam) {
+                       V3 mu, V3 jac, V2 H, V2 Hw, V1 w, V3 force0, V3 force1,
+                       int team = kDagTeam) {
   auto [g, r0, r1] = sem_dag_graph<cfg::TE_dag>(u0, u1, xix, xiz, gx, gz, l2m,
                                                 mu, jac, H, Hw, w);
   g.outputs(r0, r1).team_size(team).execute(TeamPolicyTag<>{}, force0, force1);
@@ -767,8 +783,7 @@ void library_dag_force(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m,
 
 template <int TE>
 void library_dag_mo_force(V3 u0, V3 u1, V3 xix, V3 xiz, V3 gx, V3 gz, V3 l2m,
-                          V3 mu, V3 jac, V2 H, V2 Hw,
-                          const Kokkos::Array<float, cfg::N>& w, V3 force0,
+                          V3 mu, V3 jac, V2 H, V2 Hw, V1 w, V3 force0,
                           V3 force1, int team = kDagTeam) {
   auto [g, r0, r1] = sem_dag_graph_mo<cfg::TE_dag>(u0, u1, xix, xiz, gx, gz,
                                                    l2m, mu, jac, H, Hw, w);
@@ -1451,11 +1466,19 @@ int main(int argc, char* argv[]) {
     fill_field(jac, E, 8);
     Kokkos::Array<float, cfg::N> w{};
     fill_operators(H, Hw, w);
+    // The same weights as a device View, for the library implementations only.
+    // The hand-written kernels keep the Array, so they are an unchanged control
+    // for the Array-vs-View change inside WeightedSum.
+    Kokkos::View<float*, Kokkos::LayoutRight> wv_("w", cfg::N);
+    auto wvh = Kokkos::create_mirror_view(wv_);
+    for (int a = 0; a < cfg::N; ++a) wvh(a) = w[a];
+    Kokkos::deep_copy(wv_, wvh);
+    const V1 wv = wv_;
     Kokkos::fence();
 
     // Scratch, measured rather than estimated: the fused tree's real cost.
     auto node = library_node<0, cfg::TE_tree>(u0, u1, xix, xiz, gx, gz, l2m, mu,
-                                              jac, H, Hw, w);
+                                              jac, H, Hw, wv);
     using LibEval =
         Evaluator<TeamPolicyTag<>, decltype(node), CombFrc<cfg::TE_tree>>;
     const std::size_t sbytes =
@@ -1472,7 +1495,7 @@ int main(int argc, char* argv[]) {
     // tree's PER-COMPONENT figure -- it is doing twice the work for less.
     {
       auto [dg, dr0, dr1] = sem_dag_graph<cfg::TE_dag>(u0, u1, xix, xiz, gx, gz,
-                                                       l2m, mu, jac, H, Hw, w);
+                                                       l2m, mu, jac, H, Hw, wv);
       const auto outs     = dg.outputs(dr0, dr1);
       std::printf(
           "DAG scratch/team:     %zu bytes (both components, one launch)%s\n",
@@ -1485,7 +1508,7 @@ int main(int argc, char* argv[]) {
     // question that killed the previous attempt at this.
     {
       auto [dg, dr0, dr1] = sem_dag_graph_mo<cfg::TE_dag>(
-          u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H, Hw, w);
+          u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H, Hw, wv);
       const auto outs = dg.outputs(dr0, dr1);
       // Slots are POOLED by live range, so the store is no longer one buffer
       // per node output. The unpooled figure is printed beside it because the
@@ -1559,9 +1582,9 @@ int main(int argc, char* argv[]) {
     };
     auto run_lib = [&] {
       library_force<0, cfg::TE_tree>(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H,
-                                     Hw, w, fl0);
+                                     Hw, wv, fl0);
       library_force<1, cfg::TE_tree>(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H,
-                                     Hw, w, fl1);
+                                     Hw, wv, fl1);
     };
     run_base();
     run_lib();
@@ -1590,7 +1613,7 @@ int main(int argc, char* argv[]) {
     V3   fd0("fd0", E, cfg::N, cfg::N), fd1("fd1", E, cfg::N, cfg::N);
     auto run_dag = [&] {
       library_dag_force<cfg::TE_dag>(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H,
-                                     Hw, w, fd0, fd1);
+                                     Hw, wv, fd0, fd1);
     };
     run_dag();
     Kokkos::fence();
@@ -1608,7 +1631,7 @@ int main(int argc, char* argv[]) {
     V3   fm0("fm0", E, cfg::N, cfg::N), fm1("fm1", E, cfg::N, cfg::N);
     auto run_mo = [&] {
       library_dag_mo_force<cfg::TE_dag>(u0, u1, xix, xiz, gx, gz, l2m, mu, jac,
-                                        H, Hw, w, fm0, fm1);
+                                        H, Hw, wv, fm0, fm1);
     };
     run_mo();
     Kokkos::fence();
@@ -1632,13 +1655,13 @@ int main(int argc, char* argv[]) {
         const double a = seconds_of(
             [&] {
               library_dag_force<cfg::TE_dag>(u0, u1, xix, xiz, gx, gz, l2m, mu,
-                                             jac, H, Hw, w, fd0, fd1, ts);
+                                             jac, H, Hw, wv, fd0, fd1, ts);
             },
             warmup, reps);
         const double b = seconds_of(
             [&] {
               library_dag_mo_force<cfg::TE_dag>(u0, u1, xix, xiz, gx, gz, l2m,
-                                                mu, jac, H, Hw, w, fm0, fm1,
+                                                mu, jac, H, Hw, wv, fm0, fm1,
                                                 ts);
             },
             warmup, reps);
@@ -1728,7 +1751,7 @@ int main(int argc, char* argv[]) {
     // second output, but shares everything below them).
     auto run_lib1 = [&] {
       library_force<0, cfg::TE_tree>(u0, u1, xix, xiz, gx, gz, l2m, mu, jac, H,
-                                     Hw, w, fl0);
+                                     Hw, wv, fl0);
     };
     const double tl1 = seconds_of(run_lib1, warmup, reps);
     std::printf("%-30s %10.3f %14s %16s %8s\n", "  [diag] library, 1 component",
