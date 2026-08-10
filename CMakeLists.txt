@@ -118,6 +118,11 @@ add_executable(test_slot_node tests/test_slot_node.cpp)
 target_link_libraries(test_slot_node PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_slot_node)
 
+# test_adopted_output — custom main() wraps Kokkos init/finalize
+add_executable(test_adopted_output tests/test_adopted_output.cpp)
+target_link_libraries(test_adopted_output PRIVATE tensor GTest::gtest)
+gtest_discover_tests(test_adopted_output)
+
 # ---------------------------------------------------------------------------
 # Negative-compilation tests for the slot guards.
 #

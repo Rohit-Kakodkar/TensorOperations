@@ -424,6 +424,50 @@ struct Evaluator<TeamPolicyTag<ES>,
         alloc_a_(n.node_a, t.a, team),
         alloc_b_(n.node_b, t.b, team),
         alloc_c_(c_tile_, team) {
+    finish_construction(n, t);
+  }
+
+  // ADOPTING form: write the output into a buffer the CALLER already carved,
+  // instead of carving one from the team cursor.
+  //
+  // This is what lets a DAG driver own every intermediate. It carves one buffer
+  // per node up front and hands each evaluator its own, so a node's result
+  // outlives that evaluator and other nodes can name it (SlotTag) -- which a
+  // self-carving evaluator cannot offer, because its buffer's identity is
+  // decided by construction ORDER, and construction order is exactly what a
+  // shared graph cannot fix in advance.
+  //
+  // Only the C slot is adopted. A and B still carve their own staging buffers
+  // here, and still bump the cursor in declaration order, so a caller must
+  // request operand_scratch_size_per_team() for this evaluator ON TOP OF the
+  // buffer it hands in. Charging scratch_size_per_team() instead would
+  // double-count the output.
+  //
+  // Identical to the carving form in every other respect, and produces the same
+  // type: adoption is a constructor choice, not a type-level one, so nothing
+  // downstream needs to know which constructor ran.
+  KOKKOS_FUNCTION Evaluator(node_type n, tiling_type t,
+                            const team_member_t& team, scratch_view_t adopted_c)
+      : shape_(n.shape()),
+        a_shape_(n.node_a.shape()),
+        a_leaf_(Impl::canonical_c_tile<NA>(t.a)),
+        b_leaf_(Impl::canonical_c_tile<NB>(t.b)),
+        a_tile_(axes_a::to_canon_tile(a_leaf_)),
+        b_tile_(axes_b::to_canon_tile(b_leaf_)),
+        c_tile_(axes_c::to_canon_tile(t.c)),
+        alloc_a_(n.node_a, t.a, team),
+        alloc_b_(n.node_b, t.b, team),
+        alloc_c_(adopted_c) {
+    finish_construction(n, t);
+  }
+
+ private:
+  // Everything both constructors do once their allocators exist. Factored so
+  // the adopting form cannot drift from the carving one -- in particular so it
+  // cannot quietly lose GUARD B.
+  // `t` is read only by the guard, which compiles out under NDEBUG.
+  KOKKOS_FUNCTION void finish_construction(
+      const node_type& n, [[maybe_unused]] const tiling_type& t) {
     result_.hook_op  = n.hook_op;
     result_.storage_ = alloc_c_.get();
     // GUARD B, checked once per team rather than once per evaluation. See
@@ -440,6 +484,7 @@ struct Evaluator<TeamPolicyTag<ES>,
         "node rather than a slot.");
   }
 
+ public:
   // Does either operand name a buffer another node owns? Public because it
   // gates GUARD B below, and a driver deciding whether it must ask that
   // question needs to be able to see this one.
@@ -553,9 +598,22 @@ struct Evaluator<TeamPolicyTag<ES>,
   // (which only accepts that native bundle), an input operand sizes a staging
   // buffer of the canonical shape. The output (C) slot has no operand and so
   // no perm to apply.
+  // Everything this evaluator carves EXCEPT its output tile -- what the
+  // ADOPTING constructor still needs from the team, on top of the buffer handed
+  // to it. A caller that adopts must request this and NOT
+  // scratch_size_per_team(), which would double-count the output.
+  static std::size_t operand_scratch_size_per_team(const tiling_type& t) {
+    return alloc_a_t::bytes(t.a) + alloc_b_t::bytes(t.b);
+  }
+
+  // Stated as `output + operands` rather than as an independent third sum, so
+  // the two queries cannot drift apart: a driver that carves outputs itself and
+  // then charges operand_scratch_size_per_team() is asking for exactly the
+  // complement of what it allocated BY CONSTRUCTION, rather than by a test that
+  // has to remember to compare the two.
   static std::size_t scratch_size_per_team(const tiling_type& t) {
     return alloc_c_t::bytes(axes_c::to_canon_tile(t.c)) +
-           alloc_a_t::bytes(t.a) + alloc_b_t::bytes(t.b);
+           operand_scratch_size_per_team(t);
   }
 
  private:
@@ -1075,6 +1133,27 @@ struct Evaluator<TeamPolicyTag<ES>,
         op_allocs_(make_op_allocs(n, t, team, ops_seq{})),
         out_allocs_(make_out_allocs(t, team, outs_seq{})) {}
 
+  // ADOPTING form: write the NumOut outputs into buffers the caller already
+  // carved. Mirrors the contraction evaluator's adopting constructor; see it
+  // for why a DAG driver needs this at all.
+  //
+  // Takes one buffer per output because a multi-output combine really does own
+  // NumOut distinct tiles (out_allocs_ is already an array). All of them share
+  // one layout -- make_out_allocs builds every slot from the same
+  // output_tile(t) -- so they share a type and a Kokkos::Array carries them.
+  //
+  // The operand allocators still carve, and still bump the cursor in
+  // declaration order, so a caller must request operand_scratch_size_per_team()
+  // on top of the buffers it hands in.
+  KOKKOS_FUNCTION Evaluator(node_type n, tiling_type t,
+                            const team_member_t&                  team,
+                            Kokkos::Array<scratch_view_t, NumOut> adopted_out)
+      : fn_(n.fn),
+        shape_(n.shape()),
+        out_tile_(output_tile(t)),
+        op_allocs_(make_op_allocs(n, t, team, ops_seq{})),
+        out_allocs_(adopt_out_allocs(adopted_out, outs_seq{})) {}
+
   KOKKOS_FUNCTION result_type operator()(
       const team_member_t& team, Kokkos::Array<int, Rank> tile_idx) const {
     // Bring every operand tile into the combine's output order -- by staging a
@@ -1126,10 +1205,18 @@ struct Evaluator<TeamPolicyTag<ES>,
     return Impl::tile_count_along(out_tile_, d, shape_[d]);
   }
 
+  // Everything this evaluator carves EXCEPT its NumOut output tiles -- what the
+  // ADOPTING constructor still needs from the team. See the contraction
+  // evaluator's pair of the same name; the two are stated the same way for the
+  // same reason.
+  static std::size_t operand_scratch_size_per_team(const tiling_type& t) {
+    return operand_bytes(t);
+  }
+
   static std::size_t scratch_size_per_team(const tiling_type& t) {
     const out_tile_t out = output_tile(t);
     return static_cast<std::size_t>(NumOut) * out_alloc_t::bytes(out) +
-           operand_bytes(t);
+           operand_scratch_size_per_team(t);
   }
 
  private:
@@ -1234,6 +1321,14 @@ struct Evaluator<TeamPolicyTag<ES>,
       const tiling_type& t, const team_member_t& team,
       std::index_sequence<Ms...>) {
     return {(static_cast<void>(Ms), out_alloc_t{output_tile(t), team})...};
+  }
+
+  // The same, over buffers the caller carved. Carves nothing and takes no team.
+  template <std::size_t... Ms>
+  KOKKOS_FUNCTION static Kokkos::Array<out_alloc_t, NumOut> adopt_out_allocs(
+      const Kokkos::Array<scratch_view_t, NumOut>& adopted,
+      std::index_sequence<Ms...>) {
+    return {out_alloc_t{adopted[Ms]}...};
   }
 
   // Wrap each output allocator's scratch tile in an interm handle (NoHook: the
