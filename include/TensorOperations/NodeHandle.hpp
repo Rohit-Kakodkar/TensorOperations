@@ -16,6 +16,7 @@ struct InputTag {};
 struct IntermTag {};
 struct ContractionTag {};
 struct CombineTag {};
+struct SlotTag {};
 
 // Sentinel for "no hook"
 struct NoHook {};
@@ -36,12 +37,24 @@ namespace Impl {
 
 // Does Node instantiate NodeHandle with this tag? One trait covers all tags
 // (InputTag, ContractionTag, ...).
+//
+// The _v alias strips cv-ref before matching, and that is a safety property
+// rather than a convenience. A partial specialization on NodeHandle<Tag,...>
+// does not match `const NodeHandle<Tag,...>`, which is exactly what
+// `decltype(some_const_node)` yields -- so without the decay the trait answers
+// FALSE for a node it should recognize. Answering false is not inert: the
+// staging predicates in Evaluator.hpp are written as if-constexpr chains whose
+// fallthrough branch is the permissive one ("copied into its own buffer,
+// therefore shape-unconstrained"), so a cv-qualified node silently acquires
+// permissions its bare type is denied. Decay here, once, rather than at each of
+// the call sites that would have to remember.
 template <typename Tag, typename Node>
 struct has_node_tag : std::false_type {};
 template <typename Tag, typename... Args>
 struct has_node_tag<Tag, NodeHandle<Tag, Args...>> : std::true_type {};
 template <typename Tag, typename Node>
-inline constexpr bool has_node_tag_v = has_node_tag<Tag, Node>::value;
+inline constexpr bool has_node_tag_v =
+    has_node_tag<Tag, std::remove_cv_t<std::remove_reference_t<Node>>>::value;
 
 // Is T any NodeHandle instantiation? Guards factory operands against
 // structurally node-like non-node types: a CombineOutputHandle carries
@@ -51,8 +64,10 @@ template <typename T>
 struct is_node_handle : std::false_type {};
 template <typename Tag, typename... Args>
 struct is_node_handle<NodeHandle<Tag, Args...>> : std::true_type {};
+// Decayed for the same reason as has_node_tag_v above.
 template <typename T>
-inline constexpr bool is_node_handle_v = is_node_handle<T>::value;
+inline constexpr bool is_node_handle_v =
+    is_node_handle<std::remove_cv_t<std::remove_reference_t<T>>>::value;
 
 // Safely extracts T::value_type when it exists; falls back to void.
 template <typename T, typename = void>
@@ -128,6 +143,52 @@ struct NodeHandle<IntermTag, Storage, IntRank, ExecSpace, HookOp> {
 };
 
 // ---------------------------------------------------------------------------
+// Slot specialization — a LABELLED, read-only view of a buffer some OTHER node
+// owns.
+//
+// This is the node kind that lets a consumer NAME its operand rather than nest
+// that operand's whole subtree by value. Nesting is what makes a shared subtree
+// evaluate once PER CONSUMER (each ScratchAllocator holds its own inner
+// Evaluator, ScratchAllocator.hpp); naming it evaluates it once, full stop.
+//
+// Structurally this is an IntermTag node plus the two things an OPERAND needs
+// and IntermTag does not carry: `modes_seq`, from which the contraction
+// evaluator derives permA/permB, and `shape()`, which its k-tile counts index.
+// A distinct tag rather than widening IntermTag, which is used pervasively for
+// internal handoff between evaluators and whose Specializations 6/7/8 would all
+// have to absorb the extra parameters.
+//
+// DELIBERATELY NO HOOK, and that is load-bearing rather than an omission. A
+// hook is applied by writing back into the buffer it rides on (Evaluator/
+// Team.hpp Specializations 7 and 8), which is sound only while a buffer has
+// exactly one consumer. A slot exists in order to be shared, so the mutating
+// paths must be unreachable from it — carrying no hook member makes that
+// structural instead of a rule someone has to remember. The complementary
+// restriction, on in-place REORDERING, cannot be expressed structurally and is
+// stated in Impl::operand_stageable_v.
+//
+// Storage is the producing node's own output scratch view. Its type depends
+// only on (value_type, exec space, output tile) — never on the producing node —
+// so a slot is typeable from the tile alone, with no recursion into whatever
+// computed it.
+// ---------------------------------------------------------------------------
+template <typename Storage, typename IntRank, typename ExecSpace,
+          typename ModesSeq>
+struct NodeHandle<SlotTag, Storage, IntRank, ExecSpace, ModesSeq> {
+  using node_tag            = SlotTag;
+  static constexpr int Rank = IntRank::value;
+  using storage_type        = Storage;
+  using value_type          = typename Storage::value_type;
+  using exec_space          = ExecSpace;
+  using modes_seq           = ModesSeq;
+
+  Storage                  storage_;
+  Kokkos::Array<int, Rank> shape_;  // the PRODUCER's full output extents
+
+  KOKKOS_FUNCTION Kokkos::Array<int, Rank> shape() const { return shape_; }
+};
+
+// ---------------------------------------------------------------------------
 // Factory functions
 // ---------------------------------------------------------------------------
 
@@ -155,6 +216,31 @@ KOKKOS_FUNCTION auto make_interm_node(Storage storage, HookOp hook = {}) {
       "interm hook must be callable as op(i_0, ..., i_{Rank-1}, value_type&)");
   return NodeHandle<IntermTag, Storage, std::integral_constant<int, Rank>,
                     ExecSpace, HookOp>{std::move(storage), std::move(hook)};
+}
+
+// Slot node — label an existing buffer (a producing node's output scratch) so
+// it can be read as an operand.
+//
+// `shape` is the PRODUCER's full per-mode extents in the order the labels are
+// given, NOT the tile's: a consumer computes its k-tile counts against the
+// operand's global shape (Evaluator/Team.hpp, accumulate_block), exactly as it
+// does for an input operand's tensor extents.
+//
+// Two slot nodes MAY alias one buffer with different labels, and that is the
+// relabel mechanism. When a shared result has to be spelled in two consumers'
+// differing canonical orders, declare it twice rather than moving data; the
+// consumer whose labels do not match the storage order resolves the difference
+// through its own gather permutation, zero-copy (Impl::operand_relabelable_v).
+template <int32_t... Modes, typename Storage>
+KOKKOS_FUNCTION auto make_slot_node(
+    Storage storage, Kokkos::Array<int, sizeof...(Modes)> shape) {
+  constexpr int Rank = static_cast<int>(sizeof...(Modes));
+  using ExecSpace    = typename Impl::exec_space_of<Storage>::type;
+  using ModesSeq     = std::integer_sequence<int32_t, Modes...>;
+  static_assert(static_cast<int>(Storage::rank) == Rank,
+                "slot node: one label per storage mode");
+  return NodeHandle<SlotTag, Storage, std::integral_constant<int, Rank>,
+                    ExecSpace, ModesSeq>{std::move(storage), shape};
 }
 
 // ---------------------------------------------------------------------------

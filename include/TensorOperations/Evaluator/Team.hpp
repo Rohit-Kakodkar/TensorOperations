@@ -222,23 +222,26 @@ struct Evaluator<TeamPolicyTag<ES>, NodeHandle<InputTag, T, ModesSeq, HookOp>,
   static_assert(node_type::Rank == Rank,
                 "input staging tile must carry one extent per input mode");
 
-  node_type     node;
-  tiling_type   tiling;
-  tiled_input_t tiled_input_;
+  // EXPERIMENT E1: store only what operator() actually reads. `node` held a
+  // second copy of the tensor handle that tiled_input_ already owns, and
+  // `tiling` was consumed by tile_view in the constructor and never read again.
+  // Both were pure per-thread weight, duplicated once per nesting level.
+  [[no_unique_address]] HookOp hook_;
+  tiled_input_t                tiled_input_;
 
   // team is accepted (unused) to keep this constructor's call signature
   // identical to every other team-tier evaluator's — existing call sites
   // construct all of them uniformly as (node, tile, team).
   KOKKOS_FUNCTION Evaluator(node_type n, tiling_type t,
                             const team_member_t& team)
-      : node(n), tiling(t), tiled_input_(tile_view(n.handle, t)) {}
+      : hook_(n.hook_op), tiled_input_(tile_view(n.handle, t)) {}
 
   // Same (team, tile_idx) call signature as before; team is unused — this is
   // now pure pointer/layout arithmetic, no Kokkos::parallel_for.
   KOKKOS_FUNCTION result_type operator()(
       const team_member_t& team, Kokkos::Array<int, Rank> tile_idx) const {
     auto sv = subview_tile(tiled_input_, tile_idx);
-    return result_type{sv, node.hook_op};
+    return result_type{sv, hook_};
   }
 
   // Outer tile count along native dimension d (the operand's own declared
@@ -365,9 +368,15 @@ struct Evaluator<TeamPolicyTag<ES>,
   // The operands' full tiling specs (a nested Tile<A,B,C> bundle, when fused)
   // are not retained: only the allocators, built from them here, still need
   // them. What the evaluator itself works in is the leaf tiles below.
-  node_type      node;
-  a_leaf_t       a_leaf_;  // A's leaf tile, in A's own axis order
-  b_leaf_t       b_leaf_;  // B's leaf tile, in B's own axis order
+  // EXPERIMENT E2: `node` held the ENTIRE operand subtree (node_a, node_b),
+  // which alloc_a_/alloc_b_ already store again via their inner evaluators --
+  // so every node was resident twice per level, compounding down the tree.
+  // After construction only these two shapes are read, plus the hook, which
+  // result_ already carries.
+  Kokkos::Array<int, Rank>  shape_;    // was node.shape()
+  Kokkos::Array<int, RankA> a_shape_;  // was node.node_a.shape()
+  a_leaf_t                  a_leaf_;   // A's leaf tile, in A's own axis order
+  b_leaf_t                  b_leaf_;   // B's leaf tile, in B's own axis order
   a_out_canon_t  a_tile_;  // ... and in this contraction's canonical order
   b_out_canon_t  b_tile_;
   tile_c_canon_t c_tile_;
@@ -378,7 +387,8 @@ struct Evaluator<TeamPolicyTag<ES>,
 
   KOKKOS_FUNCTION Evaluator(node_type n, tiling_type t,
                             const team_member_t& team)
-      : node(n),
+      : shape_(n.shape()),
+        a_shape_(n.node_a.shape()),
         a_leaf_(Impl::canonical_c_tile<NA>(t.a)),
         b_leaf_(Impl::canonical_c_tile<NB>(t.b)),
         a_tile_(axes_a::to_canon_tile(a_leaf_)),
@@ -387,7 +397,7 @@ struct Evaluator<TeamPolicyTag<ES>,
         alloc_a_(n.node_a, t.a, team),
         alloc_b_(n.node_b, t.b, team),
         alloc_c_(c_tile_, team) {
-    result_.hook_op  = node.hook_op;
+    result_.hook_op  = n.hook_op;
     result_.storage_ = alloc_c_.get();
   }
 
@@ -421,8 +431,8 @@ struct Evaluator<TeamPolicyTag<ES>,
     int                      total_k_tiles = 1;
     for (int i = 0; i < NumK; ++i) {
       int native_dim = pA[FreeA + i];
-      n_k_tiles[i]   = Impl::tile_count_along(a_leaf_, native_dim,
-                                              node.node_a.shape()[native_dim]);
+      n_k_tiles[i] =
+          Impl::tile_count_along(a_leaf_, native_dim, a_shape_[native_dim]);
       total_k_tiles *= n_k_tiles[i];
     }
     // Mixed-radix counter (LSB fastest); carry-increment avoids per-step
@@ -441,7 +451,7 @@ struct Evaluator<TeamPolicyTag<ES>,
   }
 
   KOKKOS_FUNCTION int outer_extent_canon(int d) const noexcept {
-    return Impl::tile_count_along(c_tile_, d, node.shape()[d]);
+    return Impl::tile_count_along(c_tile_, d, shape_[d]);
   }
 
   // Each operand allocator is handed its own NATIVE tiling spec and derives its
@@ -954,17 +964,23 @@ struct Evaluator<TeamPolicyTag<ES>,
   using result_type   = Kokkos::Array<interm_type, NumOut>;
   using team_member_t = Impl::team_member_t<exec_space>;
 
-  node_type   node;
-  tiling_type tiling;      // the tile spec (plain output tile or CombineTile)
+  // EXPERIMENT E3: same trim. `node` carried the operand pack (which op_allocs_
+  // already holds via its inner evaluators) and `tiling` carried the whole
+  // nested bundle, both consumed during construction only. fn is genuinely
+  // per-element state and stays.
+  [[no_unique_address]] CombineFn fn_;
+  Kokkos::Array<int, Rank>        shape_;
+  out_tile_t                      out_tile_;
   op_allocs_t op_allocs_;  // one allocator / operand, each owning its scratch
   Kokkos::Array<out_alloc_t, NumOut> out_allocs_;  // one allocator / output
 
   KOKKOS_FUNCTION Evaluator(node_type n, tiling_type t,
                             const team_member_t& team)
-      : node(n),
-        tiling(t),
-        op_allocs_(make_op_allocs(node, tiling, team, ops_seq{})),
-        out_allocs_(make_out_allocs(tiling, team, outs_seq{})) {}
+      : fn_(n.fn),
+        shape_(n.shape()),
+        out_tile_(output_tile(t)),
+        op_allocs_(make_op_allocs(n, t, team, ops_seq{})),
+        out_allocs_(make_out_allocs(t, team, outs_seq{})) {}
 
   KOKKOS_FUNCTION result_type operator()(
       const team_member_t& team, Kokkos::Array<int, Rank> tile_idx) const {
@@ -979,7 +995,7 @@ struct Evaluator<TeamPolicyTag<ES>,
     // The interm handles wrapping each output allocator's scratch: built once
     // here, written through below, and returned as-is.
     const result_type results = make_results(outs_seq{});
-    const auto        f = node.fn;  // local copy: lambda captures no `this`
+    const auto        f       = fn_;  // local copy: lambda captures no `this`
     // All outputs share one layout, so the first drives the traversal.
     const scratch_view_t out0 = results[0].storage_;
     Impl::team_for_each_coord(team, out0, [=](auto coord) {
@@ -1014,7 +1030,7 @@ struct Evaluator<TeamPolicyTag<ES>,
   // Output tile count along canonical dim d (output order is canonical here).
   // Lets a parent treat this evaluator as an operand stager for fused chaining.
   KOKKOS_FUNCTION int outer_extent_canon(int d) const noexcept {
-    return Impl::tile_count_along(output_tile(tiling), d, node.shape()[d]);
+    return Impl::tile_count_along(out_tile_, d, shape_[d]);
   }
 
   static std::size_t scratch_size_per_team(const tiling_type& t) {
