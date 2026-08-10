@@ -17,9 +17,24 @@ KOKKOS_FORCEINLINE_FUNCTION int scratch_extent(const V& v) noexcept {
 // View a staged scratch tile as a 2D GEMM matrix: collapse the first `Split`
 // tile dims into rows and the rest into columns. Split is the free-mode count
 // for A / the contracted-mode count for B / the free-A count for C.
+//
+// The THREE-argument reshape, with the target order stated rather than inferred
+// from the source layout's kind. For the row-major scratch this always gets --
+// alloc_scratch_tile builds make_tile_layout(tile, LayoutRight{}) and nothing
+// else supplies a staged layout -- LayoutRight reproduces the two-argument
+// form's result type exactly, so this is behaviour- and codegen-neutral. It was
+// checked before the switch by asserting the two spellings agree at every call
+// site in the tree, and by diffing the emitted SASS.
+//
+// The order is fixed here only because the source's is. If a staged operand
+// ever reaches the GEMM in a non-row-major order -- the reason to want an
+// explicit order at all -- this argument has to be DERIVED from that layout,
+// not left as LayoutRight, and the collapse then needs a guard that it still
+// enumerates rows the way B and C do. Passing a constant here does not make
+// that case work; it only puts the parameter where it will go.
 template <int Split, typename View, typename Tile>
 KOKKOS_FORCEINLINE_FUNCTION auto as_matrix(const View& v, const Tile& t) {
-  return reshape(v, prefix_product(t, rank_c<Split>));
+  return reshape(v, prefix_product(t, rank_c<Split>), LayoutRight{});
 }
 
 // Ceil-division. The template form binds the divisor at compile time so the

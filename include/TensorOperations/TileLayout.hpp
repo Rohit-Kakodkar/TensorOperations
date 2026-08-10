@@ -283,6 +283,40 @@ struct SeqToTile<std::integer_sequence<int, E...>> {
 template <typename Seq>
 using seq_to_tile_t = typename SeqToTile<Seq>::type;
 
+// flat_view_t<NestedLayout> — the FLAT StaticLayout describing the same memory.
+//
+// A nested layout's mode grouping is a purely logical re-indexing: which
+// offsets exist, and in what memory order, is fixed by its leaves alone.
+// Concatenating the per-mode sequences therefore yields a flat layout with an
+// identical element→offset map, which is what lets reshape() accept a nested
+// source by forwarding rather than by growing a second planner.
+//
+// The three conventions line up with no translation, and the middle one is the
+// subtle one:
+//   • ext/str concatenate mode-major, so leaf i of the flat view is global leaf
+//     i of the nested one.
+//   • concat_seq_t<OrdSeqs...> is memory-position -> GLOBAL LEAF index, and a
+//     global leaf index IS the mode-major position — i.e. exactly the flat
+//     view's dimension index. See the comment above ReshapeModeSeq for why the
+//     per-mode slicing of `ord` looks wrong and is not; this alias is the
+//     second consumer of that invariant, so changing it breaks
+//     reshape-of-nested silently (the permutation static_assert below would
+//     still pass).
+//
+// Deliberately host-only, like everything else feeding the planner.
+template <typename L>
+struct FlatViewOf;
+
+template <typename... ExtSeqs, typename... StrSeqs, typename... OrdSeqs>
+struct FlatViewOf<StaticLayout<DeviceTuple<ExtSeqs...>, DeviceTuple<StrSeqs...>,
+                               DeviceTuple<OrdSeqs...>>> {
+  using type = StaticLayout<seq_to_tile_t<concat_seq_t<ExtSeqs...>>,
+                            concat_seq_t<StrSeqs...>, concat_seq_t<OrdSeqs...>>;
+};
+
+template <typename L>
+using flat_view_t = typename FlatViewOf<L>::type;
+
 // order_is_permutation, reached through a sequence rather than a loose pack.
 template <typename OrdSeq>
 struct OrderSeqIsPermutation;
@@ -910,7 +944,12 @@ namespace Impl {
 // Fixed capacities for the ragged plan below. A plan is a compile-time value,
 // so it cannot allocate; exceeding either bound is reported as CapacityExceeded
 // rather than silently truncated.
-inline constexpr int kReshapeMaxModes  = 8;
+//
+// Modes is 16 rather than 8 because tile_layout() reshapes a rank-N source into
+// 2N modes: at 8 it would have capped tiling at rank 4, where the hand-rolled
+// interleaving it replaced had no rank limit at all. With 16 leaves the real
+// ceiling is a rank-8 source, whose tiling needs exactly 16 of each.
+inline constexpr int kReshapeMaxModes  = 16;
 inline constexpr int kReshapeMaxLeaves = 16;
 
 enum class ReshapeStatus : int {
