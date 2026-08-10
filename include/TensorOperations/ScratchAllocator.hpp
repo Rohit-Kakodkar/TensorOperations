@@ -15,7 +15,8 @@
 //   OuterOpTag     — containing operation: ContractionTag, CombineTag
 //   NodeTypeOrTag  — either:
 //     • IntermTag                    — the output (C) slot; no operand node
-//     • a full operand NodeHandle    — InputTag or ContractionTag node
+//     • a full operand NodeHandle    — an InputTag leaf, or a fused node that
+//       produces its own scratch (ContractionTag / CombineTag)
 //   ValueType      — the scalar the slot's scratch is typed on. Chosen by the
 //     consuming evaluator (its own value_type), never derived per operand: a
 //     staging buffer holds the consumer's scalar regardless of the input
@@ -64,17 +65,25 @@ struct ScratchAllocator;
 // allocated exactly once and stage() never rebuilds the evaluator.
 // ---------------------------------------------------------------------------
 
-// ContractionTag operand: the inner evaluator already owns a C scratch tile
-// (allocated in its own constructor), so this form carves nothing of its own --
-// get() hands that buffer back directly (zero-copy, no cursor bump), valid for
-// either OuterOpTag and also for a PERMUTED operand, which the consumer stages
-// by reordering that same buffer in place rather than by copying it elsewhere.
-// bytes() is the inner evaluator's full recursive scratch_size_per_team and
-// ignores PermSeq: neither the zero-copy nor the in-place-reorder path costs a
-// byte beyond it.
+// Fused operand (ContractionTag or CombineTag -- see produces_own_scratch_v):
+// the inner evaluator already owns its output scratch tile (allocated in its
+// own constructor), so this form carves nothing of its own -- get() hands that
+// buffer back directly (zero-copy, no cursor bump), valid for either OuterOpTag
+// and also for a PERMUTED operand, which the consumer stages by reordering that
+// same buffer in place rather than by copying it elsewhere. bytes() is the
+// inner evaluator's full recursive scratch_size_per_team and ignores PermSeq:
+// neither the zero-copy nor the in-place-reorder path costs a byte beyond it.
+//
+// One specialization covers both fused kinds because the containing operation
+// only ever asks three things of an operand -- its scratch view type, that
+// buffer, and "evaluate yourself at this tile" -- and a combine answers all
+// three the same way a contraction does. The single asymmetry is that a
+// combine's operator() returns one interm PER OUTPUT, normalized by
+// Impl::single_result (which is also where the phase-1 NumOut == 1 restriction
+// is stated).
 template <typename ES, typename OuterOpTag, typename NA, typename V,
           typename TileA, typename PermSeq>
-  requires(Impl::has_node_tag_v<ContractionTag, NA>)
+  requires(Impl::produces_own_scratch_v<NA>)
 struct ScratchAllocator<TeamPolicyTag<ES>, OuterOpTag, NA, V, TileA, PermSeq> {
   using inner_eval_t   = Evaluator<TeamPolicyTag<ES>, NA, TileA>;
   using team_member_t  = Impl::team_member_t<ES>;
@@ -92,7 +101,7 @@ struct ScratchAllocator<TeamPolicyTag<ES>, OuterOpTag, NA, V, TileA, PermSeq> {
   KOKKOS_FUNCTION scratch_view_t get() const { return eval_.scratch(); }
   template <typename Team, typename Idx>
   KOKKOS_FUNCTION auto stage(const Team& team, const Idx& idx) const {
-    return eval_(team, idx);
+    return Impl::single_result(eval_(team, idx));
   }
 };
 
