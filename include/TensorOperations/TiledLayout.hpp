@@ -42,6 +42,51 @@ KOKKOS_FUNCTION Kokkos::Array<int, N> argsort_by_stride(
   return order;
 }
 
+// The same order, KNOWN FROM THE LAYOUT TYPE instead of sorted.
+//
+// A Kokkos LayoutRight view has non-increasing strides by construction, so its
+// ascending-stride order is always {N-1, ..., 0}; LayoutLeft's is always
+// {0, ..., N-1}. Sorting to rediscover that is not merely redundant, it is
+// EXPENSIVE IN THE WORST WAY: argsort_by_stride indexes `order` and `strides`
+// by loop variables, and a dynamically indexed array cannot live in registers,
+// so every thread gets both arrays in LOCAL memory and every comparison is a
+// local round trip. Measured on the SEM DAG (ncu, TE=16, team 256): the
+// comparison alone was the single largest long_scoreboard line in the kernel at
+// 17.9%, with the swap adding 4.6%, and the sort's four lines accounted for 29%
+// of all local-memory sectors.
+//
+// These return the identical permutation the sort would, for the layouts they
+// claim -- checked against argsort_by_stride in tests/test_tiled_layout.cpp,
+// including the tied-stride cases a unit extent produces.
+template <int N>
+KOKKOS_FUNCTION constexpr Kokkos::Array<int, N> right_order_array() noexcept {
+  Kokkos::Array<int, N> order{};
+  for (int i = 0; i < N; ++i) order[i] = N - 1 - i;
+  return order;
+}
+template <int N>
+KOKKOS_FUNCTION constexpr Kokkos::Array<int, N> left_order_array() noexcept {
+  Kokkos::Array<int, N> order{};
+  for (int i = 0; i < N; ++i) order[i] = i;
+  return order;
+}
+
+// Memory order for a view of ViewType: decided at COMPILE TIME where the layout
+// fixes it, and sorted only where it genuinely varies (LayoutStride, or any
+// layout this does not recognise). Same dispatch the subview_tile overloads
+// already make on array_layout -- this closes the one path that still sorted.
+template <typename ViewType, int N>
+KOKKOS_FUNCTION Kokkos::Array<int, N> memory_order_of(
+    const Kokkos::Array<int, N>& strides) noexcept {
+  using layout_t = typename ViewType::array_layout;
+  if constexpr (std::is_same_v<layout_t, Kokkos::LayoutRight>)
+    return right_order_array<N>();
+  else if constexpr (std::is_same_v<layout_t, Kokkos::LayoutLeft>)
+    return left_order_array<N>();
+  else
+    return argsort_by_stride<N>(strides);
+}
+
 // Per-dimension reciprocal 1/extent, for divide-free (reciprocal-multiply)
 // decode on device.
 template <int N>
@@ -62,10 +107,13 @@ struct TiledLayoutResult {
   Kokkos::Array<float, N> inner_inv_extents;
 };
 
+// The inner order is a PARAMETER, not something this derives, so a caller that
+// knows it from the layout type does not pay a sort. The delegating overload
+// below keeps the sorting behaviour for callers that do not.
 template <int N>
 KOKKOS_FUNCTION TiledLayoutResult<N> compute_tiled_layout(
     Kokkos::Array<int, N> extents, Kokkos::Array<int, N> strides,
-    Kokkos::Array<int, N> tile_sizes) {
+    Kokkos::Array<int, N> tile_sizes, Kokkos::Array<int, N> inner_order) {
   TiledLayoutResult<N>  r{};
   Kokkos::Array<int, N> inner_extents{};  // tile size clamped to orig extent
   for (int d = 0; d < N; ++d) {
@@ -76,9 +124,17 @@ KOKKOS_FUNCTION TiledLayoutResult<N> compute_tiled_layout(
     r.outer_strides[d] = T * strides[d];
     r.inner_strides[d] = strides[d];
   }
-  r.inner_order       = argsort_by_stride<N>(r.inner_strides);
+  r.inner_order       = inner_order;
   r.inner_inv_extents = reciprocals<N>(inner_extents);
   return r;
+}
+
+template <int N>
+KOKKOS_FUNCTION TiledLayoutResult<N> compute_tiled_layout(
+    Kokkos::Array<int, N> extents, Kokkos::Array<int, N> strides,
+    Kokkos::Array<int, N> tile_sizes) {
+  return compute_tiled_layout<N>(extents, strides, tile_sizes,
+                                 argsort_by_stride<N>(strides));
 }
 
 }  // namespace Impl
@@ -700,7 +756,11 @@ KOKKOS_FUNCTION auto tile_view(const ViewType& view, Tile tile)
     tsizes[d]  = tile.extent(d);
   }
 
-  const auto r = Impl::compute_tiled_layout<N>(extents, strides, tsizes);
+  // The order comes from ViewType's layout, not from sorting these strides --
+  // see Impl::memory_order_of. This runs per thread on device, so a sort here
+  // is 29% of the kernel's local-memory traffic for an answer the type knows.
+  const auto r = Impl::compute_tiled_layout<N>(
+      extents, strides, tsizes, Impl::memory_order_of<ViewType, N>(strides));
   return {view, LT{make_tile_layout(tile, LayoutRight{}), r}};
 }
 
