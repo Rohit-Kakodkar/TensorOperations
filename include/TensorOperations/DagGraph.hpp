@@ -428,11 +428,13 @@ KOKKOS_FUNCTION auto dag_adopted_arg(const Store& store,
 
 // Evaluate node K: bind its slot operands, adopt its own slots, run it at the
 // index gathered from the root's.
-template <std::size_t K, typename ES, typename RootNode, typename Team,
-          typename NodesT, typename TilesT, typename Store, std::size_t RootR>
+template <std::size_t K, typename ES, typename RootNode, typename ValueT,
+          typename Team, typename NodesT, typename TilesT, typename Store,
+          std::size_t RootR>
 KOKKOS_FUNCTION void dag_run_node(const Team& team, const NodesT& nodes,
                                   const TilesT& tiles, const Store& store,
-                                  const Kokkos::Array<int, RootR>& root_idx) {
+                                  const Kokkos::Array<int, RootR>& root_idx,
+                                  ValueT* operand_base) {
   using Node = tuple_element_t<K, NodesT>;
   using Gather =
       dag_gather_seq_t<typename Node::modes_seq, typename RootNode::modes_seq>;
@@ -441,9 +443,14 @@ KOKKOS_FUNCTION void dag_run_node(const Team& team, const NodesT& nodes,
 
   const auto idx   = dag_node_index<Node::Rank, RootR>(root_idx, Gather{});
   auto       bound = bind_slots(nodes.template get<K>(), store);
-  auto       eval  = make_evaluator<TeamPolicyTag<ES>>(
+  // A FRESH arena per node is the reset: operand staging is dead at this node's
+  // barrier, so every node starts at the region's base and the driver only ever
+  // reserved the largest node's worth. `arena` is a local, so the cursor lives
+  // in registers and no thread has to publish it.
+  OperandArena<ValueT> arena{operand_base, 0};
+  auto                 eval = make_evaluator<TeamPolicyTag<ES>>(
       bound, tiles.template get<K>(), team,
-      dag_adopted_arg<Node, Base>(store, std::make_index_sequence<M>{}));
+      dag_adopted_arg<Node, Base>(store, std::make_index_sequence<M>{}), arena);
   eval(team, idx);
   // Node K's result must be visible before any later node reads it. The
   // contraction evaluator ends its k-loop with a barrier, but the combine
@@ -451,13 +458,17 @@ KOKKOS_FUNCTION void dag_run_node(const Team& team, const NodesT& nodes,
   team.team_barrier();
 }
 
-template <typename ES, typename RootNode, typename Team, typename NodesT,
-          typename TilesT, typename Store, std::size_t RootR, std::size_t... Ks>
+template <typename ES, typename RootNode, typename ValueT, typename Team,
+          typename NodesT, typename TilesT, typename Store, std::size_t RootR,
+          std::size_t... Ks>
 KOKKOS_FUNCTION void dag_run_all(const Team& team, const NodesT& nodes,
                                  const TilesT& tiles, const Store& store,
                                  const Kokkos::Array<int, RootR>& root_idx,
+                                 ValueT*                          operand_base,
                                  std::index_sequence<Ks...>) {
-  (dag_run_node<Ks, ES, RootNode>(team, nodes, tiles, store, root_idx), ...);
+  (dag_run_node<Ks, ES, RootNode, ValueT>(team, nodes, tiles, store, root_idx,
+                                          operand_base),
+   ...);
 }
 
 // Write one root SLOT out to its global view, through the existing store
@@ -553,6 +564,69 @@ std::size_t dag_pool_bytes(const TilesT& tiles, std::index_sequence<Ps...>) {
           dag_pool_elems<NodesT, RootsSeq, TilesT>(tiles, Ps, slots_seq{})));
 }
 
+// One node's operand staging, named so the max fold below can call it twice
+// without spelling the evaluator type out each time.
+// HOST-ONLY: operand_scratch_size_per_team is a host function, so naming it in
+// device code buys warning #20011 and a runtime trap. The kernel never asks for
+// a size -- it is handed the element count the host computed.
+template <typename ES, typename NodesT, typename TilesT, std::size_t K>
+std::size_t dag_node_operand_bytes(const TilesT& tiles) {
+  return dag_eval_t<ES, tuple_element_t<K, NodesT>,
+                    tuple_element_t<K, TilesT>>::
+      operand_scratch_size_per_team(tiles.template get<K>());
+}
+
+// Operand staging for the whole graph: the LARGEST node's requirement, not the
+// sum over nodes.
+//
+// Every node's operand buffers die at that node's team_barrier, so no two
+// nodes' are ever live together, and the largest node's total is a hard lower
+// bound -- one this reaches exactly.
+//
+// That is also why this is a max of SUMS rather than, as the slot store does, a
+// sum of per-pool maxima. Pooling would pin each operand buffer to one offset
+// across every node, and max-of-sums <= sum-of-maxes always: for a graph whose
+// nodes want their large operand in different positions the gap approaches 2x.
+// Operand live ranges are all [K,K], so the interval graph is a disjoint union
+// of cliques and the optimal plan degenerates to "reset a cursor per node" --
+// there is nothing for a colouring pass to discover.
+template <typename V, typename ES, typename NodesT, typename TilesT,
+          std::size_t... Ks>
+std::size_t dag_operand_bytes_max(const TilesT& tiles,
+                                  std::index_sequence<Ks...>) {
+  std::size_t m = 0;
+  ((m = dag_node_operand_bytes<ES, NodesT, TilesT, Ks>(tiles) > m
+            ? dag_node_operand_bytes<ES, NodesT, TilesT, Ks>(tiles)
+            : m),
+   ...);
+  return m;
+}
+
+// The same in ELEMENTS, for the device-side carve; rounded up so a partial
+// element cannot truncate the region.
+template <typename V, typename ES, typename NodesT, typename TilesT,
+          std::size_t... Ks>
+std::size_t dag_operand_elems(const TilesT& tiles, std::index_sequence<Ks...>) {
+  return (dag_operand_bytes_max<V, ES, NodesT, TilesT>(
+              tiles, std::index_sequence<Ks...>{}) +
+          sizeof(V) - 1) /
+         sizeof(V);
+}
+
+// What the arena carve actually CONSUMES from the team cursor, which is what
+// the launcher must request -- not dag_operand_bytes_max, because shmem_size
+// rounds up and the difference is real scratch. Host and device must agree here
+// exactly: under-requesting by even one rounding step overruns the team's
+// allocation and faults the kernel, and it faults ONLY on GPU, because Serial's
+// 32 KB is slack enough to absorb it. Learned the hard way.
+template <typename V, typename ES, typename NodesT, typename TilesT,
+          std::size_t... Ks>
+std::size_t dag_arena_bytes(const TilesT& tiles, std::index_sequence<Ks...>) {
+  return scratch_backing_t<V, ES>::shmem_size(
+      dag_operand_elems<V, ES, NodesT, TilesT>(tiles,
+                                               std::index_sequence<Ks...>{}));
+}
+
 // Carve the pools, then place every slot in the one its live range earned it.
 //
 // Two bump allocations where there used to be one per slot: the POOLS come off
@@ -598,8 +672,8 @@ KOKKOS_FUNCTION auto dag_carve_store(const Team& team, const TilesT& tiles,
 template <typename ValueType, typename ES, typename NodesT, typename TilesT,
           typename RootsSeq, typename... ViewTs>
 int execute_dag_team(const NodesT& nodes, const TilesT& tiles,
-                     std::size_t bytes, int team_size, RootsSeq roots,
-                     const ViewTs&... views) {
+                     std::size_t bytes, std::size_t arena_elems_in,
+                     int team_size, RootsSeq roots, const ViewTs&... views) {
   using member_t               = team_member_t<ES>;
   constexpr std::size_t NNodes = tuple_size_v<NodesT>;
   using all_seq                = std::make_index_sequence<NNodes>;
@@ -616,6 +690,9 @@ int execute_dag_team(const NodesT& nodes, const TilesT& tiles,
       canonical_c_tile<GridNode>(tiles.template get<NNodes - 1>());
 
   const int wk = work_items(grid_node, grid_tile);
+  // Captured by value into the kernel: the arena's size is a HOST computation
+  // (see dag_node_operand_bytes) and the device is only told how big it is.
+  const std::size_t arena_elems = arena_elems_in;
 
   // Kokkos::AUTO is a poor default HERE and measurably so. It sizes the team
   // from OCCUPANCY alone, which is the wrong objective for a graph whose work
@@ -664,7 +741,15 @@ int execute_dag_team(const NodesT& nodes, const TilesT& tiles,
         const auto store = dag_carve_store<ValueType, ES, NodesT, RootsSeq>(
             team, td, slots_seq{});
 
-        dag_run_all<ES, GridNode>(team, nd, td, store, grid_idx, all_seq{});
+        // ONE operand-staging region for the whole graph, sized by the largest
+        // node. Carved after the slot pools so both come off the team cursor in
+        // a predictable order.
+        ValueType* const operand_base =
+            scratch_backing_t<ValueType, ES>(team.team_scratch(0), arena_elems)
+                .data();
+
+        dag_run_all<ES, GridNode, ValueType>(team, nd, td, store, grid_idx,
+                                             operand_base, all_seq{});
         dag_store_roots<ES, GridNode, member_t, NodesT>(team, td, store,
                                                         grid_idx, varr, roots);
       });
@@ -692,7 +777,9 @@ struct DagOutputs {
   std::size_t slot_bytes() const {
     return dag.template pooled_slot_bytes<Roots...>();
   }
-  std::size_t operand_bytes() const { return dag.operand_bytes(); }
+  // The arena, not the sum: this is what the launch requests.
+  // dag.operand_bytes() is still the un-pooled bound if you want the ratio.
+  std::size_t operand_bytes() const { return dag.arena_bytes(); }
   std::size_t scratch_bytes() const { return slot_bytes() + operand_bytes(); }
 
   // Pools the store carves, against dag.slot_bytes()'s one-per-slot. The ratio
@@ -777,8 +864,24 @@ struct DagGraph {
   // What the evaluators still carve once their outputs are adopted -- the
   // complement of the store, never scratch_size_per_team(), which would charge
   // every output twice.
+  // The un-pooled bound: every node's operand staging charged at once. Kept as
+  // the honest denominator for what the arena buys; arena_bytes() is what the
+  // launcher actually requests.
   std::size_t operand_bytes() const {
     return operand_bytes_impl(std::make_index_sequence<N>{});
+  }
+
+  // What the OPERAND ARENA needs: the largest single node's staging, because no
+  // two nodes' operand buffers are ever live at once. Independent of the root
+  // set, unlike the slot pools.
+  std::size_t arena_bytes() const {
+    return Impl::dag_arena_bytes<ValueType, ExecSpace, NodesT, TilesT>(
+        tiles, std::make_index_sequence<N>{});
+  }
+  // The same region measured in elements, which is what the device carve wants.
+  std::size_t arena_elems() const {
+    return Impl::dag_operand_elems<ValueType, ExecSpace, NodesT, TilesT>(
+        tiles, std::make_index_sequence<N>{});
   }
   std::size_t scratch_bytes() const { return slot_bytes() + operand_bytes(); }
 
@@ -815,8 +918,8 @@ struct DagGraph {
            "cannot be gathered from the grid node's. Retile so every shared "
            "mode matches and every unshared mode has one tile.");
     return Impl::execute_dag_team<ValueType, ES>(
-        nodes, tiles, pooled_slot_bytes<Roots...>() + operand_bytes(),
-        team_size, std::index_sequence<Roots...>{}, views...);
+        nodes, tiles, pooled_slot_bytes<Roots...>() + arena_bytes(),
+        arena_elems(), team_size, std::index_sequence<Roots...>{}, views...);
   }
 
  private:

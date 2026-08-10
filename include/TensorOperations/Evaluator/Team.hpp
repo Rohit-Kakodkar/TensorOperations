@@ -135,10 +135,55 @@ KOKKOS_FORCEINLINE_FUNCTION auto alloc_scratch_tile_at(ValueType*  ptr,
   return ScratchView<ValueType, ES, tile_layout_t>{backing, layout};
 }
 
+// A bump arena over a region the DRIVER owns, for OPERAND STAGING.
+//
+// Operand staging is the shortest-lived scratch in the library: a node stages
+// its operands, runs, and is done with them at its own team_barrier. But every
+// ScratchAllocator carves from the team cursor, and Kokkos never rewinds that,
+// so a driver must request the SUM over nodes for buffers of which only ONE
+// node's are ever live. On the SEM DAG at TE=16 that is 18,528 B where the
+// largest single node needs 4,352.
+//
+// So the driver carves ONE region sized by the largest node and hands each node
+// a fresh arena over it. Resetting is not an operation -- a new arena per node
+// IS the reset, which is why this holds an offset rather than living anywhere.
+//
+// PER-THREAD BY DESIGN, and that is not a bug: every thread of a team executes
+// the same constructor sequence with the same tiles, so every thread computes
+// the same offsets. Keeping the cursor in a register avoids the shared-memory
+// write and the barrier that a team-wide cursor would need.
+template <typename ValueType>
+struct OperandArena {
+  ValueType*  base   = nullptr;
+  std::size_t offset = 0;  // bytes consumed so far
+
+  KOKKOS_FUNCTION ValueType* take(std::size_t bytes) noexcept {
+    auto* p =
+        reinterpret_cast<ValueType*>(reinterpret_cast<char*>(base) + offset);
+    offset += bytes;
+    return p;
+  }
+};
+
+// KOKKOS_FUNCTION because the operand arena advances by exactly this on DEVICE.
+// Without it nvcc emits only warning #20011 and the kernel traps at runtime as
+// "unspecified launch failure" while the CPU build stays green.
 template <typename ValueType, typename ES, typename Tile>
-std::size_t scratch_tile_bytes(const Tile& tile) {
+KOKKOS_FUNCTION std::size_t scratch_tile_bytes(const Tile& tile) {
   return scratch_backing_t<ValueType, ES>::shmem_size(
       static_cast<std::size_t>(make_tile_layout(tile, LayoutRight{}).size()));
+}
+
+// Advance an arena by exactly what scratch_tile_bytes charges for this tile, so
+// a node's total consumption equals its operand_scratch_size_per_team() BY
+// CONSTRUCTION -- the sizing query and the allocation cannot drift, and the
+// arena stays aligned because every step is a multiple of Kokkos's own
+// shmem_size granularity over an already-aligned base.
+template <typename ValueType, typename ES, typename Tile>
+KOKKOS_FORCEINLINE_FUNCTION auto alloc_scratch_tile_from(
+    OperandArena<ValueType>& arena, const Tile& tile) {
+  return alloc_scratch_tile_at<ValueType, ES>(
+      arena.take(scratch_tile_bytes<ValueType, ES>(tile)), tile);
 }
 
 // CRTP mix-in supplying the proxy-assignment calling convention
@@ -475,6 +520,27 @@ struct Evaluator<TeamPolicyTag<ES>,
         c_tile_(axes_c::to_canon_tile(t.c)),
         alloc_a_(n.node_a, t.a, team),
         alloc_b_(n.node_b, t.b, team),
+        alloc_c_(adopted_c) {
+    finish_construction(n, t);
+  }
+
+  // The same, with the A/B staging buffers taken from a driver-owned ARENA
+  // rather than the team cursor. Operand staging dies at the node's barrier, so
+  // one region sized by the largest node serves every node -- see
+  // Impl::OperandArena. Output is adopted here too, so this form carves nothing
+  // from the team at all.
+  KOKKOS_FUNCTION Evaluator(node_type n, tiling_type t,
+                            const team_member_t& team, scratch_view_t adopted_c,
+                            Impl::OperandArena<value_type>& arena)
+      : shape_(n.shape()),
+        a_shape_(n.node_a.shape()),
+        a_leaf_(Impl::canonical_c_tile<NA>(t.a)),
+        b_leaf_(Impl::canonical_c_tile<NB>(t.b)),
+        a_tile_(axes_a::to_canon_tile(a_leaf_)),
+        b_tile_(axes_b::to_canon_tile(b_leaf_)),
+        c_tile_(axes_c::to_canon_tile(t.c)),
+        alloc_a_(n.node_a, t.a, team, arena),
+        alloc_b_(n.node_b, t.b, team, arena),
         alloc_c_(adopted_c) {
     finish_construction(n, t);
   }
@@ -1172,6 +1238,19 @@ struct Evaluator<TeamPolicyTag<ES>,
         op_allocs_(make_op_allocs(n, t, team, ops_seq{})),
         out_allocs_(adopt_out_allocs(adopted_out, outs_seq{})) {}
 
+  // Arena form of the adopting constructor: operand staging comes from the
+  // driver's region instead of the team cursor. Operands that carve nothing (a
+  // slot names another node's buffer) leave the arena untouched.
+  KOKKOS_FUNCTION Evaluator(node_type n, tiling_type t,
+                            const team_member_t&                  team,
+                            Kokkos::Array<scratch_view_t, NumOut> adopted_out,
+                            Impl::OperandArena<value_type>&       arena)
+      : fn_(n.fn),
+        shape_(n.shape()),
+        out_tile_(output_tile(t)),
+        op_allocs_(make_op_allocs(n, t, team, arena, ops_seq{})),
+        out_allocs_(adopt_out_allocs(adopted_out, outs_seq{})) {}
+
   KOKKOS_FUNCTION result_type operator()(
       const team_member_t& team, Kokkos::Array<int, Rank> tile_idx) const {
     // Bring every operand tile into the combine's output order -- by staging a
@@ -1331,6 +1410,18 @@ struct Evaluator<TeamPolicyTag<ES>,
       std::index_sequence<Ks...>) {
     return op_allocs_t{op_alloc_t<Ks>{n.operands.template get<Ks>(),
                                       native_op_tile<Ks>(t), team}...};
+  }
+
+  // Arena form. Braced-init again, so the operands consume the arena in
+  // DECLARATION ORDER -- the same guarantee carve_slot_store relies on, and
+  // here it is what makes a node's arena consumption match the bytes its
+  // operand_scratch_size_per_team() reports.
+  template <std::size_t... Ks>
+  KOKKOS_FUNCTION static op_allocs_t make_op_allocs(
+      const node_type& n, const tiling_type& t, const team_member_t& team,
+      Impl::OperandArena<value_type>& arena, std::index_sequence<Ks...>) {
+    return op_allocs_t{op_alloc_t<Ks>{n.operands.template get<Ks>(),
+                                      native_op_tile<Ks>(t), team, arena}...};
   }
 
   // One IntermTag allocator per output slot, each carving its own tile.
