@@ -1,5 +1,26 @@
 # SEM stiffness: where the library's 4.26x gap actually comes from
 
+> ## CURRENT STATE, 2026-08-03 — Tasks 1-5 are all DONE. The gap is **1.24x on GPU, 1.08x on CPU**.
+>
+> This document was written when the library was 4.26x slower than a hand-written kernel and
+> the leading hypothesis was wrong. What actually closed it, in the order it was measured:
+>
+> | | GPU (E=2.5M) | CPU (E=16384) |
+> |---|---|---|
+> | hand-written baseline | 9.739 ms | 41.736 ms |
+> | library tree, as this document found it | 41.5 ms (4.26x) | 154.5 ms (3.69x) |
+> | + task 5, index arithmetic | 33.196 ms (3.41x) | 107.133 ms (2.57x) |
+> | + task 4, fan-out dedup (DAG) | 14.979 ms (1.53x) | 58.486 ms (1.40x) |
+> | + task 3, multi-output F stage | **12.068 ms (1.24x)** | **45.204 ms (1.08x)** |
+>
+> Every row `PASS`es at `max rel diff 0.00e+00`. The library now beats **`CONTROL-C`**, the
+> hand-written kernel reproducing the DAG's work profile, on both backends (0.96x / 0.72x) —
+> so the remaining gap is against the *baseline* only, and it is what two nodes that cannot
+> share modes (`{q,e,j}` vs `{q,e,i}`) inherently cost, plus the residual of Task 5.
+>
+> The rest of this document is the record of how that was found, including three claims it
+> made and later had to retract. Those retractions are kept in place deliberately.
+
 **Status:** measured 2026-08-01 on `feat/fused-combine-operands`, H100 NVL (sm_80
 build, PTX JIT) and Serial/AVX-512. All numbers below are `min` of 3 reps after
 1 warmup, `E = 2500000` (GPU) / `E = 16384` (CPU). Tasks 1 and 2 are **done**;
@@ -408,7 +429,90 @@ touching the graph semantics. Task 5 is therefore promoted and scoped below.
 
 ---
 
-### Task 3 — Multi-output combine as a fused operand (phase 2)
+### Task 3 — Multi-output combine
+
+> ### ✅ DONE 2026-08-03, and **not** the way this entry scopes it below.
+>
+> The corrected scope (options B+C, the tree-evaluator plumbing) was overtaken by Task 4.
+> Once the DAG landed, the whole task reduced to **letting a DAG node own more than one
+> slot** — the sharing machinery the tree lacked is exactly what makes a multi-output node
+> cheap. Neither `Impl::single_result` nor `CombineOutputHandle` was touched, so none of
+> the public-API stickiness this entry warned about was incurred.
+>
+> The SEM graph now runs as **12 nodes owning 14 slots**: 4 gradients, **two 2-output stress
+> integrands**, 4 divergences, 2 weighted sums. `max rel diff 0.00e+00` on both backends.
+>
+> | | DAG | DAG-MO | |
+> |---|---|---|---|
+> | GPU (E=2.5M) | 14.979 ms | **12.068 ms** | **1.24x faster** |
+> | CPU (E=16384) | 58.486 ms | **45.204 ms** | **1.29x faster** |
+> | scratch/team | 20,688 B | **20,688 B** | unchanged |
+> | stress evals | 4 | **2** | |
+> | aux global traffic | 4x | **2x** | |
+> | gap to baseline, GPU | 1.53x | **1.24x** | |
+> | gap to baseline, CPU | 1.40x | **1.08x** | |
+>
+> **`CONTROL-C` is no longer the floor for this row.** It carries four stress evals, so
+> DAG-MO does strictly less work than any hand-written control in this benchmark: 0.72x of
+> `CONTROL-C` on CPU and **0.96x on GPU** — on both backends the library is now faster than
+> the hand-written kernel with the DAG's work profile. The hand-written **baseline** is the
+> only bound left.
+>
+> #### The team size was stale, and re-sweeping it was worth more than expected
+>
+> `kDagTeam` was 128, tuned for the 14-node DAG. A sweep over the new graph found **64**,
+> worth 1.11x on the DAG and 1.15x on DAG-MO — so the GPU rows above are the re-tuned ones
+> and both DAG rows moved. The sweep now runs in **every** benchmark invocation, because a
+> hardcoded value tuned for a graph that no longer exists is invisible otherwise.
+>
+> The optimum is interior (32 is worse again) and it is **low occupancy, 21.6%**, which is
+> worth recording because "raise occupancy" is the reflex it defeats:
+>
+> | block | occupancy | warp-inst | **fp32-inst** | barrier stall | time |
+> |---|---|---|---|---|---|
+> | 64 | **21.6%** | 143.9 M | **574 M** | 1.01 | **800.8 us** |
+> | 128 | **42.8%** | 190.3 M | **577 M** | 3.61 | 843.8 us |
+>
+> (`ncu`, H100, E=65536, the DAG row.) Doubling the team doubles resident warps and buys
+> **0.5% more floating-point work** — fp32 is flat because the useful work is fixed by the
+> `TE*N*N = 256`-point tile. What the extra warps do instead is execute the loop scaffolding
+> and index arithmetic anyway (+32% warp-instructions) and participate in every one of the
+> graph's ~14 `team_barrier()`s (3.6x the barrier stall ratio). This is the same lesson
+> Task 4 recorded and then had to relearn: occupancy counts RESIDENT warps, not useful ones,
+> and past the tile's parallelism the two diverge.
+>
+> #### What made it small
+>
+> Everything on the producer side already existed. The combine evaluator has held
+> `Kokkos::Array<out_alloc_t, NumOut> out_allocs_` (`Evaluator/Team.hpp:1126`) and an
+> adopting constructor taking `Kokkos::Array<scratch_view_t, NumOut>` (`:1148`) since
+> multi-output landed at the graph root. What was missing was only that `DagGraph` assumed
+> **slot index == node index**. The change is that prefix sum:
+>
+> - `Impl::dag_slot_base` / `dag_slot_owner` (`DagGraph.hpp`) relate the two indices;
+> - `add()` returns one handle **per output** (`auto [g, f0, f1] = g0.add(node, tile)`);
+> - the store carves one buffer per node *output*, and a root is addressed by slot.
+>
+> The two constexpr helpers are exposed as **variable templates** (`dag_slot_base_v`), not
+> called directly in device code: they are host-only `constexpr` (`std::array` is), and
+> naming one inside a `KOKKOS_FUNCTION` draws nvcc `#20013`.
+>
+> #### Two things this entry got right, and one it did not
+>
+> Right: **two 2-output nodes and not one 4-output node** — the mode-order constraint is
+> real, and all outputs of a combine necessarily share its modes. Right: the payoff is the
+> stress and aux traffic, not the gradients (Task 4 had already taken those to 4).
+>
+> Wrong: the projected endpoint. This entry projected ~24 ms / 1.75x from the 1-component
+> proxy. Measured against the DAG it is 1.21x on GPU — smaller, because Task 4 had already
+> collected the launch merge and the gradient collapse that projection was partly counting.
+>
+> #### What is left
+>
+> The residual, which is [Task 5](#task-5--strength-reduce-the-tiled-layout-index-arithmetic)'s
+> address arithmetic, and it is the only named mechanism still standing on the GPU. The two
+> reference directions cannot merge further — `{q,e,j}` vs `{q,e,i}` — so the remaining
+> excess over `kUseful` is one duplicated chain rule and stress evaluation, by construction.
 
 **Priority: HIGH — the largest single algorithmic win.**
 

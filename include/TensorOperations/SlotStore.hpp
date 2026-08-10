@@ -35,8 +35,9 @@ using SlotView = decltype(Impl::alloc_scratch_tile<ValueType, ExecSpace>(
 // ---------------------------------------------------------------------------
 // SlotStore<Views...>
 //
-// One team-scratch buffer per node in a DAG, carved in a single pass and owned
-// by the driver rather than by the evaluators that fill them.
+// One team-scratch buffer per node OUTPUT in a DAG (so one per node, except for
+// a multi-output combine), carved in a single pass and owned by the driver
+// rather than by the evaluators that fill them.
 //
 // This is the inversion that makes sharing possible. An evaluator that carves
 // its own output decides that buffer's identity by CONSTRUCTION ORDER, so a
