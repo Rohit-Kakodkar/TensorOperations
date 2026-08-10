@@ -395,6 +395,117 @@ struct OrderedSubviewLayout {
 };
 
 // ---------------------------------------------------------------------------
+// StaticExtentSubviewLayout<ExtSeq, OrderSeq>
+//
+// OrderedSubviewLayout with the EXTENTS lifted into the type. Strides, base
+// offset and everything else stay runtime -- a subview's strides come from the
+// parent tensor and are not knowable at compile time. Only the extents move,
+// and only the DECODE cares.
+//
+// WHY. OrderedSubviewLayout has to delinearize with runtime extents, and
+// integer division by a runtime divisor is expensive on a GPU, so it uses the
+// float-reciprocal trick: int -> float, multiply by 1/e, float -> int, then two
+// compares and predicated fixups to repair the rounding. Per dimension. Per
+// element. `ncu` source counters put that pattern at 22% of the SEM kernel's
+// instructions and 22.5% of all its integer work -- the single largest
+// identifiable item.
+//
+// With compile-time extents the same decode is `linear % e` and `linear / e` on
+// a constant divisor, which the compiler lowers to a multiply-shift: no floats,
+// no compares, no fixups. It is exactly what StaticLayout::operator[] already
+// does for scratch tiles ("exact integer division on compile-time divisors, no
+// reciprocal needed"); this brings the global-subview path to the same footing.
+//
+// PRECONDITION: the tile must not overhang the tensor, so that the clamped
+// extent TiledLayout::extent(N+d) really is the static tile extent. The team
+// tier assumes tiles divide evenly everywhere already (no boundary guard in the
+// store, no remainder path in the GEMM); subview_tile asserts it here rather
+// than trusting it, because getting it wrong would decode silently wrong
+// coordinates rather than fail.
+// ---------------------------------------------------------------------------
+
+template <typename ExtSeq, typename OrderSeq>
+struct StaticExtentSubviewLayout;
+
+template <int... Ext, int... Order>
+struct StaticExtentSubviewLayout<std::integer_sequence<int, Ext...>,
+                                 std::integer_sequence<int, Order...>> {
+  static constexpr int rank = sizeof...(Ext);
+  static_assert(sizeof...(Order) == rank,
+                "StaticExtentSubviewLayout: Order must have rank elements");
+  static_assert(((Ext > 0) && ...),
+                "StaticExtentSubviewLayout requires positive extents");
+
+  using ext_seq   = std::integer_sequence<int, Ext...>;
+  using order_seq = std::integer_sequence<int, Order...>;
+
+  KOKKOS_FUNCTION constexpr StaticExtentSubviewLayout(
+      int base, Kokkos::Array<int, rank> str) noexcept
+      : base_offset_(base), strides_(str) {}
+
+  KOKKOS_FUNCTION static constexpr int extent(int d) noexcept {
+    constexpr int e[] = {Ext...};
+    return e[d];
+  }
+  KOKKOS_FUNCTION constexpr int stride(int d) const noexcept {
+    return strides_[d];
+  }
+  KOKKOS_FUNCTION static constexpr int size() noexcept { return (Ext * ...); }
+
+  KOKKOS_FUNCTION static constexpr int unit_stride_dim() noexcept {
+    constexpr int a[] = {Order...};
+    return a[0];  // Order[0] is the fastest-varying dimension
+  }
+
+  KOKKOS_FUNCTION constexpr int base_offset() const noexcept {
+    return base_offset_;
+  }
+
+  KOKKOS_FUNCTION int flat_offset(
+      const Impl::Index<rank>& coord) const noexcept {
+    return flat_offset_impl_(coord, std::make_index_sequence<rank>{});
+  }
+
+  // Delinearize by exact integer division on compile-time divisors. Same shape
+  // as OrderedSubviewLayout::decode_impl -- peel in memory order, compile-time
+  // subscripts so the arrays stay in registers -- minus the float round trip
+  // and its fixups, which only existed because the divisor was runtime.
+  KOKKOS_FUNCTION Impl::Index<rank> operator[](int linear) const noexcept {
+    return decode_impl(linear, std::make_index_sequence<rank>{});
+  }
+
+ private:
+  template <std::size_t... Ds>
+  KOKKOS_FORCEINLINE_FUNCTION int flat_offset_impl_(
+      const Impl::Index<rank>& coord,
+      std::index_sequence<Ds...>) const noexcept {
+    return (base_offset_ + ... +
+            (coord.template get<static_cast<int>(Ds)>() *
+             strides_[static_cast<int>(Ds)]));
+  }
+
+  template <std::size_t... J>
+  KOKKOS_FORCEINLINE_FUNCTION Impl::Index<rank> decode_impl(
+      int linear, std::index_sequence<J...>) const noexcept {
+    Impl::Index<rank> idx{};
+    (
+        [&] {
+          constexpr int ord[] = {Order...};
+          constexpr int exs[] = {Ext...};
+          constexpr int d     = ord[static_cast<int>(J)];
+          constexpr int e     = exs[d];
+          idx.data[d]         = linear % e;  // constant divisor
+          linear              = linear / e;
+        }(),
+        ...);
+    return idx;
+  }
+
+  int                      base_offset_;
+  Kokkos::Array<int, rank> strides_;
+};
+
+// ---------------------------------------------------------------------------
 // View<ViewType, Layout>
 //
 // Generic view backed by a ViewType (any type exposing .data()) and indexed
@@ -648,9 +759,83 @@ KOKKOS_FUNCTION auto subview_tile_params(
 }
 }  // namespace Impl
 
-// LayoutRight specialization.
+namespace Impl {
+
+// Does this tile layout carry compile-time extents? Defaulted to false so a
+// layout that has not said (a dynamic tile) never takes the static path.
+template <typename L, typename = void>
+struct tile_layout_is_static : std::false_type {};
+template <typename L>
+struct tile_layout_is_static<L, std::void_t<decltype(L::is_static)>>
+    : std::bool_constant<L::is_static> {};
+template <typename L>
+inline constexpr bool tile_layout_is_static_v = tile_layout_is_static<L>::value;
+
+// The tile layout's extents, lifted into a sequence.
+template <typename TL, std::size_t... Ds>
+constexpr auto tile_ext_seq(std::index_sequence<Ds...>) {
+  return std::integer_sequence<int, TL::extent(static_cast<int>(Ds))...>{};
+}
+template <typename TL, int N>
+using tile_ext_seq_t =
+    decltype(tile_ext_seq<TL>(std::make_index_sequence<N>{}));
+
+// Build the static-extent subview. Asserts the precondition that makes it
+// legal: the tile must not overhang, or the clamped extent the runtime path
+// would have used is not the static one baked in here, and every decoded
+// coordinate would be silently wrong.
+template <typename VT, typename ExtSeq, typename OrderSeq, std::size_t M>
+KOKKOS_FUNCTION auto make_static_extent_subview(VT backing, int base,
+                                                Kokkos::Array<int, M> ext,
+                                                Kokkos::Array<int, M> str,
+                                                ExtSeq, OrderSeq) {
+  using layout_t = StaticExtentSubviewLayout<ExtSeq, OrderSeq>;
+#ifndef NDEBUG
+  for (int d = 0; d < static_cast<int>(M); ++d)
+    assert(ext[d] == layout_t::extent(d) &&
+           "subview_tile: the tile overhangs the tensor along some mode, so "
+           "its clamped extent is not its static extent. The team tier assumes "
+           "tiles divide evenly (no boundary guard in the store, no remainder "
+           "path in the GEMM); size the tensor to a multiple of the tile.");
+#else
+  (void)ext;
+#endif
+  return View<VT, layout_t>{backing, layout_t{base, str}};
+}
+
+}  // namespace Impl
+
+// LayoutRight, STATIC tile: compile-time extents, so the delinearize is exact
+// integer division on constants rather than a float reciprocal with fixups.
 template <typename VT, int N, typename TL>
-  requires std::is_same_v<typename VT::array_layout, Kokkos::LayoutRight>
+  requires(std::is_same_v<typename VT::array_layout, Kokkos::LayoutRight> &&
+           Impl::tile_layout_is_static_v<TL>)
+KOKKOS_FUNCTION auto subview_tile(
+    const View<VT, TiledLayout<N, TL>>&             tv,
+    Kokkos::Array<int, static_cast<std::size_t>(N)> outer_idx) {
+  const auto p = Impl::subview_tile_params(tv, outer_idx);
+  return Impl::make_static_extent_subview(
+      tv.backing_, p.base, p.ext, p.str, Impl::tile_ext_seq_t<TL, N>{},
+      Impl::right_order_seq<N>(std::make_index_sequence<N>{}));
+}
+
+// LayoutLeft, STATIC tile.
+template <typename VT, int N, typename TL>
+  requires(std::is_same_v<typename VT::array_layout, Kokkos::LayoutLeft> &&
+           Impl::tile_layout_is_static_v<TL>)
+KOKKOS_FUNCTION auto subview_tile(
+    const View<VT, TiledLayout<N, TL>>&             tv,
+    Kokkos::Array<int, static_cast<std::size_t>(N)> outer_idx) {
+  const auto p = Impl::subview_tile_params(tv, outer_idx);
+  return Impl::make_static_extent_subview(
+      tv.backing_, p.base, p.ext, p.str, Impl::tile_ext_seq_t<TL, N>{},
+      Impl::left_order_seq<N>(std::make_index_sequence<N>{}));
+}
+
+// LayoutRight specialization (dynamic tile).
+template <typename VT, int N, typename TL>
+  requires(std::is_same_v<typename VT::array_layout, Kokkos::LayoutRight> &&
+           !Impl::tile_layout_is_static_v<TL>)
 KOKKOS_FUNCTION auto subview_tile(
     const View<VT, TiledLayout<N, TL>>&             tv,
     Kokkos::Array<int, static_cast<std::size_t>(N)> outer_idx) {
@@ -660,9 +845,10 @@ KOKKOS_FUNCTION auto subview_tile(
       Impl::right_order_seq<N>(std::make_index_sequence<N>{}));
 }
 
-// LayoutLeft specialization.
+// LayoutLeft specialization (dynamic tile).
 template <typename VT, int N, typename TL>
-  requires std::is_same_v<typename VT::array_layout, Kokkos::LayoutLeft>
+  requires(std::is_same_v<typename VT::array_layout, Kokkos::LayoutLeft> &&
+           !Impl::tile_layout_is_static_v<TL>)
 KOKKOS_FUNCTION auto subview_tile(
     const View<VT, TiledLayout<N, TL>>&             tv,
     Kokkos::Array<int, static_cast<std::size_t>(N)> outer_idx) {
@@ -779,6 +965,27 @@ KOKKOS_FUNCTION constexpr auto reorder_layout(
   return Impl::make_ordered_subview_layout(
       src.base_offset(), ext, str, inv,
       Impl::reorder_order_seq(std::integer_sequence<int, Order...>{}, perm));
+}
+
+// The extents are compile-time, so gathering them is a type computation and the
+// result stays a StaticExtentSubviewLayout -- the store path reorders a subview
+// into canonical order and must not fall back to the runtime layout on the way.
+template <int... Ext, int... Order, int... Perm>
+KOKKOS_FUNCTION constexpr auto reorder_layout(
+    const StaticExtentSubviewLayout<std::integer_sequence<int, Ext...>,
+                                    std::integer_sequence<int, Order...>>& src,
+    std::integer_sequence<int, Perm...> perm) {
+  constexpr int N = sizeof...(Ext);
+  static_assert(sizeof...(Perm) == N,
+                "reorder_layout: permutation must have N elements");
+  constexpr int         p[] = {Perm...};
+  Kokkos::Array<int, N> str{};
+  for (int i = 0; i < N; ++i) str[i] = src.stride(p[i]);
+  using new_ext = std::integer_sequence<
+      int, Impl::value_at<static_cast<std::size_t>(Perm), Ext...>()...>;
+  using new_order = decltype(Impl::reorder_order_seq(
+      std::integer_sequence<int, Order...>{}, perm));
+  return StaticExtentSubviewLayout<new_ext, new_order>{src.base_offset(), str};
 }
 
 // ---------------------------------------------------------------------------

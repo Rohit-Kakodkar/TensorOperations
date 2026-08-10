@@ -611,6 +611,72 @@ in place rather than leaving it to mislead.
 
 ### Task 5 — Strength-reduce the tiled-layout index arithmetic
 
+> ### ✅ DONE 2026-08-03. Located with `ncu` source counters first, then fixed. **Helps every path, not just the DAG.**
+>
+> | | before | after | |
+> |---|---|---|---|
+> | GPU, library tree | 41.5 ms | **33.18 ms** | 1.25x |
+> | GPU, library DAG | 18.34 ms | **16.55 ms** | 1.11x |
+> | CPU, library tree | 37.7 ms | **26.72 ms** | 1.41x |
+> | CPU, library DAG | 19.00 ms | **14.60 ms** | 1.30x |
+> | gap to baseline, GPU | 1.88x | **1.70x** | |
+> | gap to baseline, CPU | 1.82x | **1.40x** | |
+>
+> Every hand-written row (baseline, CONTROL, CONTROL-B, CONTROL-C) is unchanged, which is the
+> control that says this is a real change and not a measurement shift. **On CPU the library DAG
+> now BEATS `CONTROL-C`** — 14.60 ms against 15.67 ms, a residual of **0.93x**: the library is
+> faster than the hand-written kernel doing the same work profile.
+>
+> #### Attribution came first, and it is why this one landed
+>
+> Two earlier attempts guessed at the location and bought nothing — the combine's coordinate
+> re-encode was worth 1.7% of integer instructions and 0% of time, and unrolling
+> `TiledLayout::flat_offset` produced *byte-identical* instruction counts because the compiler
+> was already doing it. Both were reverted.
+>
+> `ncu --section SourceCounters` then named the real one. 71% of the kernel's instructions are
+> integer/address, and the top opcodes are not multiply-adds but **compares, selects and
+> predicated fixups** — the signature of `OrderedSubviewLayout::decode_impl`:
+>
+> ```
+> I2F   R12, R11                       int -> float
+> FMUL  R12, R12, 0.125                multiply by 1/e
+> F2I.TRUNC.NTZ R12, R12               back to int
+> IMAD  R15, R12, -0x8, R11            r = linear - q*e
+> ISETP.GE.AND P3, PT, R15, RZ, PT     if (r < 0)
+> ISETP.GT.OR  P1, PT, R15, 0x7, !P3   else if (r >= e)
+> @P3  IADD3 ... / @!P3 IADD3 ...      fixups        (per dimension, per element)
+> ```
+>
+> **1.64 billion thread-instructions: 22.1% of the kernel, 22.5% of all its integer work.**
+>
+> #### The fix
+>
+> The reciprocal trick exists because a subview's extents are runtime values. For a `StaticTile`
+> they are not. `StaticExtentSubviewLayout` lifts the EXTENTS into the type and leaves strides,
+> base offset and everything else runtime — only the decode needed constants, and with them
+> `linear % e` / `linear / e` lower to a multiply-shift. It is what `StaticLayout::operator[]`
+> already did for scratch tiles; this brings the global-subview path to the same footing.
+>
+> #### The "done when" criterion was a bad metric, and this is worth recording
+>
+> This task said *done when the integer:fp32 ratio drops materially*. It went **UP**: 3.05 →
+> 3.93. Not because integer work grew — it fell 13% — but because **fp32 fell 32%**, since
+> `I2F`/`FMUL`/`F2I` were counted as floating-point instructions. The ratio was measuring the
+> defect's own float instructions.
+>
+> The metric that actually tracked the win is total instructions (232.8 M → 190.3 M warp
+> instructions, −18.2%) and, best of all, **fp32 against `CONTROL-C` is now 1.01x** — the
+> library retires the same floating-point work as the hand-written kernel, where it previously
+> showed 1.50x. That 50% was never physics.
+>
+> #### What is left
+>
+> Against `CONTROL-C` the DAG is 1.31x (was 1.45x), and it is now **entirely integer**: 2.36x
+> the integer instructions at 1.01x the fp32. Also unaddressed: 20.4 M local-memory sectors
+> against `CONTROL-C`'s zero, at 40 registers/thread — the compiler is capping registers and
+> spilling. That is a separate mechanism from the index math.
+
 **Priority: HIGH — promoted from DEFERRED now that Task 2 has named the cause.**
 
 The library spends 5.19 integer instructions per fp32 instruction; the hand

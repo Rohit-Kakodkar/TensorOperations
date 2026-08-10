@@ -422,16 +422,25 @@ TEST(TiledLayout, ReorderOrderedSubviewLayout2D) {
     for (int j = 0; j < 6; ++j) v(i, j) = static_cast<float>(i * 6 + j);
 
   auto tv = tile_view(v, StaticTile<4, 6>{});  // shape (1,1,4,6)
-  // subview_tile on a LayoutRight source yields an OrderedSubviewLayout with
-  // compile-time order {N-1,...,0} = {1,0}.
+  // subview_tile on a LayoutRight source with a STATIC tile yields a
+  // StaticExtentSubviewLayout: compile-time extents {4,6} and compile-time
+  // order {N-1,...,0} = {1,0}. The extents are in the type so the delinearize
+  // can divide by constants instead of by float reciprocals.
   auto sv = subview_tile(tv, Kokkos::Array<int, 2>{0, 0});
-  static_assert(
-      std::is_same_v<decltype(sv)::layout_t, OrderedSubviewLayout<2, 1, 0>>);
+  static_assert(std::is_same_v<
+                decltype(sv)::layout_t,
+                StaticExtentSubviewLayout<std::integer_sequence<int, 4, 6>,
+                                          std::integer_sequence<int, 1, 0>>>);
 
   auto r = reorder_view(sv, std::integer_sequence<int, 1, 0>{});
-  // Order {1,0} transposed by Perm {1,0} -> new memory order {0,1}.
-  static_assert(
-      std::is_same_v<decltype(r)::layout_t, OrderedSubviewLayout<2, 0, 1>>);
+  // Extents gathered by Perm {1,0} -> {6,4}; order {1,0} transposed -> {0,1}.
+  // Reordering must STAY on the static layout: the store path reorders a
+  // subview into canonical order, and falling back to runtime extents there
+  // would put the float-reciprocal decode straight back.
+  static_assert(std::is_same_v<
+                decltype(r)::layout_t,
+                StaticExtentSubviewLayout<std::integer_sequence<int, 6, 4>,
+                                          std::integer_sequence<int, 0, 1>>>);
 
   constexpr int perm[] = {1, 0};
   for (int i = 0; i < 2; ++i) {
