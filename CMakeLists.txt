@@ -80,6 +80,10 @@ add_executable(test_combine_node tests/test_combine_node.cpp)
 target_link_libraries(test_combine_node PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_combine_node)
 
+add_executable(test_team2 tests/test_team2.cpp)
+target_link_libraries(test_team2 PRIVATE tensor GTest::gtest)
+gtest_discover_tests(test_team2)
+
 # test_tiling — custom main() wraps Kokkos init/finalize
 add_executable(test_tiling tests/test_tiling.cpp)
 target_link_libraries(test_tiling PRIVATE tensor GTest::gtest)
