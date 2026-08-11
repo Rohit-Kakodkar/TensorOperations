@@ -84,6 +84,10 @@ add_executable(test_team2 tests/test_team2.cpp)
 target_link_libraries(test_team2 PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_team2)
 
+add_executable(test_regroup_view tests/test_regroup_view.cpp)
+target_link_libraries(test_regroup_view PRIVATE tensor GTest::gtest)
+gtest_discover_tests(test_regroup_view)
+
 # test_tiling — custom main() wraps Kokkos init/finalize
 add_executable(test_tiling tests/test_tiling.cpp)
 target_link_libraries(test_tiling PRIVATE tensor GTest::gtest)

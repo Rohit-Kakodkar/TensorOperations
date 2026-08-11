@@ -851,6 +851,208 @@ struct StaticTileLayoutStride<StaticTile<Extents...>, Order...>
     : Impl::static_layout_for_t<StaticTile<Extents...>,
                                 std::integer_sequence<int, Order...>> {};
 
+namespace Impl {
+
+template <int N>
+struct CoalescePlan {
+  int n = 0;
+  int ext[N]{};
+  int str[N]{};
+};
+
+template <int... E, int... S>
+constexpr CoalescePlan<sizeof...(E)> coalesce_plan(
+    std::integer_sequence<int, E...>, std::integer_sequence<int, S...>) {
+  constexpr int N = sizeof...(E);
+  static_assert(sizeof...(E) == sizeof...(S),
+                "coalesce: extents and strides must have the same length");
+  const int       e[N] = {E...};
+  const int       s[N] = {S...};
+  CoalescePlan<N> p{};
+  for (int i = 0; i < N; ++i) {
+    if (e[i] == 1) continue;
+    if (p.n > 0 && s[i] == p.ext[p.n - 1] * p.str[p.n - 1])
+      p.ext[p.n - 1] *= e[i];
+    else {
+      p.ext[p.n] = e[i];
+      p.str[p.n] = s[i];
+      ++p.n;
+    }
+  }
+  if (p.n == 0) {
+    p.ext[0] = 1;
+    p.str[0] = 1;
+    p.n      = 1;
+  }
+  return p;
+}
+
+template <typename ExtSeq, typename StrSeq>
+inline constexpr auto coalesce_plan_v = coalesce_plan(ExtSeq{}, StrSeq{});
+
+template <auto P, std::size_t... I>
+auto coalesced_ext_impl(std::index_sequence<I...>)
+    -> std::integer_sequence<int, P.ext[I]...>;
+template <auto P, std::size_t... I>
+auto coalesced_str_impl(std::index_sequence<I...>)
+    -> std::integer_sequence<int, P.str[I]...>;
+
+template <typename ExtSeq, typename StrSeq>
+using coalesced_ext_t =
+    decltype(coalesced_ext_impl<coalesce_plan_v<ExtSeq, StrSeq>>(
+        std::make_index_sequence<static_cast<std::size_t>(
+            coalesce_plan_v<ExtSeq, StrSeq>.n)>{}));
+template <typename ExtSeq, typename StrSeq>
+using coalesced_str_t =
+    decltype(coalesced_str_impl<coalesce_plan_v<ExtSeq, StrSeq>>(
+        std::make_index_sequence<static_cast<std::size_t>(
+            coalesce_plan_v<ExtSeq, StrSeq>.n)>{}));
+
+template <typename ExtSeq, typename StrSeq>
+struct Coalesce {
+  using ext = coalesced_ext_t<ExtSeq, StrSeq>;
+  using str = coalesced_str_t<ExtSeq, StrSeq>;
+};
+
+template <typename AxesSeq>
+struct AxesOf;
+template <int... A>
+struct AxesOf<std::integer_sequence<int, A...>> {
+  static constexpr std::size_t size = sizeof...(A);
+  static constexpr int         at(std::size_t k) noexcept {
+    constexpr int a[] = {A...};
+    return a[k];
+  }
+};
+
+template <typename Layout, typename AxesSeq, typename Js>
+struct GroupSlice;
+template <typename Layout, typename AxesSeq, std::size_t... J>
+struct GroupSlice<Layout, AxesSeq, std::index_sequence<J...>> {
+  using axes = AxesOf<AxesSeq>;
+  using ext =
+      std::integer_sequence<int,
+                            Layout::extent(axes::at(axes::size - 1 - J))...>;
+  using str =
+      std::integer_sequence<int,
+                            Layout::stride(axes::at(axes::size - 1 - J))...>;
+};
+template <typename Layout, typename AxesSeq>
+using group_slice_t =
+    GroupSlice<Layout, AxesSeq,
+               std::make_index_sequence<AxesOf<AxesSeq>::size>>;
+
+template <typename Layout, typename G>
+using group_ext_t =
+    typename Coalesce<typename group_slice_t<Layout, G>::ext,
+                      typename group_slice_t<Layout, G>::str>::ext;
+template <typename Layout, typename G>
+using group_str_t =
+    typename Coalesce<typename group_slice_t<Layout, G>::ext,
+                      typename group_slice_t<Layout, G>::str>::str;
+
+template <int... S>
+constexpr auto leaf_memory_order(std::integer_sequence<int, S...>) noexcept {
+  constexpr std::size_t N      = sizeof...(S);
+  const int             str[N] = {S...};
+  std::array<int, N>    ord{};
+  for (std::size_t i = 0; i < N; ++i) ord[i] = static_cast<int>(i);
+  for (std::size_t i = 0; i < N; ++i)
+    for (std::size_t j = i + 1; j < N; ++j)
+      if (str[ord[j]] < str[ord[i]]) {
+        const int t = ord[i];
+        ord[i]      = ord[j];
+        ord[j]      = t;
+      }
+  return ord;
+}
+
+template <auto Arr, std::size_t Off, std::size_t... I>
+auto arr_slice_impl(std::index_sequence<I...>)
+    -> std::integer_sequence<int, Arr[Off + I]...>;
+template <auto Arr, std::size_t Off, std::size_t N>
+using arr_slice_t =
+    decltype(arr_slice_impl<Arr, Off>(std::make_index_sequence<N>{}));
+
+template <int... A>
+constexpr bool axes_partition_rank(std::integer_sequence<int, A...>,
+                                   int R) noexcept {
+  constexpr std::size_t N = sizeof...(A);
+  if (static_cast<int>(N) != R) return false;
+  const int a[N]    = {A...};
+  bool      seen[N] = {};
+  for (std::size_t i = 0; i < N; ++i) {
+    if (a[i] < 0 || a[i] >= R || seen[a[i]]) return false;
+    seen[a[i]] = true;
+  }
+  return true;
+}
+
+template <typename Layout, typename Groups>
+struct RegroupModes;
+template <typename Layout, typename... Gs>
+struct RegroupModes<Layout, DeviceTuple<Gs...>> {
+  static constexpr std::size_t count = sizeof...(Gs);
+  static constexpr std::size_t arity(std::size_t i) noexcept {
+    const std::size_t a[] = {group_ext_t<Layout, Gs>::size()...};
+    return a[i];
+  }
+  static constexpr std::size_t offset(std::size_t i) noexcept {
+    std::size_t s = 0;
+    for (std::size_t k = 0; k < i; ++k) s += arity(k);
+    return s;
+  }
+  static constexpr auto order =
+      leaf_memory_order(concat_seq_t<group_str_t<Layout, Gs>...>{});
+};
+
+template <typename Layout, typename Groups, typename Is>
+struct RegroupLayoutOf;
+template <typename Layout, typename... Gs, std::size_t... I>
+struct RegroupLayoutOf<Layout, DeviceTuple<Gs...>, std::index_sequence<I...>> {
+  using groups = DeviceTuple<Gs...>;
+  using modes  = RegroupModes<Layout, groups>;
+
+  static_assert(sizeof...(Gs) >= 1,
+                "regroup_layout: needs at least one mode group");
+  static_assert(axes_partition_rank(concat_seq_t<Gs...>{}, Layout::rank),
+                "regroup_layout: the groups must name every axis of the layout "
+                "exactly once");
+
+  using type =
+      StaticLayout<DeviceTuple<group_ext_t<Layout, Gs>...>,
+                   DeviceTuple<group_str_t<Layout, Gs>...>,
+                   DeviceTuple<arr_slice_t<modes::order, modes::offset(I),
+                                           modes::arity(I)>...>>;
+};
+
+template <typename Groups>
+struct GroupCount;
+template <typename... Gs>
+struct GroupCount<DeviceTuple<Gs...>> {
+  static constexpr std::size_t value = sizeof...(Gs);
+};
+
+template <typename Layout, typename Groups>
+using regroup_layout_t = typename RegroupLayoutOf<
+    Layout, Groups, std::make_index_sequence<GroupCount<Groups>::value>>::type;
+
+template <int Begin, typename Js>
+struct IotaSeq;
+template <int Begin, std::size_t... J>
+struct IotaSeq<Begin, std::index_sequence<J...>> {
+  using type = std::integer_sequence<int, (Begin + static_cast<int>(J))...>;
+};
+template <int Begin, int End>
+using iota_seq_t =
+    typename IotaSeq<Begin, std::make_index_sequence<End - Begin>>::type;
+
+template <int Split, int Rank>
+using split_groups_t =
+    DeviceTuple<iota_seq_t<0, Split>, iota_seq_t<Split, Rank>>;
+
+}  // namespace Impl
+
 // ---------------------------------------------------------------------------
 // DynamicTileLayoutRight — runtime extents, row-major (rightmost fastest)
 // ---------------------------------------------------------------------------
