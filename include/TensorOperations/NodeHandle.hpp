@@ -17,6 +17,7 @@ struct IntermTag {};
 struct ContractionTag {};
 struct CombineTag {};
 struct SlotTag {};
+struct StagedTag {};
 
 // Sentinel for "no hook"
 struct NoHook {};
@@ -142,6 +143,33 @@ struct NodeHandle<IntermTag, Storage, IntRank, ExecSpace, HookOp> {
   [[no_unique_address]] HookOp hook_op;
 };
 
+template <typename Operand, typename ModesSeq>
+struct NodeHandle<StagedTag, Operand, ModesSeq> {
+  Operand operand_;
+
+  using node_tag            = StagedTag;
+  using operand_type        = Operand;
+  static constexpr int Rank = Operand::Rank;
+  using value_type          = typename Operand::value_type;
+  using exec_space          = typename Operand::exec_space;
+  using modes_seq           = ModesSeq;
+
+  static_assert(static_cast<int>(ModesSeq::size()) == Rank,
+                "staged node: one label per axis");
+  static_assert(Impl::labels_distinct_v<ModesSeq>,
+                "staged node: labels must be distinct");
+
+  KOKKOS_FUNCTION Kokkos::Array<int, Rank> shape() const {
+    return operand_.shape();
+  }
+
+  template <int32_t... Modes>
+  KOKKOS_FUNCTION auto as() const {
+    return NodeHandle<StagedTag, Operand,
+                      std::integer_sequence<int32_t, Modes...>>{operand_};
+  }
+};
+
 // ---------------------------------------------------------------------------
 // Slot specialization — a LABELLED, read-only view of a buffer some OTHER node
 // owns.
@@ -228,6 +256,12 @@ KOKKOS_FUNCTION auto make_interm_node(Storage storage, HookOp hook = {}) {
       "interm hook must be callable as op(i_0, ..., i_{Rank-1}, value_type&)");
   return NodeHandle<IntermTag, Storage, std::integral_constant<int, Rank>,
                     ExecSpace, HookOp>{std::move(storage), std::move(hook)};
+}
+
+template <typename Operand>
+KOKKOS_FUNCTION auto make_stage_node(Operand op) {
+  return NodeHandle<StagedTag, Operand, typename Operand::modes_seq>{
+      std::move(op)};
 }
 
 // Slot node — label an existing buffer (a producing node's output scratch) so

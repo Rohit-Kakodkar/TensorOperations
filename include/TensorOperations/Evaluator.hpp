@@ -501,5 +501,6 @@ KOKKOS_FUNCTION auto make_evaluator(NodeType node, Tile tile,
 
 #include <TensorOperations/Evaluator/Team.hpp>
 #include <TensorOperations/Evaluator/Team2.hpp>
+#include <TensorOperations/Evaluator/Level.hpp>
 
 }  // namespace TensorOperations

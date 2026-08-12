@@ -154,6 +154,52 @@ class Evaluator<TeamPolicyTag2<ES>,
   team_member_t team_;
 };
 
+template <typename ES, typename Operand, typename ModesSeq, typename Tile_>
+class Evaluator<TeamPolicyTag2<ES>, NodeHandle<StagedTag, Operand, ModesSeq>,
+                Tile_> {
+ public:
+  using node_type     = NodeHandle<StagedTag, Operand, ModesSeq>;
+  using policy_tag    = TeamPolicyTag2<ES>;
+  using tiling_type   = Tile_;
+  using value_type    = typename node_type::value_type;
+  using exec_space    = ES;
+  using modes_seq     = typename node_type::modes_seq;
+  using team_member_t = Impl::team_member_t<ES>;
+
+  using scratch_view_t = decltype(Impl::alloc_scratch_tile<value_type, ES>(
+      std::declval<const team_member_t&>(), std::declval<const Tile_&>()));
+
+  static_assert(static_cast<int>(Tile_::rank) == node_type::Rank,
+                "staged tile rank must equal the operand's rank");
+
+  KOKKOS_FUNCTION Evaluator(node_type n, Tile_ t, const team_member_t& team)
+      : node_(n),
+        tile_(t),
+        dst_(Impl::alloc_scratch_tile<value_type, ES>(team, t)),
+        team_(team) {}
+
+  KOKKOS_FUNCTION Evaluator(node_type n, Tile_ t, scratch_view_t adopted,
+                            const team_member_t& team)
+      : node_(n), tile_(t), dst_(adopted), team_(team) {}
+
+  KOKKOS_FUNCTION auto operator()(
+      Kokkos::Array<int, Tile_::rank> tile_idx) const {
+    auto src    = make_evaluator<TeamPolicyTag2<ES>>(node_.operand_, tile_,
+                                                     team_)(tile_idx);
+    auto stager = make_evaluator<TeamPolicyTag2<ES>>(make_interm_node(dst_),
+                                                     StageTag{}, team_);
+    return (stager = src);
+  }
+
+  KOKKOS_FUNCTION const scratch_view_t& storage() const { return dst_; }
+
+ private:
+  node_type      node_;
+  Tile_          tile_;
+  scratch_view_t dst_;
+  team_member_t  team_;
+};
+
 template <typename AEval, typename BEval, typename CNode>
 struct ContractOperands {
   AEval a;
