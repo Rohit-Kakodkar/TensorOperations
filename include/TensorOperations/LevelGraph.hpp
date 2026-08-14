@@ -42,24 +42,35 @@ struct lg_flat_member {
 template <typename LevelsT, std::size_t F>
 using lg_flat_member_t = typename lg_flat_member<LevelsT, F>::type;
 
-template <typename V, typename ES, typename LevelsT, typename Team,
-          typename StageTilesT, std::size_t... Ss, std::size_t... Fs>
+template <typename LevelsT, std::size_t NumStages, std::size_t GS>
+struct lg_slot_member_node {
+  static constexpr std::size_t L = lg_slot_level_v<LevelsT, NumStages, GS>;
+  static constexpr std::size_t M = lg_slot_member_v<LevelsT, NumStages, GS>;
+  using type = tuple_element_t<M, tuple_element_t<L, LevelsT>>;
+};
+template <typename LevelsT, std::size_t NumStages, std::size_t GS>
+using lg_slot_tile_t = member_out_tile_t<
+    typename lg_slot_member_node<LevelsT, NumStages, GS>::type>;
+
+template <typename V, typename ES, typename LevelsT, std::size_t NumStages,
+          typename Team, typename StageTilesT, std::size_t... Ss,
+          std::size_t... Ls>
 KOKKOS_FUNCTION auto lg_carve(const Team& team, const StageTilesT& stage_tiles,
                               std::index_sequence<Ss...>,
-                              std::index_sequence<Fs...>) {
+                              std::index_sequence<Ls...>) {
   return carve_slot_store<V, ES>(
       team, stage_tiles.template get<Ss>()...,
-      member_out_tile_t<lg_flat_member_t<LevelsT, Fs>>{}...);
+      lg_slot_tile_t<LevelsT, NumStages, NumStages + Ls>{}...);
 }
 
-template <typename V, typename ES, typename LevelsT, typename StageTilesT,
-          std::size_t... Ss, std::size_t... Fs>
+template <typename V, typename ES, typename LevelsT, std::size_t NumStages,
+          typename StageTilesT, std::size_t... Ss, std::size_t... Ls>
 std::size_t lg_scratch_bytes(const StageTilesT& stage_tiles,
                              std::index_sequence<Ss...>,
-                             std::index_sequence<Fs...>) {
+                             std::index_sequence<Ls...>) {
   return slot_store_bytes<V, ES>(
       stage_tiles.template get<Ss>()...,
-      member_out_tile_t<lg_flat_member_t<LevelsT, Fs>>{}...);
+      lg_slot_tile_t<LevelsT, NumStages, NumStages + Ls>{}...);
 }
 
 template <typename V, typename ES, typename GridNode, std::size_t RootR,
@@ -146,15 +157,80 @@ KOKKOS_FUNCTION void lg_run_contraction_level(const LevelsT& levels,
 }
 
 template <typename V, typename ES, typename LevelsT, std::size_t NumStages,
+          std::size_t L, std::size_t M, typename Store, typename Team,
+          std::size_t... Ks, std::size_t... Os>
+KOKKOS_FUNCTION auto lg_make_combine_member_impl(const LevelsT& levels,
+                                                 const Store&   store,
+                                                 const Team&    team,
+                                                 std::index_sequence<Ks...>,
+                                                 std::index_sequence<Os...>) {
+  using Node                 = tuple_element_t<M, tuple_element_t<L, LevelsT>>;
+  constexpr std::size_t Base = lg_member_base_v<LevelsT, NumStages, L, M>;
+  using OutNode = decltype(make_interm_node(store.template get<Base>()));
+  Kokkos::Array<OutNode, static_cast<std::size_t>(Node::NumOut)> outs{
+      make_interm_node(store.template get<Base + Os>())...};
+  auto ops = make_combine_operands(
+      make_value_evaluator(
+          make_interm_node(
+              store.template get<
+                  tuple_element_t<Ks, typename Node::ops_tuple_t>::SlotIdx>()),
+          team)...,
+      outs);
+  return make_evaluator<TeamPolicyTag2<ES>>(
+      levels.template get<L>().template get<M>(), ops, team);
+}
+
+template <typename V, typename ES, typename LevelsT, std::size_t NumStages,
+          std::size_t L, std::size_t M, typename Store, typename Team>
+KOKKOS_FUNCTION auto lg_make_combine_member(const LevelsT& levels,
+                                            const Store&   store,
+                                            const Team&    team) {
+  using Node = tuple_element_t<M, tuple_element_t<L, LevelsT>>;
+  return lg_make_combine_member_impl<V, ES, LevelsT, NumStages, L, M>(
+      levels, store, team,
+      std::make_index_sequence<static_cast<std::size_t>(Node::NumOps)>{},
+      std::make_index_sequence<static_cast<std::size_t>(Node::NumOut)>{});
+}
+
+template <typename EvalsT, typename Coord, std::size_t... Ms>
+KOKKOS_FUNCTION void lg_store_coord(const EvalsT& evs, const Coord& coord,
+                                    std::index_sequence<Ms...>) {
+  (evs.template get<Ms>()(coord), ...);
+}
+
+template <typename V, typename ES, typename LevelsT, std::size_t NumStages,
+          std::size_t L, typename Store, typename Team, std::size_t... Ms>
+KOKKOS_FUNCTION void lg_run_combine_level(const LevelsT& levels,
+                                          const Store& store, const Team& team,
+                                          std::index_sequence<Ms...>) {
+  constexpr std::size_t Base0 = lg_member_base_v<LevelsT, NumStages, L, 0>;
+
+  auto evs =
+      DeviceTuple<decltype(lg_make_combine_member<V, ES, LevelsT, NumStages, L,
+                                                  Ms>(levels, store, team))...>{
+          lg_make_combine_member<V, ES, LevelsT, NumStages, L, Ms>(
+              levels, store, team)...};
+
+  const auto out0 = store.template get<Base0>();
+  team_for_each_coord(team, out0, [=](auto coord) {
+    lg_store_coord(evs, coord, std::index_sequence<Ms...>{});
+  });
+  team.team_barrier();
+}
+
+template <typename V, typename ES, typename LevelsT, std::size_t NumStages,
           std::size_t L, typename Store, typename Team>
 KOKKOS_FUNCTION void lg_run_level(const LevelsT& levels, const Store& store,
                                   const Team& team) {
   using LevelT             = tuple_element_t<L, LevelsT>;
   constexpr std::size_t NM = tuple_size_v<LevelT>;
-  static_assert(lg_all_contraction_v<LevelT>,
-                "level graph driver: only contraction levels are wired so far");
-  lg_run_contraction_level<V, ES, LevelsT, NumStages, L>(
-      levels, store, team, std::make_index_sequence<NM>{});
+  if constexpr (lg_all_contraction_v<LevelT>) {
+    lg_run_contraction_level<V, ES, LevelsT, NumStages, L>(
+        levels, store, team, std::make_index_sequence<NM>{});
+  } else {
+    lg_run_combine_level<V, ES, LevelsT, NumStages, L>(
+        levels, store, team, std::make_index_sequence<NM>{});
+  }
 }
 
 template <typename V, typename ES, typename LevelsT, std::size_t NumStages,
@@ -202,15 +278,15 @@ template <typename V, typename ES, typename StagesT, typename StageTilesT,
 int lg_execute(const StagesT& stages, const StageTilesT& stage_tiles,
                const LevelsT& levels, std::size_t bytes, int team_size,
                RootsSeq roots, const ViewTs&... views) {
-  using member_t           = team_member_t<ES>;
-  constexpr std::size_t NL = tuple_size_v<LevelsT>;
-  constexpr std::size_t NF = lg_total_members_v<LevelsT>;
-  using GridNode           = tuple_element_t<NumStages - 1, StagesT>;
-  constexpr int RootR      = GridNode::Rank;
+  using member_t            = team_member_t<ES>;
+  constexpr std::size_t NL  = tuple_size_v<LevelsT>;
+  constexpr std::size_t NLS = lg_num_slots_v<LevelsT, NumStages> - NumStages;
+  using GridNode            = tuple_element_t<NumStages - 1, StagesT>;
+  constexpr int RootR       = GridNode::Rank;
 
-  using stage_seq = std::make_index_sequence<NumStages>;
-  using flat_seq  = std::make_index_sequence<NF>;
-  using level_seq = std::make_index_sequence<NL>;
+  using stage_seq      = std::make_index_sequence<NumStages>;
+  using level_slot_seq = std::make_index_sequence<NLS>;
+  using level_seq      = std::make_index_sequence<NL>;
 
   const StagesT     sd = stages;
   const StageTilesT gt = stage_tiles;
@@ -236,8 +312,8 @@ int lg_execute(const StagesT& stages, const StageTilesT& stage_tiles,
         const auto grid_idx = decode_tile_index<RootR>(
             static_cast<int>(team.league_rank()), grid_node.shape(), grid_tile);
 
-        auto store =
-            lg_carve<V, ES, LevelsT>(team, gt, stage_seq{}, flat_seq{});
+        auto store = lg_carve<V, ES, LevelsT, NumStages>(team, gt, stage_seq{},
+                                                         level_slot_seq{});
 
         lg_run_stages<V, ES, GridNode, RootR>(sd, gt, store, grid_idx, team,
                                               stage_seq{});
@@ -325,9 +401,10 @@ struct LevelGraph {
   }
 
   std::size_t scratch_bytes() const {
-    return Impl::lg_scratch_bytes<ValueType, ExecSpace, LevelsT>(
+    return Impl::lg_scratch_bytes<ValueType, ExecSpace, LevelsT, num_stages>(
         stage_tiles, std::make_index_sequence<num_stages>{},
-        std::make_index_sequence<Impl::lg_total_members_v<LevelsT>>{});
+        std::make_index_sequence<Impl::lg_num_slots_v<LevelsT, num_stages> -
+                                 num_stages>{});
   }
 
   bool index_consistent() const {
@@ -358,21 +435,29 @@ struct LevelGraph {
   auto add_impl(const Level& level, std::index_sequence<Ms...>) const {
     using NewLevels         = decltype(tuple_append(levels, level));
     constexpr std::size_t L = num_levels;
-    return std::make_tuple(
-        LevelGraph<ValueType, ExecSpace, StagesT, StageTilesT, NewLevels>{
-            stages, stage_tiles, tuple_append(levels, level)},
-        member_handle<NewLevels, L, Ms>(level.template get<Ms>())...);
+    return std::tuple_cat(
+        std::make_tuple(
+            LevelGraph<ValueType, ExecSpace, StagesT, StageTilesT, NewLevels>{
+                stages, stage_tiles, tuple_append(levels, level)}),
+        member_handles<NewLevels, L, Ms>(level.template get<Ms>())...);
   }
 
   template <typename NewLevels, std::size_t L, std::size_t M, typename Member>
-  auto member_handle(const Member& m) const {
-    static_assert(Impl::output_arity<Member>::value == 1,
-                  "level graph add(): multi-output members are not wired yet");
-    constexpr std::size_t Slot =
+  auto member_handles(const Member& m) const {
+    return member_handles_impl<NewLevels, L, M>(
+        m, std::make_index_sequence<static_cast<std::size_t>(
+               Impl::output_arity<Member>::value)>{});
+  }
+
+  template <typename NewLevels, std::size_t L, std::size_t M, typename Member,
+            std::size_t... Os>
+  auto member_handles_impl(const Member& m, std::index_sequence<Os...>) const {
+    constexpr std::size_t Base =
         Impl::lg_member_base_v<NewLevels, num_stages, L, M>;
     using Tile = member_out_tile_t<Member>;
-    return make_slot_node_seq<Slot, typename Member::modes_seq>(
-        SlotView<ValueType, ExecSpace, Tile>{}, m.shape());
+    return std::make_tuple(
+        make_slot_node_seq<Base + Os, typename Member::modes_seq>(
+            SlotView<ValueType, ExecSpace, Tile>{}, m.shape())...);
   }
 
   template <std::size_t S>
