@@ -530,6 +530,182 @@ TEST(LevelGraphRuntime, MultiOutputCombineEqualsReference) {
 
 }  // namespace rt
 
+// ===========================================================================
+// Declared-order contraction output. A contraction STORES canonically
+// (freeA ++ freeB) but is DECLARED, and therefore read, in whatever order its
+// labels say -- the permutation rides in the slot's view type, never in the
+// stored bytes.
+//
+// Every extent here is pairwise distinct and every permutation is a 3-CYCLE,
+// both deliberately. An involution cannot test a permutation's direction (it
+// passes against its own inverse), and equal extents hide a direction error
+// outright: the extents-only wall in Team2.hpp cannot see axis order, so with
+// rt's (5,2,5,5) shapes a fully inverted perm still type-checks.
+// ===========================================================================
+namespace declared {
+
+constexpr int dQ = 7, dA = 3, dB = 4, dC = 5, dTE = 2, dE = 8;
+
+using ViewH      = Kokkos::View<float**, Kokkos::LayoutRight, ES>;
+using ViewU      = Kokkos::View<float****, Kokkos::LayoutRight, ES>;
+using ViewO      = Kokkos::View<float****, Kokkos::LayoutRight, ES>;
+using ViewW      = Kokkos::View<float**, Kokkos::LayoutRight, ES>;
+using TileH      = StaticTile<dQ, dA>;
+using TileU      = StaticTile<dTE, dA, dB, dC>;
+constexpr int dP = 6;
+using TileW      = StaticTile<dP, dQ>;
+
+float hval(int q, int a) {
+  return 0.3f + 0.17f * q - 0.23f * a + 0.04f * q * a;
+}
+float wval(int p, int q) { return 0.6f - 0.11f * p + 0.19f * q; }
+float uval(int e, int a, int b, int c) {
+  return 0.7f - 0.13f * e + 0.09f * a - 0.05f * b + 0.21f * c +
+         0.02f * (e + b) * (c + 1);
+}
+
+struct ScaleD {
+  KOKKOS_FUNCTION float operator()(int, int, int, int, float g) const {
+    return 2.0f * g + 0.5f;
+  }
+};
+
+void fill(ViewH Hd, ViewU Ud) {
+  auto Hh = Kokkos::create_mirror_view(Hd);
+  auto Uh = Kokkos::create_mirror_view(Ud);
+  for (int q = 0; q < dQ; ++q)
+    for (int a = 0; a < dA; ++a) Hh(q, a) = hval(q, a);
+  for (int e = 0; e < dE; ++e)
+    for (int a = 0; a < dA; ++a)
+      for (int b = 0; b < dB; ++b)
+        for (int c = 0; c < dC; ++c) Uh(e, a, b, c) = uval(e, a, b, c);
+  Kokkos::deep_copy(Hd, Hh);
+  Kokkos::deep_copy(Ud, Uh);
+}
+
+double gref(int q, int e, int b, int c) {
+  double g = 0.0;
+  for (int a = 0; a < dA; ++a) g += hval(q, a) * uval(e, a, b, c);
+  return g;
+}
+
+// The contraction's canonical order is <q,e,b,c>; it is DECLARED <e,b,q,c>,
+// a 3-cycle on the first three axes, and rooted directly. Pins that the store
+// path reconciles a non-identity permC against canonical scratch.
+TEST(LevelGraphDeclaredOrder, NonCanonicalContractionRootEqualsReference) {
+  ViewH Hd("H", dQ, dA);
+  ViewU Ud("U", dE, dA, dB, dC);
+  ViewO Od("O", dE, dB, dQ, dC);
+  fill(Hd, Ud);
+
+  auto g0      = make_level_graph<float, ES>();
+  auto [g1, h] = g0.stage(make_input_node(make_handle<'q', 'a'>(Hd)), TileH{});
+  auto [g2, u] =
+      g1.stage(make_input_node(make_handle<'e', 'a', 'b', 'c'>(Ud)), TileU{});
+
+  auto ga       = make_contraction_node<'e', 'b', 'q', 'c'>(h, u);
+  auto [g3, ca] = g2.add(ga);
+
+  g3.outputs(ca).execute(TeamPolicyTag2<ES>{}, Od);
+  Kokkos::fence();
+
+  auto Oh = Kokkos::create_mirror_view(Od);
+  Kokkos::deep_copy(Oh, Od);
+
+  double max_err = 0.0;
+  for (int e = 0; e < dE; ++e)
+    for (int b = 0; b < dB; ++b)
+      for (int q = 0; q < dQ; ++q)
+        for (int c = 0; c < dC; ++c)
+          max_err =
+              std::max(max_err, std::abs(gref(q, e, b, c) - Oh(e, b, q, c)));
+  EXPECT_LT(max_err, 1e-4) << "declared-order contraction != reference";
+}
+
+// The consumer's order differs from BOTH the storage order and the producer's
+// declared order, so the read permutation is the composition of the two. This
+// is the SEM shape: one gradient slot read by combines in different frames.
+TEST(LevelGraphDeclaredOrder, CombineReadsDeclaredSlotInItsOwnOrder) {
+  ViewH Hd("H", dQ, dA);
+  ViewU Ud("U", dE, dA, dB, dC);
+  ViewO Od("O", dQ, dC, dE, dB);
+  fill(Hd, Ud);
+
+  auto g0      = make_level_graph<float, ES>();
+  auto [g1, h] = g0.stage(make_input_node(make_handle<'q', 'a'>(Hd)), TileH{});
+  auto [g2, u] =
+      g1.stage(make_input_node(make_handle<'e', 'a', 'b', 'c'>(Ud)), TileU{});
+
+  auto ga       = make_contraction_node<'e', 'b', 'q', 'c'>(h, u);
+  auto [g3, ca] = g2.add(ga);
+  auto cmb      = make_combine_node<'q', 'c', 'e', 'b'>(ca, ScaleD{});
+  auto [g4, pa] = g3.add(cmb);
+
+  g4.outputs(pa).execute(TeamPolicyTag2<ES>{}, Od);
+  Kokkos::fence();
+
+  auto Oh = Kokkos::create_mirror_view(Od);
+  Kokkos::deep_copy(Oh, Od);
+
+  double max_err = 0.0;
+  for (int q = 0; q < dQ; ++q)
+    for (int c = 0; c < dC; ++c)
+      for (int e = 0; e < dE; ++e)
+        for (int b = 0; b < dB; ++b) {
+          const double ref = 2.0 * gref(q, e, b, c) + 0.5;
+          max_err          = std::max(max_err, std::abs(ref - Oh(q, c, e, b)));
+        }
+  EXPECT_LT(max_err, 1e-4) << "combine over declared-order slot != reference";
+}
+
+// A declared-order slot consumed by ANOTHER CONTRACTION, which is the only
+// consumer that reads a slot handle's shape() as well as its labels. Level 2
+// reads level 1's slot through a non-identity presentation permutation, and
+// declares its own output non-canonically in turn.
+TEST(LevelGraphDeclaredOrder, ContractionReadsDeclaredSlotOperand) {
+  ViewH Hd("H", dQ, dA);
+  ViewW Wd("W", dP, dQ);
+  ViewU Ud("U", dE, dA, dB, dC);
+  ViewO Od("O", dE, dB, dP, dC);
+  fill(Hd, Ud);
+
+  auto Wh = Kokkos::create_mirror_view(Wd);
+  for (int p = 0; p < dP; ++p)
+    for (int q = 0; q < dQ; ++q) Wh(p, q) = wval(p, q);
+  Kokkos::deep_copy(Wd, Wh);
+
+  auto g0      = make_level_graph<float, ES>();
+  auto [g1, h] = g0.stage(make_input_node(make_handle<'q', 'a'>(Hd)), TileH{});
+  auto [g2, w] = g1.stage(make_input_node(make_handle<'p', 'q'>(Wd)), TileW{});
+  auto [g3, u] =
+      g2.stage(make_input_node(make_handle<'e', 'a', 'b', 'c'>(Ud)), TileU{});
+
+  auto ga       = make_contraction_node<'e', 'b', 'q', 'c'>(h, u);
+  auto [g4, ca] = g3.add(ga);
+  auto gb       = make_contraction_node<'e', 'b', 'p', 'c'>(w, ca);
+  auto [g5, cb] = g4.add(gb);
+
+  g5.outputs(cb).execute(TeamPolicyTag2<ES>{}, Od);
+  Kokkos::fence();
+
+  auto Oh = Kokkos::create_mirror_view(Od);
+  Kokkos::deep_copy(Oh, Od);
+
+  double max_err = 0.0;
+  for (int e = 0; e < dE; ++e)
+    for (int b = 0; b < dB; ++b)
+      for (int p = 0; p < dP; ++p)
+        for (int c = 0; c < dC; ++c) {
+          double ref = 0.0;
+          for (int q = 0; q < dQ; ++q) ref += wval(p, q) * gref(q, e, b, c);
+          max_err = std::max(max_err, std::abs(ref - Oh(e, b, p, c)));
+        }
+  EXPECT_LT(max_err, 1e-4)
+      << "contraction over declared-order slot != reference";
+}
+
+}  // namespace declared
+
 int main(int argc, char* argv[]) {
   ::testing::InitGoogleTest(&argc, argv);
   Kokkos::initialize(argc, argv);

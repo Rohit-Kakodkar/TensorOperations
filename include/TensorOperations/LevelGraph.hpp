@@ -52,6 +52,80 @@ template <typename LevelsT, std::size_t NumStages, std::size_t GS>
 using lg_slot_tile_t = member_out_tile_t<
     typename lg_slot_member_node<LevelsT, NumStages, GS>::type>;
 
+template <typename Node, typename OpModes,
+          typename Tag = typename Node::node_tag>
+struct lg_canon_modes_of {
+  using type = OpModes;
+};
+template <typename Node, typename OpModes>
+struct lg_canon_modes_of<Node, OpModes, ContractionTag> {
+  using type = gather_modes_seq_t<OpModes, typename Node::permC_seq>;
+};
+
+template <typename LevelsT, std::size_t NumStages, std::size_t S,
+          typename OpModes, bool IsStage = (S < NumStages)>
+struct lg_slot_canon_modes {
+  using type = OpModes;
+};
+template <typename LevelsT, std::size_t NumStages, std::size_t S,
+          typename OpModes>
+struct lg_slot_canon_modes<LevelsT, NumStages, S, OpModes, false> {
+  using type = typename lg_canon_modes_of<
+      typename lg_slot_member_node<LevelsT, NumStages, S>::type, OpModes>::type;
+};
+
+template <typename Member, typename Tag = typename Member::node_tag>
+struct lg_member_decl_modes {
+  using type = typename Member::modes_seq;
+};
+template <typename Member>
+struct lg_member_decl_modes<Member, ContractionTag> {
+  using type =
+      gather_modes_seq_t<typename Member::modes_seq,
+                         inverse_perm_seq_t<typename Member::permC_seq>>;
+};
+
+template <typename Member, typename Tag = typename Member::node_tag>
+struct lg_member_decl_tile {
+  using type = member_out_tile_t<Member>;
+};
+template <typename Member>
+struct lg_member_decl_tile<Member, ContractionTag> {
+  using canon_layout = decltype(make_tile_layout(
+      std::declval<member_out_tile_t<Member>>(), LayoutRight{}));
+  using type = TileFromPerm<canon_layout,
+                            inverse_perm_seq_t<typename Member::permC_seq>>;
+};
+
+template <typename Member, typename Tag = typename Member::node_tag>
+struct lg_member_decl_shape {
+  static auto get(const Member& m) { return m.shape(); }
+};
+template <typename Member>
+struct lg_member_decl_shape<Member, ContractionTag> {
+  static auto get(const Member& m) {
+    return scatter_index(m.shape(), typename Member::permC_seq{});
+  }
+};
+
+template <typename LevelsT, std::size_t NumStages, std::size_t S,
+          typename OpModes, typename TargetModes, typename Store, typename Team>
+KOKKOS_FUNCTION auto lg_read_slot(const Store& store, const Team& team) {
+  using Canon =
+      typename lg_slot_canon_modes<LevelsT, NumStages, S, OpModes>::type;
+  static_assert(same_label_set_v<Canon, TargetModes>,
+                "level graph: an operand's labels must be a permutation of the "
+                "labels it is read as. The read permutation is DERIVED from "
+                "labels, so a mismatched label set has no well-defined order");
+  using Perm = label_perm_seq_t<TargetModes, Canon>;
+  if constexpr (is_identity_v<Perm>)
+    return make_value_evaluator(make_interm_node(store.template get<S>()),
+                                team);
+  else
+    return make_value_evaluator(
+        make_interm_node(reorder_view(store.template get<S>(), Perm{})), team);
+}
+
 template <typename V, typename ES, typename LevelsT, std::size_t NumStages,
           typename Team, typename StageTilesT, std::size_t... Ss,
           std::size_t... Ls>
@@ -119,10 +193,11 @@ KOKKOS_FUNCTION auto lg_make_contraction_member(const LevelsT& levels,
   constexpr std::size_t SlotB = Node::node_b_type::SlotIdx;
   constexpr std::size_t SlotC = lg_member_base_v<LevelsT, NumStages, L, M>;
 
-  auto a =
-      make_value_evaluator(make_interm_node(store.template get<SlotA>()), team);
-  auto b =
-      make_value_evaluator(make_interm_node(store.template get<SlotB>()), team);
+  using AModes = typename Node::node_a_type::modes_seq;
+  using BModes = typename Node::node_b_type::modes_seq;
+
+  auto a = lg_read_slot<LevelsT, NumStages, SlotA, AModes, AModes>(store, team);
+  auto b = lg_read_slot<LevelsT, NumStages, SlotB, BModes, BModes>(store, team);
   return contract_into(levels.template get<L>().template get<M>(), a, b,
                        make_interm_node(store.template get<SlotC>()), team);
 }
@@ -170,11 +245,11 @@ KOKKOS_FUNCTION auto lg_make_combine_member_impl(const LevelsT& levels,
   Kokkos::Array<OutNode, static_cast<std::size_t>(Node::NumOut)> outs{
       make_interm_node(store.template get<Base + Os>())...};
   auto ops = make_combine_operands(
-      make_value_evaluator(
-          make_interm_node(
-              store.template get<
-                  tuple_element_t<Ks, typename Node::ops_tuple_t>::SlotIdx>()),
-          team)...,
+      lg_read_slot<
+          LevelsT, NumStages,
+          tuple_element_t<Ks, typename Node::ops_tuple_t>::SlotIdx,
+          typename tuple_element_t<Ks, typename Node::ops_tuple_t>::modes_seq,
+          typename Node::modes_seq>(store, team)...,
       outs);
   return make_evaluator<TeamPolicyTag2<ES>>(
       levels.template get<L>().template get<M>(), ops, team);
@@ -255,7 +330,8 @@ KOKKOS_FUNCTION void lg_store_root(const LevelsT& levels, const Store& store,
 
   const auto idx   = dag_node_index<Node::Rank, RootR>(grid_idx, Gather{});
   auto       seval = make_evaluator<TeamPolicyTag<ES>>(
-      make_interm_node(store.template get<R>()), member_out_tile_t<Node>{});
+      make_interm_node(store.template get<R>()),
+      typename lg_member_decl_tile<Node>::type{});
   seval(team, idx, view, output_perm_seq<Node>());
 }
 
@@ -454,10 +530,12 @@ struct LevelGraph {
   auto member_handles_impl(const Member& m, std::index_sequence<Os...>) const {
     constexpr std::size_t Base =
         Impl::lg_member_base_v<NewLevels, num_stages, L, M>;
-    using Tile = member_out_tile_t<Member>;
+    using Tile = typename Impl::lg_member_decl_tile<Member>::type;
     return std::make_tuple(
-        make_slot_node_seq<Base + Os, typename Member::modes_seq>(
-            SlotView<ValueType, ExecSpace, Tile>{}, m.shape())...);
+        make_slot_node_seq<Base + Os,
+                           typename Impl::lg_member_decl_modes<Member>::type>(
+            SlotView<ValueType, ExecSpace, Tile>{},
+            Impl::lg_member_decl_shape<Member>::get(m))...);
   }
 
   template <std::size_t S>

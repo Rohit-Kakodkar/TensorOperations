@@ -116,12 +116,6 @@ KOKKOS_FUNCTION auto contract_into(NodeT node, AEval a, BEval b, CNode c,
                                    const Team& team) {
   using ES = typename NodeT::exec_space;
 
-  static_assert(
-      Impl::is_identity_v<typename NodeT::permC_seq>,
-      "contract_into: Tag2 writes C in CANONICAL order (freeA in A's order, "
-      "then freeB in B's order) and ignores permC, so the contraction node's "
-      "output labels must already be canonical");
-
   return make_evaluator<TeamPolicyTag2<ES>>(
       node,
       ContractOperands{

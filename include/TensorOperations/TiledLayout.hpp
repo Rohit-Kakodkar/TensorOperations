@@ -1128,6 +1128,16 @@ KOKKOS_FUNCTION constexpr auto reorder_tile(
   return make_tile_layout(new_tile, new_order);
 }
 
+template <int... E, int... Order, int... Perm>
+KOKKOS_FUNCTION constexpr auto reorder_tile(
+    StaticTileLayoutStride<StaticTile<E...>, Order...>,
+    std::integer_sequence<int, Perm...> perm) noexcept {
+  constexpr auto new_tile = reorder_static_tile(StaticTile<E...>{}, perm);
+  constexpr auto new_order =
+      Impl::reorder_order_seq(std::integer_sequence<int, Order...>{}, perm);
+  return make_tile_layout(new_tile, new_order);
+}
+
 // View-level wrapper for reorder_tile (mirrors the reorder_layout overload
 // above), so callers can write plain reorder_view(view, perm) regardless of
 // whether the backing layout is an OrderedSubviewLayout (global/subview
