@@ -232,37 +232,48 @@ KOKKOS_FUNCTION void lg_run_contraction_level(const LevelsT& levels,
 }
 
 template <typename V, typename ES, typename LevelsT, std::size_t NumStages,
-          std::size_t L, std::size_t M, typename Store, typename Team,
-          std::size_t... Ks, std::size_t... Os>
-KOKKOS_FUNCTION auto lg_make_combine_member_impl(const LevelsT& levels,
-                                                 const Store&   store,
-                                                 const Team&    team,
-                                                 std::index_sequence<Ks...>,
-                                                 std::index_sequence<Os...>) {
+          typename GridNode, std::size_t RootR, std::size_t L, std::size_t M,
+          typename Store, typename Team, std::size_t... Ks, std::size_t... Os>
+KOKKOS_FUNCTION auto lg_make_combine_member_impl(
+    const LevelsT& levels, const Store& store,
+    const Kokkos::Array<int, RootR>& grid_idx, const Team& team,
+    std::index_sequence<Ks...>, std::index_sequence<Os...>) {
   using Node                 = tuple_element_t<M, tuple_element_t<L, LevelsT>>;
   constexpr std::size_t Base = lg_member_base_v<LevelsT, NumStages, L, M>;
+
+  using Gather =
+      dag_gather_seq_t<typename Node::modes_seq, typename GridNode::modes_seq>;
+  using OutTile  = member_out_tile_t<Node>;
+  const auto idx = dag_node_index<Node::Rank, RootR>(grid_idx, Gather{});
+
+  Kokkos::Array<int, Node::Rank> origin{};
+  for (int d = 0; d < Node::Rank; ++d) origin[d] = idx[d] * OutTile::extent(d);
   using OutNode = decltype(make_interm_node(store.template get<Base>()));
   Kokkos::Array<OutNode, static_cast<std::size_t>(Node::NumOut)> outs{
       make_interm_node(store.template get<Base + Os>())...};
-  auto ops = make_combine_operands(
-      lg_read_slot<
-          LevelsT, NumStages,
-          tuple_element_t<Ks, typename Node::ops_tuple_t>::SlotIdx,
-          typename tuple_element_t<Ks, typename Node::ops_tuple_t>::modes_seq,
-          typename Node::modes_seq>(store, team)...,
-      outs);
+  auto ops =
+      make_combine_operands(
+          lg_read_slot<LevelsT, NumStages,
+                       tuple_element_t<Ks, typename Node::ops_tuple_t>::SlotIdx,
+                       typename tuple_element_t<
+                           Ks, typename Node::ops_tuple_t>::modes_seq,
+                       typename Node::modes_seq>(store, team)...,
+          outs)
+          .at(origin);
   return make_evaluator<TeamPolicyTag2<ES>>(
       levels.template get<L>().template get<M>(), ops, team);
 }
 
 template <typename V, typename ES, typename LevelsT, std::size_t NumStages,
-          std::size_t L, std::size_t M, typename Store, typename Team>
-KOKKOS_FUNCTION auto lg_make_combine_member(const LevelsT& levels,
-                                            const Store&   store,
-                                            const Team&    team) {
+          typename GridNode, std::size_t RootR, std::size_t L, std::size_t M,
+          typename Store, typename Team>
+KOKKOS_FUNCTION auto lg_make_combine_member(
+    const LevelsT& levels, const Store& store,
+    const Kokkos::Array<int, RootR>& grid_idx, const Team& team) {
   using Node = tuple_element_t<M, tuple_element_t<L, LevelsT>>;
-  return lg_make_combine_member_impl<V, ES, LevelsT, NumStages, L, M>(
-      levels, store, team,
+  return lg_make_combine_member_impl<V, ES, LevelsT, NumStages, GridNode, RootR,
+                                     L, M>(
+      levels, store, grid_idx, team,
       std::make_index_sequence<static_cast<std::size_t>(Node::NumOps)>{},
       std::make_index_sequence<static_cast<std::size_t>(Node::NumOut)>{});
 }
@@ -274,17 +285,20 @@ KOKKOS_FUNCTION void lg_store_coord(const EvalsT& evs, const Coord& coord,
 }
 
 template <typename V, typename ES, typename LevelsT, std::size_t NumStages,
-          std::size_t L, typename Store, typename Team, std::size_t... Ms>
-KOKKOS_FUNCTION void lg_run_combine_level(const LevelsT& levels,
-                                          const Store& store, const Team& team,
-                                          std::index_sequence<Ms...>) {
+          typename GridNode, std::size_t RootR, std::size_t L, typename Store,
+          typename Team, std::size_t... Ms>
+KOKKOS_FUNCTION void lg_run_combine_level(
+    const LevelsT& levels, const Store& store,
+    const Kokkos::Array<int, RootR>& grid_idx, const Team& team,
+    std::index_sequence<Ms...>) {
   constexpr std::size_t Base0 = lg_member_base_v<LevelsT, NumStages, L, 0>;
 
   auto evs =
-      DeviceTuple<decltype(lg_make_combine_member<V, ES, LevelsT, NumStages, L,
-                                                  Ms>(levels, store, team))...>{
-          lg_make_combine_member<V, ES, LevelsT, NumStages, L, Ms>(
-              levels, store, team)...};
+      DeviceTuple<decltype(lg_make_combine_member<V, ES, LevelsT, NumStages,
+                                                  GridNode, RootR, L, Ms>(
+          levels, store, grid_idx, team))...>{
+          lg_make_combine_member<V, ES, LevelsT, NumStages, GridNode, RootR, L,
+                                 Ms>(levels, store, grid_idx, team)...};
 
   const auto out0 = store.template get<Base0>();
   team_for_each_coord(team, out0, [=](auto coord) {
@@ -294,26 +308,32 @@ KOKKOS_FUNCTION void lg_run_combine_level(const LevelsT& levels,
 }
 
 template <typename V, typename ES, typename LevelsT, std::size_t NumStages,
-          std::size_t L, typename Store, typename Team>
+          typename GridNode, std::size_t RootR, std::size_t L, typename Store,
+          typename Team>
 KOKKOS_FUNCTION void lg_run_level(const LevelsT& levels, const Store& store,
-                                  const Team& team) {
+                                  const Kokkos::Array<int, RootR>& grid_idx,
+                                  const Team&                      team) {
   using LevelT             = tuple_element_t<L, LevelsT>;
   constexpr std::size_t NM = tuple_size_v<LevelT>;
   if constexpr (lg_all_contraction_v<LevelT>) {
     lg_run_contraction_level<V, ES, LevelsT, NumStages, L>(
         levels, store, team, std::make_index_sequence<NM>{});
   } else {
-    lg_run_combine_level<V, ES, LevelsT, NumStages, L>(
-        levels, store, team, std::make_index_sequence<NM>{});
+    lg_run_combine_level<V, ES, LevelsT, NumStages, GridNode, RootR, L>(
+        levels, store, grid_idx, team, std::make_index_sequence<NM>{});
   }
 }
 
 template <typename V, typename ES, typename LevelsT, std::size_t NumStages,
-          typename Store, typename Team, std::size_t... Ls>
-KOKKOS_FUNCTION void lg_run_all_levels(const LevelsT& levels,
-                                       const Store& store, const Team& team,
-                                       std::index_sequence<Ls...>) {
-  (lg_run_level<V, ES, LevelsT, NumStages, Ls>(levels, store, team), ...);
+          typename GridNode, std::size_t RootR, typename Store, typename Team,
+          std::size_t... Ls>
+KOKKOS_FUNCTION void lg_run_all_levels(
+    const LevelsT& levels, const Store& store,
+    const Kokkos::Array<int, RootR>& grid_idx, const Team& team,
+    std::index_sequence<Ls...>) {
+  (lg_run_level<V, ES, LevelsT, NumStages, GridNode, RootR, Ls>(levels, store,
+                                                                grid_idx, team),
+   ...);
 }
 
 template <typename V, typename ES, typename LevelsT, std::size_t NumStages,
@@ -393,8 +413,8 @@ int lg_execute(const StagesT& stages, const StageTilesT& stage_tiles,
 
         lg_run_stages<V, ES, GridNode, RootR>(sd, gt, store, grid_idx, team,
                                               stage_seq{});
-        lg_run_all_levels<V, ES, LevelsT, NumStages>(ld, store, team,
-                                                     level_seq{});
+        lg_run_all_levels<V, ES, LevelsT, NumStages, GridNode, RootR>(
+            ld, store, grid_idx, team, level_seq{});
         lg_store_roots<V, ES, LevelsT, NumStages, GridNode, RootR>(
             ld, store, grid_idx, team, varr, roots);
       });
