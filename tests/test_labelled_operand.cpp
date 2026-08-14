@@ -54,6 +54,56 @@ static_assert(!Impl::labels_distinct_v<M<'e', 'a', 'a', 'c'>>);
 static_assert(!Impl::valid_contraction_v<4, H0, AU, M<'i', 'e', 'b', 'z'>>);
 static_assert(!Impl::valid_contraction_v<4, H0, AU, M<'i', 'e', 'b', 'a'>>);
 
+// --- P2: the combine-operand permutations, derived vs hand-written ----------
+//
+// Every non-identity operand in the 3D SEM level graph is spelled by hand at
+// its call site today (bench_sem_stiffness_3d, library2). PermutedAt takes the
+// same permutation from label_perm_seq_t instead, so the two must agree
+// operand for operand or a permuted read silently transposes.
+
+template <typename Out, typename Op>
+using LP = Impl::label_perm_seq_t<Out, Op>;
+
+using OutXi  = M<'q', 'e', 'k', 'j'>;
+using OutEta = M<'q', 'e', 'k', 'i'>;
+using OutGam = M<'q', 'e', 'j', 'i'>;
+using OutWs  = M<'e', 'k', 'j', 'i'>;
+
+static_assert(std::is_same_v<LP<OutXi, M<'q', 'e', 'k', 'j'>>, Pm<0, 1, 2, 3>>);
+static_assert(std::is_same_v<LP<OutXi, M<'j', 'e', 'k', 'q'>>, Pm<3, 1, 2, 0>>);
+static_assert(std::is_same_v<LP<OutXi, M<'k', 'e', 'j', 'q'>>, Pm<3, 1, 0, 2>>);
+
+static_assert(
+    std::is_same_v<LP<OutEta, M<'i', 'e', 'k', 'q'>>, Pm<3, 1, 2, 0>>);
+static_assert(
+    std::is_same_v<LP<OutEta, M<'q', 'e', 'k', 'i'>>, Pm<0, 1, 2, 3>>);
+static_assert(
+    std::is_same_v<LP<OutEta, M<'k', 'e', 'q', 'i'>>, Pm<2, 1, 0, 3>>);
+
+static_assert(
+    std::is_same_v<LP<OutGam, M<'i', 'e', 'q', 'j'>>, Pm<2, 1, 3, 0>>);
+static_assert(
+    std::is_same_v<LP<OutGam, M<'j', 'e', 'q', 'i'>>, Pm<2, 1, 0, 3>>);
+static_assert(
+    std::is_same_v<LP<OutGam, M<'q', 'e', 'j', 'i'>>, Pm<0, 1, 2, 3>>);
+
+static_assert(std::is_same_v<LP<OutWs, M<'i', 'e', 'k', 'j'>>, Pm<1, 2, 3, 0>>);
+static_assert(std::is_same_v<LP<OutWs, M<'j', 'e', 'k', 'i'>>, Pm<1, 2, 0, 3>>);
+static_assert(std::is_same_v<LP<OutWs, M<'k', 'e', 'j', 'i'>>, Pm<1, 0, 2, 3>>);
+
+static_assert(Impl::is_identity_v<LP<OutXi, M<'q', 'e', 'k', 'j'>>>);
+static_assert(!Impl::is_identity_v<LP<OutWs, M<'i', 'e', 'k', 'j'>>>);
+
+// PermutedAt scatters through the inverse: native[Perm[i]] = coord[i], spelled
+// as the gather native[d] = coord[Inv[d]]. Two shapes that differ pin the
+// direction -- a self-inverse permutation alone could not.
+static_assert(
+    std::is_same_v<Impl::inverse_perm_seq_t<Pm<3, 1, 2, 0>>, Pm<3, 1, 2, 0>>);
+static_assert(
+    std::is_same_v<Impl::inverse_perm_seq_t<Pm<2, 1, 3, 0>>, Pm<3, 1, 0, 2>>);
+static_assert(
+    std::is_same_v<Impl::inverse_perm_seq_t<Pm<1, 2, 3, 0>>, Pm<3, 0, 1, 2>>);
+
 }  // namespace
 
 TEST(LabelledOperand, DerivedPermsMatchHandWritten) { SUCCEED(); }

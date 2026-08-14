@@ -407,6 +407,79 @@ KOKKOS_FUNCTION auto make_combine_operands(Args... args) {
 
 namespace Impl {
 
+template <typename PermSeq, typename Eval>
+struct PermutedAt {
+  using perm_seq     = PermSeq;
+  using eval_type    = Eval;
+  using storage_type = typename Eval::storage_type;
+  using value_type   = typename Eval::value_type;
+  using exec_space   = typename Eval::exec_space;
+  using inv_perm_seq = inverse_perm_seq_t<PermSeq>;
+
+  static constexpr int Rank = static_cast<int>(storage_type::layout_t::rank);
+
+  static_assert(PermSeq::size() == static_cast<std::size_t>(Rank),
+                "PermutedAt: permutation must have one entry per operand mode");
+
+  Eval e;
+
+  template <typename Coord>
+  KOKKOS_FORCEINLINE_FUNCTION value_type& at(const Coord& coord) const {
+    return read_at(coord, inv_perm_seq{});
+  }
+
+ private:
+  template <typename Coord, int... Inv>
+  KOKKOS_FORCEINLINE_FUNCTION value_type& read_at(
+      const Coord& coord, std::integer_sequence<int, Inv...>) const {
+    return e.node().storage_[Index<Rank>{coord[Inv]...}];
+  }
+};
+
+template <typename OpEval>
+struct permuted_at_traits {
+  static constexpr bool is_permuted = false;
+  using perm_seq =
+      iota_seq_t<0, static_cast<int>(OpEval::storage_type::layout_t::rank)>;
+};
+
+template <typename PermSeq, typename Eval>
+struct permuted_at_traits<PermutedAt<PermSeq, Eval>> {
+  static constexpr bool is_permuted = true;
+  using perm_seq                    = PermSeq;
+};
+
+template <typename OpEval>
+inline constexpr bool is_permuted_at_v =
+    permuted_at_traits<OpEval>::is_permuted;
+
+template <typename OpEval>
+using read_perm_t = typename permuted_at_traits<OpEval>::perm_seq;
+
+template <typename PermSeq, typename Eval>
+KOKKOS_FUNCTION auto make_permuted_at(Eval e) {
+  if constexpr (is_identity_v<PermSeq>)
+    return e;
+  else
+    return PermutedAt<PermSeq, Eval>{e};
+}
+
+template <typename OpEval, typename Coord>
+KOKKOS_FORCEINLINE_FUNCTION decltype(auto) combine_read(const OpEval& op,
+                                                        const Coord&  coord) {
+  if constexpr (is_permuted_at_v<OpEval>)
+    return op.at(coord);
+  else
+    return op.node().storage_[coord];
+}
+
+template <typename OpLayout, typename OutLayout, int... P, std::size_t... I>
+KOKKOS_FUNCTION constexpr bool perm_extents_agree(
+    std::integer_sequence<int, P...>, std::index_sequence<I...>) noexcept {
+  return ((OpLayout::extent(P) == OutLayout::extent(static_cast<int>(I))) &&
+          ...);
+}
+
 // Does one operand present the output's shape? Stated at namespace scope so
 // the evaluator can fold it over its operand pack in a single static_assert.
 //
@@ -419,8 +492,9 @@ inline constexpr bool combine_op_aligned_v = [] {
   if constexpr (OpEval::storage_type::layout_t::rank != Rank)
     return false;
   else
-    return extents_agree<typename OpEval::storage_type::layout_t, 0, OutLayout,
-                         0, Rank>();
+    return perm_extents_agree<typename OpEval::storage_type::layout_t,
+                              OutLayout>(read_perm_t<OpEval>{},
+                                         std::make_index_sequence<Rank>{});
 }();
 
 }  // namespace Impl
@@ -468,9 +542,10 @@ class Evaluator<TeamPolicyTag2<ES>,
                 "combine destination must carry one extent per output mode");
   static_assert(
       (Impl::combine_op_aligned_v<Rank, out_layout_t, OpEvals> && ...),
-      "Tag2 combine: every operand must already present the output's extents "
-      "on every mode -- Tag2 gathers no axes, so a permuted operand must be "
-      "relabeled and staged into the output order before it gets here");
+      "Tag2 combine: every operand must present the output's extents on every "
+      "mode, read through its own access permutation -- Tag2 gathers no axes, "
+      "so a permuted operand must arrive either relabeled into the output "
+      "order (AlignedOperands) or wrapped in PermutedAt (PermutedOperands)");
 
   KOKKOS_FUNCTION Evaluator(node_type n, tiling_type t,
                             const team_member_t& team)
@@ -525,7 +600,7 @@ class Evaluator<TeamPolicyTag2<ES>,
   KOKKOS_FUNCTION Kokkos::Array<value_type, NumOps> gather_vals(
       const Coord& coord, std::index_sequence<Ks...>) const {
     return {static_cast<value_type>(
-        ops_.template get<Ks>().node().storage_[coord])...};
+        Impl::combine_read(ops_.template get<Ks>(), coord))...};
   }
 
   template <std::size_t... Ms>

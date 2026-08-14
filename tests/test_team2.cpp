@@ -1297,6 +1297,58 @@ static_assert(std::is_same_v<decltype(std::declval<const Comb2&>()(0, 0)),
 static_assert(Comb1::Rank == 2 && Comb1::NumOps == 2 && Comb1::NumOut == 1);
 static_assert(Comb2::NumOut == 2);
 
+// --- P2: PermutedAt's compile-time surface ---------------------------------
+
+using CScratchT = scratch_view_for_t<CTt>;
+using CNodeT    = decltype(make_interm_node(std::declval<CScratchT>()));
+using CValT     = Impl::value_evaluator_t<CNodeT>;
+using PermT     = Impl::PermutedAt<Swap, CValT>;
+
+// A plain evaluator reports the identity read permutation, so every existing
+// operand keeps today's meaning.
+static_assert(!Impl::is_permuted_at_v<CVal>);
+static_assert(
+    std::is_same_v<Impl::read_perm_t<CVal>, std::integer_sequence<int, 0, 1>>,
+    "a plain evaluator's read permutation must be the identity");
+static_assert(Impl::is_permuted_at_v<PermT>);
+static_assert(std::is_same_v<Impl::read_perm_t<PermT>, Swap>);
+static_assert(std::is_same_v<typename PermT::storage_type, CScratchT>,
+              "PermutedAt must present the operand's NATIVE storage");
+
+// An identity permutation is not a wrapper: make_permuted_at hands the plain
+// evaluator straight back, so the aligned and permuted policies produce the
+// SAME type wherever the operand is already in output order.
+static_assert(std::is_same_v<
+              decltype(Impl::make_permuted_at<std::integer_sequence<int, 0, 1>>(
+                  std::declval<CVal>())),
+              CVal>);
+
+using CTLayout  = scratch_layout_for_t<CT>;
+using CTtLayout = scratch_layout_for_t<CTt>;
+
+// A cI x cJ operand read at Swap does NOT present a cI x cJ output's extents
+// (cI != cJ), while the cJ x cI one does. This is the check that a transposed
+// operand slipped in unpermuted must fail.
+static_assert(Impl::combine_op_aligned_v<2, CTLayout, CVal>);
+static_assert(Impl::combine_op_aligned_v<2, CTLayout, PermT>);
+static_assert(!Impl::combine_op_aligned_v<2, CTLayout, CValT>,
+              "a {j,i}-shaped operand must not pass as aligned to an {i,j} "
+              "output");
+static_assert(!Impl::combine_op_aligned_v<2, CTtLayout, PermT>,
+              "PermutedAt<Swap> over a cJ x cI tile presents cI x cJ, not "
+              "cJ x cI");
+
+// The ill-formed-not-false case the if constexpr chain protects: a rank-1
+// operand layout against a rank-2 output must answer false. Reached with `&&`
+// it would not be false, it would fail to compile -- the operand's read
+// permutation is one element long and the output index pack is two, and a fold
+// over packs of different lengths is an error, not a value.
+using C1     = scratch_view_for_t<StaticTile<cI>>;
+using CNode1 = decltype(make_interm_node(std::declval<C1>()));
+static_assert(
+    !Impl::combine_op_aligned_v<2, CTLayout, Impl::value_evaluator_t<CNode1>>,
+    "a short-rank check must short-circuit before any extent is read");
+
 // A hooked destination keeps its hook on the node handed back.
 using Ops1H = decltype(make_combine_operands(
     std::declval<CVal>(), std::declval<CVal>(), std::declval<CNodeH>()));
@@ -1504,6 +1556,105 @@ void run_relabeled(V2 a, V2 bt, Buf1D out) {
           const auto pv = res[0].node().storage_;
           for (int i = 0; i < cI; ++i)
             for (int j = 0; j < cJ; ++j) out(i * cJ + j) = pv(i, j);
+        });
+      });
+  Kokkos::fence();
+}
+
+// P2: the same {'j','i'} operand, but held in its NATIVE order and read at a
+// permuted coordinate instead of relabeled into a strided view. Both arms run
+// in one kernel off one staged native tile, so a divergence is the read form
+// and nothing else.
+void run_permuted_vs_aligned(V2 a, V2 bt, Buf1D aligned, Buf1D permuted) {
+  auto node = make_combine_node<'i', 'j'>(
+      make_input_node(make_handle<'i', 'j'>(a)),
+      make_input_node(make_handle<'j', 'i'>(bt)), Mix{});
+  const std::size_t bytes = scratch_for<CT, CTt, CT, CT, CT>();
+  Kokkos::parallel_for(
+      Kokkos::TeamPolicy<ES>(1, Kokkos::AUTO)
+          .set_scratch_size(0, Kokkos::PerTeam(bytes)),
+      KOKKOS_LAMBDA(const team_t& team) {
+        auto A    = stage_full(node.operands.get<0>(), CT{}, team);
+        auto Bnat = stage_full(node.operands.get<1>(), CTt{}, team);
+
+        auto Bal = Impl::combine_operand<AlignedOperands, Swap>(Bnat, team);
+        auto Bpm = Impl::combine_operand<PermutedOperands, Swap>(Bnat, team);
+
+        static_assert(!Impl::is_permuted_at_v<decltype(Bal)>,
+                      "AlignedOperands must keep today's reorder_view operand");
+        static_assert(Impl::is_permuted_at_v<decltype(Bpm)>,
+                      "PermutedOperands must wrap the native storage");
+        static_assert(std::is_same_v<typename decltype(Bpm)::storage_type,
+                                     typename decltype(Bnat)::storage_type>,
+                      "PermutedAt must hold the operand's NATIVE storage type");
+
+        auto P0 =
+            make_interm_node(Impl::alloc_scratch_tile<float, ES>(team, CT{}));
+        auto P1 =
+            make_interm_node(Impl::alloc_scratch_tile<float, ES>(team, CT{}));
+        auto ra = make_evaluator<TeamPolicyTag2<ES>>(
+            node, make_combine_operands(A, Bal, P0), team)();
+        auto rp = make_evaluator<TeamPolicyTag2<ES>>(
+            node, make_combine_operands(A, Bpm, P1), team)();
+        team.team_barrier();
+
+        Kokkos::single(Kokkos::PerTeam(team), [=]() {
+          const auto av = ra[0].node().storage_;
+          const auto pv = rp[0].node().storage_;
+          for (int i = 0; i < cI; ++i)
+            for (int j = 0; j < cJ; ++j) {
+              aligned(i * cJ + j)  = av(i, j);
+              permuted(i * cJ + j) = pv(i, j);
+            }
+        });
+      });
+  Kokkos::fence();
+}
+
+// Rank 2 cannot pin the SCATTER DIRECTION: <1,0> is its own inverse, so
+// permuting where the inverse belongs reads the same element. This is the same
+// A/B at rank 3 with <1,2,0>, whose inverse <2,0,1> differs, over three
+// distinct extents.
+void run_permuted3_vs_aligned(V3 a, V3 bp, Buf1D aligned, Buf1D permuted) {
+  auto node = make_combine_node<'i', 'j', 'k'>(
+      make_input_node(make_handle<'i', 'j', 'k'>(a)),
+      make_input_node(make_handle<'k', 'i', 'j'>(bp)), Mix3{});
+  using GTn = StaticTile<gK, gI, gJ>;
+  using Rot =
+      Impl::label_perm_seq_t<std::integer_sequence<int32_t, 'i', 'j', 'k'>,
+                             std::integer_sequence<int32_t, 'k', 'i', 'j'>>;
+  static_assert(std::is_same_v<Rot, std::integer_sequence<int, 1, 2, 0>>);
+
+  const std::size_t bytes = scratch_for<GT, GTn, GT, GT>();
+  Kokkos::parallel_for(
+      Kokkos::TeamPolicy<ES>(1, Kokkos::AUTO)
+          .set_scratch_size(0, Kokkos::PerTeam(bytes)),
+      KOKKOS_LAMBDA(const team_t& team) {
+        auto A    = stage_full(node.operands.get<0>(), GT{}, team);
+        auto Bnat = stage_full(node.operands.get<1>(), GTn{}, team);
+
+        auto Bal = Impl::combine_operand<AlignedOperands, Rot>(Bnat, team);
+        auto Bpm = Impl::combine_operand<PermutedOperands, Rot>(Bnat, team);
+
+        auto P0 =
+            make_interm_node(Impl::alloc_scratch_tile<float, ES>(team, GT{}));
+        auto P1 =
+            make_interm_node(Impl::alloc_scratch_tile<float, ES>(team, GT{}));
+        auto ra = make_evaluator<TeamPolicyTag2<ES>>(
+            node, make_combine_operands(A, Bal, P0), team)();
+        auto rp = make_evaluator<TeamPolicyTag2<ES>>(
+            node, make_combine_operands(A, Bpm, P1), team)();
+        team.team_barrier();
+
+        Kokkos::single(Kokkos::PerTeam(team), [=]() {
+          const auto av = ra[0].node().storage_;
+          const auto pv = rp[0].node().storage_;
+          for (int i = 0; i < gI; ++i)
+            for (int j = 0; j < gJ; ++j)
+              for (int k = 0; k < gK; ++k) {
+                aligned((i * gJ + j) * gK + k)  = av(i, j, k);
+                permuted((i * gJ + j) * gK + k) = pv(i, j, k);
+              }
         });
       });
   Kokkos::fence();
@@ -1746,6 +1897,60 @@ TEST(Team2Combine, RelabeledOperandAligns) {
                   ah(i, j) * bth(j, i) + 0.5f * i - static_cast<float>(j),
                   1e-5f)
           << "i=" << i << " j=" << j;
+}
+
+TEST(Team2Combine, PermutedOperandMatchesAligned) {
+  using namespace combine;
+  V2   a("a", cI, cJ), bt("bt", cJ, cI);
+  auto ah = fill2(a, p_val);
+  // bt is stored {j, i}: bt(j, i) is the operand's value at output (i, j).
+  auto bth = fill2(bt, [](int j, int i) { return q_val(i, j); });
+
+  Buf1D aligned("aligned", cI * cJ), permuted("permuted", cI * cJ);
+  run_permuted_vs_aligned(a, bt, aligned, permuted);
+  const auto ga = to_host(aligned);
+  const auto gp = to_host(permuted);
+
+  for (int i = 0; i < cI; ++i)
+    for (int j = 0; j < cJ; ++j) {
+      const float want =
+          ah(i, j) * bth(j, i) + 0.5f * i - static_cast<float>(j);
+      EXPECT_NEAR(ga[i * cJ + j], want, 1e-5f) << "i=" << i << " j=" << j;
+      EXPECT_EQ(gp[i * cJ + j], ga[i * cJ + j]) << "i=" << i << " j=" << j;
+    }
+}
+
+TEST(Team2Combine, PermutedOperandMatchesAlignedRank3) {
+  using namespace combine;
+  V3   a("a", gI, gJ, gK), bp("bp", gK, gI, gJ);
+  auto ah = Kokkos::create_mirror_view(a);
+  auto bh = Kokkos::create_mirror_view(bp);
+  for (int i = 0; i < gI; ++i)
+    for (int j = 0; j < gJ; ++j)
+      for (int k = 0; k < gK; ++k) {
+        ah(i, j, k) = 0.5f + 0.25f * i - 0.125f * j + 0.75f * k;
+        // bp is stored {k, i, j}: bp(k, i, j) is the value at output (i, j, k).
+        bh(k, i, j) =
+            -1.0f + 0.375f * i + 0.5f * j - 0.25f * k + 0.0625f * i * k;
+      }
+  Kokkos::deep_copy(a, ah);
+  Kokkos::deep_copy(bp, bh);
+
+  Buf1D aligned("aligned", gI * gJ * gK), permuted("permuted", gI * gJ * gK);
+  run_permuted3_vs_aligned(a, bp, aligned, permuted);
+  const auto ga = to_host(aligned);
+  const auto gp = to_host(permuted);
+
+  for (int i = 0; i < gI; ++i)
+    for (int j = 0; j < gJ; ++j)
+      for (int k = 0; k < gK; ++k) {
+        const int   f    = (i * gJ + j) * gK + k;
+        const float want = ah(i, j, k) * bh(k, i, j) +
+                           static_cast<float>(100 * i + 10 * j + k);
+        EXPECT_NEAR(ga[f], want, 1e-4f)
+            << "i=" << i << " j=" << j << " k=" << k;
+        EXPECT_EQ(gp[f], ga[f]) << "i=" << i << " j=" << j << " k=" << k;
+      }
 }
 
 TEST(Team2Combine, DestHookRidesForwardUnapplied) {

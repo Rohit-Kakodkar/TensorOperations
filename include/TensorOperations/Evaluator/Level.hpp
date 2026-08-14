@@ -1,5 +1,10 @@
 #pragma once
 
+struct AlignedOperands {};
+struct PermutedOperands {};
+
+using DefaultOperandPolicy = AlignedOperands;
+
 namespace Impl {
 
 template <typename PermSeq, typename Eval>
@@ -17,6 +22,20 @@ KOKKOS_FUNCTION auto reorder_operand(Eval e, const Team& team) {
   } else {
     return (make_evaluator<TeamPolicyTag2<typename Eval::exec_space>>(
                 e, PermSeq{}, team) = e);
+  }
+}
+
+template <typename Policy, typename PermSeq, typename Eval, typename Team>
+KOKKOS_FUNCTION auto combine_operand(Eval e, const Team& team) {
+  static_assert(std::is_same_v<Policy, AlignedOperands> ||
+                    std::is_same_v<Policy, PermutedOperands>,
+                "combine_operand: policy must be AlignedOperands or "
+                "PermutedOperands");
+  if constexpr (std::is_same_v<Policy, PermutedOperands>) {
+    (void)team;
+    return make_permuted_at<PermSeq>(e);
+  } else {
+    return reorder_operand<PermSeq>(e, team);
   }
 }
 
