@@ -17,6 +17,7 @@ struct IntermTag {};
 struct ContractionTag {};
 struct CombineTag {};
 struct SlotTag {};
+struct StagedTag {};
 
 // Sentinel for "no hook"
 struct NoHook {};
@@ -142,6 +143,33 @@ struct NodeHandle<IntermTag, Storage, IntRank, ExecSpace, HookOp> {
   [[no_unique_address]] HookOp hook_op;
 };
 
+template <typename Operand, typename ModesSeq>
+struct NodeHandle<StagedTag, Operand, ModesSeq> {
+  Operand operand_;
+
+  using node_tag            = StagedTag;
+  using operand_type        = Operand;
+  static constexpr int Rank = Operand::Rank;
+  using value_type          = typename Operand::value_type;
+  using exec_space          = typename Operand::exec_space;
+  using modes_seq           = ModesSeq;
+
+  static_assert(static_cast<int>(ModesSeq::size()) == Rank,
+                "staged node: one label per axis");
+  static_assert(Impl::labels_distinct_v<ModesSeq>,
+                "staged node: labels must be distinct");
+
+  KOKKOS_FUNCTION Kokkos::Array<int, Rank> shape() const {
+    return operand_.shape();
+  }
+
+  template <int32_t... Modes>
+  KOKKOS_FUNCTION auto as() const {
+    return NodeHandle<StagedTag, Operand,
+                      std::integer_sequence<int32_t, Modes...>>{operand_};
+  }
+};
+
 // ---------------------------------------------------------------------------
 // Slot specialization — a LABELLED, read-only view of a buffer some OTHER node
 // owns.
@@ -198,6 +226,15 @@ struct NodeHandle<SlotTag, IntSlotIdx, Storage, IntRank, ExecSpace, ModesSeq> {
   Kokkos::Array<int, Rank> shape_;  // the PRODUCER's full output extents
 
   KOKKOS_FUNCTION Kokkos::Array<int, Rank> shape() const { return shape_; }
+
+  template <int32_t... Modes>
+  KOKKOS_FUNCTION auto as() const {
+    static_assert(static_cast<int>(sizeof...(Modes)) == Rank,
+                  "slot node as(): one label per axis");
+    return NodeHandle<SlotTag, IntSlotIdx, Storage, IntRank, ExecSpace,
+                      std::integer_sequence<int32_t, Modes...>>{storage_,
+                                                                shape_};
+  }
 };
 
 // ---------------------------------------------------------------------------
@@ -230,6 +267,12 @@ KOKKOS_FUNCTION auto make_interm_node(Storage storage, HookOp hook = {}) {
                     ExecSpace, HookOp>{std::move(storage), std::move(hook)};
 }
 
+template <typename Operand>
+KOKKOS_FUNCTION auto make_stage_node(Operand op) {
+  return NodeHandle<StagedTag, Operand, typename Operand::modes_seq>{
+      std::move(op)};
+}
+
 // Slot node — label an existing buffer (a producing node's output scratch) so
 // it can be read as an operand.
 //
@@ -246,17 +289,23 @@ KOKKOS_FUNCTION auto make_interm_node(Storage storage, HookOp hook = {}) {
 // `SlotIdx` names the buffer within the driver's slot store. Standalone uses --
 // binding a buffer by hand, outside any driver -- can pass 0 and ignore it; it
 // only means something to a DagGraph.
-template <std::size_t SlotIdx, int32_t... Modes, typename Storage>
-KOKKOS_FUNCTION auto make_slot_node(
-    Storage storage, Kokkos::Array<int, sizeof...(Modes)> shape) {
-  constexpr int Rank = static_cast<int>(sizeof...(Modes));
+template <std::size_t SlotIdx, typename ModesSeq, typename Storage>
+KOKKOS_FUNCTION auto make_slot_node_seq(
+    Storage storage, Kokkos::Array<int, ModesSeq::size()> shape) {
+  constexpr int Rank = static_cast<int>(ModesSeq::size());
   using ExecSpace    = typename Impl::exec_space_of<Storage>::type;
-  using ModesSeq     = std::integer_sequence<int32_t, Modes...>;
   static_assert(static_cast<int>(Storage::rank) == Rank,
                 "slot node: one label per storage mode");
   return NodeHandle<SlotTag, std::integral_constant<std::size_t, SlotIdx>,
                     Storage, std::integral_constant<int, Rank>, ExecSpace,
                     ModesSeq>{std::move(storage), shape};
+}
+
+template <std::size_t SlotIdx, int32_t... Modes, typename Storage>
+KOKKOS_FUNCTION auto make_slot_node(
+    Storage storage, Kokkos::Array<int, sizeof...(Modes)> shape) {
+  return make_slot_node_seq<SlotIdx, std::integer_sequence<int32_t, Modes...>>(
+      std::move(storage), shape);
 }
 
 // ---------------------------------------------------------------------------
