@@ -232,11 +232,9 @@ class Evaluator<TeamPolicyTag2<ES>,
                             const team_member_t& team)
       : node_(n),
         c_(ops.c),
-        a2_(reshape(ops.a.node().storage_, StaticTile<SA, SK>{},
-                    LayoutRight{})),
-        b2_(reshape(ops.b.node().storage_, StaticTile<SK, SB>{},
-                    LayoutRight{})),
-        c2_(reshape(ops.c.storage_, StaticTile<SA, SB>{}, LayoutRight{})),
+        a2_(regroup_view(ops.a.node().storage_, Split<FreeA, RankA>{})),
+        b2_(regroup_view(ops.b.node().storage_, Split<NumK, RankB>{})),
+        c2_(regroup_view(ops.c.storage_, Split<FreeA, RankC>{})),
         team_(team) {}
 
   KOKKOS_FUNCTION value_type operator()(int i, int j) const {
@@ -257,15 +255,12 @@ class Evaluator<TeamPolicyTag2<ES>,
   }
 
  private:
-  using a_matrix_t =
-      decltype(reshape(std::declval<typename AEval::storage_type>(),
-                       StaticTile<SA, SK>{}, LayoutRight{}));
-  using b_matrix_t =
-      decltype(reshape(std::declval<typename BEval::storage_type>(),
-                       StaticTile<SK, SB>{}, LayoutRight{}));
-  using c_matrix_t =
-      decltype(reshape(std::declval<typename CNode::storage_type>(),
-                       StaticTile<SA, SB>{}, LayoutRight{}));
+  using a_matrix_t = decltype(regroup_view(
+      std::declval<typename AEval::storage_type>(), Split<FreeA, RankA>{}));
+  using b_matrix_t = decltype(regroup_view(
+      std::declval<typename BEval::storage_type>(), Split<NumK, RankB>{}));
+  using c_matrix_t = decltype(regroup_view(
+      std::declval<typename CNode::storage_type>(), Split<FreeA, RankC>{}));
 
   node_type     node_;
   CNode         c_;

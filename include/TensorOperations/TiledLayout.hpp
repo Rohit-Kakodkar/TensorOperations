@@ -975,6 +975,31 @@ KOKKOS_FUNCTION auto reshape(const View<ViewType, Layout>& view,
   return {view.backing_, reshape(view.layout(), tile, order)};
 }
 
+template <int S, int R>
+struct Split {
+  static_assert(S > 0 && S < R,
+                "Split: the split must leave both modes non-empty");
+};
+
+template <typename Layout, int S, int R>
+  requires(requires {
+    Layout::stride(0);
+    Layout::extent(0);
+  })
+KOKKOS_FUNCTION constexpr auto regroup_layout(Layout, Split<S, R>)
+    -> Impl::regroup_layout_t<Layout, Impl::split_groups_t<S, R>> {
+  static_assert(R == Layout::rank,
+                "Split: the stated rank must match the layout's rank");
+  return {};
+}
+
+template <typename ViewType, typename Layout, int S, int R>
+KOKKOS_FUNCTION auto regroup_view(const View<ViewType, Layout>& view,
+                                  Split<S, R>                   split)
+    -> View<ViewType, decltype(regroup_layout(view.layout(), split))> {
+  return {view.backing_, regroup_layout(view.layout(), split)};
+}
+
 // ---------------------------------------------------------------------------
 // reorder_layout — logically permute (transpose) a subview's dimensions.
 //

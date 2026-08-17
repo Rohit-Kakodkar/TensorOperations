@@ -816,6 +816,310 @@ TEST(Team2Contract, MultipleFreeAModesCollapseIntoSA) {
 }
 
 // ---------------------------------------------------------------------------
+// Tag2 ContractionTag over PERMUTED operands — the capability the regroup
+// exists for. A relabeled operand is a zero-copy strided view, so the row and
+// column groups the contraction collapses are no longer contiguous runs of the
+// operand's memory-order stream; reshape could not express these at all.
+//
+// reorder_view's permutation reads perm[d] = the SOURCE axis that becomes
+// destination axis d, matching Team2Relabel.GlobalRank3CyclePermutation.
+// ---------------------------------------------------------------------------
+namespace permuted {
+
+using contract::scratch_for;
+using contract::stage_full;
+using contract::to_host;
+
+using PV2 = Kokkos::View<float**, Kokkos::LayoutRight, ES>;
+using PV3 = Kokkos::View<float***, Kokkos::LayoutRight, ES>;
+
+KOKKOS_INLINE_FUNCTION float u_val(int p, int q, int r) {
+  return 0.5f + 0.25f * p - 0.125f * q + 0.375f * r + 0.0625f * p * r -
+         0.03125f * q * r;
+}
+KOKKOS_INLINE_FUNCTION float h_val(int d, int m, int k) {
+  return 1.25f - 0.5f * d + 0.75f * m - 0.25f * k + 0.125f * m * k * (d + 1);
+}
+
+// The SEM gradient level: one tensor staged once, three contractions each
+// taking a different axis as k. Directions 1 and 2 reach it through a permuted
+// view of the SAME buffer instead of a transposed copy.
+constexpr int uP = 3, uQ = 4, uR = 5, hM = 2;
+
+using TU  = StaticTile<uP, uQ, uR>;
+using TH0 = StaticTile<hM, uP>;
+using TH1 = StaticTile<hM, uQ>;
+using TH2 = StaticTile<hM, uR>;
+using TC0 = StaticTile<hM, uQ, uR>;
+using TC1 = StaticTile<hM, uP, uR>;
+using TC2 = StaticTile<hM, uP, uQ>;
+
+void run_three_directions(PV3 u, PV2 h0, PV2 h1, PV2 h2, Buf1D o0, Buf1D o1,
+                          Buf1D o2) {
+  auto un  = make_input_node(make_handle<'p', 'q', 'r'>(u));
+  auto h0n = make_input_node(make_handle<'m', 'p'>(h0));
+  auto h1n = make_input_node(make_handle<'m', 'q'>(h1));
+  auto h2n = make_input_node(make_handle<'m', 'r'>(h2));
+
+  auto n0 = make_contraction_node<'m', 'q', 'r'>(h0n, un);
+  auto n1 = make_contraction_node<'m', 'p', 'r'>(h1n, un);
+  auto n2 = make_contraction_node<'m', 'p', 'q'>(h2n, un);
+
+  const std::size_t bytes = scratch_for<TU, TH0, TH1, TH2, TC0, TC1, TC2>();
+  Kokkos::parallel_for(
+      Kokkos::TeamPolicy<ES>(1, Kokkos::AUTO)
+          .set_scratch_size(0, Kokkos::PerTeam(bytes)),
+      KOKKOS_LAMBDA(const team_t& team) {
+        auto U  = stage_full(un, TU{}, team);
+        auto A0 = stage_full(h0n, TH0{}, team);
+        auto A1 = stage_full(h1n, TH1{}, team);
+        auto A2 = stage_full(h2n, TH2{}, team);
+
+        // (p,q,r) -> (q,p,r): k = q, free (p,r), both groups gapped.
+        auto B1 = (make_evaluator<TeamPolicyTag2<ES>>(
+                       U, std::integer_sequence<int, 1, 0, 2>{}, team) = U);
+        // (p,q,r) -> (r,p,q): k = r is the unit-stride axis, free (p,q).
+        auto B2 = (make_evaluator<TeamPolicyTag2<ES>>(
+                       U, std::integer_sequence<int, 2, 0, 1>{}, team) = U);
+
+        auto C0 =
+            make_interm_node(Impl::alloc_scratch_tile<float, ES>(team, TC0{}));
+        auto C1 =
+            make_interm_node(Impl::alloc_scratch_tile<float, ES>(team, TC1{}));
+        auto C2 =
+            make_interm_node(Impl::alloc_scratch_tile<float, ES>(team, TC2{}));
+        team.team_barrier();
+
+        make_evaluator<TeamPolicyTag2<ES>>(n0, ContractOperands{A0, U, C0},
+                                           team)();
+        make_evaluator<TeamPolicyTag2<ES>>(n1, ContractOperands{A1, B1, C1},
+                                           team)();
+        make_evaluator<TeamPolicyTag2<ES>>(n2, ContractOperands{A2, B2, C2},
+                                           team)();
+        team.team_barrier();
+
+        Kokkos::single(Kokkos::PerTeam(team), [=]() {
+          const auto v0 = C0.storage_;
+          const auto v1 = C1.storage_;
+          const auto v2 = C2.storage_;
+          for (int m = 0; m < hM; ++m) {
+            for (int q = 0; q < uQ; ++q)
+              for (int r = 0; r < uR; ++r)
+                o0((m * uQ + q) * uR + r) = v0(m, q, r);
+            for (int p = 0; p < uP; ++p)
+              for (int r = 0; r < uR; ++r)
+                o1((m * uP + p) * uR + r) = v1(m, p, r);
+            for (int p = 0; p < uP; ++p)
+              for (int q = 0; q < uQ; ++q)
+                o2((m * uP + p) * uQ + q) = v2(m, p, q);
+          }
+        });
+      });
+  Kokkos::fence();
+}
+
+// A permuted A operand, where it is the ROW group that is gapped: W(x,y,z)
+// presented as (x,z,y), so the free modes straddle the contracted one.
+constexpr int wX = 3, wY = 4, wZ = 2, wL = 5;
+
+using TW  = StaticTile<wX, wY, wZ>;
+using TWB = StaticTile<wY, wL>;
+using TWC = StaticTile<wX, wZ, wL>;
+
+void run_permuted_a(PV3 w, PV2 b, Buf1D out) {
+  auto wn = make_input_node(make_handle<'x', 'y', 'z'>(w));
+  auto bn = make_input_node(make_handle<'y', 'l'>(b));
+  auto n  = make_contraction_node<'x', 'z', 'l'>(wn, bn);
+
+  const std::size_t bytes = scratch_for<TW, TWB, TWC>();
+  Kokkos::parallel_for(
+      Kokkos::TeamPolicy<ES>(1, Kokkos::AUTO)
+          .set_scratch_size(0, Kokkos::PerTeam(bytes)),
+      KOKKOS_LAMBDA(const team_t& team) {
+        auto W = stage_full(wn, TW{}, team);
+        auto B = stage_full(bn, TWB{}, team);
+        auto A = (make_evaluator<TeamPolicyTag2<ES>>(
+                      W, std::integer_sequence<int, 0, 2, 1>{}, team) = W);
+        auto C =
+            make_interm_node(Impl::alloc_scratch_tile<float, ES>(team, TWC{}));
+        team.team_barrier();
+
+        make_evaluator<TeamPolicyTag2<ES>>(n, ContractOperands{A, B, C},
+                                           team)();
+        team.team_barrier();
+
+        Kokkos::single(Kokkos::PerTeam(team), [=]() {
+          const auto cv = C.storage_;
+          for (int x = 0; x < wX; ++x)
+            for (int z = 0; z < wZ; ++z)
+              for (int l = 0; l < wL; ++l)
+                out((x * wZ + z) * wL + l) = cv(x, z, l);
+        });
+      });
+  Kokkos::fence();
+}
+
+// The extent static_asserts reject most mis-groupings at compile time, but a
+// group whose axes have EQUAL extents can be collapsed in either order and
+// still typecheck. That is where a silent transpose lives, so the free group
+// here is square: S(a,b,c) with extent(a) == extent(c), contracted over b.
+constexpr int sA = 3, sB = 2, sC = 3, sM = 2;
+
+using TS  = StaticTile<sA, sB, sC>;
+using TSH = StaticTile<sM, sB>;
+using TSC = StaticTile<sM, sA, sC>;
+
+void run_square_free_group(PV3 s, PV2 h, Buf1D out) {
+  auto sn = make_input_node(make_handle<'a', 'b', 'c'>(s));
+  auto hn = make_input_node(make_handle<'m', 'b'>(h));
+  auto n  = make_contraction_node<'m', 'a', 'c'>(hn, sn);
+
+  const std::size_t bytes = scratch_for<TS, TSH, TSC>();
+  Kokkos::parallel_for(
+      Kokkos::TeamPolicy<ES>(1, Kokkos::AUTO)
+          .set_scratch_size(0, Kokkos::PerTeam(bytes)),
+      KOKKOS_LAMBDA(const team_t& team) {
+        auto S = stage_full(sn, TS{}, team);
+        auto H = stage_full(hn, TSH{}, team);
+        auto B = (make_evaluator<TeamPolicyTag2<ES>>(
+                      S, std::integer_sequence<int, 1, 0, 2>{}, team) = S);
+        auto C =
+            make_interm_node(Impl::alloc_scratch_tile<float, ES>(team, TSC{}));
+        team.team_barrier();
+
+        make_evaluator<TeamPolicyTag2<ES>>(n, ContractOperands{H, B, C},
+                                           team)();
+        team.team_barrier();
+
+        Kokkos::single(Kokkos::PerTeam(team), [=]() {
+          const auto cv = C.storage_;
+          for (int m = 0; m < sM; ++m)
+            for (int a = 0; a < sA; ++a)
+              for (int c = 0; c < sC; ++c)
+                out((m * sA + a) * sC + c) = cv(m, a, c);
+        });
+      });
+  Kokkos::fence();
+}
+
+}  // namespace permuted
+
+TEST(Team2ContractPermuted, SquareFreeGroupKeepsItsAxisOrder) {
+  using namespace permuted;
+  PV3  s("s", sA, sB, sC);
+  PV2  h("h", sM, sB);
+  auto sh = Kokkos::create_mirror_view(s);
+  auto hh = Kokkos::create_mirror_view(h);
+  for (int a = 0; a < sA; ++a)
+    for (int b = 0; b < sB; ++b)
+      for (int c = 0; c < sC; ++c) sh(a, b, c) = u_val(a, b, c);
+  for (int m = 0; m < sM; ++m)
+    for (int b = 0; b < sB; ++b) hh(m, b) = h_val(2, m, b);
+  Kokkos::deep_copy(s, sh);
+  Kokkos::deep_copy(h, hh);
+
+  Buf1D out("out", sM * sA * sC);
+  run_square_free_group(s, h, out);
+  const auto got = to_host(out);
+
+  // u_val is not symmetric in its first and third arguments, so a group
+  // collapsed as (c,a) rather than (a,c) shows up as a transposed C.
+  for (int m = 0; m < sM; ++m)
+    for (int a = 0; a < sA; ++a)
+      for (int c = 0; c < sC; ++c) {
+        double acc = 0.0;
+        for (int b = 0; b < sB; ++b)
+          acc += static_cast<double>(hh(m, b)) * sh(a, b, c);
+        EXPECT_NEAR(got[(m * sA + a) * sC + c], static_cast<float>(acc), 1e-4f)
+            << "m=" << m << " a=" << a << " c=" << c;
+      }
+}
+
+TEST(Team2ContractPermuted, ThreeDirectionsShareOneStagedTensor) {
+  using namespace permuted;
+  PV3  u("u", uP, uQ, uR);
+  PV2  h0("h0", hM, uP), h1("h1", hM, uQ), h2("h2", hM, uR);
+  auto uh  = Kokkos::create_mirror_view(u);
+  auto h0h = Kokkos::create_mirror_view(h0);
+  auto h1h = Kokkos::create_mirror_view(h1);
+  auto h2h = Kokkos::create_mirror_view(h2);
+  for (int p = 0; p < uP; ++p)
+    for (int q = 0; q < uQ; ++q)
+      for (int r = 0; r < uR; ++r) uh(p, q, r) = u_val(p, q, r);
+  for (int m = 0; m < hM; ++m) {
+    for (int p = 0; p < uP; ++p) h0h(m, p) = h_val(0, m, p);
+    for (int q = 0; q < uQ; ++q) h1h(m, q) = h_val(1, m, q);
+    for (int r = 0; r < uR; ++r) h2h(m, r) = h_val(2, m, r);
+  }
+  Kokkos::deep_copy(u, uh);
+  Kokkos::deep_copy(h0, h0h);
+  Kokkos::deep_copy(h1, h1h);
+  Kokkos::deep_copy(h2, h2h);
+
+  Buf1D o0("o0", hM * uQ * uR), o1("o1", hM * uP * uR), o2("o2", hM * uP * uQ);
+  run_three_directions(u, h0, h1, h2, o0, o1, o2);
+  const auto g0 = to_host(o0);
+  const auto g1 = to_host(o1);
+  const auto g2 = to_host(o2);
+
+  for (int m = 0; m < hM; ++m) {
+    for (int q = 0; q < uQ; ++q)
+      for (int r = 0; r < uR; ++r) {
+        double acc = 0.0;
+        for (int p = 0; p < uP; ++p)
+          acc += static_cast<double>(h0h(m, p)) * uh(p, q, r);
+        EXPECT_NEAR(g0[(m * uQ + q) * uR + r], static_cast<float>(acc), 1e-4f)
+            << "d=0 m=" << m << " q=" << q << " r=" << r;
+      }
+    for (int p = 0; p < uP; ++p)
+      for (int r = 0; r < uR; ++r) {
+        double acc = 0.0;
+        for (int q = 0; q < uQ; ++q)
+          acc += static_cast<double>(h1h(m, q)) * uh(p, q, r);
+        EXPECT_NEAR(g1[(m * uP + p) * uR + r], static_cast<float>(acc), 1e-4f)
+            << "d=1 m=" << m << " p=" << p << " r=" << r;
+      }
+    for (int p = 0; p < uP; ++p)
+      for (int q = 0; q < uQ; ++q) {
+        double acc = 0.0;
+        for (int r = 0; r < uR; ++r)
+          acc += static_cast<double>(h2h(m, r)) * uh(p, q, r);
+        EXPECT_NEAR(g2[(m * uP + p) * uQ + q], static_cast<float>(acc), 1e-4f)
+            << "d=2 m=" << m << " p=" << p << " q=" << q;
+      }
+  }
+}
+
+TEST(Team2ContractPermuted, PermutedAOperandGapsTheRowGroup) {
+  using namespace permuted;
+  PV3  w("w", wX, wY, wZ);
+  PV2  b("b", wY, wL);
+  auto wh = Kokkos::create_mirror_view(w);
+  auto bh = Kokkos::create_mirror_view(b);
+  for (int x = 0; x < wX; ++x)
+    for (int y = 0; y < wY; ++y)
+      for (int z = 0; z < wZ; ++z) wh(x, y, z) = u_val(x, y, z);
+  for (int y = 0; y < wY; ++y)
+    for (int l = 0; l < wL; ++l) bh(y, l) = h_val(1, y, l);
+  Kokkos::deep_copy(w, wh);
+  Kokkos::deep_copy(b, bh);
+
+  Buf1D out("out", wX * wZ * wL);
+  run_permuted_a(w, b, out);
+  const auto got = to_host(out);
+
+  for (int x = 0; x < wX; ++x)
+    for (int z = 0; z < wZ; ++z)
+      for (int l = 0; l < wL; ++l) {
+        double acc = 0.0;
+        for (int y = 0; y < wY; ++y)
+          acc += static_cast<double>(wh(x, y, z)) * bh(y, l);
+        EXPECT_NEAR(got[(x * wZ + z) * wL + l], static_cast<float>(acc), 1e-4f)
+            << "x=" << x << " z=" << z << " l=" << l;
+      }
+}
+
+// ---------------------------------------------------------------------------
 // Tag2 CombineTag — pointwise, N-ary, multi-output
 // ---------------------------------------------------------------------------
 namespace combine {
