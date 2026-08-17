@@ -704,6 +704,50 @@ TEST(LevelGraphDeclaredOrder, ContractionReadsDeclaredSlotOperand) {
       << "contraction over declared-order slot != reference";
 }
 
+// A combine fn sees the GLOBAL output coordinate, not the tile-local one. The
+// grid mode 'e' has dE/dTE == 4 tiles, so a tile-local origin is wrong for
+// every team but the first -- and wrong only in the metric-style terms a real
+// kernel reads from global memory, which is exactly how it would hide.
+struct OriginProbe {
+  KOKKOS_FUNCTION float operator()(int e, int b, int q, int c, float g) const {
+    return g + 1000.0f * e + 10.0f * b + 1.0f * q + 0.5f * c;
+  }
+};
+
+TEST(LevelGraphDeclaredOrder, CombineFnSeesGlobalCoordinate) {
+  ViewH Hd("H", dQ, dA);
+  ViewU Ud("U", dE, dA, dB, dC);
+  ViewO Od("O", dE, dB, dQ, dC);
+  fill(Hd, Ud);
+
+  auto g0      = make_level_graph<float, ES>();
+  auto [g1, h] = g0.stage(make_input_node(make_handle<'q', 'a'>(Hd)), TileH{});
+  auto [g2, u] =
+      g1.stage(make_input_node(make_handle<'e', 'a', 'b', 'c'>(Ud)), TileU{});
+
+  auto ga       = make_contraction_node<'e', 'b', 'q', 'c'>(h, u);
+  auto [g3, ca] = g2.add(ga);
+  auto cmb      = make_combine_node<'e', 'b', 'q', 'c'>(ca, OriginProbe{});
+  auto [g4, pa] = g3.add(cmb);
+
+  g4.outputs(pa).execute(TeamPolicyTag2<ES>{}, Od);
+  Kokkos::fence();
+
+  auto Oh = Kokkos::create_mirror_view(Od);
+  Kokkos::deep_copy(Oh, Od);
+
+  double max_err = 0.0;
+  for (int e = 0; e < dE; ++e)
+    for (int b = 0; b < dB; ++b)
+      for (int q = 0; q < dQ; ++q)
+        for (int c = 0; c < dC; ++c) {
+          const double ref =
+              gref(q, e, b, c) + 1000.0 * e + 10.0 * b + 1.0 * q + 0.5 * c;
+          max_err = std::max(max_err, std::abs(ref - Oh(e, b, q, c)));
+        }
+  EXPECT_LT(max_err, 1e-3) << "combine fn did not see the global coordinate";
+}
+
 }  // namespace declared
 
 int main(int argc, char* argv[]) {
