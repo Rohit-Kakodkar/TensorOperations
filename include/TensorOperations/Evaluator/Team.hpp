@@ -632,14 +632,17 @@ struct Evaluator<TeamPolicyTag<ES>,
       const team_member_t& team, Kokkos::Array<int, Rank> tile_idx) const {
     TIMING_SCOPE_ENTER(g_timing_stats.contraction_accum_time,
                        g_timing_stats.contraction_accum_count);
-    // Zero the output scratch at the start of every evaluation so this operator
-    // is re-runnable. A parent contraction re-invokes a fused operand once per
-    // contracted tile (recompute) on the same evaluator instance, and each run
-    // must accumulate from a clean C.
-    auto c = alloc_c_.get();
-    Kokkos::parallel_for(Kokkos::TeamVectorRange(team, c.size()),
-                         [c](int i) { c.data()[i] = S{0}; });
-    team.team_barrier();
+    // C IS NOT PRE-ZEROED. The FIRST contracted block STORES into C and every
+    // later one accumulates, so C is initialized by the same store that writes
+    // the first block's result -- see accumulate_block<First>. That keeps this
+    // operator re-runnable (a parent contraction re-invokes a fused operand
+    // once per contracted tile on the same evaluator instance, and each run
+    // begins by overwriting C) without a separate pass over the tile.
+    //
+    // The pass this replaces wrote a full tile of zeros and the GEMM
+    // immediately loaded them back into its accumulators. On the SEM DAG that
+    // was ~30% of the kernel's shared-memory stores, plus one team barrier per
+    // contraction, all of it discarded.
     // Per-mode k-tile counts (from A's own leaf tile/shape, read through
     // permA_seq) and their product. a_leaf_ and node.node_a.shape() are both
     // in A's own axis order -- the operand's declared order for an input leaf,
@@ -657,15 +660,29 @@ struct Evaluator<TeamPolicyTag<ES>,
           Impl::tile_count_along(a_leaf_, native_dim, a_shape_[native_dim]);
       total_k_tiles *= n_k_tiles[i];
     }
+    // tile_count_along is a ceil_div, so this is >= 1 for any non-empty
+    // operand; a zero extent is already a hard error in this evaluator. The
+    // peeled first block below relies on it.
+    assert(total_k_tiles >= 1 &&
+           "contraction: contracted extent must be non-empty");
     // Mixed-radix counter (LSB fastest); carry-increment avoids per-step
     // div/mod.
     Kokkos::Array<int, NumK> k_tile_idx{};
-    for (int lin = 0; lin < total_k_tiles; ++lin) {
-      accumulate_block(team, tile_idx, k_tile_idx);
+    const auto               advance = [&] {
       for (int i = NumK - 1; i >= 0; --i) {
         if (++k_tile_idx[i] < n_k_tiles[i]) break;
         k_tile_idx[i] = 0;
       }
+    };
+    // Iteration 0 is PEELED so that "is this the first block" is a compile-time
+    // constant rather than a loop-carried test: accumulate_block<true> zeroes
+    // its registers instead of loading C, which is what removes the need for a
+    // zeroing pass. The cost is two instantiations of the GEMM body.
+    accumulate_block<true>(team, tile_idx, k_tile_idx);
+    advance();
+    for (int lin = 1; lin < total_k_tiles; ++lin) {
+      accumulate_block<false>(team, tile_idx, k_tile_idx);
+      advance();
     }
     TIMING_SCOPE_EXIT(g_timing_stats.contraction_accum_time,
                       g_timing_stats.contraction_accum_count);
@@ -741,6 +758,13 @@ struct Evaluator<TeamPolicyTag<ES>,
   // Stage one contracted tile of A and B into scratch and accumulate the block
   // product into C. The barriers bracket the shared-scratch reads/writes;
   // consecutive calls reuse the same scratch (no double buffering).
+  //
+  // First == true means this is the leading contracted block: it STORES into C
+  // rather than accumulating, which is what initializes the tile and is why
+  // operator() does not pre-zero it. Callers must pass true for exactly the
+  // first block of every evaluation -- operator() peels that iteration so the
+  // choice is a compile-time constant here and no branch reaches the GEMM.
+  template <bool First>
   KOKKOS_FUNCTION void accumulate_block(
       const team_member_t& team, const Kokkos::Array<int, Rank>& c_tile_idx,
       const Kokkos::Array<int, NumK>& k_tile_idx) const {
@@ -789,15 +813,43 @@ struct Evaluator<TeamPolicyTag<ES>,
     constexpr int W = static_cast<int>(simd_t::size());
 
 #if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
-    constexpr int MT = 4;  // output rows / item
-    constexpr int NT = 2;  // output cols / item
+    // -DTENSOR_GEMM_MT/NT/NR override these for a re-sweep without editing
+    // here. They are not free parameters of the kernel alone: the register
+    // blocking sets the TeamThreadRange work-item count to (SA/MT)*(SB/NR),
+    // which is the largest team size the GEMM can keep busy. MT and NR are
+    // therefore coupled to the team size and to the tile.
+// MT stays 4 even though 8 is faster on the SEM DAG (1.8%), because MT is NOT
+// a global constant of the kernel -- it trades shared-load traffic against
+// per-thread parallelism and the balance moves with SA. Measured 2026-08-05,
+// H100 NVL, best-of-7 x 3:
+//
+//   MT              2       4       8
+//   SEM DAG-MO   7.436   7.020   6.914 ms   (SA=8, so MT=8 is ONE row block)
+//   matmul  N=512  --   2288    1929 G/s    (SA=TI=64)
+//   matmul N=1024  --   7182    6707 G/s
+//   matmul N=2048  --   9948   11279 G/s
+//
+// So MT=8 wins the SEM graph and large matmul and LOSES 16% at N=512. A fixed
+// default cannot serve both; picking MT from SA at compile time is the real
+// fix. Until then 4 is the value that regresses nothing.
+#ifndef TENSOR_GEMM_MT
+#define TENSOR_GEMM_MT 4
+#endif
+#ifndef TENSOR_GEMM_NT
+#define TENSOR_GEMM_NT 2
+#endif
+#ifndef TENSOR_GEMM_NR
+#define TENSOR_GEMM_NR 2
+#endif
+    constexpr int MT = TENSOR_GEMM_MT;  // output rows / item
+    constexpr int NT = TENSOR_GEMM_NT;  // output cols / item
     // NR=2 (not 4): the shared-load bank is (col_block*NR + n) mod 32, so a
     // power-of-two NR > 2 makes register-blocked lanes alias banks on rows
     // wider than 32 elems. NR=2 halves the conflicts AND drops register
     // pressure (64->48 regs, occupancy 48->60%): measured +20% matmul / +28%
     // contraction on A100 vs NR=4. (Tuning NR beats address swizzling, which
     // only regressed.)
-    constexpr int NR = 2;  // C columns / item
+    constexpr int NR = TENSOR_GEMM_NR;  // C columns / item
 #else
     constexpr int MT = 8;  // output rows / item
     constexpr int NT = 8;  // output cols / item
@@ -835,10 +887,17 @@ struct Evaluator<TeamPolicyTag<ES>,
           const int bi = t / (SB / NR);  // C tile-block row
           const int bj = t % (SB / NR);  // C tile-block column
           simd_t    acc[MT][NR / W];
+          // The leading block never reads C: it is about to define it. Every
+          // later block picks up where the previous store left off.
           TENSOR_PRAGMA_UNROLL
           for (int i = 0; i < MT; ++i) TENSOR_PRAGMA_UNROLL
-          for (int n = 0; n < NR; n += W)
-            acc[i][n / W] = simd_t(&c_reg(bi, i, bj, n), KE::simd_flag_default);
+          for (int n = 0; n < NR; n += W) {
+            if constexpr (First)
+              acc[i][n / W] = simd_t(value_type{0});
+            else
+              acc[i][n / W] =
+                  simd_t(&c_reg(bi, i, bj, n), KE::simd_flag_default);
+          }
 
           // One contracted register-block (NT-deep rank-1 updates).
           for (int k0 = 0; k0 < SK / NT; ++k0) {

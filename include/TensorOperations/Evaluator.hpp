@@ -19,6 +19,11 @@ struct TeamPolicyTag {
   using execution_space = ES;
 };
 
+template <typename ES = Kokkos::DefaultExecutionSpace>
+struct TeamPolicyTag2 {
+  using execution_space = ES;
+};
+
 // Tiling specs (StaticTile / DynamicTile) live in Tiling.hpp.
 
 // ---------------------------------------------------------------------------
@@ -495,5 +500,6 @@ KOKKOS_FUNCTION auto make_evaluator(NodeType node, Tile tile,
 }
 
 #include <TensorOperations/Evaluator/Team.hpp>
+#include <TensorOperations/Evaluator/Team2.hpp>
 
 }  // namespace TensorOperations
