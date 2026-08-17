@@ -154,6 +154,52 @@ class Evaluator<TeamPolicyTag2<ES>,
   team_member_t team_;
 };
 
+template <typename ES, typename Operand, typename ModesSeq, typename Tile_>
+class Evaluator<TeamPolicyTag2<ES>, NodeHandle<StagedTag, Operand, ModesSeq>,
+                Tile_> {
+ public:
+  using node_type     = NodeHandle<StagedTag, Operand, ModesSeq>;
+  using policy_tag    = TeamPolicyTag2<ES>;
+  using tiling_type   = Tile_;
+  using value_type    = typename node_type::value_type;
+  using exec_space    = ES;
+  using modes_seq     = typename node_type::modes_seq;
+  using team_member_t = Impl::team_member_t<ES>;
+
+  using scratch_view_t = decltype(Impl::alloc_scratch_tile<value_type, ES>(
+      std::declval<const team_member_t&>(), std::declval<const Tile_&>()));
+
+  static_assert(static_cast<int>(Tile_::rank) == node_type::Rank,
+                "staged tile rank must equal the operand's rank");
+
+  KOKKOS_FUNCTION Evaluator(node_type n, Tile_ t, const team_member_t& team)
+      : node_(n),
+        tile_(t),
+        dst_(Impl::alloc_scratch_tile<value_type, ES>(team, t)),
+        team_(team) {}
+
+  KOKKOS_FUNCTION Evaluator(node_type n, Tile_ t, scratch_view_t adopted,
+                            const team_member_t& team)
+      : node_(n), tile_(t), dst_(adopted), team_(team) {}
+
+  KOKKOS_FUNCTION auto operator()(
+      Kokkos::Array<int, Tile_::rank> tile_idx) const {
+    auto src    = make_evaluator<TeamPolicyTag2<ES>>(node_.operand_, tile_,
+                                                     team_)(tile_idx);
+    auto stager = make_evaluator<TeamPolicyTag2<ES>>(make_interm_node(dst_),
+                                                     StageTag{}, team_);
+    return (stager = src);
+  }
+
+  KOKKOS_FUNCTION const scratch_view_t& storage() const { return dst_; }
+
+ private:
+  node_type      node_;
+  Tile_          tile_;
+  scratch_view_t dst_;
+  team_member_t  team_;
+};
+
 template <typename AEval, typename BEval, typename CNode>
 struct ContractOperands {
   AEval a;
@@ -237,19 +283,16 @@ class Evaluator<TeamPolicyTag2<ES>,
         c2_(regroup_view(ops.c.storage_, Split<FreeA, RankC>{})),
         team_(team) {}
 
-  KOKKOS_FUNCTION value_type operator()(int i, int j) const {
+  KOKKOS_FORCEINLINE_FUNCTION void operator()(int i, int j) const {
     value_type acc{};
     for (int k = 0; k < SK; ++k) acc += a2_(i, k) * b2_(k, j);
-    return acc;
+    c2_(i, j) = acc;
   }
 
   KOKKOS_FUNCTION auto operator()() const {
     const auto self = *this;
-    Kokkos::parallel_for(Kokkos::TeamVectorRange(team_, SA * SB), [=](int t) {
-      const int i    = t / SB;
-      const int j    = t % SB;
-      self.c2_(i, j) = self(i, j);
-    });
+    Kokkos::parallel_for(Kokkos::TeamVectorRange(team_, SA * SB),
+                         [=](int t) { self(t / SB, t % SB); });
     return make_value_evaluator(make_interm_node(c_.storage_, node_.hook_op),
                                 team_);
   }
@@ -433,14 +476,22 @@ class Evaluator<TeamPolicyTag2<ES>,
                             const team_member_t& team)
       : fn_(n.fn), ops_(t.ops), outs_(t.outs), origin_(t.origin), team_(team) {}
 
-  // Pure per-element accessor -- the combine's answer to the GEMM's
-  // operator()(i, j). Writes nothing; takes one index per output mode.
+  // Pure per-element read: takes one index per output mode and writes nothing.
+  // Distinct from the storing operator()(coord) below, which is the per-element
+  // step a fused level driver calls.
   template <typename... Idx>
+    requires(sizeof...(Idx) == Rank)
   KOKKOS_FUNCTION Kokkos::Array<value_type, NumOut> operator()(
       Idx... idx) const {
-    static_assert(sizeof...(Idx) == Rank,
-                  "combine element access takes one index per output mode");
     return apply_at(Impl::Index<Rank>{static_cast<int>(idx)...});
+  }
+
+  template <typename Coord>
+    requires(!std::is_integral_v<Coord>)
+  KOKKOS_FORCEINLINE_FUNCTION void operator()(const Coord& coord) const {
+    const Kokkos::Array<value_type, NumOut> r = apply_at(coord);
+    TENSOR_PRAGMA_UNROLL
+    for (int m = 0; m < NumOut; ++m) outs_[m].storage_[coord] = r[m];
   }
 
   // Team-parallel evaluation: apply fn over the whole output tile, scattering
@@ -451,11 +502,7 @@ class Evaluator<TeamPolicyTag2<ES>,
     const auto self = *this;
     // Every output shares one layout, so the first drives the traversal.
     const auto out0 = outs_[0].storage_;
-    Impl::team_for_each_coord(team_, out0, [=](auto coord) {
-      const Kokkos::Array<value_type, NumOut> r = self.apply_at(coord);
-      TENSOR_PRAGMA_UNROLL
-      for (int m = 0; m < NumOut; ++m) self.outs_[m].storage_[coord] = r[m];
-    });
+    Impl::team_for_each_coord(team_, out0, [=](auto coord) { self(coord); });
     return make_results(outs_seq{});
   }
 

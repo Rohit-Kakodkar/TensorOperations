@@ -384,6 +384,27 @@ constexpr bool same_label_set() {
   return true;
 }
 
+// --- label predicates, host-constexpr, safe to name from device code --------
+//
+// Every predicate below is a namespace-scope variable template rather than a
+// call, because the underlying constexpr functions are host-only and naming
+// them from a KOKKOS_FUNCTION -- including inside a static_assert -- trips
+// nvcc #20013 when Kokkos_ENABLE_CUDA_CONSTEXPR is OFF, as it is here.
+
+template <int RC, typename AModesSeq, typename BModesSeq, typename OutSeq>
+inline constexpr bool valid_contraction_v =
+    valid_contraction<RC, AModesSeq, BModesSeq, OutSeq>();
+
+template <typename A, typename B>
+inline constexpr bool same_label_set_v = same_label_set<A, B>();
+
+template <typename ModesSeq>
+inline constexpr bool labels_distinct_v =
+    all_distinct(seq_to_array(ModesSeq{}));
+
+template <typename PermSeq>
+inline constexpr bool is_identity_v = is_identity_seq(PermSeq{});
+
 // --- device-side permutation application ------------------------------------
 
 /// Canonical -> native index scatter: `native[Perm[i]] = canonical[i]`.
