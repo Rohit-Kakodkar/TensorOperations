@@ -284,8 +284,10 @@ class Evaluator<TeamPolicyTag2<ES>,
         team_(team) {}
 
   KOKKOS_FORCEINLINE_FUNCTION void operator()(int i, int j) const {
+    const auto a_row = slice(a2_, i, ALL);
+    const auto b_col = slice(b2_, ALL, j);
     value_type acc{};
-    for (int k = 0; k < SK; ++k) acc += a2_(i, k) * b2_(k, j);
+    for (int k = 0; k < SK; ++k) acc += a_row(k) * b_col(k);
     c2_(i, j) = acc;
   }
 

@@ -1000,6 +1000,13 @@ KOKKOS_FUNCTION auto regroup_view(const View<ViewType, Layout>& view,
   return {view.backing_, regroup_layout(view.layout(), split)};
 }
 
+template <typename ViewType, typename Layout, typename... I>
+KOKKOS_FORCEINLINE_FUNCTION auto slice(const View<ViewType, Layout>& view,
+                                       I... idx)
+    -> View<ViewType, decltype(slice(view.layout(), idx...))> {
+  return {view.backing_, slice(view.layout(), idx...)};
+}
+
 // ---------------------------------------------------------------------------
 // reorder_layout — logically permute (transpose) a subview's dimensions.
 //

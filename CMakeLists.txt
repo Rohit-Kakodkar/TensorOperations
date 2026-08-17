@@ -88,6 +88,11 @@ add_executable(test_regroup_view tests/test_regroup_view.cpp)
 target_link_libraries(test_regroup_view PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_regroup_view)
 
+# test_slice — custom main() wraps Kokkos init/finalize
+add_executable(test_slice tests/test_slice.cpp)
+target_link_libraries(test_slice PRIVATE tensor GTest::gtest)
+gtest_discover_tests(test_slice)
+
 add_executable(test_labelled_operand tests/test_labelled_operand.cpp)
 target_link_libraries(test_labelled_operand PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_labelled_operand)
