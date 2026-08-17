@@ -150,6 +150,12 @@ add_executable(test_slot_liveness tests/test_slot_liveness.cpp)
 target_link_libraries(test_slot_liveness PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_slot_liveness)
 
+# test_level_graph — LevelPlan slot algebra, tile derivation, level predicates.
+# Host-only: no kernel, no scratch, no launch, so gtest_main is enough.
+add_executable(test_level_graph tests/test_level_graph.cpp)
+target_link_libraries(test_level_graph PRIVATE tensor GTest::gtest_main)
+gtest_discover_tests(test_level_graph)
+
 # ---------------------------------------------------------------------------
 # Negative-compilation tests for the slot guards.
 #
@@ -189,6 +195,36 @@ endforeach()
 set_tests_properties(SlotGuardNegative.Case1 SlotGuardNegative.Case2
                      PROPERTIES PASS_REGULAR_EXPRESSION
                      "operand [AB] is a SLOT and perm[AB] is not the identity")
+
+# ---------------------------------------------------------------------------
+# Negative-compilation tests for the LEVEL guards. Same rationale and same
+# caveats as the slot guards above.
+#
+# Each case is pinned to its OWN guard's diagnostic rather than to a shared
+# one. The predicates are written so that exactly one guard fires per defect --
+# the iteration-space check returns true for a level that is not homogeneous,
+# leaving that defect to the homogeneity guard alone -- so a case matching two
+# messages means a predicate started over-reporting.
+# ---------------------------------------------------------------------------
+foreach(case 0 1 2 3 4)
+  add_executable(level_guard_neg_${case} EXCLUDE_FROM_ALL
+                 tests/negative/level_guard_negative.cpp)
+  target_link_libraries(level_guard_neg_${case} PRIVATE tensor)
+  target_compile_definitions(level_guard_neg_${case}
+                             PRIVATE LEVEL_NEG_CASE=${case})
+  add_test(NAME LevelGuardNegative.Case${case}
+           COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}
+                   --target level_guard_neg_${case} --config $<CONFIG>)
+endforeach()
+set_tests_properties(LevelGuardNegative.Case1 PROPERTIES
+                     PASS_REGULAR_EXPRESSION
+                     "a level must be NON-EMPTY and HOMOGENEOUS")
+set_tests_properties(LevelGuardNegative.Case2 LevelGuardNegative.Case3
+                     PROPERTIES PASS_REGULAR_EXPRESSION
+                     "must share ONE iteration space")
+set_tests_properties(LevelGuardNegative.Case4 PROPERTIES
+                     PASS_REGULAR_EXPRESSION
+                     "may not read a slot ITS OWN LEVEL")
 
 # Benchmarks (opt-in: -DTENSOR_OPS_BUILD_BENCHMARKS=ON). No gtest; own main().
 if(TENSOR_OPS_BUILD_BENCHMARKS)

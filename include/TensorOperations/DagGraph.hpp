@@ -195,6 +195,8 @@ constexpr void dag_note_node_reads(std::array<std::size_t, NS>& last,
     dag_note_combine_reads<Node, NS>(
         last, k,
         std::make_index_sequence<static_cast<std::size_t>(Node::NumOps)>{});
+  } else if constexpr (has_node_tag_v<StagedTag, Node>) {
+    dag_note_read<NS>(last, dag_operand_slot<typename Node::operand_type>(), k);
   }
 }
 
