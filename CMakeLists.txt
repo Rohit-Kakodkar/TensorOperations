@@ -150,10 +150,10 @@ add_executable(test_slot_liveness tests/test_slot_liveness.cpp)
 target_link_libraries(test_slot_liveness PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_slot_liveness)
 
-# test_level_graph — LevelPlan slot algebra, tile derivation, level predicates.
-# Host-only: no kernel, no scratch, no launch, so gtest_main is enough.
+# test_level_graph — LevelPlan slot algebra + LevelGraph runtime equivalence.
+# Custom main() wraps Kokkos init/finalize for the runtime half.
 add_executable(test_level_graph tests/test_level_graph.cpp)
-target_link_libraries(test_level_graph PRIVATE tensor GTest::gtest_main)
+target_link_libraries(test_level_graph PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_level_graph)
 
 # ---------------------------------------------------------------------------

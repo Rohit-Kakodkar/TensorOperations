@@ -28,12 +28,15 @@
 // involution: it equals its own inverse, so it cannot distinguish a gather
 // permutation from a scatter one, and a direction bug survives it untouched.
 // ===========================================================================
+#include <TensorOperations/LevelGraph.hpp>
 #include <TensorOperations/LevelPlan.hpp>
 #include <TensorOperations/NodeHandle.hpp>
 #include <TensorOperations/Tiling.hpp>
 
 #include <Kokkos_Core.hpp>
 #include <gtest/gtest.h>
+
+#include <cmath>
 
 using namespace TensorOperations;
 using ES = Kokkos::DefaultExecutionSpace;
@@ -278,4 +281,259 @@ TEST(LevelPlanTest, TheSemGradientLevelIsOneLegalLevel) {
   EXPECT_EQ(SemPlan::num_slots, 5u);
   EXPECT_EQ((Impl::lg_member_sa_v<Ga>), kN);
   EXPECT_EQ((Impl::lg_member_sb_v<Ga>), kTE * kN * kN);
+}
+
+// ===========================================================================
+// The runtime half: a graph GENERATES the kernel LevelPlan only describes, and
+// its output equals a hand-driven reference. Grid is the last stage, tiled over
+// the batch mode 'e'; the stages materialize both operands once per team and
+// the contraction level reads them.
+//
+//   stage H[q,a]          (batch-independent, one tile every team re-reads)
+//   stage U[e,a,b,c]      (the grid: E/TE teams, one 'e'-tile each)
+//   level: Gd[q,e,b,c] = sum_a Hd[q,d] U[e,a,b,c]   for d in {a,b,c}, the
+//          differing axis relabelled onto the SAME staged H.
+// ===========================================================================
+namespace rt {
+
+constexpr int rN = 5, rTE = 2, rE = 8;
+
+using ViewH  = Kokkos::View<float**, Kokkos::LayoutRight, ES>;
+using ViewU  = Kokkos::View<float****, Kokkos::LayoutRight, ES>;
+using ViewC  = Kokkos::View<float****, Kokkos::LayoutRight, ES>;
+using TileHr = StaticTile<rN, rN>;
+using TileUr = StaticTile<rTE, rN, rN, rN>;
+
+float hval(int q, int a) { return 0.1f + 0.3f * q - 0.2f * a + 0.05f * q * a; }
+float uval(int e, int a, int b, int c) {
+  return 0.2f + 0.11f * e - 0.07f * a + 0.13f * b - 0.03f * c +
+         0.01f * (e + a) * (b + 1);
+}
+
+TEST(LevelGraphRuntime, SingleContractionMemberEqualsReference) {
+  ViewH Hd("H", rN, rN);
+  ViewU Ud("U", rE, rN, rN, rN);
+  ViewC Cd("C", rN, rE, rN, rN);
+
+  auto Hh = Kokkos::create_mirror_view(Hd);
+  auto Uh = Kokkos::create_mirror_view(Ud);
+  for (int q = 0; q < rN; ++q)
+    for (int a = 0; a < rN; ++a) Hh(q, a) = hval(q, a);
+  for (int e = 0; e < rE; ++e)
+    for (int a = 0; a < rN; ++a)
+      for (int b = 0; b < rN; ++b)
+        for (int c = 0; c < rN; ++c) Uh(e, a, b, c) = uval(e, a, b, c);
+  Kokkos::deep_copy(Hd, Hh);
+  Kokkos::deep_copy(Ud, Uh);
+
+  auto g0      = make_level_graph<float, ES>();
+  auto [g1, h] = g0.stage(make_input_node(make_handle<'q', 'a'>(Hd)), TileHr{});
+  auto [g2, u] =
+      g1.stage(make_input_node(make_handle<'e', 'a', 'b', 'c'>(Ud)), TileUr{});
+  auto ga       = make_contraction_node<'q', 'e', 'b', 'c'>(h, u);
+  auto [g3, ca] = g2.add(ga);
+
+  g3.outputs(ca).execute(TeamPolicyTag2<ES>{}, Cd);
+  Kokkos::fence();
+
+  auto Ch = Kokkos::create_mirror_view(Cd);
+  Kokkos::deep_copy(Ch, Cd);
+
+  double max_err = 0.0;
+  for (int q = 0; q < rN; ++q)
+    for (int e = 0; e < rE; ++e)
+      for (int b = 0; b < rN; ++b)
+        for (int c = 0; c < rN; ++c) {
+          double ref = 0.0;
+          for (int a = 0; a < rN; ++a) ref += hval(q, a) * uval(e, a, b, c);
+          max_err = std::max(max_err, std::abs(ref - Ch(q, e, b, c)));
+        }
+  EXPECT_LT(max_err, 1e-4) << "graph contraction != reference";
+}
+
+TEST(LevelGraphRuntime, ThreeMemberFusedGradientLevelEqualsReference) {
+  ViewH Hd("H", rN, rN);
+  ViewU Ud("U", rE, rN, rN, rN);
+  ViewC Ax("Ax", rN, rE, rN, rN);
+  ViewC Bx("Bx", rN, rE, rN, rN);
+  ViewC Cx("Cx", rN, rE, rN, rN);
+
+  auto Hh = Kokkos::create_mirror_view(Hd);
+  auto Uh = Kokkos::create_mirror_view(Ud);
+  for (int q = 0; q < rN; ++q)
+    for (int a = 0; a < rN; ++a) Hh(q, a) = hval(q, a);
+  for (int e = 0; e < rE; ++e)
+    for (int a = 0; a < rN; ++a)
+      for (int b = 0; b < rN; ++b)
+        for (int c = 0; c < rN; ++c) Uh(e, a, b, c) = uval(e, a, b, c);
+  Kokkos::deep_copy(Hd, Hh);
+  Kokkos::deep_copy(Ud, Uh);
+
+  auto g0      = make_level_graph<float, ES>();
+  auto [g1, h] = g0.stage(make_input_node(make_handle<'q', 'a'>(Hd)), TileHr{});
+  auto [g2, u] =
+      g1.stage(make_input_node(make_handle<'e', 'a', 'b', 'c'>(Ud)), TileUr{});
+
+  auto gax = make_contraction_node<'q', 'e', 'b', 'c'>(h, u);
+  auto gbx =
+      make_contraction_node<'q', 'e', 'a', 'c'>(h.template as<'q', 'b'>(), u);
+  auto gcx =
+      make_contraction_node<'q', 'e', 'a', 'b'>(h.template as<'q', 'c'>(), u);
+  auto [g3, ha, hb, hc] = g2.add(gax, gbx, gcx);
+
+  g3.outputs(ha, hb, hc).execute(TeamPolicyTag2<ES>{}, Ax, Bx, Cx);
+  Kokkos::fence();
+
+  auto Ah  = Kokkos::create_mirror_view(Ax);
+  auto Bh  = Kokkos::create_mirror_view(Bx);
+  auto Chh = Kokkos::create_mirror_view(Cx);
+  Kokkos::deep_copy(Ah, Ax);
+  Kokkos::deep_copy(Bh, Bx);
+  Kokkos::deep_copy(Chh, Cx);
+
+  // A modes (q,e,b,c): sum_a H[q,a] U[e,a,b,c]
+  // B modes (q,e,a,c): sum_b H[q,b] U[e,a,b,c]
+  // C modes (q,e,a,b): sum_c H[q,c] U[e,a,b,c]
+  double ea = 0.0, eb = 0.0, ec = 0.0;
+  for (int q = 0; q < rN; ++q)
+    for (int e = 0; e < rE; ++e)
+      for (int m = 0; m < rN; ++m)
+        for (int n = 0; n < rN; ++n) {
+          double ra = 0.0, rb = 0.0, rc = 0.0;
+          for (int k = 0; k < rN; ++k) {
+            ra += hval(q, k) * uval(e, k, m, n);
+            rb += hval(q, k) * uval(e, m, k, n);
+            rc += hval(q, k) * uval(e, m, n, k);
+          }
+          ea = std::max(ea, std::abs(ra - Ah(q, e, m, n)));
+          eb = std::max(eb, std::abs(rb - Bh(q, e, m, n)));
+          ec = std::max(ec, std::abs(rc - Chh(q, e, m, n)));
+        }
+  EXPECT_LT(ea, 1e-4) << "member a";
+  EXPECT_LT(eb, 1e-4) << "member b";
+  EXPECT_LT(ec, 1e-4) << "member c";
+}
+
+struct ScaleG {
+  KOKKOS_FUNCTION float operator()(int, int, int, int, float g) const {
+    return 2.0f * g + 0.5f;
+  }
+};
+
+struct DupG {
+  KOKKOS_FUNCTION Kokkos::Array<float, 2> operator()(int, int, int, int,
+                                                     float g) const {
+    return {2.0f * g, 3.0f * g};
+  }
+};
+
+// A combine LEVEL reading the slot a prior contraction level wrote: the first
+// multi-level graph and the first exercise of the combine driver. The pointwise
+// op is coordinate-free, so the tile-local coord the fused range passes is
+// irrelevant and the reference is exactly 2*grad + 0.5.
+TEST(LevelGraphRuntime, CombineLevelReadingContractionEqualsReference) {
+  ViewH Hd("H", rN, rN);
+  ViewU Ud("U", rE, rN, rN, rN);
+  ViewC Px("P", rN, rE, rN, rN);
+
+  auto Hh = Kokkos::create_mirror_view(Hd);
+  auto Uh = Kokkos::create_mirror_view(Ud);
+  for (int q = 0; q < rN; ++q)
+    for (int a = 0; a < rN; ++a) Hh(q, a) = hval(q, a);
+  for (int e = 0; e < rE; ++e)
+    for (int a = 0; a < rN; ++a)
+      for (int b = 0; b < rN; ++b)
+        for (int c = 0; c < rN; ++c) Uh(e, a, b, c) = uval(e, a, b, c);
+  Kokkos::deep_copy(Hd, Hh);
+  Kokkos::deep_copy(Ud, Uh);
+
+  auto g0      = make_level_graph<float, ES>();
+  auto [g1, h] = g0.stage(make_input_node(make_handle<'q', 'a'>(Hd)), TileHr{});
+  auto [g2, u] =
+      g1.stage(make_input_node(make_handle<'e', 'a', 'b', 'c'>(Ud)), TileUr{});
+
+  auto ga       = make_contraction_node<'q', 'e', 'b', 'c'>(h, u);
+  auto [g3, ca] = g2.add(ga);
+  auto cmb      = make_combine_node<'q', 'e', 'b', 'c'>(ca, ScaleG{});
+  auto [g4, pa] = g3.add(cmb);
+
+  g4.outputs(pa).execute(TeamPolicyTag2<ES>{}, Px);
+  Kokkos::fence();
+
+  auto Ph = Kokkos::create_mirror_view(Px);
+  Kokkos::deep_copy(Ph, Px);
+
+  double max_err = 0.0;
+  for (int q = 0; q < rN; ++q)
+    for (int e = 0; e < rE; ++e)
+      for (int b = 0; b < rN; ++b)
+        for (int c = 0; c < rN; ++c) {
+          double g = 0.0;
+          for (int a = 0; a < rN; ++a) g += hval(q, a) * uval(e, a, b, c);
+          double ref = 2.0 * g + 0.5;
+          max_err    = std::max(max_err, std::abs(ref - Ph(q, e, b, c)));
+        }
+  EXPECT_LT(max_err, 1e-4) << "combine-over-contraction != reference";
+}
+
+// One combine member emitting TWO outputs in a single pass. Pins the slot
+// fan-out (member != slot: o0 and o1 are two consecutive level slots off one
+// member) and the slot-indexed carve that gives each its own buffer.
+TEST(LevelGraphRuntime, MultiOutputCombineEqualsReference) {
+  ViewH Hd("H", rN, rN);
+  ViewU Ud("U", rE, rN, rN, rN);
+  ViewC O0("O0", rN, rE, rN, rN);
+  ViewC O1("O1", rN, rE, rN, rN);
+
+  auto Hh = Kokkos::create_mirror_view(Hd);
+  auto Uh = Kokkos::create_mirror_view(Ud);
+  for (int q = 0; q < rN; ++q)
+    for (int a = 0; a < rN; ++a) Hh(q, a) = hval(q, a);
+  for (int e = 0; e < rE; ++e)
+    for (int a = 0; a < rN; ++a)
+      for (int b = 0; b < rN; ++b)
+        for (int c = 0; c < rN; ++c) Uh(e, a, b, c) = uval(e, a, b, c);
+  Kokkos::deep_copy(Hd, Hh);
+  Kokkos::deep_copy(Ud, Uh);
+
+  auto g0      = make_level_graph<float, ES>();
+  auto [g1, h] = g0.stage(make_input_node(make_handle<'q', 'a'>(Hd)), TileHr{});
+  auto [g2, u] =
+      g1.stage(make_input_node(make_handle<'e', 'a', 'b', 'c'>(Ud)), TileUr{});
+
+  auto ga           = make_contraction_node<'q', 'e', 'b', 'c'>(h, u);
+  auto [g3, ca]     = g2.add(ga);
+  auto cmb          = make_combine_node<'q', 'e', 'b', 'c'>(ca, DupG{});
+  auto [g4, o0, o1] = g3.add(cmb);
+
+  g4.outputs(o0, o1).execute(TeamPolicyTag2<ES>{}, O0, O1);
+  Kokkos::fence();
+
+  auto H0 = Kokkos::create_mirror_view(O0);
+  auto H1 = Kokkos::create_mirror_view(O1);
+  Kokkos::deep_copy(H0, O0);
+  Kokkos::deep_copy(H1, O1);
+
+  double e0 = 0.0, e1 = 0.0;
+  for (int q = 0; q < rN; ++q)
+    for (int e = 0; e < rE; ++e)
+      for (int b = 0; b < rN; ++b)
+        for (int c = 0; c < rN; ++c) {
+          double g = 0.0;
+          for (int a = 0; a < rN; ++a) g += hval(q, a) * uval(e, a, b, c);
+          e0 = std::max(e0, std::abs(2.0 * g - H0(q, e, b, c)));
+          e1 = std::max(e1, std::abs(3.0 * g - H1(q, e, b, c)));
+        }
+  EXPECT_LT(e0, 1e-4) << "multi-output combine o0";
+  EXPECT_LT(e1, 1e-4) << "multi-output combine o1";
+}
+
+}  // namespace rt
+
+int main(int argc, char* argv[]) {
+  ::testing::InitGoogleTest(&argc, argv);
+  Kokkos::initialize(argc, argv);
+  int rc = RUN_ALL_TESTS();
+  Kokkos::finalize();
+  return rc;
 }

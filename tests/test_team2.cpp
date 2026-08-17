@@ -589,7 +589,7 @@ using TB = StaticTile<kK, kL>;
 using TC = StaticTile<kI, kL>;
 
 template <typename Hook>
-void run_matmul(V2 a, V2 b, Buf1D team_out, Buf1D scalar_out, Hook hook) {
+void run_matmul(V2 a, V2 b, Buf1D team_out, Hook hook) {
   auto node = make_contraction_node<'i', 'l'>(
       make_input_node(make_handle<'i', 'k'>(a)),
       make_input_node(make_handle<'k', 'l'>(b)), hook);
@@ -611,10 +611,7 @@ void run_matmul(V2 a, V2 b, Buf1D team_out, Buf1D scalar_out, Hook hook) {
         Kokkos::single(Kokkos::PerTeam(team), [=]() {
           const auto cv = res.node().storage_;
           for (int i = 0; i < kI; ++i)
-            for (int l = 0; l < kL; ++l) {
-              team_out(i * kL + l)   = cv(i, l);
-              scalar_out(i * kL + l) = gemm(i, l);
-            }
+            for (int l = 0; l < kL; ++l) team_out(i * kL + l) = cv(i, l);
         });
       });
   Kokkos::fence();
@@ -690,6 +687,53 @@ std::vector<float> to_host(Buf1D v) {
   return out;
 }
 
+// P1: drive the SAME contraction two ways -- once through operator()(), once
+// through a caller-written range calling the element operator()(i, j). The
+// second shape is what the fused level driver will emit, so they must agree.
+void run_element_vs_driver_matmul(V2 a, V2 b, Buf1D driver_out,
+                                  Buf1D manual_out) {
+  auto node = make_contraction_node<'i', 'l'>(
+      make_input_node(make_handle<'i', 'k'>(a)),
+      make_input_node(make_handle<'k', 'l'>(b)));
+  const std::size_t bytes = scratch_for<TA, TB, TC, TC>();
+  Kokkos::parallel_for(
+      Kokkos::TeamPolicy<ES>(1, Kokkos::AUTO)
+          .set_scratch_size(0, Kokkos::PerTeam(bytes)),
+      KOKKOS_LAMBDA(const team_t& team) {
+        auto A = stage_full(node.node_a, TA{}, team);
+        auto B = stage_full(node.node_b, TB{}, team);
+        auto C0 =
+            make_interm_node(Impl::alloc_scratch_tile<float, ES>(team, TC{}));
+        auto C1 =
+            make_interm_node(Impl::alloc_scratch_tile<float, ES>(team, TC{}));
+        auto driver = make_evaluator<TeamPolicyTag2<ES>>(
+            node, ContractOperands{A, B, C0}, team);
+        auto manual = make_evaluator<TeamPolicyTag2<ES>>(
+            node, ContractOperands{A, B, C1}, team);
+        team.team_barrier();
+
+        auto res = driver();
+
+        constexpr int SA   = decltype(manual)::SA;
+        constexpr int SB   = decltype(manual)::SB;
+        const auto    self = manual;
+        Kokkos::parallel_for(Kokkos::TeamVectorRange(team, SA * SB),
+                             [=](int t) { self(t / SB, t % SB); });
+        team.team_barrier();
+
+        Kokkos::single(Kokkos::PerTeam(team), [=]() {
+          const auto dv = res.node().storage_;
+          const auto mv = C1.storage_;
+          for (int i = 0; i < kI; ++i)
+            for (int l = 0; l < kL; ++l) {
+              driver_out(i * kL + l) = dv(i, l);
+              manual_out(i * kL + l) = mv(i, l);
+            }
+        });
+      });
+  Kokkos::fence();
+}
+
 }  // namespace contract
 
 using contract::a_val;
@@ -707,10 +751,9 @@ TEST(Team2Contract, MatmulMatchesHostReference) {
   Kokkos::deep_copy(a, ah);
   Kokkos::deep_copy(b, bh);
 
-  Buf1D team_out("team", kI * kL), scalar_out("scalar", kI * kL);
-  run_matmul(a, b, team_out, scalar_out, NoHook{});
-  const auto got    = to_host(team_out);
-  const auto scalar = to_host(scalar_out);
+  Buf1D team_out("team", kI * kL);
+  run_matmul(a, b, team_out, NoHook{});
+  const auto got = to_host(team_out);
 
   for (int i = 0; i < kI; ++i)
     for (int l = 0; l < kL; ++l) {
@@ -718,10 +761,6 @@ TEST(Team2Contract, MatmulMatchesHostReference) {
       for (int k = 0; k < kK; ++k)
         acc += static_cast<double>(ah(i, k)) * bh(k, l);
       EXPECT_NEAR(got[i * kL + l], static_cast<float>(acc), 1e-4f)
-          << "i=" << i << " l=" << l;
-      // The two operators must agree: operator()() is only a parallel wrapper
-      // around operator()(i, j).
-      EXPECT_FLOAT_EQ(scalar[i * kL + l], got[i * kL + l])
           << "i=" << i << " l=" << l;
     }
 }
@@ -738,8 +777,8 @@ TEST(Team2Contract, HookRidesForwardUnapplied) {
   Kokkos::deep_copy(a, ah);
   Kokkos::deep_copy(b, bh);
 
-  Buf1D team_out("team", kI * kL), scalar_out("scalar", kI * kL);
-  run_matmul(a, b, team_out, scalar_out, ScaleC{});
+  Buf1D team_out("team", kI * kL);
+  run_matmul(a, b, team_out, ScaleC{});
   const auto got = to_host(team_out);
 
   // ScaleC triples. The scratch must hold the RAW contraction; the hook rides
@@ -824,6 +863,34 @@ TEST(Team2Contract, MultipleFreeAModesCollapseIntoSA) {
 // reorder_view's permutation reads perm[d] = the SOURCE axis that becomes
 // destination axis d, matching Team2Relabel.GlobalRank3CyclePermutation.
 // ---------------------------------------------------------------------------
+TEST(Team2Contract, ElementOperatorMatchesDriver) {
+  using namespace contract;
+  V2   a("a", kI, kK), b("b", kK, kL);
+  auto ah = Kokkos::create_mirror_view(a);
+  auto bh = Kokkos::create_mirror_view(b);
+  for (int i = 0; i < kI; ++i)
+    for (int k = 0; k < kK; ++k) ah(i, k) = a_val(i, k);
+  for (int k = 0; k < kK; ++k)
+    for (int l = 0; l < kL; ++l) bh(k, l) = b_val(k, l);
+  Kokkos::deep_copy(a, ah);
+  Kokkos::deep_copy(b, bh);
+
+  Buf1D driver_out("driver", kI * kL), manual_out("manual", kI * kL);
+  run_element_vs_driver_matmul(a, b, driver_out, manual_out);
+  const auto d = to_host(driver_out);
+  const auto m = to_host(manual_out);
+
+  for (int i = 0; i < kI; ++i)
+    for (int l = 0; l < kL; ++l) {
+      double acc = 0.0;
+      for (int k = 0; k < kK; ++k)
+        acc += static_cast<double>(ah(i, k)) * bh(k, l);
+      EXPECT_NEAR(d[i * kL + l], static_cast<float>(acc), 1e-4f)
+          << "i=" << i << " l=" << l;
+      EXPECT_FLOAT_EQ(m[i * kL + l], d[i * kL + l]) << "i=" << i << " l=" << l;
+    }
+}
+
 namespace permuted {
 
 using contract::scratch_for;
@@ -1482,6 +1549,63 @@ auto fill2(V v, F f) {
   return h;
 }
 
+// P1: the multi-output combine driven two ways -- operator()() versus a flat
+// caller-written range that builds its own coordinate and calls the element
+// operator()(coord). The second is the fused level driver's shape.
+void run_element_vs_driver_multi_out(V2 a, V2 b, Buf1D d0, Buf1D d1, Buf1D m0,
+                                     Buf1D m1) {
+  auto node = make_combine_node<'i', 'j'>(
+      make_input_node(make_handle<'i', 'j'>(a)),
+      make_input_node(make_handle<'i', 'j'>(b)), SumDiff{});
+  const std::size_t bytes = scratch_for<CT, CT, CT, CT, CT, CT>();
+  Kokkos::parallel_for(
+      Kokkos::TeamPolicy<ES>(1, Kokkos::AUTO)
+          .set_scratch_size(0, Kokkos::PerTeam(bytes)),
+      KOKKOS_LAMBDA(const team_t& team) {
+        auto A = stage_full(node.operands.get<0>(), CT{}, team);
+        auto B = stage_full(node.operands.get<1>(), CT{}, team);
+        auto D0 =
+            make_interm_node(Impl::alloc_scratch_tile<float, ES>(team, CT{}));
+        auto D1 =
+            make_interm_node(Impl::alloc_scratch_tile<float, ES>(team, CT{}));
+        auto M0 =
+            make_interm_node(Impl::alloc_scratch_tile<float, ES>(team, CT{}));
+        auto M1 =
+            make_interm_node(Impl::alloc_scratch_tile<float, ES>(team, CT{}));
+        const Kokkos::Array<decltype(D0), 2> douts{D0, D1};
+        const Kokkos::Array<decltype(M0), 2> mouts{M0, M1};
+
+        auto driver = make_evaluator<TeamPolicyTag2<ES>>(
+            node, make_combine_operands(A, B, douts), team);
+        auto manual = make_evaluator<TeamPolicyTag2<ES>>(
+            node, make_combine_operands(A, B, mouts), team);
+        team.team_barrier();
+
+        auto res = driver();
+
+        const auto self = manual;
+        Kokkos::parallel_for(
+            Kokkos::TeamVectorRange(team, cI * cJ),
+            [=](int t) { self(Impl::Index<2>{t / cJ, t % cJ}); });
+        team.team_barrier();
+
+        Kokkos::single(Kokkos::PerTeam(team), [=]() {
+          const auto dv0 = res[0].node().storage_;
+          const auto dv1 = res[1].node().storage_;
+          const auto mv0 = M0.storage_;
+          const auto mv1 = M1.storage_;
+          for (int i = 0; i < cI; ++i)
+            for (int j = 0; j < cJ; ++j) {
+              d0(i * cJ + j) = dv0(i, j);
+              d1(i * cJ + j) = dv1(i, j);
+              m0(i * cJ + j) = mv0(i, j);
+              m1(i * cJ + j) = mv1(i, j);
+            }
+        });
+      });
+  Kokkos::fence();
+}
+
 }  // namespace combine
 
 TEST(Team2Combine, ResultTypesAreAsExpected) { SUCCEED(); }
@@ -1649,4 +1773,35 @@ int main(int argc, char* argv[]) {
   int result = RUN_ALL_TESTS();
   Kokkos::finalize();
   return result;
+}
+
+TEST(Team2Combine, ElementOperatorMatchesDriver) {
+  using namespace combine;
+  V2   a("a", cI, cJ), b("b", cI, cJ);
+  auto ah = Kokkos::create_mirror_view(a);
+  auto bh = Kokkos::create_mirror_view(b);
+  for (int i = 0; i < cI; ++i)
+    for (int j = 0; j < cJ; ++j) {
+      ah(i, j) = p_val(i, j);
+      bh(i, j) = q_val(i, j);
+    }
+  Kokkos::deep_copy(a, ah);
+  Kokkos::deep_copy(b, bh);
+
+  Buf1D d0("d0", cI * cJ), d1("d1", cI * cJ);
+  Buf1D m0("m0", cI * cJ), m1("m1", cI * cJ);
+  run_element_vs_driver_multi_out(a, b, d0, d1, m0, m1);
+  const auto hd0 = to_host(d0), hd1 = to_host(d1);
+  const auto hm0 = to_host(m0), hm1 = to_host(m1);
+
+  for (int i = 0; i < cI; ++i)
+    for (int j = 0; j < cJ; ++j) {
+      const int   n  = i * cJ + j;
+      const float e0 = ah(i, j) + bh(i, j) + static_cast<float>(i);
+      const float e1 = ah(i, j) - bh(i, j) - static_cast<float>(j);
+      EXPECT_FLOAT_EQ(hd0[n], e0) << "i=" << i << " j=" << j;
+      EXPECT_FLOAT_EQ(hd1[n], e1) << "i=" << i << " j=" << j;
+      EXPECT_FLOAT_EQ(hm0[n], hd0[n]) << "i=" << i << " j=" << j;
+      EXPECT_FLOAT_EQ(hm1[n], hd1[n]) << "i=" << i << " j=" << j;
+    }
 }
