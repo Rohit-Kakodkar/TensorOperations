@@ -87,11 +87,15 @@ View2 make_view(const char* name, int r, int c, int salt) {
 // Four stages then three levels, so the slot order is
 //   0 E, 1 F, 2 B, 3 A, 4 C0, 5 C1, 6 C2.
 auto level_chain(View2 a, View2 b, View2 e, View2 f) {
-  auto g0      = make_level_graph<float, ES>(Map{});
-  auto [g1, E] = g0.stage(make_input_node(make_handle<'l', 'm'>(e)));
-  auto [g2, F] = g1.stage(make_input_node(make_handle<'l', 'm'>(f)));
-  auto [g3, B] = g2.stage(make_input_node(make_handle<'k', 'l'>(b)));
-  auto [g4, A] = g3.stage(make_input_node(make_handle<'i', 'k'>(a)));
+  auto g0 = make_level_graph<float, ES>(Map{});
+  auto [g1, E] =
+      g0.add(make_stage_node(make_input_node(make_handle<'l', 'm'>(e))));
+  auto [g2, F] =
+      g1.add(make_stage_node(make_input_node(make_handle<'l', 'm'>(f))));
+  auto [g3, B] =
+      g2.add(make_stage_node(make_input_node(make_handle<'k', 'l'>(b))));
+  auto [g4, A] =
+      g3.add(make_stage_node(make_input_node(make_handle<'i', 'k'>(a))));
 
   auto [g5, c0] = g4.add(make_contraction_node<'i', 'l'>(A, B));
   auto [g6, c1] =
@@ -106,21 +110,24 @@ using ChainGraph  = std::decay_t<decltype(std::get<0>(
                 std::declval<View2>(), std::declval<View2>())))>;
 using ChainLevels = ChainGraph::levels_type;
 
-// Hand-traced. Time 0 is the stages, level L is time L+1, and the root store
-// runs at time 4. Ranges are CLOSED at both ends.
+// Hand-traced. Staging is now a LEVEL, so the timeline is just level indices:
+// E, F, B and A are levels 0-3, the three contractions are levels 4-6, and the
+// root store runs at 7. Ranges are CLOSED at both ends.
 //
-//   slot 0  E   staged, last read by level 1  -> [0,2]
-//   slot 1  F   staged, last read by level 2  -> [0,3]
-//   slot 2  B   staged, last read by level 0  -> [0,1]
-//   slot 3  A   staged, last read by level 0  -> [0,1]
-//   slot 4  C0  written level 0, read level 1 -> [1,2]
-//   slot 5  C1  written level 1, read level 2 -> [2,3]
-//   slot 6  C2  written level 2, root         -> [3,4]
+//   slot 0  E   level 0, last read by level 5 -> [0,5]
+//   slot 1  F   level 1, last read by level 6 -> [1,6]
+//   slot 2  B   level 2, last read by level 4 -> [2,4]
+//   slot 3  A   level 3, last read by level 4 -> [3,4]
+//   slot 4  C0  level 4, read level 5         -> [4,5]
+//   slot 5  C1  level 5, read level 6         -> [5,6]
+//   slot 6  C2  level 6, root                 -> [6,7]
 //
-// A and B die before C1 is written, so C1 reclaims B's buffer and C2 reclaims
-// E's. F is live across every death and can never be touched.
-constexpr auto kChainPlan = Impl::lg_pool_of_slot<ChainLevels, 4, /*root=*/6>();
-static_assert(kChainPlan.size() == 7, "4 stages + 3 level outputs");
+// B and A die at level 4, so C1 reclaims B's buffer and C2 reclaims E's. F is
+// live across every death and can never be touched. The ASSIGNMENT is unchanged
+// from when staging was its own phase -- the timeline stretched but the
+// overlaps did not.
+constexpr auto kChainPlan = Impl::lg_pool_of_slot<ChainLevels, 0, /*root=*/6>();
+static_assert(kChainPlan.size() == 7, "seven levels, one slot each");
 static_assert(kChainPlan[0] == 0);
 static_assert(kChainPlan[1] == 1);
 static_assert(kChainPlan[2] == 2);
@@ -128,7 +135,7 @@ static_assert(kChainPlan[3] == 3);
 static_assert(kChainPlan[4] == 4, "C0 is live alongside every stage");
 static_assert(kChainPlan[5] == 2, "C1 reclaims B's buffer");
 static_assert(kChainPlan[6] == 0, "C2 reclaims E's buffer");
-static_assert(Impl::lg_pool_count<ChainLevels, 4, 6>() == 5,
+static_assert(Impl::lg_pool_count<ChainLevels, 0, 6>() == 5,
               "seven slots must fit in five pools");
 
 // --- the same graph, with a SECOND member in the last level ----------------
@@ -138,11 +145,15 @@ static_assert(Impl::lg_pool_count<ChainLevels, 4, 6>() == 5,
 // live and must never share. This is the property a per-MEMBER port of the DAG
 // analysis would get wrong, and it would get it wrong silently.
 auto level_wide(View2 a, View2 b, View2 e, View2 f) {
-  auto g0      = make_level_graph<float, ES>(Map{});
-  auto [g1, E] = g0.stage(make_input_node(make_handle<'l', 'm'>(e)));
-  auto [g2, F] = g1.stage(make_input_node(make_handle<'l', 'm'>(f)));
-  auto [g3, B] = g2.stage(make_input_node(make_handle<'k', 'l'>(b)));
-  auto [g4, A] = g3.stage(make_input_node(make_handle<'i', 'k'>(a)));
+  auto g0 = make_level_graph<float, ES>(Map{});
+  auto [g1, E] =
+      g0.add(make_stage_node(make_input_node(make_handle<'l', 'm'>(e))));
+  auto [g2, F] =
+      g1.add(make_stage_node(make_input_node(make_handle<'l', 'm'>(f))));
+  auto [g3, B] =
+      g2.add(make_stage_node(make_input_node(make_handle<'k', 'l'>(b))));
+  auto [g4, A] =
+      g3.add(make_stage_node(make_input_node(make_handle<'i', 'k'>(a))));
 
   auto [g5, c0] = g4.add(make_contraction_node<'i', 'l'>(A, B));
   auto [g6, x, y] =
@@ -156,7 +167,7 @@ using WideGraph  = std::decay_t<decltype(std::get<0>(
                std::declval<View2>(), std::declval<View2>())))>;
 using WideLevels = WideGraph::levels_type;
 
-constexpr auto kWidePlan = Impl::lg_pool_of_slot<WideLevels, 4, 5, 6>();
+constexpr auto kWidePlan = Impl::lg_pool_of_slot<WideLevels, 0, 5, 6>();
 static_assert(kWidePlan[5] != kWidePlan[6],
               "two members of ONE level are simultaneously live: there is no "
               "barrier between them, so their outputs may never share a pool");
@@ -170,13 +181,13 @@ static_assert(kWidePlan[4] != kWidePlan[5] && kWidePlan[4] != kWidePlan[6],
 // every slot its own pool would satisfy every disjointness property in this
 // file and buy nothing.
 TEST(LevelLivenessTest, PoolingActuallyReclaimsBuffers) {
-  static_assert(Impl::lg_pool_count<ChainLevels, 4, 6>() <
-                    Impl::lg_num_slots_v<ChainLevels, 4>,
+  static_assert(Impl::lg_pool_count<ChainLevels, 0, 6>() <
+                    Impl::lg_num_slots_v<ChainLevels, 0>,
                 "pooling must use fewer pools than there are slots");
   // Bound to locals first: the commas in the template arguments would be read
   // as extra macro arguments.
-  constexpr std::size_t pools = Impl::lg_pool_count<ChainLevels, 4, 6>();
-  constexpr std::size_t slots = Impl::lg_num_slots_v<ChainLevels, 4>;
+  constexpr std::size_t pools = Impl::lg_pool_count<ChainLevels, 0, 6>();
+  constexpr std::size_t slots = Impl::lg_num_slots_v<ChainLevels, 0>;
   EXPECT_EQ(pools, 5u);
   EXPECT_EQ(slots, 7u);
 }
