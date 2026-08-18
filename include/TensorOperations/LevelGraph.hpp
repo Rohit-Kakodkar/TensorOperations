@@ -53,6 +53,28 @@ template <typename LevelsT, std::size_t NumStages, std::size_t GS>
 using lg_slot_tile_t = member_out_tile_t<
     typename lg_slot_member_node<LevelsT, NumStages, GS>::type>;
 
+// A staged member with its tile resolved from the graph's label map; every
+// other member kind passes through untouched.
+//
+// This is where a stage node stops being half-built. make_stage_node cannot
+// know the tile -- it is a property of the graph, not the tensor -- so the node
+// arrives with tile_type = void and the graph completes it.
+template <typename LT, typename Member,
+          typename Tag = typename Member::node_tag>
+struct lg_resolve_member {
+  using type = Member;
+  static const Member& get(const Member& m) { return m; }
+};
+template <typename LT, typename Member>
+struct lg_resolve_member<LT, Member, StagedTag> {
+  using type = NodeHandle<StagedTag, typename Member::operand_type,
+                          typename Member::modes_seq,
+                          tile_from_labels_t<LT, typename Member::modes_seq>>;
+  static type get(const Member& m) { return type{m.operand_}; }
+};
+template <typename LT, typename Member>
+using lg_resolve_member_t = typename lg_resolve_member<LT, Member>::type;
+
 template <typename Node, typename OpModes,
           typename Tag = typename Node::node_tag>
 struct lg_canon_modes_of {
@@ -652,9 +674,11 @@ struct LevelGraph {
     // runs from the stages outward.
     using Tile = tile_from_labels_t<LabelTilesT, typename Node::modes_seq>;
     constexpr std::size_t Idx  = num_stages;
-    auto                  node = make_stage_node(input_node);
-    using NewStages            = decltype(tuple_append(stages, node));
-    using NewStageTiles        = decltype(tuple_append(stage_tiles, Tile{}));
+    auto                  node = Impl::lg_resolve_member<
+        LabelTilesT, decltype(make_stage_node(
+                         input_node))>::get(make_stage_node(input_node));
+    using NewStages     = decltype(tuple_append(stages, node));
+    using NewStageTiles = decltype(tuple_append(stage_tiles, Tile{}));
 
     auto handle = make_slot_node_seq<Idx, typename Node::modes_seq>(
         SlotView<ValueType, ExecSpace, Tile>{}, input_node.shape());

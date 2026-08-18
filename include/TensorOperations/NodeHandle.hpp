@@ -143,12 +143,22 @@ struct NodeHandle<IntermTag, Storage, IntRank, ExecSpace, HookOp> {
   [[no_unique_address]] HookOp hook_op;
 };
 
-template <typename Operand, typename ModesSeq>
-struct NodeHandle<StagedTag, Operand, ModesSeq> {
+// Tile is `void` until the graph resolves it.
+//
+// Every other member kind DERIVES its output tile from its operands, so
+// MemberOutTile can compute one from the node alone. A stage has no operands to
+// derive from -- its tile is a property of the graph's label map, which the
+// node does not know. So `make_stage_node(input)` leaves it unresolved and
+// LevelGraph::add fills it in: `add` is the first place where both the node and
+// the map are in scope. Downstream, `tile_type` is simply what MemberOutTile
+// reports.
+template <typename Operand, typename ModesSeq, typename Tile>
+struct NodeHandle<StagedTag, Operand, ModesSeq, Tile> {
   Operand operand_;
 
   using node_tag            = StagedTag;
   using operand_type        = Operand;
+  using tile_type           = Tile;
   static constexpr int Rank = Operand::Rank;
   using value_type          = typename Operand::value_type;
   using exec_space          = typename Operand::exec_space;
@@ -163,10 +173,13 @@ struct NodeHandle<StagedTag, Operand, ModesSeq> {
     return operand_.shape();
   }
 
+  // Relabelling keeps the tile UNRESOLVED even if it was resolved, because the
+  // tile follows the labels: a different label order is a different tile, and
+  // re-deriving it is the graph's job, not this node's.
   template <int32_t... Modes>
   KOKKOS_FUNCTION auto as() const {
     return NodeHandle<StagedTag, Operand,
-                      std::integer_sequence<int32_t, Modes...>>{operand_};
+                      std::integer_sequence<int32_t, Modes...>, void>{operand_};
   }
 };
 
@@ -269,7 +282,7 @@ KOKKOS_FUNCTION auto make_interm_node(Storage storage, HookOp hook = {}) {
 
 template <typename Operand>
 KOKKOS_FUNCTION auto make_stage_node(Operand op) {
-  return NodeHandle<StagedTag, Operand, typename Operand::modes_seq>{
+  return NodeHandle<StagedTag, Operand, typename Operand::modes_seq, void>{
       std::move(op)};
 }
 
