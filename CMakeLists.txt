@@ -272,7 +272,7 @@ set_tests_properties(ArenaGuardNegative.Case1 PROPERTIES
 # leaving that defect to the homogeneity guard alone -- so a case matching two
 # messages means a predicate started over-reporting.
 # ---------------------------------------------------------------------------
-foreach(case 0 1 2 3 4)
+foreach(case 0 1 2 3 4 5)
   add_executable(level_guard_neg_${case} EXCLUDE_FROM_ALL
                  tests/negative/level_guard_negative.cpp)
   target_link_libraries(level_guard_neg_${case} PRIVATE tensor)
@@ -286,6 +286,7 @@ set_tests_properties(LevelGuardNegative.Case1 PROPERTIES
                      PASS_REGULAR_EXPRESSION
                      "a level must be NON-EMPTY and HOMOGENEOUS")
 set_tests_properties(LevelGuardNegative.Case2 LevelGuardNegative.Case3
+                     LevelGuardNegative.Case5
                      PROPERTIES PASS_REGULAR_EXPRESSION
                      "must share ONE iteration space")
 set_tests_properties(LevelGuardNegative.Case4 PROPERTIES

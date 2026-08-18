@@ -440,11 +440,13 @@ struct LevelPlan {
                 "two decodes are different objects, so a mixed level computes "
                 "both and banks neither");
 
-  static_assert(Impl::lg_levels_space_v<LevelsT>,
-                "level graph: every member of a level must share ONE iteration "
-                "space -- contraction members must agree on SA and SB "
-                "(separately, not on their product), combine members on their "
-                "whole output tile layout");
+  static_assert(
+      Impl::lg_levels_space_v<LevelsT>,
+      "level graph: every member of a level must share ONE iteration "
+      "space -- contraction members must agree on SA and SB "
+      "(separately, not on their product), combine and STAGED members "
+      "on their whole output tile layout. For a staged level this is "
+      "what makes fusing its copies into one range sound");
 
   static_assert(
       Impl::lg_levels_reads_v<LevelsT, NumStages>,
