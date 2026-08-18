@@ -27,11 +27,34 @@ namespace TensorOperations {
 // and finely in another. Nothing in the SEM pipeline does that, and a single
 // source of truth is the point.
 // ---------------------------------------------------------------------------
+// A BLOCKED label: the tensor is longer than the tile along it, so it is cut
+// into tiles and becomes a grid mode -- one team per tile.
 template <int32_t Label, int Extent>
 struct LabelTile {
-  static constexpr int32_t label  = Label;
-  static constexpr int     extent = Extent;
+  static constexpr int32_t label   = Label;
+  static constexpr int     extent  = Extent;
+  static constexpr bool    gridded = true;
   static_assert(Extent > 0, "LabelTile: a tile extent must be positive");
+};
+
+// A WHOLE label: the tile spans the axis, so there is exactly one tile and
+// every team's index along it is 0.
+//
+// Declaring that is worth a distinct entry because it keeps the label OUT of
+// the grid. A grid mode costs a live register for its index and a division to
+// decode it, for every team, whether or not it ever varies -- and most labels
+// of a real graph never do. The SEM3D pipeline blocks one axis out of six, and
+// gridding the other five measured a 25% occupancy loss.
+//
+// Getting this wrong is a silent wrong answer -- a genuinely blocked label
+// marked Whole would leave every team computing the first tile -- so the extent
+// is checked against the tile at launch, unconditionally.
+template <int32_t Label, int Extent>
+struct LabelWhole {
+  static constexpr int32_t label   = Label;
+  static constexpr int     extent  = Extent;
+  static constexpr bool    gridded = false;
+  static_assert(Extent > 0, "LabelWhole: an extent must be positive");
 };
 
 template <typename... Entries>
@@ -97,7 +120,89 @@ struct TileFromLabels<LT, std::integer_sequence<int32_t, Modes...>> {
   using type = StaticTile<label_tile_v<LT, Modes>...>;
 };
 
+// The map's labels, in declaration order. This doubles as the GRID's mode list:
+// a level graph iterates over every label it knows about, and a label whose
+// extent equals its tile simply contributes one tile and a constant index 0.
+// That is why no node has to be designated as the grid -- the label set is the
+// grid, and it cannot be got wrong by reordering a call.
+template <typename LT>
+struct LabelSeq;
+template <typename... Entries>
+struct LabelSeq<LabelTiles<Entries...>> {
+  using type = std::integer_sequence<int32_t, Entries::label...>;
+};
+
+// Where a label sits in that list, so a per-label quantity gathered at runtime
+// (an extent, say) lands in the slot the grid tile expects. -1 if absent, which
+// the TileFromLabels guard has already ruled out for any label a node carries.
+template <typename... Entries>
+constexpr int label_index_lookup(int32_t l) {
+  const int32_t ls[] = {Entries::label..., int32_t{0}};
+  for (std::size_t i = 0; i < sizeof...(Entries); ++i)
+    if (ls[i] == l) return static_cast<int>(i);
+  return -1;
+}
+
+// The same lookup with the label as a RUNTIME value, for gathering a per-label
+// quantity while walking a node's modes. Host-only, like every constexpr
+// function here; label_index_v is the form to name from device code.
+template <typename LT>
+struct LabelIndexOf;
+template <typename... Entries>
+struct LabelIndexOf<LabelTiles<Entries...>> {
+  static constexpr int get(int32_t l) {
+    return label_index_lookup<Entries...>(l);
+  }
+};
+template <typename LT>
+constexpr int label_index_of(int32_t l) {
+  return LabelIndexOf<LT>::get(l);
+}
+
+// Whether a label is a grid mode, and its tile, by runtime label value.
+template <typename... Entries>
+constexpr bool label_gridded_lookup(int32_t l) {
+  const int32_t ls[] = {Entries::label..., int32_t{0}};
+  const bool    gs[] = {Entries::gridded..., false};
+  for (std::size_t i = 0; i < sizeof...(Entries); ++i)
+    if (ls[i] == l) return gs[i];
+  return false;
+}
+template <typename LT>
+struct LabelQuery;
+template <typename... Entries>
+struct LabelQuery<LabelTiles<Entries...>> {
+  static constexpr bool gridded(int32_t l) {
+    return label_gridded_lookup<Entries...>(l);
+  }
+  static constexpr int tile(int32_t l) {
+    return label_tile_lookup<Entries...>(l);
+  }
+};
+template <typename LT>
+constexpr bool label_gridded_of(int32_t l) {
+  return LabelQuery<LT>::gridded(l);
+}
+template <typename LT>
+constexpr int label_tile_of(int32_t l) {
+  return LabelQuery<LT>::tile(l);
+}
+
+template <typename LT, int32_t Label>
+inline constexpr int label_index_v = -1;
+template <typename... Entries, int32_t Label>
+inline constexpr int label_index_v<LabelTiles<Entries...>, Label> =
+    label_index_lookup<Entries...>(Label);
+
 }  // namespace Impl
+
+// The map's labels as a mode sequence -- the grid's modes.
+template <typename LT>
+using label_seq_t = typename Impl::LabelSeq<LT>::type;
+
+// The tile of the grid itself: one extent per label, in map order.
+template <typename LT>
+using grid_tile_t = typename Impl::TileFromLabels<LT, label_seq_t<LT>>::type;
 
 // The tile a node with these labels gets, in the label sequence's own order.
 // Order matters: the same label set in a different order is a different tile,

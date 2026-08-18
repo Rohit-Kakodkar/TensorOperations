@@ -304,8 +304,8 @@ using ViewC  = Kokkos::View<float****, Kokkos::LayoutRight, ES>;
 using TileHr = StaticTile<rN, rN>;
 // One extent per label, replacing the per-stage tiles below.
 using MapR =
-    LabelTiles<LabelTile<'q', rN>, LabelTile<'a', rN>, LabelTile<'e', rTE>,
-               LabelTile<'b', rN>, LabelTile<'c', rN>>;
+    LabelTiles<LabelWhole<'q', rN>, LabelWhole<'a', rN>, LabelTile<'e', rTE>,
+               LabelWhole<'b', rN>, LabelWhole<'c', rN>>;
 using TileUr = StaticTile<rTE, rN, rN, rN>;
 
 float hval(int q, int a) { return 0.1f + 0.3f * q - 0.2f * a + 0.05f * q * a; }
@@ -555,8 +555,8 @@ using TileU      = StaticTile<dTE, dA, dB, dC>;
 constexpr int dP = 6;
 using TileW      = StaticTile<dP, dQ>;
 using MapD =
-    LabelTiles<LabelTile<'q', dQ>, LabelTile<'a', dA>, LabelTile<'b', dB>,
-               LabelTile<'c', dC>, LabelTile<'e', dTE>, LabelTile<'p', dP>>;
+    LabelTiles<LabelWhole<'q', dQ>, LabelWhole<'a', dA>, LabelWhole<'b', dB>,
+               LabelWhole<'c', dC>, LabelTile<'e', dTE>, LabelWhole<'p', dP>>;
 
 float hval(int q, int a) {
   return 0.3f + 0.17f * q - 0.23f * a + 0.04f * q * a;

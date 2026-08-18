@@ -132,12 +132,24 @@ auto assemble_tile(const Node& node, const Tuple& tiles) {
 
 // Row-major decode of a linear work-item index into per-mode tile indices.
 // Returns 0-based tile coordinates (not element offsets) along each free mode.
+//
+// The n == 1 short-circuit is not a micro-optimization. A mode covered by a
+// single tile always decodes to 0 and leaves idx untouched, but writing that as
+// a division makes the compiler emit the full runtime integer-division sequence
+// -- I2F, MUFU.RCP, F2I and sign fixup, about twenty instructions -- because n
+// is a runtime value it cannot prove is 1. Most modes of a real grid are
+// un-tiled: the SEM3D graph grids one axis out of six. Skipping them turns
+// twenty instructions into a compare the whole team takes the same way.
 template <int Rank, typename Tile>
 KOKKOS_FUNCTION Kokkos::Array<int, Rank> decode_tile_index(
     int idx, const Kokkos::Array<int, Rank>& shape, const Tile& tile) {
   Kokkos::Array<int, Rank> tidx{};
   for (int d = Rank - 1; d >= 0; --d) {
-    int n   = (shape[d] + tile.extent(d) - 1) / tile.extent(d);
+    const int n = (shape[d] + tile.extent(d) - 1) / tile.extent(d);
+    if (n == 1) {
+      tidx[d] = 0;
+      continue;
+    }
     tidx[d] = static_cast<int>(idx % static_cast<int>(n));
     idx /= static_cast<int>(n);
   }

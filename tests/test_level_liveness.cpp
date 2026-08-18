@@ -60,8 +60,8 @@ using TC = StaticTile<kTI, kL>;  // == StaticTile<kTI, kM>
 
 // One extent per label. i is multi-tiled (32 over a 16 tile); every other axis
 // is whole, so only i is gridded.
-using Map = LabelTiles<LabelTile<'i', kTI>, LabelTile<'k', kK>,
-                       LabelTile<'l', kL>, LabelTile<'m', kM>>;
+using Map = LabelTiles<LabelTile<'i', kTI>, LabelWhole<'k', kK>,
+                       LabelWhole<'l', kL>, LabelWhole<'m', kM>>;
 
 float fill_val(int r, int c, int salt) {
   return 0.5f + 0.25f * r - 0.125f * c +

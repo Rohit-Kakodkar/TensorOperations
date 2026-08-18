@@ -200,9 +200,9 @@ struct GTiles {
 // is a whole NGLL. This is what every stage tile is looked up in, and every
 // downstream tile follows from those by derivation.
 template <int TE>
-using GMap = LabelTiles<LabelTile<'e', TE>, LabelTile<'k', cfg::N>,
-                        LabelTile<'j', cfg::N>, LabelTile<'i', cfg::N>,
-                        LabelTile<'p', cfg::N>, LabelTile<'r', cfg::N>>;
+using GMap = LabelTiles<LabelTile<'e', TE>, LabelWhole<'k', cfg::N>,
+                        LabelWhole<'j', cfg::N>, LabelWhole<'i', cfg::N>,
+                        LabelWhole<'p', cfg::N>, LabelWhole<'r', cfg::N>>;
 
 inline constexpr int kFnBegin = __LINE__;
 // F^r_c for ALL NINE (r,c) from one chain rule and one stress evaluation.
