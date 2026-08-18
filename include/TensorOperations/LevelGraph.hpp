@@ -1,4 +1,5 @@
 #pragma once
+#include <TensorOperations/LabelTiles.hpp>
 #include <TensorOperations/LevelPlan.hpp>
 
 #include <array>
@@ -498,9 +499,10 @@ struct LevelOutputs {
   }
 };
 
-template <typename ValueType, typename ExecSpace, typename StagesT,
-          typename StageTilesT, typename LevelsT>
+template <typename ValueType, typename ExecSpace, typename LabelTilesT,
+          typename StagesT, typename StageTilesT, typename LevelsT>
 struct LevelGraph {
+  using label_tiles_type                  = LabelTilesT;
   using levels_type                       = LevelsT;
   static constexpr std::size_t num_stages = tuple_size_v<StagesT>;
   static constexpr std::size_t num_levels = tuple_size_v<LevelsT>;
@@ -509,12 +511,19 @@ struct LevelGraph {
   StageTilesT stage_tiles;
   LevelsT     levels;
 
-  template <typename Node, typename Tile>
-  auto stage(const Node& input_node, const Tile&) const {
+  template <typename Node>
+  auto stage(const Node& input_node) const {
     static_assert(num_levels == 0,
                   "level graph: stage() every input before adding any level -- "
                   "a level reads stage slots, so the stage set must be closed "
                   "before the first level is added");
+    // The tile is no longer the caller's to choose: it follows from the labels
+    // this input carries and the graph's one tile extent per label. Every
+    // DOWNSTREAM tile then agrees with the map for free, because a member's
+    // output tile is derived from its operands and that derivation is asserted
+    // equivalent to the map in tests/test_label_tiles.cpp -- so the induction
+    // runs from the stages outward.
+    using Tile = tile_from_labels_t<LabelTilesT, typename Node::modes_seq>;
     constexpr std::size_t Idx  = num_stages;
     auto                  node = make_stage_node(input_node);
     using NewStages            = decltype(tuple_append(stages, node));
@@ -524,9 +533,9 @@ struct LevelGraph {
         SlotView<ValueType, ExecSpace, Tile>{}, input_node.shape());
 
     return std::make_tuple(
-        LevelGraph<ValueType, ExecSpace, NewStages, NewStageTiles, LevelsT>{
-            tuple_append(stages, node), tuple_append(stage_tiles, Tile{}),
-            levels},
+        LevelGraph<ValueType, ExecSpace, LabelTilesT, NewStages, NewStageTiles,
+                   LevelsT>{tuple_append(stages, node),
+                            tuple_append(stage_tiles, Tile{}), levels},
         handle);
   }
 
@@ -592,9 +601,9 @@ struct LevelGraph {
     using NewLevels         = decltype(tuple_append(levels, level));
     constexpr std::size_t L = num_levels;
     return std::tuple_cat(
-        std::make_tuple(
-            LevelGraph<ValueType, ExecSpace, StagesT, StageTilesT, NewLevels>{
-                stages, stage_tiles, tuple_append(levels, level)}),
+        std::make_tuple(LevelGraph<ValueType, ExecSpace, LabelTilesT, StagesT,
+                                   StageTilesT, NewLevels>{
+            stages, stage_tiles, tuple_append(levels, level)}),
         member_handles<NewLevels, L, Ms>(level.template get<Ms>())...);
   }
 
@@ -656,11 +665,19 @@ struct LevelGraph {
   }
 };
 
+// The tile map is the graph's single source of truth for tile extents: one per
+// label, supplied once here instead of once per stage() call.
+//
+// Taken as an ARGUMENT rather than a template parameter so it is deduced, which
+// keeps ExecSpace's default reachable and puts the map where a reader looks for
+// the graph's configuration. LabelTiles is stateless, so the value is discarded
+// once its type has been read -- the same convention stage() used for its tile.
 template <typename ValueType,
-          typename ExecSpace = Kokkos::DefaultExecutionSpace>
-auto make_level_graph() {
-  return LevelGraph<ValueType, ExecSpace, DeviceTuple<>, DeviceTuple<>,
-                    DeviceTuple<>>{{}, {}, {}};
+          typename ExecSpace = Kokkos::DefaultExecutionSpace,
+          typename LabelTilesT>
+auto make_level_graph(LabelTilesT) {
+  return LevelGraph<ValueType, ExecSpace, LabelTilesT, DeviceTuple<>,
+                    DeviceTuple<>, DeviceTuple<>>{{}, {}, {}};
 }
 
 }  // namespace TensorOperations

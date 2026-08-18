@@ -195,6 +195,15 @@ struct GTiles {
   using E_ = StaticTile<TE, cfg::N, cfg::N, cfg::N>;  // the frame
 };
 
+// The same extents, said once per LABEL instead of once per tensor. 'e' is the
+// element axis and the only one that is blocked; every spatial and summed axis
+// is a whole NGLL. This is what every stage tile is looked up in, and every
+// downstream tile follows from those by derivation.
+template <int TE>
+using GMap = LabelTiles<LabelTile<'e', TE>, LabelTile<'k', cfg::N>,
+                        LabelTile<'j', cfg::N>, LabelTile<'i', cfg::N>,
+                        LabelTile<'p', cfg::N>, LabelTile<'r', cfg::N>>;
+
 inline constexpr int kFnBegin = __LINE__;
 // F^r_c for ALL NINE (r,c) from one chain rule and one stress evaluation.
 //
@@ -252,17 +261,15 @@ void levelgraph_sem3d(Fields d, int team) {
   // H is (free, summed) and Hw is (summed, free): Hw is H's weighted
   // TRANSPOSE. 'r' is renamed per use to the axis that operator reconstructs;
   // 'p' is the summed point and never appears in an output.
-  auto g0 = make_level_graph<float, ES>();
-  auto [g1, h] =
-      g0.stage(make_input_node(make_handle<'r', 'p'>(d.H)), typename T::H_{});
-  auto [g2, hw] =
-      g1.stage(make_input_node(make_handle<'p', 'r'>(d.Hw)), typename T::H_{});
-  auto [g3, u0] = g2.stage(
-      make_input_node(make_handle<'e', 'k', 'j', 'i'>(d.u0)), typename T::E_{});
-  auto [g4, u1] = g3.stage(
-      make_input_node(make_handle<'e', 'k', 'j', 'i'>(d.u1)), typename T::E_{});
-  auto [g5, u2] = g4.stage(
-      make_input_node(make_handle<'e', 'k', 'j', 'i'>(d.u2)), typename T::E_{});
+  auto g0       = make_level_graph<float, ES>(GMap<TE>{});
+  auto [g1, h]  = g0.stage(make_input_node(make_handle<'r', 'p'>(d.H)));
+  auto [g2, hw] = g1.stage(make_input_node(make_handle<'p', 'r'>(d.Hw)));
+  auto [g3, u0] =
+      g2.stage(make_input_node(make_handle<'e', 'k', 'j', 'i'>(d.u0)));
+  auto [g4, u1] =
+      g3.stage(make_input_node(make_handle<'e', 'k', 'j', 'i'>(d.u1)));
+  auto [g5, u2] =
+      g4.stage(make_input_node(make_handle<'e', 'k', 'j', 'i'>(d.u2)));
 
   // LEVEL 1 -- nine gradients, one fused range. The direction is which axis of
   // the one staged u is summed ('p' in slot 3 = d/d(xi), slot 2 = d/d(eta),
@@ -343,18 +350,16 @@ inline constexpr int kGraphEnd = __LINE__;
 // Host-side scratch query, for the table. Needs no launch.
 template <int TE>
 std::size_t levelgraph_scratch(Fields d) {
-  using T = GTiles<TE>;
-  auto g0 = make_level_graph<float, ES>();
-  auto [g1, h] =
-      g0.stage(make_input_node(make_handle<'r', 'p'>(d.H)), typename T::H_{});
-  auto [g2, hw] =
-      g1.stage(make_input_node(make_handle<'p', 'r'>(d.Hw)), typename T::H_{});
-  auto [g3, u0] = g2.stage(
-      make_input_node(make_handle<'e', 'k', 'j', 'i'>(d.u0)), typename T::E_{});
-  auto [g4, u1] = g3.stage(
-      make_input_node(make_handle<'e', 'k', 'j', 'i'>(d.u1)), typename T::E_{});
-  auto [g5, u2] = g4.stage(
-      make_input_node(make_handle<'e', 'k', 'j', 'i'>(d.u2)), typename T::E_{});
+  using T       = GTiles<TE>;
+  auto g0       = make_level_graph<float, ES>(GMap<TE>{});
+  auto [g1, h]  = g0.stage(make_input_node(make_handle<'r', 'p'>(d.H)));
+  auto [g2, hw] = g1.stage(make_input_node(make_handle<'p', 'r'>(d.Hw)));
+  auto [g3, u0] =
+      g2.stage(make_input_node(make_handle<'e', 'k', 'j', 'i'>(d.u0)));
+  auto [g4, u1] =
+      g3.stage(make_input_node(make_handle<'e', 'k', 'j', 'i'>(d.u1)));
+  auto [g5, u2] =
+      g4.stage(make_input_node(make_handle<'e', 'k', 'j', 'i'>(d.u2)));
   auto [g6, gx0, gx1, gx2, ge0, ge1, ge2, gg0, gg1, gg2] = g5.add(
       make_contraction_node<'e', 'k', 'j', 'i'>(
           h.template as<'i', 'p'>(), u0.template as<'e', 'k', 'j', 'p'>()),
