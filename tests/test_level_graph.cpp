@@ -285,9 +285,9 @@ TEST(LevelPlanTest, TheSemGradientLevelIsOneLegalLevel) {
 
 // ===========================================================================
 // The runtime half: a graph GENERATES the kernel LevelPlan only describes, and
-// its output equals a hand-driven reference. Grid is the last stage, tiled over
-// the batch mode 'e'; the stages materialize both operands once per team and
-// the contraction level reads them.
+// its output equals a hand-driven reference. The grid is the map's one blocked
+// label, the batch mode 'e'; the stages materialize both operands once per team
+// and the contraction level reads them.
 //
 //   stage H[q,a]          (batch-independent, one tile every team re-reads)
 //   stage U[e,a,b,c]      (the grid: E/TE teams, one 'e'-tile each)

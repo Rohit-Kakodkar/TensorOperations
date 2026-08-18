@@ -17,11 +17,11 @@ namespace TensorOperations {
 // appears. Say that once, and every node's tile becomes a lookup.
 //
 // What that buys beyond saying it once: the GRID stops being a designated node.
-// The grid node is today whichever tensor was staged LAST, which sets the
-// league size and every member's tile index, and nothing at the call site says
-// so. With tiles keyed on labels, a label is gridded iff its extent exceeds its
-// tile, and there is nothing to designate and nothing to get wrong by
-// reordering.
+// It used to be whichever tensor was staged LAST -- that one positional fact
+// set the league size and every member's tile index, and nothing at the call
+// site said so. With tiles keyed on labels the grid is just the BLOCKED labels
+// (LabelTile below, against LabelWhole), so there is nothing to designate and
+// nothing to get wrong by reordering.
 //
 // The cost, chosen deliberately: a label cannot be tiled coarsely in one node
 // and finely in another. Nothing in the SEM pipeline does that, and a single

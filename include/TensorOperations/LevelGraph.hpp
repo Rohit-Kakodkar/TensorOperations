@@ -712,9 +712,10 @@ struct LevelGraph {
                   "LevelGraph::execute policy tag must match the graph's "
                   "execution space");
     assert(index_consistent() &&
-           "LevelGraph: a mode is tiled inconsistently with the grid node, so "
-           "its tile index cannot be gathered. Retile so every shared mode "
-           "matches and every unshared mode has one tile.");
+           "LevelGraph: a mode is tiled inconsistently with the grid, so its "
+           "tile index cannot be gathered. Every blocked label must be tiled "
+           "identically wherever it appears, and every label outside the grid "
+           "must have exactly one tile.");
     return Impl::lg_execute<ValueType, ExecSpace, LabelTilesT, StagesT,
                             StageTilesT, LevelsT, num_stages>(
         stages, stage_tiles, levels,

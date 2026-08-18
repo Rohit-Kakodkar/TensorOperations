@@ -186,19 +186,14 @@ struct Fields {
 // IMPLEMENTATION 1 -- the declarative level graph
 // ===========================================================================
 
-// Only TWO tile types appear in this file. Every intermediate tile is DERIVED:
+// NO tile type appears in this file. Every tile is either looked up in the map
+// below by the labels its tensor already declares, or DERIVED from operands --
 // a contraction's from contract_c_tile_t, a combine's from combine_out_tile_t.
-// The sibling file spells five (H_, E_, Q_, Grad, Div, Comb, Sum) by hand.
-template <int TE>
-struct GTiles {
-  using H_ = StaticTile<cfg::N, cfg::N>;              // H and Hw
-  using E_ = StaticTile<TE, cfg::N, cfg::N, cfg::N>;  // the frame
-};
-
-// The same extents, said once per LABEL instead of once per tensor. 'e' is the
-// element axis and the only one that is blocked; every spatial and summed axis
-// is a whole NGLL. This is what every stage tile is looked up in, and every
-// downstream tile follows from those by derivation.
+// The sibling file spells seven (H_, E_, Q_, Grad, Div, Comb, Sum) by hand.
+//
+// One extent per LABEL. 'e' is the element axis and the only BLOCKED one, so
+// the league is its tile count; every spatial and summed axis is a whole NGLL
+// and stays out of the grid entirely.
 template <int TE>
 using GMap = LabelTiles<LabelTile<'e', TE>, LabelWhole<'k', cfg::N>,
                         LabelWhole<'j', cfg::N>, LabelWhole<'i', cfg::N>,
@@ -251,12 +246,11 @@ inline constexpr int kFnEnd = __LINE__;
 inline constexpr int kGraphBegin = __LINE__;
 template <int TE>
 void levelgraph_sem3d(Fields d, int team) {
-  using T = GTiles<TE>;
   const Integrand9  integrand{d};
   const WeightedSum wsum{d};
 
-  // Stages. The LAST stage is the GRID node -- the league size is its tile
-  // count -- so a rank-4 u must come last and the operators first.
+  // Stages, in any order: the grid is derived from GMap's blocked labels, so
+  // nothing here is positional.
   //
   // H is (free, summed) and Hw is (summed, free): Hw is H's weighted
   // TRANSPOSE. 'r' is renamed per use to the axis that operator reconstructs;
@@ -350,7 +344,6 @@ inline constexpr int kGraphEnd = __LINE__;
 // Host-side scratch query, for the table. Needs no launch.
 template <int TE>
 std::size_t levelgraph_scratch(Fields d) {
-  using T       = GTiles<TE>;
   auto g0       = make_level_graph<float, ES>(GMap<TE>{});
   auto [g1, h]  = g0.stage(make_input_node(make_handle<'r', 'p'>(d.H)));
   auto [g2, hw] = g1.stage(make_input_node(make_handle<'p', 'r'>(d.Hw)));
