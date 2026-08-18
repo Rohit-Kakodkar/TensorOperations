@@ -1472,9 +1472,9 @@ struct Evaluator<TeamPolicyTag<ES>,
   }
 
   // Arena form. Braced-init again, so the operands consume the arena in
-  // DECLARATION ORDER -- the same guarantee carve_slot_store relies on, and
-  // here it is what makes a node's arena consumption match the bytes its
-  // operand_scratch_size_per_team() reports.
+  // DECLARATION ORDER -- the same guarantee dag_carve_pools relies on in
+  // DagGraph.hpp, and here it is what makes a node's arena consumption match
+  // the bytes its operand_scratch_size_per_team() reports.
   template <std::size_t... Ks>
   KOKKOS_FUNCTION static op_allocs_t make_op_allocs(
       const node_type& n, const tiling_type& t, const team_member_t& team,

@@ -202,6 +202,30 @@ set_tests_properties(SlotGuardNegative.Case1 SlotGuardNegative.Case2
                      "operand [AB] is a SLOT and perm[AB] is not the identity")
 
 # ---------------------------------------------------------------------------
+# Negative-compilation tests for the ARENA guard. Same rationale and same
+# caveats as the slot guards above.
+#
+# One guard, so one failing case: the arena builds every slot at a compile-time
+# offset and therefore cannot size a tile whose extents are runtime values.
+# ---------------------------------------------------------------------------
+foreach(case 0 1)
+  add_executable(arena_guard_neg_${case} EXCLUDE_FROM_ALL
+                 tests/negative/arena_guard_negative.cpp)
+  target_link_libraries(arena_guard_neg_${case} PRIVATE tensor)
+  target_compile_definitions(arena_guard_neg_${case}
+                             PRIVATE ARENA_NEG_CASE=${case})
+  add_test(NAME ArenaGuardNegative.Case${case}
+           COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}
+                   --target arena_guard_neg_${case} --config $<CONFIG>)
+endforeach()
+# Pinned to the guard's own wording rather than to WILL_FAIL: a DynamicTile also
+# fails LATER, on a missing num_elements, and matching that instead would let
+# the guard be deleted without the test noticing.
+set_tests_properties(ArenaGuardNegative.Case1 PROPERTIES
+                     PASS_REGULAR_EXPRESSION
+                     "slot tiles must have compile-time extents")
+
+# ---------------------------------------------------------------------------
 # Negative-compilation tests for the LEVEL guards. Same rationale and same
 # caveats as the slot guards above.
 #

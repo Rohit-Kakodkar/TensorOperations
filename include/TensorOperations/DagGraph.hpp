@@ -552,7 +552,7 @@ KOKKOS_FUNCTION std::size_t dag_pool_elems(const TilesT& tiles, std::size_t p,
 }
 
 // Team scratch the POOLED store needs: the sum of the pool maxima, against
-// slot_store_bytes()'s sum over every slot. This is the number the launcher
+// slot_bytes()'s sum over every slot. This is the number the launcher
 // requests, and it must be computed the same way on the host (to size the
 // policy) and on the device (to carve), which is why both go through
 // dag_pool_elems.
@@ -643,7 +643,8 @@ KOKKOS_FUNCTION auto dag_carve_pools(const Team& team, const TilesT& tiles,
   using slots_seq = std::make_index_sequence<dag_num_slots<NodesT>()>;
   // Braces, not parentheses: each backing view bumps the team cursor and the
   // elements of a braced-init-list are evaluated left to right, so the pools
-  // land at predictable offsets. Same guarantee carve_slot_store relies on.
+  // land at predictable offsets. Same guarantee make_op_allocs relies on in
+  // Evaluator/Team.hpp.
   return Kokkos::Array<V*, sizeof...(Ps)>{
       scratch_backing_t<V, ES>(
           team.team_scratch(0),
