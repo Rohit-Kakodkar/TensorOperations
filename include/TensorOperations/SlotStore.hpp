@@ -139,6 +139,63 @@ KOKKOS_FUNCTION constexpr std::size_t slot_arena_prefix(std::size_t n) {
 template <typename... Tiles>
 struct SlotTiles {};
 
+// A pool assignment, one entry per slot, as a type so it can travel as one
+// template argument. Same reason SlotTiles exists.
+template <std::size_t... Pools>
+struct SlotPools {};
+
+// The arena laid out by POOL rather than by slot: pool P is as big as its
+// largest occupant, pools sit end to end, and every slot assigned to P starts
+// at P's base. Slots sharing a pool therefore ALIAS, which is the point -- the
+// caller's plan is what guarantees that no two of them are ever live at once.
+//
+// prefix(i) is the offset of slot i in elements; prefix(N) is the whole arena.
+// ONE function for both, called from the host to size the policy and from the
+// device to carve, because those two numbers agreeing is the invariant.
+//
+// pelems is sized N rather than the pool count because the pool count is not a
+// constant expression here and cannot exceed the number of slots.
+template <typename ValueType, typename ExecSpace, typename PoolsList,
+          typename TilesList>
+struct slot_pool_arena;
+
+template <typename ValueType, typename ExecSpace, std::size_t... Pools,
+          typename... Tiles>
+struct slot_pool_arena<ValueType, ExecSpace, SlotPools<Pools...>,
+                       SlotTiles<Tiles...>> {
+  static constexpr std::size_t N = sizeof...(Tiles);
+  static_assert(sizeof...(Pools) == N,
+                "pooled slot store: the plan must assign exactly one pool per "
+                "slot");
+
+  static constexpr std::size_t prefix(std::size_t i) {
+    const std::size_t steps[] = {
+        slot_arena_step<ValueType, ExecSpace>(slot_tile_elems<Tiles>())..., 0};
+    const std::size_t pools[] = {Pools..., 0};
+
+    std::size_t pelems[N > 0 ? N : 1] = {};
+    std::size_t np                    = 0;
+    for (std::size_t k = 0; k < N; ++k) {
+      if (steps[k] > pelems[pools[k]]) pelems[pools[k]] = steps[k];
+      if (pools[k] + 1 > np) np = pools[k] + 1;
+    }
+
+    const std::size_t upto = (i >= N) ? np : pools[i];
+    std::size_t       off  = 0;
+    for (std::size_t p = 0; p < upto; ++p) off += pelems[p];
+    return off;
+  }
+
+  static constexpr std::size_t total() { return prefix(N); }
+};
+
+template <typename ValueType, typename ExecSpace, typename PoolsList,
+          typename TilesList, std::size_t I>
+struct slot_pool_offset {
+  static constexpr std::size_t value =
+      slot_pool_arena<ValueType, ExecSpace, PoolsList, TilesList>::prefix(I);
+};
+
 template <typename ValueType, typename ExecSpace, typename TilesList,
           std::size_t I>
 struct slot_arena_offset;
@@ -204,6 +261,54 @@ KOKKOS_FUNCTION auto carve_arena_slot_store(const Team& team,
                                             const Tiles&... tiles)
     -> SlotStore<SlotView<ValueType, ExecSpace, Tiles>...> {
   return place_arena_slot_store<ValueType, ExecSpace>(
+      team, std::index_sequence_for<Tiles...>{}, tiles...);
+}
+
+// ---------------------------------------------------------------------------
+// The pooled forms. Same store, same slot types, same single allocation -- the
+// only difference is that slot I lands at its POOL's base instead of its own,
+// so slots whose live ranges do not overlap share memory.
+//
+// The disjointness guarantee is correspondingly WEAKER and deliberately so: the
+// arena forms guarantee every slot pairwise disjoint, these guarantee only what
+// the caller's plan guarantees. A plan that got that wrong would not crash --
+// it would silently feed one node another node's data -- so the plan is checked
+// directly (tests/test_level_liveness.cpp) rather than trusted.
+// ---------------------------------------------------------------------------
+template <typename ValueType, typename ExecSpace, typename PoolsList,
+          typename... Tiles>
+std::size_t pooled_arena_slot_store_bytes(const Tiles&...) {
+  constexpr std::size_t elems =
+      Impl::slot_pool_arena<ValueType, ExecSpace, PoolsList,
+                            Impl::SlotTiles<Tiles...>>::total();
+  return Impl::scratch_backing_t<ValueType, ExecSpace>::shmem_size(elems);
+}
+
+template <typename ValueType, typename ExecSpace, typename PoolsList,
+          typename Team, typename... Tiles, std::size_t... Is>
+KOKKOS_FUNCTION auto place_pooled_arena_slot_store(const Team& team,
+                                                   std::index_sequence<Is...>,
+                                                   const Tiles&... tiles)
+    -> SlotStore<SlotView<ValueType, ExecSpace, Tiles>...> {
+  constexpr std::size_t elems =
+      Impl::slot_pool_arena<ValueType, ExecSpace, PoolsList,
+                            Impl::SlotTiles<Tiles...>>::total();
+  Impl::scratch_backing_t<ValueType, ExecSpace> arena(team.team_scratch(0),
+                                                      elems);
+  ValueType*                                    base = arena.data();
+  return {DeviceTuple<SlotView<ValueType, ExecSpace, Tiles>...>{
+      Impl::alloc_scratch_tile_at<ValueType, ExecSpace>(
+          base + Impl::slot_pool_offset<ValueType, ExecSpace, PoolsList,
+                                        Impl::SlotTiles<Tiles...>, Is>::value,
+          tiles)...}};
+}
+
+template <typename ValueType, typename ExecSpace, typename PoolsList,
+          typename Team, typename... Tiles>
+KOKKOS_FUNCTION auto carve_pooled_arena_slot_store(const Team& team,
+                                                   const Tiles&... tiles)
+    -> SlotStore<SlotView<ValueType, ExecSpace, Tiles>...> {
+  return place_pooled_arena_slot_store<ValueType, ExecSpace, PoolsList>(
       team, std::index_sequence_for<Tiles...>{}, tiles...);
 }
 
