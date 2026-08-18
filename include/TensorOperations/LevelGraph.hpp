@@ -361,6 +361,68 @@ KOKKOS_FUNCTION void lg_run_combine_level(
   team.team_barrier();
 }
 
+// One staged member's SOURCE view: the global subview it copies FROM. This is
+// exactly what the staged evaluator builds internally before its own copy loop
+// (Evaluator/Team2.hpp), lifted out so a whole level's sources can be built
+// before any of them is stored.
+template <typename V, typename ES, typename LevelsT, std::size_t NumStages,
+          typename GridModes, std::size_t RootR, std::size_t L, std::size_t M,
+          typename Team>
+KOKKOS_FUNCTION auto lg_stage_src(const LevelsT&                   levels,
+                                  const Kokkos::Array<int, RootR>& grid_idx,
+                                  const Team&                      team) {
+  using Node     = tuple_element_t<M, tuple_element_t<L, LevelsT>>;
+  using Gather   = dag_gather_seq_t<typename Node::modes_seq, GridModes>;
+  const auto idx = dag_node_index<Node::Rank, RootR>(grid_idx, Gather{});
+  return make_evaluator<TeamPolicyTag2<ES>>(
+             levels.template get<L>().template get<M>().operand_,
+             member_out_tile_t<Node>{}, team)(idx)
+      .node()
+      .storage_;
+}
+
+template <typename SrcsT, typename Store, typename Coord, std::size_t... Bs,
+          std::size_t... Ms>
+KOKKOS_FUNCTION void lg_copy_coord(const SrcsT& srcs, const Store& store,
+                                   Coord coord, std::index_sequence<Ms...>,
+                                   std::index_sequence<Bs...>) {
+  ((store.template get<Bs>()[coord] = srcs.template get<Ms>()[coord]), ...);
+}
+
+// A STAGE level: every member's global -> scratch copy, in ONE TeamVectorRange.
+//
+// This is the whole reason staging is a level. Run separately, each copy is its
+// own range and the SASS comes out L S L S L S ... -- every store waiting on
+// the load eight instructions ahead of it, because nvcc does not overlap
+// consecutive ranges. Building all the sources FIRST and storing them after
+// puts every LDG in flight together (L L L S S S) and turns the largest
+// long_scoreboard site in the kernel into one round trip instead of N.
+//
+// Legal only because lg_layout_space_impl already forced every member of the
+// level to share one output tile layout, which is what makes a single range
+// able to drive all of them.
+template <typename V, typename ES, typename LevelsT, std::size_t NumStages,
+          typename GridModes, std::size_t RootR, std::size_t L, typename Store,
+          typename Team, std::size_t... Ms>
+KOKKOS_FUNCTION void lg_run_staged_level(
+    const LevelsT& levels, const Store& store,
+    const Kokkos::Array<int, RootR>& grid_idx, const Team& team,
+    std::index_sequence<Ms...>) {
+  const auto srcs = DeviceTuple<
+      decltype(lg_stage_src<V, ES, LevelsT, NumStages, GridModes, RootR, L, Ms>(
+          levels, grid_idx, team))...>{
+      lg_stage_src<V, ES, LevelsT, NumStages, GridModes, RootR, L, Ms>(
+          levels, grid_idx, team)...};
+
+  using bases =
+      std::index_sequence<lg_member_base_v<LevelsT, NumStages, L, Ms>...>;
+  const auto src0 = srcs.template get<0>();
+  team_for_each_coord(team, src0, [=](auto coord) {
+    lg_copy_coord(srcs, store, coord, std::index_sequence<Ms...>{}, bases{});
+  });
+  team.team_barrier();
+}
+
 template <typename V, typename ES, typename LevelsT, std::size_t NumStages,
           typename GridModes, std::size_t RootR, std::size_t L, typename Store,
           typename Team>
@@ -369,7 +431,10 @@ KOKKOS_FUNCTION void lg_run_level(const LevelsT& levels, const Store& store,
                                   const Team&                      team) {
   using LevelT             = tuple_element_t<L, LevelsT>;
   constexpr std::size_t NM = tuple_size_v<LevelT>;
-  if constexpr (lg_all_contraction_v<LevelT>) {
+  if constexpr (lg_all_staged_v<LevelT>) {
+    lg_run_staged_level<V, ES, LevelsT, NumStages, GridModes, RootR, L>(
+        levels, store, grid_idx, team, std::make_index_sequence<NM>{});
+  } else if constexpr (lg_all_contraction_v<LevelT>) {
     lg_run_contraction_level<V, ES, LevelsT, NumStages, L>(
         levels, store, team, std::make_index_sequence<NM>{});
   } else {
