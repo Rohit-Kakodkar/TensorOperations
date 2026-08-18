@@ -155,6 +155,12 @@ add_executable(test_slot_liveness tests/test_slot_liveness.cpp)
 target_link_libraries(test_slot_liveness PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_slot_liveness)
 
+# test_level_liveness — pooling the level graph's slot store by live range.
+# Custom main() wraps Kokkos init/finalize, as test_slot_liveness does.
+add_executable(test_level_liveness tests/test_level_liveness.cpp)
+target_link_libraries(test_level_liveness PRIVATE tensor GTest::gtest)
+gtest_discover_tests(test_level_liveness)
+
 # test_level_graph — LevelPlan slot algebra + LevelGraph runtime equivalence.
 # Custom main() wraps Kokkos init/finalize for the runtime half.
 add_executable(test_level_graph tests/test_level_graph.cpp)

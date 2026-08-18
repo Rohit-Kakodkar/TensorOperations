@@ -126,22 +126,55 @@ KOKKOS_FUNCTION auto lg_read_slot(const Store& store, const Team& team) {
         make_interm_node(reorder_view(store.template get<S>(), Perm{})), team);
 }
 
+// The pool assignment, as the SlotPools type the store wants: one entry per
+// slot, in slot order. Named here rather than inline at the two call sites so
+// sizing and carving cannot be handed different plans.
+template <typename LevelsT, std::size_t NumStages, typename RootsSeq,
+          typename SlotsSeq>
+struct lg_pools_of;
+template <typename LevelsT, std::size_t NumStages, typename RootsSeq,
+          std::size_t... Ss>
+struct lg_pools_of<LevelsT, NumStages, RootsSeq, std::index_sequence<Ss...>> {
+  using type = SlotPools<lg_slot_pool_v<LevelsT, NumStages, RootsSeq, Ss>...>;
+};
+template <typename LevelsT, std::size_t NumStages, typename RootsSeq>
+using lg_pools_t = typename lg_pools_of<
+    LevelsT, NumStages, RootsSeq,
+    std::make_index_sequence<lg_num_slots_v<LevelsT, NumStages>>>::type;
+
 template <typename V, typename ES, typename LevelsT, std::size_t NumStages,
-          typename Team, typename StageTilesT, std::size_t... Ss,
-          std::size_t... Ls>
+          typename RootsSeq, typename Team, typename StageTilesT,
+          std::size_t... Ss, std::size_t... Ls>
 KOKKOS_FUNCTION auto lg_carve(const Team& team, const StageTilesT& stage_tiles,
                               std::index_sequence<Ss...>,
                               std::index_sequence<Ls...>) {
-  return carve_arena_slot_store<V, ES>(
+  return carve_pooled_arena_slot_store<
+      V, ES, lg_pools_t<LevelsT, NumStages, RootsSeq>>(
       team, stage_tiles.template get<Ss>()...,
       lg_slot_tile_t<LevelsT, NumStages, NumStages + Ls>{}...);
 }
 
 template <typename V, typename ES, typename LevelsT, std::size_t NumStages,
-          typename StageTilesT, std::size_t... Ss, std::size_t... Ls>
+          typename RootsSeq, typename StageTilesT, std::size_t... Ss,
+          std::size_t... Ls>
 std::size_t lg_scratch_bytes(const StageTilesT& stage_tiles,
                              std::index_sequence<Ss...>,
                              std::index_sequence<Ls...>) {
+  return pooled_arena_slot_store_bytes<
+      V, ES, lg_pools_t<LevelsT, NumStages, RootsSeq>>(
+      stage_tiles.template get<Ss>()...,
+      lg_slot_tile_t<LevelsT, NumStages, NumStages + Ls>{}...);
+}
+
+// The same store WITHOUT pooling: one buffer per slot. Not what the launch
+// requests -- it is the honest denominator for "what did pooling buy", and both
+// are answerable on the host before anything runs, because scratch is the
+// number that decides whether a tile size is viable at all.
+template <typename V, typename ES, typename LevelsT, std::size_t NumStages,
+          typename StageTilesT, std::size_t... Ss, std::size_t... Ls>
+std::size_t lg_unpooled_scratch_bytes(const StageTilesT& stage_tiles,
+                                      std::index_sequence<Ss...>,
+                                      std::index_sequence<Ls...>) {
   return arena_slot_store_bytes<V, ES>(
       stage_tiles.template get<Ss>()...,
       lg_slot_tile_t<LevelsT, NumStages, NumStages + Ls>{}...);
@@ -408,8 +441,8 @@ int lg_execute(const StagesT& stages, const StageTilesT& stage_tiles,
         const auto grid_idx = decode_tile_index<RootR>(
             static_cast<int>(team.league_rank()), grid_node.shape(), grid_tile);
 
-        auto store = lg_carve<V, ES, LevelsT, NumStages>(team, gt, stage_seq{},
-                                                         level_slot_seq{});
+        auto store = lg_carve<V, ES, LevelsT, NumStages, RootsSeq>(
+            team, gt, stage_seq{}, level_slot_seq{});
 
         lg_run_stages<V, ES, GridNode, RootR>(sd, gt, store, grid_idx, team,
                                               stage_seq{});
@@ -446,7 +479,18 @@ struct LevelOutputs {
 
   LevelOutputs team_size(int n) const { return {graph, n}; }
 
-  std::size_t scratch_bytes() const { return graph.scratch_bytes(); }
+  using roots_seq = std::index_sequence<Roots...>;
+
+  // Pooled (what the launch requests) against un-pooled. The ratio of the two
+  // is what liveness bought, and both are printable before anything runs.
+  std::size_t scratch_bytes() const {
+    return graph.template scratch_bytes<roots_seq>();
+  }
+  std::size_t slot_bytes() const { return graph.slot_bytes(); }
+
+  static constexpr std::size_t num_pools =
+      Impl::lg_pool_count_v<typename Graph::levels_type, Graph::num_stages,
+                            roots_seq>;
 
   template <typename ES, TensorLike... Ts>
   int execute(const TeamPolicyTag2<ES>&, const Ts&... views) const {
@@ -457,6 +501,7 @@ struct LevelOutputs {
 template <typename ValueType, typename ExecSpace, typename StagesT,
           typename StageTilesT, typename LevelsT>
 struct LevelGraph {
+  using levels_type                       = LevelsT;
   static constexpr std::size_t num_stages = tuple_size_v<StagesT>;
   static constexpr std::size_t num_levels = tuple_size_v<LevelsT>;
 
@@ -496,8 +541,22 @@ struct LevelGraph {
     return LevelOutputs<LevelGraph, Handles::SlotIdx...>{*this};
   }
 
+  // Root-dependent, and has to be: a designated output is read after every
+  // level has run, so it outlives the whole graph and cannot share a pool with
+  // anything. Which slots are roots therefore changes the plan.
+  template <typename RootsSeq>
   std::size_t scratch_bytes() const {
-    return Impl::lg_scratch_bytes<ValueType, ExecSpace, LevelsT, num_stages>(
+    return Impl::lg_scratch_bytes<ValueType, ExecSpace, LevelsT, num_stages,
+                                  RootsSeq>(
+        stage_tiles, std::make_index_sequence<num_stages>{},
+        std::make_index_sequence<Impl::lg_num_slots_v<LevelsT, num_stages> -
+                                 num_stages>{});
+  }
+
+  // One buffer per slot: what the store would cost with no liveness plan.
+  std::size_t slot_bytes() const {
+    return Impl::lg_unpooled_scratch_bytes<ValueType, ExecSpace, LevelsT,
+                                           num_stages>(
         stage_tiles, std::make_index_sequence<num_stages>{},
         std::make_index_sequence<Impl::lg_num_slots_v<LevelsT, num_stages> -
                                  num_stages>{});
@@ -522,7 +581,8 @@ struct LevelGraph {
            "matches and every unshared mode has one tile.");
     return Impl::lg_execute<ValueType, ExecSpace, StagesT, StageTilesT, LevelsT,
                             num_stages>(
-        stages, stage_tiles, levels, scratch_bytes(), team_size,
+        stages, stage_tiles, levels,
+        scratch_bytes<std::index_sequence<Roots...>>(), team_size,
         std::index_sequence<Roots...>{}, views...);
   }
 
