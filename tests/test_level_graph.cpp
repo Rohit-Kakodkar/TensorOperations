@@ -67,60 +67,52 @@ using LA    = DeviceTuple<SingleOut, SingleOut, SingleOut>;
 using LB    = DeviceTuple<MultiOut<3>, SingleOut>;
 using LC    = DeviceTuple<MultiOut<2>>;
 using Synth = DeviceTuple<LA, LB, LC>;
-constexpr std::size_t kSynthStages = 5;
-
+// Slot indices are now purely level-relative: staging is a level like any
+// other, so there is no stage prefix to skip and slot 0 is level 0's first
+// output. Synth's levels hold 3, 4 and 2 slots.
 static_assert(Impl::lg_total_members_v<Synth> == 6);
-static_assert(Impl::lg_num_slots_v<Synth, kSynthStages> == 14,
-              "5 stages + 3 + 4 + 2");
+static_assert(Impl::lg_num_slots_v<Synth> == 9, "3 + 4 + 2");
 static_assert(Impl::lg_level_slots_v<Synth, 0> == 3);
 static_assert(Impl::lg_level_slots_v<Synth, 1> == 4, "the 3-output member");
 static_assert(Impl::lg_level_slots_v<Synth, 2> == 2);
 
-static_assert(Impl::lg_level_base_v<Synth, kSynthStages, 0> == 5,
-              "level 0 starts after the stages, not at 0");
-static_assert(Impl::lg_level_base_v<Synth, kSynthStages, 1> == 8);
-static_assert(Impl::lg_level_base_v<Synth, kSynthStages, 2> == 12);
+static_assert(Impl::lg_level_base_v<Synth, 0> == 0,
+              "level 0 starts at 0 -- there is no stage prefix any more");
+static_assert(Impl::lg_level_base_v<Synth, 1> == 3);
+static_assert(Impl::lg_level_base_v<Synth, 2> == 7);
 
-static_assert(Impl::lg_member_base_v<Synth, kSynthStages, 0, 0> == 5);
-static_assert(Impl::lg_member_base_v<Synth, kSynthStages, 0, 2> == 7);
-static_assert(Impl::lg_member_base_v<Synth, kSynthStages, 1, 0> == 8);
-static_assert(Impl::lg_member_base_v<Synth, kSynthStages, 1, 1> == 11,
+static_assert(Impl::lg_member_base_v<Synth, 0, 0> == 0);
+static_assert(Impl::lg_member_base_v<Synth, 0, 2> == 2);
+static_assert(Impl::lg_member_base_v<Synth, 1, 0> == 3);
+static_assert(Impl::lg_member_base_v<Synth, 1, 1> == 6,
               "member 1 of level 1 starts 3 slots in, not 1");
-static_assert(Impl::lg_member_base_v<Synth, kSynthStages, 2, 0> == 12);
+static_assert(Impl::lg_member_base_v<Synth, 2, 0> == 7);
 
-static_assert(Impl::lg_slot_level_v<Synth, kSynthStages, 5> == 0);
-static_assert(Impl::lg_slot_level_v<Synth, kSynthStages, 7> == 0);
-static_assert(Impl::lg_slot_level_v<Synth, kSynthStages, 8> == 1);
+static_assert(Impl::lg_slot_level_v<Synth, 0> == 0);
+static_assert(Impl::lg_slot_level_v<Synth, 2> == 0);
+static_assert(Impl::lg_slot_level_v<Synth, 3> == 1);
 static_assert(
-    Impl::lg_slot_level_v<Synth, kSynthStages, 10> == 1,
+    Impl::lg_slot_level_v<Synth, 5> == 1,
     "a middle slot of a 3-output member is still that member's level");
-static_assert(Impl::lg_slot_level_v<Synth, kSynthStages, 11> == 1);
-static_assert(Impl::lg_slot_level_v<Synth, kSynthStages, 13> == 2);
+static_assert(Impl::lg_slot_level_v<Synth, 6> == 1);
+static_assert(Impl::lg_slot_level_v<Synth, 8> == 2);
 
-static_assert(Impl::lg_slot_member_v<Synth, kSynthStages, 8> == 0);
-static_assert(Impl::lg_slot_member_v<Synth, kSynthStages, 10> == 0);
-static_assert(Impl::lg_slot_member_v<Synth, kSynthStages, 11> == 1);
-static_assert(Impl::lg_slot_member_v<Synth, kSynthStages, 13> == 0);
-
-static_assert(Impl::lg_is_stage_slot_v<kSynthStages, 4>);
-static_assert(!Impl::lg_is_stage_slot_v<kSynthStages, 5>);
-static_assert(Impl::lg_slot_level_v<Synth, kSynthStages, 0> == 3,
-              "a stage slot belongs to no level, and says so");
+static_assert(Impl::lg_slot_member_v<Synth, 3> == 0);
+static_assert(Impl::lg_slot_member_v<Synth, 5> == 0);
+static_assert(Impl::lg_slot_member_v<Synth, 6> == 1);
+static_assert(Impl::lg_slot_member_v<Synth, 8> == 0);
 
 template <std::size_t L, std::size_t M>
 inline constexpr bool kRoundTrip =
-    Impl::lg_slot_level_v<Synth, kSynthStages,
-                          Impl::lg_member_base_v<Synth, kSynthStages, L, M>> ==
-        L &&
-    Impl::lg_slot_member_v<Synth, kSynthStages,
-                           Impl::lg_member_base_v<Synth, kSynthStages, L, M>> ==
-        M;
+    Impl::lg_slot_level_v<Synth, Impl::lg_member_base_v<Synth, L, M>> == L &&
+    Impl::lg_slot_member_v<Synth, Impl::lg_member_base_v<Synth, L, M>> == M;
 static_assert(kRoundTrip<0, 0> && kRoundTrip<0, 1> && kRoundTrip<0, 2>);
 static_assert(kRoundTrip<1, 0> && kRoundTrip<1, 1>);
 static_assert(kRoundTrip<2, 0>);
 
 using NoLevels = DeviceTuple<>;
-static_assert(Impl::lg_num_slots_v<NoLevels, 3> == 3);
+static_assert(Impl::lg_num_slots_v<NoLevels> == 0,
+              "no levels, no slots -- there is nothing else left to count");
 static_assert(Impl::lg_total_members_v<NoLevels> == 0);
 
 // --- 2. tile derivation ----------------------------------------------------
@@ -168,10 +160,21 @@ static_assert(
 
 constexpr int kN = 5, kTE = 16;
 
+using V2sem = Kokkos::View<float**, Kokkos::LayoutRight, ES>;
+using V4sem = Kokkos::View<float****, Kokkos::LayoutRight, ES>;
+using SemMap =
+    LabelTiles<LabelTile<'e', kTE>, LabelWhole<'q', kN>, LabelWhole<'a', kN>,
+               LabelWhole<'b', kN>, LabelWhole<'c', kN>>;
+template <typename Raw>
+using SemResolved = typename Impl::lg_resolve_member<SemMap, Raw>::type;
+using StageH      = SemResolved<decltype(make_stage_node(
+    make_input_node(make_handle<'q', 'a'>(std::declval<V2sem>()))))>;
+using StageU      = SemResolved<decltype(make_stage_node(
+    make_input_node(make_handle<'e', 'a', 'b', 'c'>(std::declval<V4sem>()))))>;
+
 using SemH = Slot<0, Modes<'q', 'a'>, StaticTile<kN, kN>>;
 using SemU = Slot<1, Modes<'e', 'a', 'b', 'c'>, StaticTile<kTE, kN, kN, kN>>;
 using SemQ = StaticTile<kN, kTE, kN, kN>;
-constexpr std::size_t kSemStages = 2;
 
 using Ga = decltype(make_contraction_node<'q', 'e', 'b', 'c'>(
     std::declval<SemH>(), std::declval<SemU>()));
@@ -193,25 +196,35 @@ static_assert(Impl::lg_member_sb_v<Gb> == kTE * kN * kN);
 static_assert(Impl::lg_member_sa_v<Gc> == kN);
 static_assert(Impl::lg_member_sb_v<Gc> == kTE * kN * kN);
 
-using GradLevel = DeviceTuple<Ga, Gb, Gc>;
-using SemLevels = DeviceTuple<GradLevel>;
+// The staged operands are now a LEVEL, which is what makes slots 0 and 1
+// belong to somebody: level 0 produces them and level 1 reads them. Before
+// staging was a level this was a one-level plan whose operands came from
+// nowhere, and the "may not read its own level" guard could not see them.
+// H is 5x5 and u is TE*5*5*5, so they cannot share a level -- the space guard
+// says so, and that is the same rule that forces the real SEM3D graph into two
+// stage levels rather than one.
+using StageLevelH = DeviceTuple<StageH>;
+using StageLevelU = DeviceTuple<StageU>;
+using GradLevel   = DeviceTuple<Ga, Gb, Gc>;
+using SemLevels   = DeviceTuple<StageLevelH, StageLevelU, GradLevel>;
 
+static_assert(Impl::lg_level_homogeneous_v<StageLevelH>,
+              "a level of stages is homogeneous too");
 static_assert(Impl::lg_level_homogeneous_v<GradLevel>);
 static_assert(Impl::lg_level_space_agrees_v<GradLevel>);
-static_assert(Impl::lg_levels_reads_v<SemLevels, kSemStages>,
-              "all three read stage slots only");
+static_assert(Impl::lg_levels_reads_v<SemLevels>,
+              "all three gradients read level 0's slots, not their own");
 
-using SemPlan = LevelPlan<SemLevels, kSemStages>;
-static_assert(SemPlan::num_levels == 1);
-static_assert(SemPlan::num_members == 3);
-static_assert(SemPlan::num_slots == 5, "2 stages + 3 gradients");
+using SemPlan = LevelPlan<SemLevels>;
+static_assert(SemPlan::num_levels == 3);
+static_assert(SemPlan::num_members == 5, "2 stages + 3 gradients");
+static_assert(SemPlan::num_slots == 5);
 
 // A member's operand slots are all strictly below its own level's base -- the
 // property the negative file's sibling case violates.
 static_assert(Impl::lg_max_operand_slot_v<Ga> == 1);
-static_assert(
-    Impl::lg_max_operand_slot_v<Ga> <
-    static_cast<int>(Impl::lg_level_base_v<SemLevels, kSemStages, 0>));
+static_assert(Impl::lg_max_operand_slot_v<Ga> <
+              static_cast<int>(Impl::lg_level_base_v<SemLevels, 2>));
 
 // --- 4. the staged-node read, in the DAG liveness fold ---------------------
 //
@@ -264,17 +277,17 @@ static_assert(Impl::dag_pool_count<StagedNodes, 2>() == 2,
 
 // The file's content is its static_asserts; these pin the same arithmetic at
 // runtime so a green ctest run reports on it rather than on an empty binary.
-TEST(LevelPlanTest, SlotSpaceStartsAfterTheStages) {
-  EXPECT_EQ((Impl::lg_num_slots_v<Synth, kSynthStages>), 14u);
-  EXPECT_EQ((Impl::lg_level_base_v<Synth, kSynthStages, 0>), 5u);
-  EXPECT_EQ((Impl::lg_level_base_v<Synth, kSynthStages, 2>), 12u);
+TEST(LevelPlanTest, SlotSpaceIsPurelyLevelRelative) {
+  EXPECT_EQ((Impl::lg_num_slots_v<Synth>), 9u);
+  EXPECT_EQ((Impl::lg_level_base_v<Synth, 0>), 0u);
+  EXPECT_EQ((Impl::lg_level_base_v<Synth, 2>), 7u);
 }
 
 TEST(LevelPlanTest, AMultiOutputMemberAdvancesTheSlotCursorByItsArity) {
-  EXPECT_EQ((Impl::lg_member_base_v<Synth, kSynthStages, 1, 0>), 8u);
-  EXPECT_EQ((Impl::lg_member_base_v<Synth, kSynthStages, 1, 1>), 11u);
-  EXPECT_EQ((Impl::lg_slot_member_v<Synth, kSynthStages, 10>), 0u);
-  EXPECT_EQ((Impl::lg_slot_member_v<Synth, kSynthStages, 11>), 1u);
+  EXPECT_EQ((Impl::lg_member_base_v<Synth, 1, 0>), 3u);
+  EXPECT_EQ((Impl::lg_member_base_v<Synth, 1, 1>), 6u);
+  EXPECT_EQ((Impl::lg_slot_member_v<Synth, 5>), 0u);
+  EXPECT_EQ((Impl::lg_slot_member_v<Synth, 6>), 1u);
 }
 
 TEST(LevelPlanTest, TheSemGradientLevelIsOneLegalLevel) {

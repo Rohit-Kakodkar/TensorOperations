@@ -329,7 +329,7 @@ void levelgraph_sem3d(Fields d, int team) {
   // level's output -- do not fire on their own. Naming the plan here is what
   // runs them. Without this an SA/SB disagreement between members would
   // silently index a sibling's output out of bounds.
-  using Plan = LevelPlan<std::decay_t<decltype(g6.levels)>, 0>;
+  using Plan = LevelPlan<std::decay_t<decltype(g6.levels)>>;
   static_assert(Plan::num_levels == 6,
                 "two stage levels (the 5x5 operators, then the three frames) "
                 "and four compute levels");
