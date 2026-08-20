@@ -101,24 +101,37 @@ using Cmb4 = decltype(make_combine_node<'q', 'e', 'b', 'c'>(
 using Cmb2 = decltype(make_combine_node<'q', 'e'>(std::declval<NodeP2>(),
                                                   std::declval<Id2>()));
 
+// The operands every case reads are slots 0 and 1, which now belong to
+// somebody: staging is a level, so they are produced by two stage levels ahead
+// of the one under test. H is 5x5 and u is TE*5*5*5, so they need a level each.
+using StageLvlH = DeviceTuple<StageH>;
+using StageLvlU = DeviceTuple<StageU>;
+template <typename Lvl>
+using WithStages = DeviceTuple<StageLvlH, StageLvlU, Lvl>;
+
 #if LEVEL_NEG_CASE == 0
-using Levels = DeviceTuple<DeviceTuple<Ga, Gb>>;
+using Levels = WithStages<DeviceTuple<Ga, Gb>>;
 #elif LEVEL_NEG_CASE == 1
-using Levels = DeviceTuple<DeviceTuple<Ga, Cmb4>>;
+using Levels = WithStages<DeviceTuple<Ga, Cmb4>>;
 #elif LEVEL_NEG_CASE == 2
-using Levels = DeviceTuple<DeviceTuple<Ga, Gr>>;
+using Levels = WithStages<DeviceTuple<Ga, Gr>>;
 #elif LEVEL_NEG_CASE == 3
-using Levels = DeviceTuple<DeviceTuple<Cmb4, Cmb2>>;
+using Levels = WithStages<DeviceTuple<Cmb4, Cmb2>>;
 #elif LEVEL_NEG_CASE == 4
-using Levels = DeviceTuple<DeviceTuple<Ga, Gsib>>;
+using Levels = WithStages<DeviceTuple<Ga, Gsib>>;
 #elif LEVEL_NEG_CASE == 5
+// The defect is IN the stage level here, so this one is not wrapped.
 using Levels = DeviceTuple<DeviceTuple<StageH, StageU>>;
 #else
 #error "LEVEL_NEG_CASE must be 0..5"
 #endif
 
-using Plan = LevelPlan<Levels, kStages>;
-static_assert(Plan::num_levels == 1);
+// Naming the alias is not enough: LevelPlan's guards live in its class body, so
+// the class has to be INSTANTIATED for any of them to fire. Dropping this line
+// made every case below compile clean -- which is precisely the failure this
+// file exists to catch, arrived at from the other direction.
+using Plan = LevelPlan<Levels>;
+static_assert(Plan::num_members > 0, "forces the guards to be instantiated");
 
 }  // namespace
 

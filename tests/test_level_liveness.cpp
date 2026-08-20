@@ -126,7 +126,7 @@ using ChainLevels = ChainGraph::levels_type;
 // live across every death and can never be touched. The ASSIGNMENT is unchanged
 // from when staging was its own phase -- the timeline stretched but the
 // overlaps did not.
-constexpr auto kChainPlan = Impl::lg_pool_of_slot<ChainLevels, 0, /*root=*/6>();
+constexpr auto kChainPlan = Impl::lg_pool_of_slot<ChainLevels, /*root=*/6>();
 static_assert(kChainPlan.size() == 7, "seven levels, one slot each");
 static_assert(kChainPlan[0] == 0);
 static_assert(kChainPlan[1] == 1);
@@ -135,7 +135,7 @@ static_assert(kChainPlan[3] == 3);
 static_assert(kChainPlan[4] == 4, "C0 is live alongside every stage");
 static_assert(kChainPlan[5] == 2, "C1 reclaims B's buffer");
 static_assert(kChainPlan[6] == 0, "C2 reclaims E's buffer");
-static_assert(Impl::lg_pool_count<ChainLevels, 0, 6>() == 5,
+static_assert(Impl::lg_pool_count<ChainLevels, 6>() == 5,
               "seven slots must fit in five pools");
 
 // --- the same graph, with a SECOND member in the last level ----------------
@@ -167,7 +167,7 @@ using WideGraph  = std::decay_t<decltype(std::get<0>(
                std::declval<View2>(), std::declval<View2>())))>;
 using WideLevels = WideGraph::levels_type;
 
-constexpr auto kWidePlan = Impl::lg_pool_of_slot<WideLevels, 0, 5, 6>();
+constexpr auto kWidePlan = Impl::lg_pool_of_slot<WideLevels, 5, 6>();
 static_assert(kWidePlan[5] != kWidePlan[6],
               "two members of ONE level are simultaneously live: there is no "
               "barrier between them, so their outputs may never share a pool");
@@ -181,13 +181,13 @@ static_assert(kWidePlan[4] != kWidePlan[5] && kWidePlan[4] != kWidePlan[6],
 // every slot its own pool would satisfy every disjointness property in this
 // file and buy nothing.
 TEST(LevelLivenessTest, PoolingActuallyReclaimsBuffers) {
-  static_assert(Impl::lg_pool_count<ChainLevels, 0, 6>() <
-                    Impl::lg_num_slots_v<ChainLevels, 0>,
-                "pooling must use fewer pools than there are slots");
+  static_assert(
+      Impl::lg_pool_count<ChainLevels, 6>() < Impl::lg_num_slots_v<ChainLevels>,
+      "pooling must use fewer pools than there are slots");
   // Bound to locals first: the commas in the template arguments would be read
   // as extra macro arguments.
-  constexpr std::size_t pools = Impl::lg_pool_count<ChainLevels, 0, 6>();
-  constexpr std::size_t slots = Impl::lg_num_slots_v<ChainLevels, 0>;
+  constexpr std::size_t pools = Impl::lg_pool_count<ChainLevels, 6>();
+  constexpr std::size_t slots = Impl::lg_num_slots_v<ChainLevels>;
   EXPECT_EQ(pools, 5u);
   EXPECT_EQ(slots, 7u);
 }

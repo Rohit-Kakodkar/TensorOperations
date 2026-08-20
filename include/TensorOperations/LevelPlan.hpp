@@ -93,40 +93,34 @@ constexpr std::size_t lg_member_offset(std::size_t l) {
   return off;
 }
 
-template <typename LevelsT, std::size_t NumStages>
+template <typename LevelsT>
 constexpr std::size_t lg_num_slots() {
-  std::size_t n = NumStages;
+  std::size_t n = 0;
   for (std::size_t s : lg_level_slots_all<LevelsT>()) n += s;
   return n;
 }
 
-template <typename LevelsT, std::size_t NumStages>
+template <typename LevelsT>
 constexpr std::size_t lg_level_base(std::size_t l) {
   const auto  s   = lg_level_slots_all<LevelsT>();
-  std::size_t off = NumStages;
+  std::size_t off = 0;
   for (std::size_t i = 0; i < l; ++i) off += s[i];
   return off;
 }
 
-template <typename LevelsT, std::size_t NumStages>
+template <typename LevelsT>
 constexpr std::size_t lg_member_base(std::size_t l, std::size_t m) {
   const auto  flat  = lg_flat_arities<LevelsT>();
   const auto  mbase = lg_member_offset<LevelsT>(l);
-  std::size_t off   = lg_level_base<LevelsT, NumStages>(l);
+  std::size_t off   = lg_level_base<LevelsT>(l);
   for (std::size_t i = 0; i < m; ++i) off += flat[mbase + i];
   return off;
 }
 
-template <std::size_t NumStages>
-constexpr bool lg_is_stage_slot(std::size_t s) {
-  return s < NumStages;
-}
-
-template <typename LevelsT, std::size_t NumStages>
+template <typename LevelsT>
 constexpr std::size_t lg_slot_level(std::size_t s) {
-  const auto sl = lg_level_slots_all<LevelsT>();
-  if (s < NumStages) return sl.size();
-  std::size_t end = NumStages;
+  const auto  sl  = lg_level_slots_all<LevelsT>();
+  std::size_t end = 0;
   for (std::size_t l = 0; l < sl.size(); ++l) {
     end += sl[l];
     if (s < end) return l;
@@ -134,14 +128,14 @@ constexpr std::size_t lg_slot_level(std::size_t s) {
   return sl.size();
 }
 
-template <typename LevelsT, std::size_t NumStages>
+template <typename LevelsT>
 constexpr std::size_t lg_slot_member(std::size_t s) {
   const auto        c = lg_level_member_counts<LevelsT>();
-  const std::size_t l = lg_slot_level<LevelsT, NumStages>(s);
+  const std::size_t l = lg_slot_level<LevelsT>(s);
   if (l >= c.size()) return 0;
   const auto  flat  = lg_flat_arities<LevelsT>();
   const auto  mbase = lg_member_offset<LevelsT>(l);
-  std::size_t end   = lg_level_base<LevelsT, NumStages>(l);
+  std::size_t end   = lg_level_base<LevelsT>(l);
   for (std::size_t m = 0; m < c[l]; ++m) {
     end += flat[mbase + m];
     if (s < end) return m;
@@ -149,28 +143,21 @@ constexpr std::size_t lg_slot_member(std::size_t s) {
   return c[l];
 }
 
-template <typename LevelsT, std::size_t NumStages>
-inline constexpr std::size_t lg_num_slots_v =
-    lg_num_slots<LevelsT, NumStages>();
-template <typename LevelsT, std::size_t NumStages, std::size_t L>
-inline constexpr std::size_t lg_level_base_v =
-    lg_level_base<LevelsT, NumStages>(L);
-template <typename LevelsT, std::size_t NumStages, std::size_t L, std::size_t M>
-inline constexpr std::size_t lg_member_base_v =
-    lg_member_base<LevelsT, NumStages>(L, M);
-template <typename LevelsT, std::size_t NumStages, std::size_t S>
-inline constexpr std::size_t lg_slot_level_v =
-    lg_slot_level<LevelsT, NumStages>(S);
-template <typename LevelsT, std::size_t NumStages, std::size_t S>
-inline constexpr std::size_t lg_slot_member_v =
-    lg_slot_member<LevelsT, NumStages>(S);
+template <typename LevelsT>
+inline constexpr std::size_t lg_num_slots_v = lg_num_slots<LevelsT>();
+template <typename LevelsT, std::size_t L>
+inline constexpr std::size_t lg_level_base_v = lg_level_base<LevelsT>(L);
+template <typename LevelsT, std::size_t L, std::size_t M>
+inline constexpr std::size_t lg_member_base_v = lg_member_base<LevelsT>(L, M);
+template <typename LevelsT, std::size_t S>
+inline constexpr std::size_t lg_slot_level_v = lg_slot_level<LevelsT>(S);
+template <typename LevelsT, std::size_t S>
+inline constexpr std::size_t lg_slot_member_v = lg_slot_member<LevelsT>(S);
 template <typename LevelsT, std::size_t L>
 inline constexpr std::size_t lg_level_slots_v =
     lg_level_slots<tuple_element_t<L, LevelsT>>();
 template <typename LevelsT>
 inline constexpr std::size_t lg_total_members_v = lg_total_members<LevelsT>();
-template <std::size_t NumStages, std::size_t S>
-inline constexpr bool lg_is_stage_slot_v = lg_is_stage_slot<NumStages>(S);
 
 // --- liveness, on a LEVEL timeline -----------------------------------------
 //
@@ -187,9 +174,8 @@ inline constexpr bool lg_is_stage_slot_v = lg_is_stage_slot<NumStages>(S);
 // live for the whole level. Ranking members within a level would produce a plan
 // that is wrong exactly where nothing checks it.
 //
-//   t = 0            the stages
-//   t = L + 1        level L
-//   t = NumLevels+1  the root store, which runs after every level
+//   t = L          level L
+//   t = NumLevels  the root store, which runs after every level
 //
 // Ranges are CLOSED at both ends, so a slot defined at level L and a slot last
 // read at level L overlap at L and can never pool together.
@@ -209,23 +195,21 @@ template <typename LevelsT, std::size_t NS, std::size_t... Ls>
 constexpr void lg_note_all_reads(std::array<std::size_t, NS>& last,
                                  std::index_sequence<Ls...>) {
   (lg_note_level_reads<tuple_element_t<Ls, LevelsT>, NS>(
-       last, Ls + 1,
+       last, Ls,
        std::make_index_sequence<tuple_size_v<tuple_element_t<Ls, LevelsT>>>{}),
    ...);
 }
 
-template <typename LevelsT, std::size_t NumStages, std::size_t... Roots>
+template <typename LevelsT, std::size_t... Roots>
 constexpr auto lg_pool_of_slot() {
-  constexpr std::size_t NS = lg_num_slots<LevelsT, NumStages>();
+  constexpr std::size_t NS = lg_num_slots<LevelsT>();
   constexpr std::size_t NL = tuple_size_v<LevelsT>;
 
   std::array<std::size_t, NS> def{}, last{};
   for (std::size_t s = 0; s < NS; ++s) {
     // lg_slot_level returns NL as a SENTINEL for a stage slot, not a level, so
     // stages are mapped to t=0 explicitly rather than by trusting the return.
-    def[s] = lg_is_stage_slot<NumStages>(s)
-                 ? std::size_t{0}
-                 : lg_slot_level<LevelsT, NumStages>(s) + 1;
+    def[s] = lg_slot_level<LevelsT>(s);
     // A slot nobody reads is still live where it is written.
     last[s] = def[s];
   }
@@ -233,14 +217,14 @@ constexpr auto lg_pool_of_slot() {
 
   // A designated output is read by lg_store_roots AFTER every level has run.
   const std::array<std::size_t, sizeof...(Roots)> roots{Roots...};
-  for (std::size_t i = 0; i < sizeof...(Roots); ++i) last[roots[i]] = NL + 1;
+  for (std::size_t i = 0; i < sizeof...(Roots); ++i) last[roots[i]] = NL;
 
   return left_edge_colour<NS>(def, last);
 }
 
-template <typename LevelsT, std::size_t NumStages, std::size_t... Roots>
+template <typename LevelsT, std::size_t... Roots>
 constexpr std::size_t lg_pool_count() {
-  const auto  p = lg_pool_of_slot<LevelsT, NumStages, Roots...>();
+  const auto  p = lg_pool_of_slot<LevelsT, Roots...>();
   std::size_t n = 0;
   for (std::size_t s = 0; s < p.size(); ++s)
     if (p[s] + 1 > n) n = p[s] + 1;
@@ -250,25 +234,24 @@ constexpr std::size_t lg_pool_count() {
 // Keyed on an index_sequence of the roots so the root set travels as one type,
 // for the same reason dag_slot_pool_v is: the functions above are host-only
 // constexpr (std::array is), so device code must name a constant.
-template <typename LevelsT, std::size_t NumStages, typename RootsSeq>
+template <typename LevelsT, typename RootsSeq>
 struct lg_plan;
-template <typename LevelsT, std::size_t NumStages, std::size_t... Roots>
-struct lg_plan<LevelsT, NumStages, std::index_sequence<Roots...>> {
+template <typename LevelsT, std::size_t... Roots>
+struct lg_plan<LevelsT, std::index_sequence<Roots...>> {
   static constexpr auto of_slot() {
-    return lg_pool_of_slot<LevelsT, NumStages, Roots...>();
+    return lg_pool_of_slot<LevelsT, Roots...>();
   }
   static constexpr std::size_t count() {
-    return lg_pool_count<LevelsT, NumStages, Roots...>();
+    return lg_pool_count<LevelsT, Roots...>();
   }
 };
 
-template <typename LevelsT, std::size_t NumStages, typename RootsSeq,
-          std::size_t S>
+template <typename LevelsT, typename RootsSeq, std::size_t S>
 inline constexpr std::size_t lg_slot_pool_v =
-    lg_plan<LevelsT, NumStages, RootsSeq>::of_slot()[S];
-template <typename LevelsT, std::size_t NumStages, typename RootsSeq>
+    lg_plan<LevelsT, RootsSeq>::of_slot()[S];
+template <typename LevelsT, typename RootsSeq>
 inline constexpr std::size_t lg_pool_count_v =
-    lg_plan<LevelsT, NumStages, RootsSeq>::count();
+    lg_plan<LevelsT, RootsSeq>::count();
 
 template <typename Node>
 using member_out_layout_t =
@@ -384,17 +367,16 @@ constexpr int lg_max_operand_slot() {
 template <typename Node>
 inline constexpr int lg_max_operand_slot_v = lg_max_operand_slot<Node>();
 
-template <typename LevelsT, std::size_t NumStages, std::size_t L,
-          std::size_t... Ms>
+template <typename LevelsT, std::size_t L, std::size_t... Ms>
 constexpr bool lg_level_reads_earlier_impl(std::index_sequence<Ms...>) {
   using LevelT = tuple_element_t<L, LevelsT>;
   return ((lg_max_operand_slot_v<tuple_element_t<Ms, LevelT>> <
-           static_cast<int>(lg_level_base<LevelsT, NumStages>(L))) &&
+           static_cast<int>(lg_level_base<LevelsT>(L))) &&
           ...);
 }
-template <typename LevelsT, std::size_t NumStages, std::size_t L>
+template <typename LevelsT, std::size_t L>
 inline constexpr bool lg_level_reads_earlier_v =
-    lg_level_reads_earlier_impl<LevelsT, NumStages, L>(
+    lg_level_reads_earlier_impl<LevelsT, L>(
         std::make_index_sequence<tuple_size_v<tuple_element_t<L, LevelsT>>>{});
 
 template <typename LevelsT, std::size_t... Ls>
@@ -405,9 +387,9 @@ template <typename LevelsT, std::size_t... Ls>
 constexpr bool lg_all_levels_space_impl(std::index_sequence<Ls...>) {
   return (lg_level_space_agrees_v<tuple_element_t<Ls, LevelsT>> && ...);
 }
-template <typename LevelsT, std::size_t NumStages, std::size_t... Ls>
+template <typename LevelsT, std::size_t... Ls>
 constexpr bool lg_all_levels_reads_impl(std::index_sequence<Ls...>) {
-  return (lg_level_reads_earlier_v<LevelsT, NumStages, Ls> && ...);
+  return (lg_level_reads_earlier_v<LevelsT, Ls> && ...);
 }
 
 template <typename LevelsT>
@@ -417,27 +399,25 @@ inline constexpr bool lg_levels_homogeneous_v =
 template <typename LevelsT>
 inline constexpr bool lg_levels_space_v = lg_all_levels_space_impl<LevelsT>(
     std::make_index_sequence<tuple_size_v<LevelsT>>{});
-template <typename LevelsT, std::size_t NumStages>
-inline constexpr bool lg_levels_reads_v =
-    lg_all_levels_reads_impl<LevelsT, NumStages>(
-        std::make_index_sequence<tuple_size_v<LevelsT>>{});
+template <typename LevelsT>
+inline constexpr bool lg_levels_reads_v = lg_all_levels_reads_impl<LevelsT>(
+    std::make_index_sequence<tuple_size_v<LevelsT>>{});
 
 }  // namespace Impl
 
-template <typename LevelsT, std::size_t NumStages>
+template <typename LevelsT>
 struct LevelPlan {
   using levels_type = LevelsT;
 
-  static constexpr std::size_t num_stages = NumStages;
-  static constexpr std::size_t num_levels = tuple_size_v<LevelsT>;
-  static constexpr std::size_t num_slots =
-      Impl::lg_num_slots_v<LevelsT, NumStages>;
+  static constexpr std::size_t num_levels  = tuple_size_v<LevelsT>;
+  static constexpr std::size_t num_slots   = Impl::lg_num_slots_v<LevelsT>;
   static constexpr std::size_t num_members = Impl::lg_total_members_v<LevelsT>;
 
   static_assert(Impl::lg_levels_homogeneous_v<LevelsT>,
                 "level graph: a level must be NON-EMPTY and HOMOGENEOUS -- "
-                "every member a contraction, or every member a combine. The "
-                "two decodes are different objects, so a mixed level computes "
+                "every member a contraction, every member a combine, or every "
+                "member a stage. The decodes are different objects, so a mixed "
+                "level computes "
                 "both and banks neither");
 
   static_assert(
@@ -449,7 +429,7 @@ struct LevelPlan {
       "what makes fusing its copies into one range sound");
 
   static_assert(
-      Impl::lg_levels_reads_v<LevelsT, NumStages>,
+      Impl::lg_levels_reads_v<LevelsT>,
       "level graph: a member may not read a slot ITS OWN LEVEL "
       "produces -- a level's members run concurrently, so a sibling's "
       "output is a cross-thread hazard, not an operand");
