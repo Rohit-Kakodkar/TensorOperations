@@ -132,6 +132,27 @@ static_assert(
                    tile_from_labels_t<SemMap, Modes<'e', 'k', 'j', 'i'>>>,
     "declared order comes from the same map, by the node's own labels");
 
+// --- THE EQUIVALENCE: a staged member --------------------------------------
+//
+// A stage is the one member kind whose tile cannot be derived from operands, so
+// it is carried on the node and resolved from the map by LevelGraph::add. This
+// pins that the carried tile is the SAME thing the map would give, which is
+// what lets MemberOutTile treat all three member kinds alike.
+using View4    = Kokkos::View<float****, Kokkos::LayoutRight, ES>;
+using RawStage = decltype(make_stage_node(
+    make_input_node(make_handle<'e', 'k', 'j', 'i'>(std::declval<View4>()))));
+using Staged   = Impl::lg_resolve_member_t<SemMap, RawStage>;
+
+static_assert(
+    std::is_same_v<typename RawStage::tile_type, void>,
+    "make_stage_node leaves the tile unresolved -- it cannot know it");
+static_assert(
+    std::is_same_v<member_out_tile_t<Staged>,
+                   tile_from_labels_t<SemMap, Modes<'e', 'k', 'j', 'i'>>>,
+    "a resolved stage reports exactly the map's tile");
+static_assert(std::is_same_v<member_out_tile_t<Staged>, TileE>,
+              "spelled out, so the assert above cannot pass vacuously");
+
 // --- THE EQUIVALENCE: combine ----------------------------------------------
 
 struct Id4 {

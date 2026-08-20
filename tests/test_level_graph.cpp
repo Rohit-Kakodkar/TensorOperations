@@ -330,10 +330,12 @@ TEST(LevelGraphRuntime, SingleContractionMemberEqualsReference) {
   Kokkos::deep_copy(Hd, Hh);
   Kokkos::deep_copy(Ud, Uh);
 
-  auto g0      = make_level_graph<float, ES>(MapR{});
-  auto [g1, h] = g0.stage(make_input_node(make_handle<'q', 'a'>(Hd)));
-  auto [g2, u] = g1.stage(make_input_node(make_handle<'e', 'a', 'b', 'c'>(Ud)));
-  auto ga      = make_contraction_node<'q', 'e', 'b', 'c'>(h, u);
+  auto g0 = make_level_graph<float, ES>(MapR{});
+  auto [g1, h] =
+      g0.add(make_stage_node(make_input_node(make_handle<'q', 'a'>(Hd))));
+  auto [g2, u] = g1.add(
+      make_stage_node(make_input_node(make_handle<'e', 'a', 'b', 'c'>(Ud))));
+  auto ga       = make_contraction_node<'q', 'e', 'b', 'c'>(h, u);
   auto [g3, ca] = g2.add(ga);
 
   g3.outputs(ca).execute(TeamPolicyTag2<ES>{}, Cd);
@@ -372,9 +374,11 @@ TEST(LevelGraphRuntime, ThreeMemberFusedGradientLevelEqualsReference) {
   Kokkos::deep_copy(Hd, Hh);
   Kokkos::deep_copy(Ud, Uh);
 
-  auto g0      = make_level_graph<float, ES>(MapR{});
-  auto [g1, h] = g0.stage(make_input_node(make_handle<'q', 'a'>(Hd)));
-  auto [g2, u] = g1.stage(make_input_node(make_handle<'e', 'a', 'b', 'c'>(Ud)));
+  auto g0 = make_level_graph<float, ES>(MapR{});
+  auto [g1, h] =
+      g0.add(make_stage_node(make_input_node(make_handle<'q', 'a'>(Hd))));
+  auto [g2, u] = g1.add(
+      make_stage_node(make_input_node(make_handle<'e', 'a', 'b', 'c'>(Ud))));
 
   auto gax = make_contraction_node<'q', 'e', 'b', 'c'>(h, u);
   auto gbx =
@@ -449,9 +453,11 @@ TEST(LevelGraphRuntime, CombineLevelReadingContractionEqualsReference) {
   Kokkos::deep_copy(Hd, Hh);
   Kokkos::deep_copy(Ud, Uh);
 
-  auto g0      = make_level_graph<float, ES>(MapR{});
-  auto [g1, h] = g0.stage(make_input_node(make_handle<'q', 'a'>(Hd)));
-  auto [g2, u] = g1.stage(make_input_node(make_handle<'e', 'a', 'b', 'c'>(Ud)));
+  auto g0 = make_level_graph<float, ES>(MapR{});
+  auto [g1, h] =
+      g0.add(make_stage_node(make_input_node(make_handle<'q', 'a'>(Hd))));
+  auto [g2, u] = g1.add(
+      make_stage_node(make_input_node(make_handle<'e', 'a', 'b', 'c'>(Ud))));
 
   auto ga       = make_contraction_node<'q', 'e', 'b', 'c'>(h, u);
   auto [g3, ca] = g2.add(ga);
@@ -497,9 +503,11 @@ TEST(LevelGraphRuntime, MultiOutputCombineEqualsReference) {
   Kokkos::deep_copy(Hd, Hh);
   Kokkos::deep_copy(Ud, Uh);
 
-  auto g0      = make_level_graph<float, ES>(MapR{});
-  auto [g1, h] = g0.stage(make_input_node(make_handle<'q', 'a'>(Hd)));
-  auto [g2, u] = g1.stage(make_input_node(make_handle<'e', 'a', 'b', 'c'>(Ud)));
+  auto g0 = make_level_graph<float, ES>(MapR{});
+  auto [g1, h] =
+      g0.add(make_stage_node(make_input_node(make_handle<'q', 'a'>(Hd))));
+  auto [g2, u] = g1.add(
+      make_stage_node(make_input_node(make_handle<'e', 'a', 'b', 'c'>(Ud))));
 
   auto ga           = make_contraction_node<'q', 'e', 'b', 'c'>(h, u);
   auto [g3, ca]     = g2.add(ga);
@@ -601,9 +609,11 @@ TEST(LevelGraphDeclaredOrder, NonCanonicalContractionRootEqualsReference) {
   ViewO Od("O", dE, dB, dQ, dC);
   fill(Hd, Ud);
 
-  auto g0      = make_level_graph<float, ES>(MapD{});
-  auto [g1, h] = g0.stage(make_input_node(make_handle<'q', 'a'>(Hd)));
-  auto [g2, u] = g1.stage(make_input_node(make_handle<'e', 'a', 'b', 'c'>(Ud)));
+  auto g0 = make_level_graph<float, ES>(MapD{});
+  auto [g1, h] =
+      g0.add(make_stage_node(make_input_node(make_handle<'q', 'a'>(Hd))));
+  auto [g2, u] = g1.add(
+      make_stage_node(make_input_node(make_handle<'e', 'a', 'b', 'c'>(Ud))));
 
   auto ga       = make_contraction_node<'e', 'b', 'q', 'c'>(h, u);
   auto [g3, ca] = g2.add(ga);
@@ -633,9 +643,11 @@ TEST(LevelGraphDeclaredOrder, CombineReadsDeclaredSlotInItsOwnOrder) {
   ViewO Od("O", dQ, dC, dE, dB);
   fill(Hd, Ud);
 
-  auto g0      = make_level_graph<float, ES>(MapD{});
-  auto [g1, h] = g0.stage(make_input_node(make_handle<'q', 'a'>(Hd)));
-  auto [g2, u] = g1.stage(make_input_node(make_handle<'e', 'a', 'b', 'c'>(Ud)));
+  auto g0 = make_level_graph<float, ES>(MapD{});
+  auto [g1, h] =
+      g0.add(make_stage_node(make_input_node(make_handle<'q', 'a'>(Hd))));
+  auto [g2, u] = g1.add(
+      make_stage_node(make_input_node(make_handle<'e', 'a', 'b', 'c'>(Ud))));
 
   auto ga       = make_contraction_node<'e', 'b', 'q', 'c'>(h, u);
   auto [g3, ca] = g2.add(ga);
@@ -675,10 +687,13 @@ TEST(LevelGraphDeclaredOrder, ContractionReadsDeclaredSlotOperand) {
     for (int q = 0; q < dQ; ++q) Wh(p, q) = wval(p, q);
   Kokkos::deep_copy(Wd, Wh);
 
-  auto g0      = make_level_graph<float, ES>(MapD{});
-  auto [g1, h] = g0.stage(make_input_node(make_handle<'q', 'a'>(Hd)));
-  auto [g2, w] = g1.stage(make_input_node(make_handle<'p', 'q'>(Wd)));
-  auto [g3, u] = g2.stage(make_input_node(make_handle<'e', 'a', 'b', 'c'>(Ud)));
+  auto g0 = make_level_graph<float, ES>(MapD{});
+  auto [g1, h] =
+      g0.add(make_stage_node(make_input_node(make_handle<'q', 'a'>(Hd))));
+  auto [g2, w] =
+      g1.add(make_stage_node(make_input_node(make_handle<'p', 'q'>(Wd))));
+  auto [g3, u] = g2.add(
+      make_stage_node(make_input_node(make_handle<'e', 'a', 'b', 'c'>(Ud))));
 
   auto ga       = make_contraction_node<'e', 'b', 'q', 'c'>(h, u);
   auto [g4, ca] = g3.add(ga);
@@ -720,9 +735,11 @@ TEST(LevelGraphDeclaredOrder, CombineFnSeesGlobalCoordinate) {
   ViewO Od("O", dE, dB, dQ, dC);
   fill(Hd, Ud);
 
-  auto g0      = make_level_graph<float, ES>(MapD{});
-  auto [g1, h] = g0.stage(make_input_node(make_handle<'q', 'a'>(Hd)));
-  auto [g2, u] = g1.stage(make_input_node(make_handle<'e', 'a', 'b', 'c'>(Ud)));
+  auto g0 = make_level_graph<float, ES>(MapD{});
+  auto [g1, h] =
+      g0.add(make_stage_node(make_input_node(make_handle<'q', 'a'>(Hd))));
+  auto [g2, u] = g1.add(
+      make_stage_node(make_input_node(make_handle<'e', 'a', 'b', 'c'>(Ud))));
 
   auto ga       = make_contraction_node<'e', 'b', 'q', 'c'>(h, u);
   auto [g3, ca] = g2.add(ga);

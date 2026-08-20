@@ -298,11 +298,18 @@ template <typename LevelT, std::size_t... Ms>
 constexpr bool lg_all_combine_impl(std::index_sequence<Ms...>) {
   return (has_node_tag_v<CombineTag, tuple_element_t<Ms, LevelT>> && ...);
 }
+template <typename LevelT, std::size_t... Ms>
+constexpr bool lg_all_staged_impl(std::index_sequence<Ms...>) {
+  return (has_node_tag_v<StagedTag, tuple_element_t<Ms, LevelT>> && ...);
+}
 template <typename LevelT>
 inline constexpr bool lg_all_contraction_v = lg_all_contraction_impl<LevelT>(
     std::make_index_sequence<tuple_size_v<LevelT>>{});
 template <typename LevelT>
 inline constexpr bool lg_all_combine_v = lg_all_combine_impl<LevelT>(
+    std::make_index_sequence<tuple_size_v<LevelT>>{});
+template <typename LevelT>
+inline constexpr bool lg_all_staged_v = lg_all_staged_impl<LevelT>(
     std::make_index_sequence<tuple_size_v<LevelT>>{});
 
 template <typename LevelT>
@@ -311,7 +318,8 @@ inline constexpr bool lg_level_nonempty_v = tuple_size_v<LevelT> > 0;
 template <typename LevelT>
 inline constexpr bool lg_level_homogeneous_v =
     lg_level_nonempty_v<LevelT> &&
-    (lg_all_contraction_v<LevelT> || lg_all_combine_v<LevelT>);
+    (lg_all_contraction_v<LevelT> || lg_all_combine_v<LevelT> ||
+     lg_all_staged_v<LevelT>);
 
 template <typename LevelT, std::size_t... Ms>
 constexpr bool lg_contraction_space_impl(std::index_sequence<Ms...>) {
@@ -320,8 +328,12 @@ constexpr bool lg_contraction_space_impl(std::index_sequence<Ms...>) {
            lg_member_sb_v<tuple_element_t<Ms, LevelT>> == lg_member_sb_v<M0>) &&
           ...);
 }
+// Identical output tile LAYOUT across a level's members. Shared by combine and
+// staged levels: both iterate their output tile coordinate-by-coordinate
+// (team_for_each_coord), so agreeing on that layout is exactly what lets one
+// TeamVectorRange drive every member.
 template <typename LevelT, std::size_t... Ms>
-constexpr bool lg_combine_space_impl(std::index_sequence<Ms...>) {
+constexpr bool lg_layout_space_impl(std::index_sequence<Ms...>) {
   using M0 = tuple_element_t<0, LevelT>;
   return (std::is_same_v<member_out_layout_t<tuple_element_t<Ms, LevelT>>,
                          member_out_layout_t<M0>> &&
@@ -336,7 +348,7 @@ constexpr bool lg_level_space_agrees() {
     return lg_contraction_space_impl<LevelT>(
         std::make_index_sequence<tuple_size_v<LevelT>>{});
   } else {
-    return lg_combine_space_impl<LevelT>(
+    return lg_layout_space_impl<LevelT>(
         std::make_index_sequence<tuple_size_v<LevelT>>{});
   }
 }
@@ -428,11 +440,13 @@ struct LevelPlan {
                 "two decodes are different objects, so a mixed level computes "
                 "both and banks neither");
 
-  static_assert(Impl::lg_levels_space_v<LevelsT>,
-                "level graph: every member of a level must share ONE iteration "
-                "space -- contraction members must agree on SA and SB "
-                "(separately, not on their product), combine members on their "
-                "whole output tile layout");
+  static_assert(
+      Impl::lg_levels_space_v<LevelsT>,
+      "level graph: every member of a level must share ONE iteration "
+      "space -- contraction members must agree on SA and SB "
+      "(separately, not on their product), combine and STAGED members "
+      "on their whole output tile layout. For a staged level this is "
+      "what makes fusing its copies into one range sound");
 
   static_assert(
       Impl::lg_levels_reads_v<LevelsT, NumStages>,

@@ -16,8 +16,12 @@
 //   2  contraction members whose SA/SB disagree
 //   3  combine members whose output tile layouts disagree
 //   4  a member reading a slot its OWN level produces
+//   5  STAGED members whose iteration spaces differ -- the guard that makes
+//      fusing a stage level's copies into one range sound
 //   0  the control: a legal two-member level, which must COMPILE.
 // ===========================================================================
+#include <TensorOperations/LabelTiles.hpp>
+#include <TensorOperations/LevelGraph.hpp>
 #include <TensorOperations/LevelPlan.hpp>
 #include <TensorOperations/NodeHandle.hpp>
 #include <TensorOperations/Tiling.hpp>
@@ -54,6 +58,21 @@ using NodeR = Slot<0, Modes<'r', 'a'>, StaticTile<kOdd, kN>>;
 // Slot 2 is level 0's FIRST OUTPUT -- naming it from inside level 0 is the
 // sibling read.
 using NodeSib = Slot<kStages, Modes<'q', 'a'>, StaticTile<kN, kN>>;
+
+// Two staged members over tensors of different rank, so their output tiles --
+// and therefore their iteration spaces -- cannot agree. A stage level runs ONE
+// TeamVectorRange over the shared space, so this must not compile.
+using V2s = Kokkos::View<float**, Kokkos::LayoutRight, ES>;
+using V4s = Kokkos::View<float****, Kokkos::LayoutRight, ES>;
+using StageMap =
+    LabelTiles<LabelTile<'e', kTE>, LabelWhole<'q', kN>, LabelWhole<'a', kN>,
+               LabelWhole<'b', kN>, LabelWhole<'c', kN>>;
+template <typename Raw>
+using Resolved = typename Impl::lg_resolve_member<StageMap, Raw>::type;
+using StageH   = Resolved<decltype(make_stage_node(
+    make_input_node(make_handle<'q', 'a'>(std::declval<V2s>()))))>;
+using StageU   = Resolved<decltype(make_stage_node(
+    make_input_node(make_handle<'e', 'a', 'b', 'c'>(std::declval<V4s>()))))>;
 
 using NodeP4 = Slot<0, Modes<'q', 'e', 'b', 'c'>, StaticTile<kN, kTE, kN, kN>>;
 using NodeP2 = Slot<1, Modes<'q', 'e'>, StaticTile<kN, kTE>>;
@@ -92,8 +111,10 @@ using Levels = DeviceTuple<DeviceTuple<Ga, Gr>>;
 using Levels = DeviceTuple<DeviceTuple<Cmb4, Cmb2>>;
 #elif LEVEL_NEG_CASE == 4
 using Levels = DeviceTuple<DeviceTuple<Ga, Gsib>>;
+#elif LEVEL_NEG_CASE == 5
+using Levels = DeviceTuple<DeviceTuple<StageH, StageU>>;
 #else
-#error "LEVEL_NEG_CASE must be 0..4"
+#error "LEVEL_NEG_CASE must be 0..5"
 #endif
 
 using Plan = LevelPlan<Levels, kStages>;

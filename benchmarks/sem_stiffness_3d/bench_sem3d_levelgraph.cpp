@@ -255,15 +255,21 @@ void levelgraph_sem3d(Fields d, int team) {
   // H is (free, summed) and Hw is (summed, free): Hw is H's weighted
   // TRANSPOSE. 'r' is renamed per use to the axis that operator reconstructs;
   // 'p' is the summed point and never appears in an output.
-  auto g0       = make_level_graph<float, ES>(GMap<TE>{});
-  auto [g1, h]  = g0.stage(make_input_node(make_handle<'r', 'p'>(d.H)));
-  auto [g2, hw] = g1.stage(make_input_node(make_handle<'p', 'r'>(d.Hw)));
-  auto [g3, u0] =
-      g2.stage(make_input_node(make_handle<'e', 'k', 'j', 'i'>(d.u0)));
-  auto [g4, u1] =
-      g3.stage(make_input_node(make_handle<'e', 'k', 'j', 'i'>(d.u1)));
-  auto [g5, u2] =
-      g4.stage(make_input_node(make_handle<'e', 'k', 'j', 'i'>(d.u2)));
+  // LEVEL 0 -- the two 5x5 operators, 25 points each.
+  // LEVEL 1 -- the three frames, 125*TE points each.
+  //
+  // The split is forced, not stylistic: a level's members must share one
+  // iteration space, and 25 != 125*TE. What the grouping buys is that the three
+  // frame copies run in ONE TeamVectorRange, so their global loads are all in
+  // flight together instead of five serialized load-store round trips.
+  auto g0 = make_level_graph<float, ES>(GMap<TE>{});
+  auto [g1, h, hw] =
+      g0.add(make_stage_node(make_input_node(make_handle<'r', 'p'>(d.H))),
+             make_stage_node(make_input_node(make_handle<'p', 'r'>(d.Hw))));
+  auto [g2, u0, u1, u2] = g1.add(
+      make_stage_node(make_input_node(make_handle<'e', 'k', 'j', 'i'>(d.u0))),
+      make_stage_node(make_input_node(make_handle<'e', 'k', 'j', 'i'>(d.u1))),
+      make_stage_node(make_input_node(make_handle<'e', 'k', 'j', 'i'>(d.u2))));
 
   // LEVEL 1 -- nine gradients, one fused range. The direction is which axis of
   // the one staged u is summed ('p' in slot 3 = d/d(xi), slot 2 = d/d(eta),
@@ -280,7 +286,7 @@ void levelgraph_sem3d(Fields d, int team) {
     return make_contraction_node<'e', 'k', 'j', 'i'>(
         h.template as<'k', 'p'>(), uu.template as<'e', 'p', 'j', 'i'>());
   };
-  auto [g6, gx0, gx1, gx2, ge0, ge1, ge2, gg0, gg1, gg2] = g5.add(
+  auto [g3, gx0, gx1, gx2, ge0, ge1, ge2, gg0, gg1, gg2] = g2.add(
       gx(u0), gx(u1), gx(u2), ge(u0), ge(u1), ge(u2), gg(u0), gg(u1), gg(u2));
 
   // LEVEL 2 -- chain rule, stress and nine integrands, ONE member.
@@ -290,8 +296,8 @@ void levelgraph_sem3d(Fields d, int team) {
   // hazard: at NGLL=5 every GLL axis is 5 and the operand check is
   // extents-only, blind to axis order, so a MISTYPED "identity" relabel
   // compiles clean and silently returns garbage. Bare cannot be mistyped.
-  auto [g7, fx0, fx1, fx2, fe0, fe1, fe2, fg0, fg1, fg2] =
-      g6.add(make_combine_node<'e', 'k', 'j', 'i'>(gx0, gx1, gx2, ge0, ge1, ge2,
+  auto [g4, fx0, fx1, fx2, fe0, fe1, fe2, fg0, fg1, fg2] =
+      g3.add(make_combine_node<'e', 'k', 'j', 'i'>(gx0, gx1, gx2, ge0, ge1, ge2,
                                                    gg0, gg1, gg2, integrand));
 
   // LEVEL 3 -- nine divergences. Structurally level 1 with H -> Hw, u -> F.
@@ -307,35 +313,39 @@ void levelgraph_sem3d(Fields d, int team) {
     return make_contraction_node<'e', 'k', 'j', 'i'>(
         hw.template as<'p', 'k'>(), f.template as<'e', 'p', 'j', 'i'>());
   };
-  auto [g8, tx0, tx1, tx2, te0, te1, te2, tg0, tg1, tg2] =
-      g7.add(dvx(fx0), dvx(fx1), dvx(fx2), dve(fe0), dve(fe1), dve(fe2),
+  auto [g5, tx0, tx1, tx2, te0, te1, te2, tg0, tg1, tg2] =
+      g4.add(dvx(fx0), dvx(fx1), dvx(fx2), dve(fe0), dve(fe1), dve(fe2),
              dvg(fg0), dvg(fg1), dvg(fg2));
 
   // LEVEL 4 -- the three weighted sums.
   auto ws = [&](auto a, auto b, auto c) {
     return make_combine_node<'e', 'k', 'j', 'i'>(a, b, c, wsum);
   };
-  auto [g9, r0, r1, r2] =
-      g8.add(ws(tx0, te0, tg0), ws(tx1, te1, tg1), ws(tx2, te2, tg2));
+  auto [g6, r0, r1, r2] =
+      g5.add(ws(tx0, te0, tg0), ws(tx1, te1, tg1), ws(tx2, te2, tg2));
 
   // LevelGraph does NOT instantiate LevelPlan, so its guards -- level
   // homogeneity, one iteration space per level, no member reading its own
   // level's output -- do not fire on their own. Naming the plan here is what
   // runs them. Without this an SA/SB disagreement between members would
   // silently index a sibling's output out of bounds.
-  using Plan = LevelPlan<std::decay_t<decltype(g9.levels)>, 5>;
-  static_assert(Plan::num_levels == 4, "four levels");
-  static_assert(Plan::num_slots == 5 + 9 + 9 + 9 + 3, "5 stages + 30 members");
+  using Plan = LevelPlan<std::decay_t<decltype(g6.levels)>, 0>;
+  static_assert(Plan::num_levels == 6,
+                "two stage levels (the 5x5 operators, then the three frames) "
+                "and four compute levels");
+  static_assert(Plan::num_slots == 2 + 3 + 9 + 9 + 9 + 3,
+                "the same 35 slots -- staging moved into levels, it did not "
+                "add or remove a buffer");
 
   // What liveness pooling costs those 35 slots. 19 is the maximum number
   // simultaneously live, which happens at levels 2 and 3: Hw (still needed by
   // the back-contractions) plus 9 gradients plus 9 integrands. Left-edge
   // coloring attains that bound, so a regression here is a plan that got worse,
   // not a plan that got unlucky.
-  static_assert(decltype(g9.outputs(r0, r1, r2))::num_pools == 19,
+  static_assert(decltype(g6.outputs(r0, r1, r2))::num_pools == 19,
                 "19 pools for the SEM3D graph");
 
-  g9.outputs(r0, r1, r2)
+  g6.outputs(r0, r1, r2)
       .team_size(team)
       .execute(TeamPolicyTag2<ES>{}, d.f0, d.f1, d.f2);
 }
@@ -344,16 +354,22 @@ inline constexpr int kGraphEnd = __LINE__;
 // Host-side scratch query, for the table. Needs no launch.
 template <int TE>
 std::size_t levelgraph_scratch(Fields d) {
-  auto g0       = make_level_graph<float, ES>(GMap<TE>{});
-  auto [g1, h]  = g0.stage(make_input_node(make_handle<'r', 'p'>(d.H)));
-  auto [g2, hw] = g1.stage(make_input_node(make_handle<'p', 'r'>(d.Hw)));
-  auto [g3, u0] =
-      g2.stage(make_input_node(make_handle<'e', 'k', 'j', 'i'>(d.u0)));
-  auto [g4, u1] =
-      g3.stage(make_input_node(make_handle<'e', 'k', 'j', 'i'>(d.u1)));
-  auto [g5, u2] =
-      g4.stage(make_input_node(make_handle<'e', 'k', 'j', 'i'>(d.u2)));
-  auto [g6, gx0, gx1, gx2, ge0, ge1, ge2, gg0, gg1, gg2] = g5.add(
+  // LEVEL 0 -- the two 5x5 operators, 25 points each.
+  // LEVEL 1 -- the three frames, 125*TE points each.
+  //
+  // The split is forced, not stylistic: a level's members must share one
+  // iteration space, and 25 != 125*TE. What the grouping buys is that the three
+  // frame copies run in ONE TeamVectorRange, so their global loads are all in
+  // flight together instead of five serialized load-store round trips.
+  auto g0 = make_level_graph<float, ES>(GMap<TE>{});
+  auto [g1, h, hw] =
+      g0.add(make_stage_node(make_input_node(make_handle<'r', 'p'>(d.H))),
+             make_stage_node(make_input_node(make_handle<'p', 'r'>(d.Hw))));
+  auto [g2, u0, u1, u2] = g1.add(
+      make_stage_node(make_input_node(make_handle<'e', 'k', 'j', 'i'>(d.u0))),
+      make_stage_node(make_input_node(make_handle<'e', 'k', 'j', 'i'>(d.u1))),
+      make_stage_node(make_input_node(make_handle<'e', 'k', 'j', 'i'>(d.u2))));
+  auto [g3, gx0, gx1, gx2, ge0, ge1, ge2, gg0, gg1, gg2] = g2.add(
       make_contraction_node<'e', 'k', 'j', 'i'>(
           h.template as<'i', 'p'>(), u0.template as<'e', 'k', 'j', 'p'>()),
       make_contraction_node<'e', 'k', 'j', 'i'>(
@@ -372,10 +388,10 @@ std::size_t levelgraph_scratch(Fields d) {
           h.template as<'k', 'p'>(), u1.template as<'e', 'p', 'j', 'i'>()),
       make_contraction_node<'e', 'k', 'j', 'i'>(
           h.template as<'k', 'p'>(), u2.template as<'e', 'p', 'j', 'i'>()));
-  auto [g7, fx0, fx1, fx2, fe0, fe1, fe2, fg0, fg1, fg2] =
-      g6.add(make_combine_node<'e', 'k', 'j', 'i'>(
+  auto [g4, fx0, fx1, fx2, fe0, fe1, fe2, fg0, fg1, fg2] =
+      g3.add(make_combine_node<'e', 'k', 'j', 'i'>(
           gx0, gx1, gx2, ge0, ge1, ge2, gg0, gg1, gg2, Integrand9{d}));
-  auto [g8, tx0, tx1, tx2, te0, te1, te2, tg0, tg1, tg2] = g7.add(
+  auto [g5, tx0, tx1, tx2, te0, te1, te2, tg0, tg1, tg2] = g4.add(
       make_contraction_node<'e', 'k', 'j', 'i'>(
           hw.template as<'p', 'i'>(), fx0.template as<'e', 'k', 'j', 'p'>()),
       make_contraction_node<'e', 'k', 'j', 'i'>(
@@ -394,11 +410,11 @@ std::size_t levelgraph_scratch(Fields d) {
           hw.template as<'p', 'k'>(), fg1.template as<'e', 'p', 'j', 'i'>()),
       make_contraction_node<'e', 'k', 'j', 'i'>(
           hw.template as<'p', 'k'>(), fg2.template as<'e', 'p', 'j', 'i'>()));
-  auto [g9, r0, r1, r2] = g8.add(
+  auto [g6, r0, r1, r2] = g5.add(
       make_combine_node<'e', 'k', 'j', 'i'>(tx0, te0, tg0, WeightedSum{d}),
       make_combine_node<'e', 'k', 'j', 'i'>(tx1, te1, tg1, WeightedSum{d}),
       make_combine_node<'e', 'k', 'j', 'i'>(tx2, te2, tg2, WeightedSum{d}));
-  return g9.outputs(r0, r1, r2).scratch_bytes();
+  return g6.outputs(r0, r1, r2).scratch_bytes();
 }
 
 // ===========================================================================

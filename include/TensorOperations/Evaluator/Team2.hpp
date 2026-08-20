@@ -154,11 +154,12 @@ class Evaluator<TeamPolicyTag2<ES>,
   team_member_t team_;
 };
 
-template <typename ES, typename Operand, typename ModesSeq, typename Tile_>
-class Evaluator<TeamPolicyTag2<ES>, NodeHandle<StagedTag, Operand, ModesSeq>,
-                Tile_> {
+template <typename ES, typename Operand, typename ModesSeq, typename NodeTile,
+          typename Tile_>
+class Evaluator<TeamPolicyTag2<ES>,
+                NodeHandle<StagedTag, Operand, ModesSeq, NodeTile>, Tile_> {
  public:
-  using node_type     = NodeHandle<StagedTag, Operand, ModesSeq>;
+  using node_type     = NodeHandle<StagedTag, Operand, ModesSeq, NodeTile>;
   using policy_tag    = TeamPolicyTag2<ES>;
   using tiling_type   = Tile_;
   using value_type    = typename node_type::value_type;
