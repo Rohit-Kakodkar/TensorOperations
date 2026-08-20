@@ -155,6 +155,12 @@ add_executable(test_slot_liveness tests/test_slot_liveness.cpp)
 target_link_libraries(test_slot_liveness PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_slot_liveness)
 
+# test_label_tiles — one tile extent per label; the equivalence asserts that
+# justify replacing per-node tile derivation with a graph-wide lookup.
+add_executable(test_label_tiles tests/test_label_tiles.cpp)
+target_link_libraries(test_label_tiles PRIVATE tensor GTest::gtest)
+gtest_discover_tests(test_label_tiles)
+
 # test_level_liveness — pooling the level graph's slot store by live range.
 # Custom main() wraps Kokkos init/finalize, as test_slot_liveness does.
 add_executable(test_level_liveness tests/test_level_liveness.cpp)
@@ -206,6 +212,31 @@ endforeach()
 set_tests_properties(SlotGuardNegative.Case1 SlotGuardNegative.Case2
                      PROPERTIES PASS_REGULAR_EXPRESSION
                      "operand [AB] is a SLOT and perm[AB] is not the identity")
+
+# ---------------------------------------------------------------------------
+# Negative-compilation tests for the LABEL-TILE MAP guards. Same rationale and
+# same caveats as the slot guards below.
+#
+# Both guards protect against a silently wrong tile rather than a crash, so each
+# case is pinned to its OWN diagnostic: a duplicate label and a missing label
+# are independent defects and neither should trip the other's assert.
+# ---------------------------------------------------------------------------
+foreach(case 0 1 2)
+  add_executable(labeltiles_guard_neg_${case} EXCLUDE_FROM_ALL
+                 tests/negative/labeltiles_guard_negative.cpp)
+  target_link_libraries(labeltiles_guard_neg_${case} PRIVATE tensor)
+  target_compile_definitions(labeltiles_guard_neg_${case}
+                             PRIVATE LABELTILES_NEG_CASE=${case})
+  add_test(NAME LabelTilesGuardNegative.Case${case}
+           COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}
+                   --target labeltiles_guard_neg_${case} --config $<CONFIG>)
+endforeach()
+set_tests_properties(LabelTilesGuardNegative.Case1 PROPERTIES
+                     PASS_REGULAR_EXPRESSION
+                     "may appear at most once in the map")
+set_tests_properties(LabelTilesGuardNegative.Case2 PROPERTIES
+                     PASS_REGULAR_EXPRESSION
+                     "must appear in the graph's tile")
 
 # ---------------------------------------------------------------------------
 # Negative-compilation tests for the ARENA guard. Same rationale and same

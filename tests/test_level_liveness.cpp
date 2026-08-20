@@ -58,6 +58,11 @@ using TB = StaticTile<kK, kL>;
 using TE = StaticTile<kL, kM>;
 using TC = StaticTile<kTI, kL>;  // == StaticTile<kTI, kM>
 
+// One extent per label. i is multi-tiled (32 over a 16 tile); every other axis
+// is whole, so only i is gridded.
+using Map = LabelTiles<LabelTile<'i', kTI>, LabelWhole<'k', kK>,
+                       LabelWhole<'l', kL>, LabelWhole<'m', kM>>;
+
 float fill_val(int r, int c, int salt) {
   return 0.5f + 0.25f * r - 0.125f * c +
          0.0625f * ((r * 7 + c * 3 + salt) % 11);
@@ -82,11 +87,11 @@ View2 make_view(const char* name, int r, int c, int salt) {
 // Four stages then three levels, so the slot order is
 //   0 E, 1 F, 2 B, 3 A, 4 C0, 5 C1, 6 C2.
 auto level_chain(View2 a, View2 b, View2 e, View2 f) {
-  auto g0      = make_level_graph<float, ES>();
-  auto [g1, E] = g0.stage(make_input_node(make_handle<'l', 'm'>(e)), TE{});
-  auto [g2, F] = g1.stage(make_input_node(make_handle<'l', 'm'>(f)), TE{});
-  auto [g3, B] = g2.stage(make_input_node(make_handle<'k', 'l'>(b)), TB{});
-  auto [g4, A] = g3.stage(make_input_node(make_handle<'i', 'k'>(a)), TA{});
+  auto g0      = make_level_graph<float, ES>(Map{});
+  auto [g1, E] = g0.stage(make_input_node(make_handle<'l', 'm'>(e)));
+  auto [g2, F] = g1.stage(make_input_node(make_handle<'l', 'm'>(f)));
+  auto [g3, B] = g2.stage(make_input_node(make_handle<'k', 'l'>(b)));
+  auto [g4, A] = g3.stage(make_input_node(make_handle<'i', 'k'>(a)));
 
   auto [g5, c0] = g4.add(make_contraction_node<'i', 'l'>(A, B));
   auto [g6, c1] =
@@ -133,11 +138,11 @@ static_assert(Impl::lg_pool_count<ChainLevels, 4, 6>() == 5,
 // live and must never share. This is the property a per-MEMBER port of the DAG
 // analysis would get wrong, and it would get it wrong silently.
 auto level_wide(View2 a, View2 b, View2 e, View2 f) {
-  auto g0      = make_level_graph<float, ES>();
-  auto [g1, E] = g0.stage(make_input_node(make_handle<'l', 'm'>(e)), TE{});
-  auto [g2, F] = g1.stage(make_input_node(make_handle<'l', 'm'>(f)), TE{});
-  auto [g3, B] = g2.stage(make_input_node(make_handle<'k', 'l'>(b)), TB{});
-  auto [g4, A] = g3.stage(make_input_node(make_handle<'i', 'k'>(a)), TA{});
+  auto g0      = make_level_graph<float, ES>(Map{});
+  auto [g1, E] = g0.stage(make_input_node(make_handle<'l', 'm'>(e)));
+  auto [g2, F] = g1.stage(make_input_node(make_handle<'l', 'm'>(f)));
+  auto [g3, B] = g2.stage(make_input_node(make_handle<'k', 'l'>(b)));
+  auto [g4, A] = g3.stage(make_input_node(make_handle<'i', 'k'>(a)));
 
   auto [g5, c0] = g4.add(make_contraction_node<'i', 'l'>(A, B));
   auto [g6, x, y] =
