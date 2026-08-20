@@ -385,3 +385,32 @@ if(TENSOR_OPS_BUILD_BENCHMARKS)
   target_link_libraries(bench_sem3d_levelgraph_li PRIVATE tensor)
   target_compile_options(bench_sem3d_levelgraph_li PRIVATE -lineinfo)
 endif()
+
+# sfpp_min — a minimal, zero-dependency stand-in for SPECFEM++'s 3D elastic
+# isotropic stiffness kernel and its data layouts. Links Kokkos ONLY, never
+# `tensor`: the dummy kernel must stay uncontaminated by the library it will be
+# compared against. See plans/sprint1/ and plans/minimal-sfpp-library-sprints.md.
+add_library(sfpp_min INTERFACE)
+target_include_directories(sfpp_min INTERFACE sfpp_min/)
+target_link_libraries(sfpp_min INTERFACE Kokkos::kokkos)
+target_compile_features(sfpp_min INTERFACE cxx_std_20)
+
+add_executable(sfpp_min_gll sfpp_min/tests/test_gll.cpp)
+target_link_libraries(sfpp_min_gll PRIVATE sfpp_min GTest::gtest)
+gtest_discover_tests(sfpp_min_gll TEST_PREFIX sfpp_min.)
+
+add_executable(sfpp_min_layout sfpp_min/tests/test_layout.cpp)
+target_link_libraries(sfpp_min_layout PRIVATE sfpp_min GTest::gtest)
+gtest_discover_tests(sfpp_min_layout TEST_PREFIX sfpp_min.)
+
+add_executable(sfpp_min_mesh sfpp_min/tests/test_mesh.cpp)
+target_link_libraries(sfpp_min_mesh PRIVATE sfpp_min GTest::gtest)
+gtest_discover_tests(sfpp_min_mesh TEST_PREFIX sfpp_min.)
+
+add_executable(sfpp_min_geometry sfpp_min/tests/test_geometry.cpp)
+target_link_libraries(sfpp_min_geometry PRIVATE sfpp_min GTest::gtest)
+gtest_discover_tests(sfpp_min_geometry TEST_PREFIX sfpp_min.)
+
+add_executable(sfpp_min_reference sfpp_min/tests/test_reference.cpp)
+target_link_libraries(sfpp_min_reference PRIVATE sfpp_min GTest::gtest)
+gtest_discover_tests(sfpp_min_reference TEST_PREFIX sfpp_min.)
