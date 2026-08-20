@@ -132,7 +132,7 @@ template <typename V, typename ES, typename LevelsT, std::size_t NumStages,
 KOKKOS_FUNCTION auto lg_carve(const Team& team, const StageTilesT& stage_tiles,
                               std::index_sequence<Ss...>,
                               std::index_sequence<Ls...>) {
-  return carve_slot_store<V, ES>(
+  return carve_arena_slot_store<V, ES>(
       team, stage_tiles.template get<Ss>()...,
       lg_slot_tile_t<LevelsT, NumStages, NumStages + Ls>{}...);
 }
@@ -142,7 +142,7 @@ template <typename V, typename ES, typename LevelsT, std::size_t NumStages,
 std::size_t lg_scratch_bytes(const StageTilesT& stage_tiles,
                              std::index_sequence<Ss...>,
                              std::index_sequence<Ls...>) {
-  return slot_store_bytes<V, ES>(
+  return arena_slot_store_bytes<V, ES>(
       stage_tiles.template get<Ss>()...,
       lg_slot_tile_t<LevelsT, NumStages, NumStages + Ls>{}...);
 }
