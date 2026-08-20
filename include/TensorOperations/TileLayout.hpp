@@ -48,6 +48,11 @@ struct StaticTile;
 template <typename... Ts>
 struct DeviceTuple;
 
+namespace Impl {
+struct StaticOffset;
+struct DynamicOffset;
+}  // namespace Impl
+
 // ---------------------------------------------------------------------------
 // StaticLayout<Extents, Strides, Order> — the one generic static layout.
 //
@@ -61,10 +66,24 @@ struct DeviceTuple;
 // pack may be deduced per specialisation. Defined below, after the Impl helpers
 // it needs; declared here so those helpers can name it.
 // ---------------------------------------------------------------------------
-template <typename Extents, typename Strides, typename Order>
+template <typename Extents, typename Strides, typename Order,
+          typename Offset = Impl::StaticOffset>
 struct StaticLayout;
 
 namespace Impl {
+
+struct StaticOffset {
+  KOKKOS_FORCEINLINE_FUNCTION static constexpr int base_offset() noexcept {
+    return 0;
+  }
+};
+
+struct DynamicOffset {
+  int                                       base_offset_ = 0;
+  KOKKOS_FORCEINLINE_FUNCTION constexpr int base_offset() const noexcept {
+    return base_offset_;
+  }
+};
 
 template <int N>
 struct Index {
@@ -126,10 +145,6 @@ struct StaticTileLayoutBase {
   KOKKOS_FORCEINLINE_FUNCTION static constexpr int extent(int k) noexcept {
     constexpr int e[] = {Extents...};
     return e[k];
-  }
-
-  KOKKOS_FORCEINLINE_FUNCTION static constexpr int base_offset() noexcept {
-    return 0;
   }
 
   KOKKOS_FORCEINLINE_FUNCTION static constexpr int size() noexcept {
@@ -531,17 +546,17 @@ struct DynamicTileLayoutBase {
 // All strides, extents, flat(), flat_offset(), and decode are compile-time
 // evaluated — no runtime arithmetic on the stride/extent arrays.
 // ---------------------------------------------------------------------------
-template <int... Extents, int... Strides, int... Order>
+template <int... Extents, int... Strides, int... Order, typename Offset>
 struct StaticLayout<StaticTile<Extents...>,
                     std::integer_sequence<int, Strides...>,
-                    std::integer_sequence<int, Order...>>
-    : Impl::StaticTileLayoutBase<Extents...> {
+                    std::integer_sequence<int, Order...>, Offset>
+    : Impl::StaticTileLayoutBase<Extents...>, Offset {
   using base = Impl::StaticTileLayoutBase<Extents...>;
-  using base::base_offset;
   using base::extent;
   using base::num_elements;
   using base::rank;
   using base::size;
+  using Offset::base_offset;
 
   static_assert(sizeof...(Strides) == rank,
                 "StaticLayout: Strides must have exactly rank elements");
@@ -610,8 +625,8 @@ struct StaticLayout<StaticTile<Extents...>,
     return flat_impl(std::index_sequence_for<I...>{}, idx...);
   }
 
-  KOKKOS_FORCEINLINE_FUNCTION static constexpr int flat_offset(
-      const Impl::Index<rank>& coord) noexcept {
+  KOKKOS_FORCEINLINE_FUNCTION constexpr int flat_offset(
+      const Impl::Index<rank>& coord) const noexcept {
     return flat_offset_impl_(coord, std::make_index_sequence<rank>{});
   }
 
@@ -641,8 +656,9 @@ struct StaticLayout<StaticTile<Extents...>,
   }
 
   template <std::size_t... Ds>
-  KOKKOS_FORCEINLINE_FUNCTION static constexpr int flat_offset_impl_(
-      const Impl::Index<rank>& coord, std::index_sequence<Ds...>) noexcept {
+  KOKKOS_FORCEINLINE_FUNCTION constexpr int flat_offset_impl_(
+      const Impl::Index<rank>& coord,
+      std::index_sequence<Ds...>) const noexcept {
     return (base_offset() + ... +
             (coord.template get<static_cast<int>(Ds)>() *
              stride<static_cast<int>(Ds)>()));
@@ -682,17 +698,19 @@ struct StaticLayout<StaticTile<Extents...>,
 // stride(int d) is NOT provided: a multi-leaf mode has no single stride. This
 // type therefore does not satisfy the TensorLike concept.
 // ---------------------------------------------------------------------------
-template <typename... ExtSeqs, typename... StrSeqs, typename... OrdSeqs>
+template <typename... ExtSeqs, typename... StrSeqs, typename... OrdSeqs,
+          typename Offset>
 struct StaticLayout<DeviceTuple<ExtSeqs...>, DeviceTuple<StrSeqs...>,
-                    DeviceTuple<OrdSeqs...>>
-    : Impl::StaticTileLayoutBase<Impl::Mode<ExtSeqs, StrSeqs>::mode_size...> {
+                    DeviceTuple<OrdSeqs...>, Offset>
+    : Impl::StaticTileLayoutBase<Impl::Mode<ExtSeqs, StrSeqs>::mode_size...>,
+      Offset {
   using base =
       Impl::StaticTileLayoutBase<Impl::Mode<ExtSeqs, StrSeqs>::mode_size...>;
-  using base::base_offset;
   using base::extent;  // collapsed: extent(d) and extent<I>() both -> int
   using base::num_elements;
   using base::rank;
   using base::size;
+  using Offset::base_offset;
 
   template <std::size_t M>
   using mode_t = Impl::Mode<Impl::type_at_t<M, ExtSeqs...>,
@@ -743,8 +761,8 @@ struct StaticLayout<DeviceTuple<ExtSeqs...>, DeviceTuple<StrSeqs...>,
     return flat_impl(std::index_sequence_for<I...>{}, idx...);
   }
 
-  KOKKOS_FORCEINLINE_FUNCTION static constexpr int flat_offset(
-      const Impl::Index<rank>& coord) noexcept {
+  KOKKOS_FORCEINLINE_FUNCTION constexpr int flat_offset(
+      const Impl::Index<rank>& coord) const noexcept {
     return flat_offset_impl_(coord, std::make_index_sequence<rank>{});
   }
 
@@ -782,8 +800,9 @@ struct StaticLayout<DeviceTuple<ExtSeqs...>, DeviceTuple<StrSeqs...>,
   }
 
   template <std::size_t... Ms>
-  KOKKOS_FORCEINLINE_FUNCTION static constexpr int flat_offset_impl_(
-      const Impl::Index<rank>& coord, std::index_sequence<Ms...>) noexcept {
+  KOKKOS_FORCEINLINE_FUNCTION constexpr int flat_offset_impl_(
+      const Impl::Index<rank>& coord,
+      std::index_sequence<Ms...>) const noexcept {
     return (base_offset() + ... +
             static_cast<int>(mode_t<Ms>::offset(
                 coord.template get<static_cast<int>(Ms)>())));
@@ -812,6 +831,179 @@ struct StaticLayout<DeviceTuple<ExtSeqs...>, DeviceTuple<StrSeqs...>,
         mode_of<Ms>(linear, std::make_index_sequence<mode_t<Ms>::arity>{})...};
   }
 };
+
+struct ALL_t {};
+inline constexpr ALL_t ALL{};
+
+namespace Impl {
+
+template <typename T>
+inline constexpr bool is_all_v = std::is_same_v<std::decay_t<T>, ALL_t>;
+
+template <int Idx, typename Seq>
+struct SeqAt;
+template <int Idx, int H, int... T>
+struct SeqAt<Idx, std::integer_sequence<int, H, T...>>
+    : SeqAt<Idx - 1, std::integer_sequence<int, T...>> {};
+template <int H, int... T>
+struct SeqAt<0, std::integer_sequence<int, H, T...>> {
+  static constexpr int value = H;
+};
+
+template <typename IdxSeq, typename Seq>
+struct SeqSelect;
+template <int... K, typename Seq>
+struct SeqSelect<std::integer_sequence<int, K...>, Seq> {
+  using type = std::integer_sequence<int, SeqAt<K, Seq>::value...>;
+};
+
+template <int Idx, typename Tup>
+struct TupleAt;
+template <int Idx, typename H, typename... T>
+struct TupleAt<Idx, DeviceTuple<H, T...>>
+    : TupleAt<Idx - 1, DeviceTuple<T...>> {};
+template <typename H, typename... T>
+struct TupleAt<0, DeviceTuple<H, T...>> {
+  using type = H;
+};
+
+template <typename IdxSeq, typename Tup>
+struct TupleSelect;
+template <int... K, typename Tup>
+struct TupleSelect<std::integer_sequence<int, K...>, Tup> {
+  using type = DeviceTuple<typename TupleAt<K, Tup>::type...>;
+};
+
+template <int V, typename Seq>
+struct SeqContains;
+template <int V, int... G>
+struct SeqContains<V, std::integer_sequence<int, G...>> {
+  static constexpr bool value = (false || ... || (G == V));
+};
+
+template <int V, typename G>
+struct CountLess;
+template <int V, int... G>
+struct CountLess<V, std::integer_sequence<int, G...>> {
+  static constexpr int value = (0 + ... + (G < V ? 1 : 0));
+};
+
+template <typename KeptSeq, int O>
+using ReindexKeptOrder =
+    std::conditional_t<SeqContains<O, KeptSeq>::value,
+                       std::integer_sequence<int, CountLess<O, KeptSeq>::value>,
+                       std::integer_sequence<int>>;
+
+template <typename KeptSeq, typename OrdSeq>
+struct OrderSelect;
+template <typename KeptSeq, int... O>
+struct OrderSelect<KeptSeq, std::integer_sequence<int, O...>> {
+  using type = concat_seq_t<ReindexKeptOrder<KeptSeq, O>...>;
+};
+
+template <typename Tup>
+struct ConcatTupleSeqs;
+template <typename... Seqs>
+struct ConcatTupleSeqs<DeviceTuple<Seqs...>> {
+  using type = concat_seq_t<Seqs...>;
+};
+
+template <typename Seq, typename G>
+struct RenormOrd;
+template <int... O, typename G>
+struct RenormOrd<std::integer_sequence<int, O...>, G> {
+  using type = std::integer_sequence<int, CountLess<O, G>::value...>;
+};
+
+template <typename OrdTup, typename G>
+struct RenormOrdTuple;
+template <typename... Seqs, typename G>
+struct RenormOrdTuple<DeviceTuple<Seqs...>, G> {
+  using type = DeviceTuple<typename RenormOrd<Seqs, G>::type...>;
+};
+
+template <typename Indices, typename... I>
+struct KeptDimsOf;
+template <std::size_t... J, typename... I>
+struct KeptDimsOf<std::index_sequence<J...>, I...> {
+  using type = concat_seq_t<std::conditional_t<
+      is_all_v<I>, std::integer_sequence<int, static_cast<int>(J)>,
+      std::integer_sequence<int>>...>;
+};
+template <typename... I>
+using kept_dims_t =
+    typename KeptDimsOf<std::index_sequence_for<I...>, I...>::type;
+
+template <typename KeptDims, typename Layout>
+struct SelectModes;
+
+template <int... K, int... E, int... S, int... O, typename Off>
+struct SelectModes<
+    std::integer_sequence<int, K...>,
+    StaticLayout<StaticTile<E...>, std::integer_sequence<int, S...>,
+                 std::integer_sequence<int, O...>, Off>> {
+ private:
+  using KeptSeq = std::integer_sequence<int, K...>;
+
+ public:
+  using type = StaticLayout<
+      seq_to_tile_t<
+          typename SeqSelect<KeptSeq, std::integer_sequence<int, E...>>::type>,
+      typename SeqSelect<KeptSeq, std::integer_sequence<int, S...>>::type,
+      typename OrderSelect<KeptSeq, std::integer_sequence<int, O...>>::type,
+      DynamicOffset>;
+};
+
+template <int... K, typename... ExtSeqs, typename... StrSeqs,
+          typename... OrdSeqs, typename Off>
+struct SelectModes<
+    std::integer_sequence<int, K...>,
+    StaticLayout<DeviceTuple<ExtSeqs...>, DeviceTuple<StrSeqs...>,
+                 DeviceTuple<OrdSeqs...>, Off>> {
+ private:
+  using KeptSeq = std::integer_sequence<int, K...>;
+  using RedExt  = typename TupleSelect<KeptSeq, DeviceTuple<ExtSeqs...>>::type;
+  using RedStr  = typename TupleSelect<KeptSeq, DeviceTuple<StrSeqs...>>::type;
+  using RedOrdRaw =
+      typename TupleSelect<KeptSeq, DeviceTuple<OrdSeqs...>>::type;
+  using G      = typename ConcatTupleSeqs<RedOrdRaw>::type;
+  using RedOrd = typename RenormOrdTuple<RedOrdRaw, G>::type;
+
+ public:
+  using type = StaticLayout<RedExt, RedStr, RedOrd, DynamicOffset>;
+};
+
+template <typename KeptDims, typename Layout>
+using select_modes_t = typename SelectModes<KeptDims, Layout>::type;
+
+template <typename T>
+KOKKOS_FORCEINLINE_FUNCTION constexpr int slice_index_value(T v) noexcept {
+  if constexpr (is_all_v<T>)
+    return 0;
+  else
+    return static_cast<int>(v);
+}
+
+}  // namespace Impl
+
+template <typename Extents, typename Strides, typename Order, typename Offset,
+          typename... I>
+KOKKOS_FORCEINLINE_FUNCTION auto slice(
+    const StaticLayout<Extents, Strides, Order, Offset>& layout, I... idx) {
+  using SrcLayout = StaticLayout<Extents, Strides, Order, Offset>;
+  static_assert(static_cast<int>(sizeof...(I)) == SrcLayout::rank,
+                "slice: expects exactly rank indices -- an integer to fix a "
+                "mode or TensorOperations::ALL to keep it");
+  using KeptDims = Impl::kept_dims_t<I...>;
+  static_assert(KeptDims::size() >= 1, "slice: at least one mode must be ALL");
+  using Reduced = Impl::select_modes_t<KeptDims, SrcLayout>;
+
+  const Kokkos::Array<int, SrcLayout::rank> full{
+      Impl::slice_index_value(idx)...};
+  Reduced reduced;
+  reduced.base_offset_ = layout.flat_offset(Impl::Index<SrcLayout::rank>{full});
+  return reduced;
+}
 
 // ---------------------------------------------------------------------------
 // StaticTileLayoutRight — compile-time extents, row-major (rightmost fastest)
@@ -1567,7 +1759,8 @@ struct ReshapeReproducesSource<Result, StaticTile<E...>,
     constexpr int o[] = {O...};
     const int     n   = static_cast<int>(Result::num_elements);
     for (int k = 0; k < n; ++k)
-      if (Result::flat_offset(Result{}[k]) != reshape_stream_offset(e, s, o, k))
+      if (Result{}.flat_offset(Result{}[k]) !=
+          reshape_stream_offset(e, s, o, k))
         return false;
     return true;
   }

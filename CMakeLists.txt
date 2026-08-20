@@ -88,6 +88,11 @@ add_executable(test_regroup_view tests/test_regroup_view.cpp)
 target_link_libraries(test_regroup_view PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_regroup_view)
 
+# test_slice — custom main() wraps Kokkos init/finalize
+add_executable(test_slice tests/test_slice.cpp)
+target_link_libraries(test_slice PRIVATE tensor GTest::gtest)
+gtest_discover_tests(test_slice)
+
 add_executable(test_labelled_operand tests/test_labelled_operand.cpp)
 target_link_libraries(test_labelled_operand PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_labelled_operand)
@@ -296,4 +301,25 @@ if(TENSOR_OPS_BUILD_BENCHMARKS)
   # NR=2 is also what forbids TE=1 in the benchmark's sweep -- SB = 25 is odd.
   target_compile_definitions(bench_sem_stiffness_3d PRIVATE
     TENSOR_GEMM_MT=5 TENSOR_GEMM_NT=5 TENSOR_GEMM_NR=2)
+
+  # --- 3D SEM stiffness on the LEVEL GRAPH (Sprint 5) -----------------------
+  # Note what is ABSENT, and that it is the point: no TENSOR_GEMM_* overrides.
+  # The Tag2 contraction is a plain dot product with no register blocking, so
+  # NGLL=5 needs no per-target GEMM retuning and TE=1 becomes legal -- neither
+  # is true of bench_sem_stiffness_3d above, whose target must pin MT/NT/NR and
+  # therefore cannot express TE=1 at all. TE=1 is where both this benchmark's
+  # implementations are fastest.
+  #
+  # The sweep stops at TE=8: LevelGraph carves 35 slots with no liveness pooling
+  # (that is Sprint 4), so scratch is 200 + 16500*TE bytes and TE=16 (264 KB)
+  # exceeds the H100's ~227 KB opt-in limit. The level-fusion spike's best tile
+  # does not survive four unpooled levels.
+  add_executable(bench_sem3d_levelgraph
+    benchmarks/sem_stiffness_3d/bench_sem3d_levelgraph.cpp)
+  target_link_libraries(bench_sem3d_levelgraph PRIVATE tensor)
+
+  add_executable(bench_sem3d_levelgraph_li
+    benchmarks/sem_stiffness_3d/bench_sem3d_levelgraph.cpp)
+  target_link_libraries(bench_sem3d_levelgraph_li PRIVATE tensor)
+  target_compile_options(bench_sem3d_levelgraph_li PRIVATE -lineinfo)
 endif()

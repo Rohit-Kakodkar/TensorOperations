@@ -64,7 +64,7 @@ static_assert(Manual2D::extent<0>() == 4 && Manual2D::extent<1>() == 8);
 static_assert(Manual2D::stride(0) == 8 && Manual2D::stride(1) == 1);
 static_assert(Manual2D::stride<0>() == 8 && Manual2D::stride<1>() == 1);
 static_assert(Manual2D{}.flat(2, 3) == 19);
-static_assert(Manual2D::flat_offset(Impl::Index<2>{2, 3}) == 19);
+static_assert(Manual2D{}.flat_offset(Impl::Index<2>{2, 3}) == 19);
 
 // ---------------------------------------------------------------------------
 // 2. Padded strides — the capability no named layout has.
@@ -82,7 +82,7 @@ static_assert(Padded2D::stride<0>() == 9 && Padded2D::stride<1>() == 1);
 static_assert(Padded2D{}.flat(0, 7) == 7);
 static_assert(Padded2D{}.flat(1, 0) == 9);   // skips the pad slot at 8
 static_assert(Padded2D{}.flat(3, 7) == 34);  // last element, buffer needs 35
-static_assert(Padded2D::flat_offset(Impl::Index<2>{1, 0}) == 9);
+static_assert(Padded2D{}.flat_offset(Impl::Index<2>{1, 0}) == 9);
 
 // A padded 3-D layout with an arbitrary memory order: extents {4,8,3},
 // Order={2,0,1} (dim 2 fastest), packed strides would be {3,12,1}; pad the
@@ -115,7 +115,7 @@ static_assert(Nested1::base_offset() == 0);
 static_assert(Nested1::extent(0) == 4 && Nested1::extent(1) == 8);
 static_assert(Nested1::extent<0>() == 4 && Nested1::extent<1>() == 8);
 static_assert(Nested1{}.flat(2, 3) == 19);  // == Manual2D{}.flat(2, 3)
-static_assert(Nested1::flat_offset(Impl::Index<2>{2, 3}) == 19);
+static_assert(Nested1{}.flat_offset(Impl::Index<2>{2, 3}) == 19);
 
 // The mode_* family agrees with the flat layout's, which now spells it too.
 static_assert(Nested1::mode_arity<0>() == 1 && Nested1::mode_arity<1>() == 1);
@@ -175,7 +175,7 @@ static_assert(Ragged{}.flat(0, 4) == 24);    // j1 -> stride 24
 static_assert(Ragged{}.flat(0, 20) == 120);  // j2 -> stride 120
 // i=5 -> (1,2); j=119 -> (3,4,5): 1 + 16 + 6 + 96 + 600
 static_assert(Ragged{}.flat(5, 119) == 719);
-static_assert(Ragged::flat_offset(Impl::Index<2>{5, 119}) == 719);
+static_assert(Ragged{}.flat_offset(Impl::Index<2>{5, 119}) == 719);
 
 // ---------------------------------------------------------------------------
 // 4. The generic reshape — reshape(StaticLayout, Tile, Order).
