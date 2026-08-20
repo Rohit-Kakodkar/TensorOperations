@@ -222,24 +222,17 @@ constexpr void dag_note_all_reads(std::array<std::size_t, NS>& last,
 // reach for if a real graph ever shows the spread; it also gives up left-edge's
 // optimality guarantee, and it needs sizes as compile-time constants, which is
 // why it is not what is here.
-template <typename NodesT, std::size_t... Roots>
-constexpr auto dag_pool_of_slot() {
-  constexpr std::size_t NS = dag_num_slots<NodesT>();
-  constexpr std::size_t NN = tuple_size_v<NodesT>;
-
-  std::array<std::size_t, NS> def{}, last{}, pool{};
-  for (std::size_t s = 0; s < NS; ++s) {
-    def[s] = dag_slot_owner<NodesT>(s);
-    // A slot nobody reads is still live where it is written.
-    last[s] = def[s];
-  }
-  dag_note_all_reads<NodesT, NS>(last, std::make_index_sequence<NN>{});
-
-  // A designated output is read by dag_store_roots AFTER every node has run, so
-  // it outlives the whole list. NN is one past the last node index.
-  const std::array<std::size_t, sizeof...(Roots)> roots{Roots...};
-  for (std::size_t i = 0; i < sizeof...(Roots); ++i) last[roots[i]] = NN;
-
+//
+// SHARED WITH THE LEVEL GRAPH. The coloring itself knows nothing about nodes,
+// levels or tiles -- it is a function of two integer arrays. LevelPlan.hpp
+// builds its own def/last on a LEVEL timeline and calls this, so there is one
+// copy of the algorithm rather than two that can silently diverge. Both callers
+// must supply CLOSED ranges; the overlap test below relies on it.
+template <std::size_t NS>
+constexpr std::array<std::size_t, NS> left_edge_colour(
+    const std::array<std::size_t, NS>& def,
+    const std::array<std::size_t, NS>& last) {
+  std::array<std::size_t, NS> pool{};
   for (std::size_t s = 0; s < NS; ++s) {
     std::size_t p = 0;
     while (true) {
@@ -255,6 +248,27 @@ constexpr auto dag_pool_of_slot() {
     pool[s] = p;
   }
   return pool;
+}
+
+template <typename NodesT, std::size_t... Roots>
+constexpr auto dag_pool_of_slot() {
+  constexpr std::size_t NS = dag_num_slots<NodesT>();
+  constexpr std::size_t NN = tuple_size_v<NodesT>;
+
+  std::array<std::size_t, NS> def{}, last{};
+  for (std::size_t s = 0; s < NS; ++s) {
+    def[s] = dag_slot_owner<NodesT>(s);
+    // A slot nobody reads is still live where it is written.
+    last[s] = def[s];
+  }
+  dag_note_all_reads<NodesT, NS>(last, std::make_index_sequence<NN>{});
+
+  // A designated output is read by dag_store_roots AFTER every node has run, so
+  // it outlives the whole list. NN is one past the last node index.
+  const std::array<std::size_t, sizeof...(Roots)> roots{Roots...};
+  for (std::size_t i = 0; i < sizeof...(Roots); ++i) last[roots[i]] = NN;
+
+  return left_edge_colour<NS>(def, last);
 }
 
 template <typename NodesT, std::size_t... Roots>

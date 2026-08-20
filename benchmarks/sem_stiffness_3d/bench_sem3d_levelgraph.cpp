@@ -326,6 +326,14 @@ void levelgraph_sem3d(Fields d, int team) {
   static_assert(Plan::num_levels == 4, "four levels");
   static_assert(Plan::num_slots == 5 + 9 + 9 + 9 + 3, "5 stages + 30 members");
 
+  // What liveness pooling costs those 35 slots. 19 is the maximum number
+  // simultaneously live, which happens at levels 2 and 3: Hw (still needed by
+  // the back-contractions) plus 9 gradients plus 9 integrands. Left-edge
+  // coloring attains that bound, so a regression here is a plan that got worse,
+  // not a plan that got unlucky.
+  static_assert(decltype(g9.outputs(r0, r1, r2))::num_pools == 19,
+                "19 pools for the SEM3D graph");
+
   g9.outputs(r0, r1, r2)
       .team_size(team)
       .execute(TeamPolicyTag2<ES>{}, d.f0, d.f1, d.f2);

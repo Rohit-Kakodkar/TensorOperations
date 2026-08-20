@@ -172,6 +172,104 @@ inline constexpr std::size_t lg_total_members_v = lg_total_members<LevelsT>();
 template <std::size_t NumStages, std::size_t S>
 inline constexpr bool lg_is_stage_slot_v = lg_is_stage_slot<NumStages>(S);
 
+// --- liveness, on a LEVEL timeline -----------------------------------------
+//
+// Slots that cannot be alive at once share a buffer, which is what takes the
+// SEM3D graph from 35 buffers to 19 and its team scratch from 16,848 to 9,584
+// bytes at TE=1 -- occupancy 13 to 24 blocks/SM, and on that kernel that is
+// worth about 12%.
+//
+// THE TIMELINE IS LEVELS, NOT MEMBERS, AND THAT IS A CORRECTNESS REQUIREMENT.
+// A DagGraph node reads its operands and writes its outputs in ONE evaluation,
+// so ranges closed at both ends make reuse safe at a node. A level does not
+// work that way: barriers exist only at level ends, and every member of a level
+// runs interleaved inside one TeamVectorRange, so every slot a level touches is
+// live for the whole level. Ranking members within a level would produce a plan
+// that is wrong exactly where nothing checks it.
+//
+//   t = 0            the stages
+//   t = L + 1        level L
+//   t = NumLevels+1  the root store, which runs after every level
+//
+// Ranges are CLOSED at both ends, so a slot defined at level L and a slot last
+// read at level L overlap at L and can never pool together.
+//
+// The operand scan is DagGraph's: dag_note_node_reads dispatches on node tag,
+// and a level's members are the same ContractionTag / CombineTag nodes with the
+// same SlotTag operands. A stage node wraps an InputTag, so it reports no slot
+// reads and the branch is a no-op. Only the iteration is new.
+
+template <typename LevelT, std::size_t NS, std::size_t... Ms>
+constexpr void lg_note_level_reads(std::array<std::size_t, NS>& last,
+                                   std::size_t t, std::index_sequence<Ms...>) {
+  (dag_note_node_reads<tuple_element_t<Ms, LevelT>, NS>(last, t), ...);
+}
+
+template <typename LevelsT, std::size_t NS, std::size_t... Ls>
+constexpr void lg_note_all_reads(std::array<std::size_t, NS>& last,
+                                 std::index_sequence<Ls...>) {
+  (lg_note_level_reads<tuple_element_t<Ls, LevelsT>, NS>(
+       last, Ls + 1,
+       std::make_index_sequence<tuple_size_v<tuple_element_t<Ls, LevelsT>>>{}),
+   ...);
+}
+
+template <typename LevelsT, std::size_t NumStages, std::size_t... Roots>
+constexpr auto lg_pool_of_slot() {
+  constexpr std::size_t NS = lg_num_slots<LevelsT, NumStages>();
+  constexpr std::size_t NL = tuple_size_v<LevelsT>;
+
+  std::array<std::size_t, NS> def{}, last{};
+  for (std::size_t s = 0; s < NS; ++s) {
+    // lg_slot_level returns NL as a SENTINEL for a stage slot, not a level, so
+    // stages are mapped to t=0 explicitly rather than by trusting the return.
+    def[s] = lg_is_stage_slot<NumStages>(s)
+                 ? std::size_t{0}
+                 : lg_slot_level<LevelsT, NumStages>(s) + 1;
+    // A slot nobody reads is still live where it is written.
+    last[s] = def[s];
+  }
+  lg_note_all_reads<LevelsT, NS>(last, std::make_index_sequence<NL>{});
+
+  // A designated output is read by lg_store_roots AFTER every level has run.
+  const std::array<std::size_t, sizeof...(Roots)> roots{Roots...};
+  for (std::size_t i = 0; i < sizeof...(Roots); ++i) last[roots[i]] = NL + 1;
+
+  return left_edge_colour<NS>(def, last);
+}
+
+template <typename LevelsT, std::size_t NumStages, std::size_t... Roots>
+constexpr std::size_t lg_pool_count() {
+  const auto  p = lg_pool_of_slot<LevelsT, NumStages, Roots...>();
+  std::size_t n = 0;
+  for (std::size_t s = 0; s < p.size(); ++s)
+    if (p[s] + 1 > n) n = p[s] + 1;
+  return n;
+}
+
+// Keyed on an index_sequence of the roots so the root set travels as one type,
+// for the same reason dag_slot_pool_v is: the functions above are host-only
+// constexpr (std::array is), so device code must name a constant.
+template <typename LevelsT, std::size_t NumStages, typename RootsSeq>
+struct lg_plan;
+template <typename LevelsT, std::size_t NumStages, std::size_t... Roots>
+struct lg_plan<LevelsT, NumStages, std::index_sequence<Roots...>> {
+  static constexpr auto of_slot() {
+    return lg_pool_of_slot<LevelsT, NumStages, Roots...>();
+  }
+  static constexpr std::size_t count() {
+    return lg_pool_count<LevelsT, NumStages, Roots...>();
+  }
+};
+
+template <typename LevelsT, std::size_t NumStages, typename RootsSeq,
+          std::size_t S>
+inline constexpr std::size_t lg_slot_pool_v =
+    lg_plan<LevelsT, NumStages, RootsSeq>::of_slot()[S];
+template <typename LevelsT, std::size_t NumStages, typename RootsSeq>
+inline constexpr std::size_t lg_pool_count_v =
+    lg_plan<LevelsT, NumStages, RootsSeq>::count();
+
 template <typename Node>
 using member_out_layout_t =
     typename SlotView<typename Node::value_type, typename Node::exec_space,
