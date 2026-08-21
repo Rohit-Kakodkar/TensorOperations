@@ -37,6 +37,33 @@
 //   * lambda is computed as (kappa + 4/3 mu) - 2 mu, not kappa - 2/3 mu.
 //     Same value, two extra flops, different rounding.
 //
+// CALIBRATION STATUS (accepted 2026-08-21): 13 of 14 ground-truth counters are
+// reproduced -- FFMA 136.0000, registers 48, shmem 26,188 B, 5 blocks/SM, block
+// 256, and all five memory-traffic counters inside 1%. The one open residual is
+// warp-inst/GLL point, 21.316 against 22.388 (-4.8%).
+//
+// That residual is ATTRIBUTED, not unexplained. Per-SASS-instruction profiling
+// of both binaries shows every memory and floating-point opcode identical to
+// four decimals DYNAMICALLY (LDG 0.8020=0.8020, LDS 3.8400=3.8400, FFMA
+// 4.3520=4.3520, FMUL/FADD/STS/RED/BAR all zero delta). The entire gap is
+// upstream's iterator bookkeeping: uniform-datapath address work (39%, upstream
+// passes a 15,832 B `assembly` by value against our 1,416 B parameter block),
+// branch/reconvergence (27%), and vector integer (34%).
+//
+// Accepted rather than closed, for two reasons: the deficit is COMMON-MODE (the
+// kernel this baseline exists to measure will also lack SPECFEM++'s iterator
+// machinery, so it cancels in that comparison), and it points the SAFE way --
+// 4.8% fewer instructions but 1.017x SLOWER than the reference, so this
+// baseline is marginally weak, not unrepresentatively strong.
+//
+// RE-OPEN THIS if any of the following becomes true:
+//   - a new kernel changes the iteration/indexing machinery, so the deficit
+//     stops being common-mode;
+//   - the kernel becomes issue-bound rather than latency-bound, putting those
+//     uniform/branch instructions on the critical path;
+//   - upstream changes stiffness_kernels.hpp, domain_view.hpp or
+//     chunked_domain_iterator.hpp -- then recalibrate from scratch.
+//
 // The no-op consumers below are NOT placeholders. They mirror the empty
 // functions the real tag combination resolves to, so that nvcc is handed the
 // same dead-code-elimination decision it is handed upstream. Forcing the loads
