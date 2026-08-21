@@ -13,10 +13,11 @@ namespace sfpp_min {
 template <typename Offset>
 struct DomainAccessor {
   Kokkos::View<real_t*> d;
+  Offset                off;
 
   KOKKOS_INLINE_FUNCTION real_t& operator()(int ispec, int iz, int iy,
                                             int ix) const {
-    return d(Offset::at(ispec, iz, iy, ix));
+    return d(off(ispec, iz, iy, ix));
   }
 };
 
@@ -31,14 +32,15 @@ class DomainArray {
 
   DomainArray(const std::string& label, int nspec)
       : nspec_(nspec),
-        d_(label, Offset::span(nspec)),
+        off_(nspec),
+        d_(label, off_.span()),
         h_(Kokkos::create_mirror_view(d_)) {}
 
   real_t& host(int ispec, int iz, int iy, int ix) const {
-    return h_(Offset::at(ispec, iz, iy, ix));
+    return h_(off_(ispec, iz, iy, ix));
   }
 
-  DomainAccessor<Offset> accessor() const { return {d_}; }
+  DomainAccessor<Offset> accessor() const { return {d_, off_}; }
 
   void to_device() { Kokkos::deep_copy(d_, h_); }
   void to_host() { Kokkos::deep_copy(h_, d_); }
@@ -52,6 +54,7 @@ class DomainArray {
 
  private:
   int       nspec_ = 0;
+  Offset    off_;
   view_type d_;
   host_type h_;
 };

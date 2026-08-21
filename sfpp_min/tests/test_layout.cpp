@@ -79,6 +79,34 @@ double round_trip_probe(int nspec) {
   return h(0);
 }
 
+double round_trip_probe_dynamic(int nspec) {
+  DomainArray<ChunkTiledDynamicOffset> a("probe_dyn", nspec);
+  for (int ispec = 0; ispec < nspec; ++ispec)
+    for (int iz = 0; iz < NGLL; ++iz)
+      for (int iy = 0; iy < NGLL; ++iy)
+        for (int ix = 0; ix < NGLL; ++ix)
+          a.host(ispec, iz, iy, ix) =
+              static_cast<real_t>(ispec * 1000 + iz * 100 + iy * 10 + ix);
+  a.to_device();
+  auto                  acc = a.accessor();
+  Kokkos::View<double*> bad("bad_dyn", 1);
+  Kokkos::parallel_for(
+      "layout_round_trip_dynamic", Kokkos::RangePolicy<>(0, nspec),
+      KOKKOS_LAMBDA(const int ispec) {
+        for (int iz = 0; iz < NGLL; ++iz)
+          for (int iy = 0; iy < NGLL; ++iy)
+            for (int ix = 0; ix < NGLL; ++ix) {
+              const double want =
+                  static_cast<double>(ispec * 1000 + iz * 100 + iy * 10 + ix);
+              const double got = acc(ispec, iz, iy, ix);
+              Kokkos::atomic_max(&bad(0), Kokkos::abs(got - want));
+            }
+      });
+  Kokkos::fence();
+  auto h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), bad);
+  return h(0);
+}
+
 }  // namespace
 
 TEST(SfppMinLayout, ChunkTiledIsBijective) {
@@ -141,6 +169,42 @@ TEST(SfppMinLayout, MatchesAnIndependentlyConstructedOrdering) {
 
 TEST(SfppMinLayout, DomainArrayRoundTripsThroughDevice) {
   EXPECT_EQ(round_trip_probe(33), 0.0);
+}
+
+TEST(SfppMinLayout, DynamicExtentOffsetMatchesStaticBitForBit) {
+  for (int nspec : {1, 4, 31, 32, 33, 64, 100}) {
+    const ChunkTiledDynamicOffset dyn(nspec);
+    EXPECT_EQ(dyn.span(), ChunkTiledOffset::span(nspec)) << "nspec=" << nspec;
+    for (int ispec = 0; ispec < nspec; ++ispec)
+      for (int iz = 0; iz < NGLL; ++iz)
+        for (int iy = 0; iy < NGLL; ++iy)
+          for (int ix = 0; ix < NGLL; ++ix)
+            ASSERT_EQ(dyn(ispec, iz, iy, ix),
+                      ChunkTiledOffset::at(ispec, iz, iy, ix))
+                << "nspec=" << nspec << " ispec=" << ispec << " iz=" << iz
+                << " iy=" << iy << " ix=" << ix;
+  }
+}
+
+TEST(SfppMinLayout, DynamicExtentOffsetIsABijection) {
+  for (int nspec : {1, 33, 64}) {
+    const ChunkTiledDynamicOffset dyn(nspec);
+    const std::size_t             span = dyn.span();
+    std::vector<char>             seen(span, 0);
+    for (int ispec = 0; ispec < nspec; ++ispec)
+      for (int iz = 0; iz < NGLL; ++iz)
+        for (int iy = 0; iy < NGLL; ++iy)
+          for (int ix = 0; ix < NGLL; ++ix) {
+            const std::size_t o = dyn(ispec, iz, iy, ix);
+            ASSERT_LT(o, span) << "escapes the allocation, nspec=" << nspec;
+            ASSERT_EQ(seen[o], 0) << "offset " << o << " aliases";
+            seen[o] = 1;
+          }
+  }
+}
+
+TEST(SfppMinLayout, DynamicExtentDomainArrayRoundTripsThroughDevice) {
+  EXPECT_EQ(round_trip_probe_dynamic(33), 0.0);
 }
 
 TEST(SfppMinLayout, ContainersAllocateTheExpectedFootprint) {

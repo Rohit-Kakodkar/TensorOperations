@@ -414,3 +414,14 @@ gtest_discover_tests(sfpp_min_geometry TEST_PREFIX sfpp_min.)
 add_executable(sfpp_min_reference sfpp_min/tests/test_reference.cpp)
 target_link_libraries(sfpp_min_reference PRIVATE sfpp_min GTest::gtest)
 gtest_discover_tests(sfpp_min_reference TEST_PREFIX sfpp_min.)
+
+add_executable(sfpp_min_kernel sfpp_min/tests/test_kernel.cpp)
+target_link_libraries(sfpp_min_kernel PRIVATE sfpp_min GTest::gtest)
+gtest_discover_tests(sfpp_min_kernel TEST_PREFIX sfpp_min.)
+
+add_executable(sfpp_min_bench sfpp_min/bench.cpp)
+target_link_libraries(sfpp_min_bench PRIVATE sfpp_min)
+
+add_executable(sfpp_min_bench_li sfpp_min/bench.cpp)
+target_link_libraries(sfpp_min_bench_li PRIVATE sfpp_min)
+target_compile_options(sfpp_min_bench_li PRIVATE -lineinfo)
