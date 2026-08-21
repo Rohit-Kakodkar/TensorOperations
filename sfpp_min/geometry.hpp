@@ -149,8 +149,8 @@ inline Mat3 curved_metric(const Mat3& base, double t) {
   return r;
 }
 
-template <typename Offset>
-void fill_curved(const MeshDims& d, const ElementSet& set, Metrics<Offset>& m) {
+template <typename MetricsT>
+void fill_curved(const MeshDims& d, const ElementSet& set, MetricsT& m) {
   const Geometry g = make_geometry(d);
   for (int ispec = 0; ispec < set.nspec(); ++ispec) {
     const int igrid = set.to_grid[ispec];
@@ -177,9 +177,8 @@ void fill_curved(const MeshDims& d, const ElementSet& set, Metrics<Offset>& m) {
   }
 }
 
-template <typename Offset>
-void fill_properties(const MeshDims& d, const ElementSet& set,
-                     Properties<Offset>& p) {
+template <typename PropertiesT>
+void fill_properties(const MeshDims& d, const ElementSet& set, PropertiesT& p) {
   for (int ispec = 0; ispec < set.nspec(); ++ispec) {
     const int igrid = set.to_grid[ispec];
     int       ex, ey, ez;

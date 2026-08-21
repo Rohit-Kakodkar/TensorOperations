@@ -155,6 +155,67 @@ KOKKOS_INLINE_FUNCTION void load_property(const PropertiesAccessor<Offset>& p,
   out.rho                  = p.rho.data()[_index];
 }
 
+// AoS storage: the same ten (three) components interleaved into ONE buffer,
+// component-fastest. The index is still computed ONCE per point -- the single-
+// index discipline of the SoA path (recomputing it per component cost 121
+// registers) -- then scaled by kArrays and offset by the component number.
+template <typename Offset>
+struct MetricsAccessorAoS {
+  using view_type              = Kokkos::View<real_t*>;
+  static constexpr int kArrays = 10;
+  view_type            buf;
+  Offset               off;
+};
+
+template <typename Offset>
+struct PropertiesAccessorAoS {
+  using view_type              = Kokkos::View<real_t*>;
+  static constexpr int kArrays = 3;
+  view_type            buf;
+  Offset               off;
+};
+
+template <typename Offset>
+MetricsAccessorAoS<Offset> make_accessor(const MetricsAoS<Offset>& m) {
+  return {m.device_view(), Offset(m.nspec())};
+}
+
+template <typename Offset>
+PropertiesAccessorAoS<Offset> make_accessor(const PropertiesAoS<Offset>& p) {
+  return {p.device_view(), Offset(p.nspec())};
+}
+
+template <typename Offset>
+KOKKOS_INLINE_FUNCTION void load_metric(const MetricsAccessorAoS<Offset>& m,
+                                        int ispec, int iz, int iy, int ix,
+                                        PointMetric& out, bool load_jacobian) {
+  const std::size_t _index =
+      m.off(ispec, iz, iy, ix) * MetricsAccessorAoS<Offset>::kArrays;
+  const real_t* base = m.buf.data() + _index;
+  out.xix            = base[0];
+  out.xiy            = base[1];
+  out.xiz            = base[2];
+  out.etax           = base[3];
+  out.etay           = base[4];
+  out.etaz           = base[5];
+  out.gammax         = base[6];
+  out.gammay         = base[7];
+  out.gammaz         = base[8];
+  if (load_jacobian) out.jacobian = base[9];
+}
+
+template <typename Offset>
+KOKKOS_INLINE_FUNCTION void load_property(
+    const PropertiesAccessorAoS<Offset>& p, int ispec, int iz, int iy, int ix,
+    PointProperty& out) {
+  const std::size_t _index =
+      p.off(ispec, iz, iy, ix) * PropertiesAccessorAoS<Offset>::kArrays;
+  const real_t* base = p.buf.data() + _index;
+  out.kappa          = base[0];
+  out.mu             = base[1];
+  out.rho            = base[2];
+}
+
 // medium_physics/compute_attenuation.hpp:14-23 -- empty for attenuation::none.
 KOKKOS_INLINE_FUNCTION void compute_attenuation(real_t (&)[3][3]) {}
 
@@ -179,35 +240,37 @@ using Unmanaged    = Kokkos::MemoryTraits<Kokkos::Unmanaged>;
 
 // LayoutLeft: element index stride-1, so the four lanes sharing a point are
 // contiguous. chunk_ndim_view.hpp:92. NOT this repo's usual LayoutRight.
-using DisplacementPack =
-    Kokkos::View<real_t[kExecChunk][NGLL][NGLL][NGLL][3], Kokkos::LayoutLeft,
-                 ScratchSpace, Unmanaged>;
-using StressIntegrand =
-    Kokkos::View<real_t[kExecChunk][NGLL][NGLL][NGLL][3][3], Kokkos::LayoutLeft,
-                 ScratchSpace, Unmanaged>;
+template <typename ScratchLayout = Kokkos::LayoutLeft>
+using DisplacementPack = Kokkos::View<real_t[kExecChunk][NGLL][NGLL][NGLL][3],
+                                      ScratchLayout, ScratchSpace, Unmanaged>;
+template <typename ScratchLayout = Kokkos::LayoutLeft>
+using StressIntegrand = Kokkos::View<real_t[kExecChunk][NGLL][NGLL][NGLL][3][3],
+                                     ScratchLayout, ScratchSpace, Unmanaged>;
 // quadrature/lagrange_derivative.hpp:37-38 -- this one really is LayoutRight.
 using LagrangeDerivative = Kokkos::View<real_t[NGLL][NGLL], Kokkos::LayoutRight,
                                         ScratchSpace, Unmanaged>;
 
+template <typename ScratchLayout = Kokkos::LayoutLeft>
 inline std::size_t dummy_shmem_size() {
-  return DisplacementPack::shmem_size() + StressIntegrand::shmem_size() +
+  return DisplacementPack<ScratchLayout>::shmem_size() +
+         StressIntegrand<ScratchLayout>::shmem_size() +
          LagrangeDerivative::shmem_size();
 }
 
 using GlobalHPrime  = Kokkos::View<real_t**, Kokkos::LayoutRight>;
 using GlobalWeights = Kokkos::View<real_t*>;
 
-template <typename Offset>
+template <typename MetricsAcc, typename PropertiesAcc>
 struct DummyKernelArgs {
-  MetricsAccessor<Offset>    metrics;
-  PropertiesAccessor<Offset> properties;
-  IglobMap::view_type        iglob;
-  Fields::view_type          displacement;
-  Fields::view_type          velocity;
-  Fields::view_type          acceleration;
-  GlobalHPrime               hprime;
-  GlobalWeights              weights;
-  int                        nspec;
+  MetricsAcc          metrics;
+  PropertiesAcc       properties;
+  IglobMap::view_type iglob;
+  Fields::view_type   displacement;
+  Fields::view_type   velocity;
+  Fields::view_type   acceleration;
+  GlobalHPrime        hprime;
+  GlobalWeights       weights;
+  int                 nspec;
 };
 
 // Registers are the binding occupancy constraint on the real kernel: it is
@@ -228,8 +291,10 @@ struct DummyKernelArgs {
 // re-measured rather than assumed. See plans/minimal-sfpp-library-sprints.md.
 using DummyLaunchBounds = Kokkos::LaunchBounds<kTeamSize, 5>;
 
-template <typename Offset>
-int dummy_stiffness(const DummyKernelArgs<Offset>& args, int team_size = -1) {
+template <typename ScratchLayout = Kokkos::LayoutLeft, typename MetricsAcc,
+          typename PropertiesAcc>
+int dummy_stiffness(const DummyKernelArgs<MetricsAcc, PropertiesAcc>& args,
+                    int team_size = -1) {
   using policy_t    = Kokkos::TeamPolicy<DummyLaunchBounds>;
   using member_type = typename policy_t::member_type;
 
@@ -245,7 +310,7 @@ int dummy_stiffness(const DummyKernelArgs<Offset>& args, int team_size = -1) {
   const auto hprime_g     = args.hprime;
   const auto weights_g    = args.weights;
 
-  const std::size_t bytes = dummy_shmem_size();
+  const std::size_t bytes = dummy_shmem_size<ScratchLayout>();
 
   // chunked_domain_iterator.hpp:668-674 passes Kokkos::AUTO. The config's
   // num_threads = 512 is dead code upstream; 256 is what AUTO returns given
@@ -260,9 +325,9 @@ int dummy_stiffness(const DummyKernelArgs<Offset>& args, int team_size = -1) {
     const int num_elements =
         (nspec - base) < kExecChunk ? (nspec - base) : kExecChunk;
 
-    DisplacementPack   up(team.team_scratch(0));
-    LagrangeDerivative hp(team.team_scratch(0));
-    StressIntegrand    F(team.team_scratch(0));
+    DisplacementPack<ScratchLayout> up(team.team_scratch(0));
+    LagrangeDerivative              hp(team.team_scratch(0));
+    StressIntegrand<ScratchLayout>  F(team.team_scratch(0));
 
     Kokkos::parallel_for(Kokkos::TeamThreadRange(team, NGLL * NGLL),
                          [&](const int n) {

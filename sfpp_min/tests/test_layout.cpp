@@ -124,6 +124,65 @@ double round_trip_probe_dynamic(int nspec) {
   return h(0);
 }
 
+template <typename Offset>
+void expect_aos_injective(int nspec, int narrays) {
+  const Offset      off(nspec);
+  const std::size_t span = off.span() * static_cast<std::size_t>(narrays);
+  std::vector<char> seen(span, 0);
+  for (int ispec = 0; ispec < nspec; ++ispec)
+    for (int iz = 0; iz < NGLL; ++iz)
+      for (int iy = 0; iy < NGLL; ++iy)
+        for (int ix = 0; ix < NGLL; ++ix)
+          for (int c = 0; c < narrays; ++c) {
+            const std::size_t o =
+                off(ispec, iz, iy, ix) * static_cast<std::size_t>(narrays) + c;
+            ASSERT_LT(o, span) << "escapes the allocation, nspec=" << nspec;
+            ASSERT_EQ(seen[o], 0) << "interleaved index " << o << " aliases";
+            seen[o] = 1;
+          }
+}
+
+double round_trip_probe_aos(int nspec) {
+  constexpr int                kArrays = MetricsAoS<ChunkTiledOffset>::kArrays;
+  MetricsAoS<ChunkTiledOffset> m(nspec);
+  const auto encode = [](int ispec, int iz, int iy, int ix, int c) {
+    return static_cast<real_t>(ispec * 100000 +
+                               (iz * 100 + iy * 10 + ix) * 100 + c);
+  };
+  typename MetricsAoS<ChunkTiledOffset>::component_type comp[kArrays] = {
+      m.xix,  m.xiy,    m.xiz,    m.etax,   m.etay,
+      m.etaz, m.gammax, m.gammay, m.gammaz, m.jacobian};
+  for (int ispec = 0; ispec < nspec; ++ispec)
+    for (int iz = 0; iz < NGLL; ++iz)
+      for (int iy = 0; iy < NGLL; ++iy)
+        for (int ix = 0; ix < NGLL; ++ix)
+          for (int c = 0; c < kArrays; ++c)
+            comp[c].host(ispec, iz, iy, ix) = encode(ispec, iz, iy, ix, c);
+  m.to_device();
+
+  const ChunkTiledOffset off(nspec);
+  auto                   buf = m.device_view();
+  Kokkos::View<double*>  bad("bad_aos", 1);
+  Kokkos::parallel_for(
+      "aos_round_trip", Kokkos::RangePolicy<>(0, nspec),
+      KOKKOS_LAMBDA(const int ispec) {
+        for (int iz = 0; iz < NGLL; ++iz)
+          for (int iy = 0; iy < NGLL; ++iy)
+            for (int ix = 0; ix < NGLL; ++ix) {
+              const std::size_t base = off(ispec, iz, iy, ix) * kArrays;
+              for (int c = 0; c < kArrays; ++c) {
+                const double want = static_cast<double>(
+                    ispec * 100000 + (iz * 100 + iy * 10 + ix) * 100 + c);
+                const double got = buf(base + c);
+                Kokkos::atomic_max(&bad(0), Kokkos::abs(got - want));
+              }
+            }
+      });
+  Kokkos::fence();
+  auto h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), bad);
+  return h(0);
+}
+
 }  // namespace
 
 TEST(SfppMinLayout, ChunkTiledIsBijective) {
@@ -278,6 +337,17 @@ TEST(SfppMinLayout, DynamicExtentOffsetIsABijection) {
 
 TEST(SfppMinLayout, DynamicExtentDomainArrayRoundTripsThroughDevice) {
   EXPECT_EQ(round_trip_probe_dynamic(33), 0.0);
+}
+
+TEST(SfppMinLayout, AoSInterleaveIsInjective) {
+  for (int nspec : {1, 31, 32, 33, 64}) {
+    expect_aos_injective<ChunkTiledOffset>(nspec, 10);
+    expect_aos_injective<ChunkTiledDynamicOffset>(nspec, 3);
+  }
+}
+
+TEST(SfppMinLayout, AoSContainerRoundTripsThroughDevice) {
+  EXPECT_EQ(round_trip_probe_aos(33), 0.0);
 }
 
 TEST(SfppMinLayout, ContainersAllocateTheExpectedFootprint) {

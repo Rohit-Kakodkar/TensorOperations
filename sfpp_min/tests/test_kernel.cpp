@@ -108,15 +108,16 @@ GllViews make_gll_views() {
 }
 
 template <typename Off>
-DummyKernelArgs<Off> make_args(Case<Off>& k, const GllViews& q) {
+auto make_args(Case<Off>& k, const GllViews& q) {
   k.m.to_device();
   k.p.to_device();
   k.g.to_device();
   k.f.to_device();
   Kokkos::deep_copy(k.f.acceleration, static_cast<real_t>(0));
-  return {make_accessor(k.m), make_accessor(k.p), k.g.map,
-          k.f.displacement,   k.f.velocity,       k.f.acceleration,
-          q.hprime,           q.weights,          k.set.nspec()};
+  return DummyKernelArgs{
+      make_accessor(k.m), make_accessor(k.p), k.g.map,
+      k.f.displacement,   k.f.velocity,       k.f.acceleration,
+      q.hprime,           q.weights,          k.set.nspec()};
 }
 
 struct ErrorReport {
@@ -127,10 +128,61 @@ struct ErrorReport {
   }
 };
 
-template <typename Off>
+template <typename ScratchLayout = Kokkos::LayoutLeft, typename Off>
 ErrorReport run_and_compare(Case<Off>& k) {
   const GllViews q    = make_gll_views();
   auto           args = make_args(k, q);
+  dummy_stiffness<ScratchLayout>(args);
+  Kokkos::fence();
+  k.f.to_host();
+
+  const ReferenceOutput want =
+      reference_stiffness(k.set, k.m, k.p, k.g, k.f, k.nglob);
+
+  ErrorReport e;
+  for (int ig = 0; ig < k.nglob; ++ig)
+    for (int c = 0; c < 3; ++c) {
+      const double got = k.f.h_acceleration(ig, c);
+      const double ref = want.a(c, ig);
+      e.worst_abs      = std::max(e.worst_abs, std::abs(got - ref));
+      e.scale          = std::max(e.scale, std::abs(ref));
+    }
+  return e;
+}
+
+template <typename Off>
+ErrorReport run_and_compare_aos(Case<Off>& k) {
+  MetricsAoS<Off>    m(k.set.nspec());
+  PropertiesAoS<Off> p(k.set.nspec());
+  for (int ispec = 0; ispec < k.set.nspec(); ++ispec)
+    for (int iz = 0; iz < NGLL; ++iz)
+      for (int iy = 0; iy < NGLL; ++iy)
+        for (int ix = 0; ix < NGLL; ++ix) {
+          m.xix.host(ispec, iz, iy, ix)    = k.m.xix.host(ispec, iz, iy, ix);
+          m.xiy.host(ispec, iz, iy, ix)    = k.m.xiy.host(ispec, iz, iy, ix);
+          m.xiz.host(ispec, iz, iy, ix)    = k.m.xiz.host(ispec, iz, iy, ix);
+          m.etax.host(ispec, iz, iy, ix)   = k.m.etax.host(ispec, iz, iy, ix);
+          m.etay.host(ispec, iz, iy, ix)   = k.m.etay.host(ispec, iz, iy, ix);
+          m.etaz.host(ispec, iz, iy, ix)   = k.m.etaz.host(ispec, iz, iy, ix);
+          m.gammax.host(ispec, iz, iy, ix) = k.m.gammax.host(ispec, iz, iy, ix);
+          m.gammay.host(ispec, iz, iy, ix) = k.m.gammay.host(ispec, iz, iy, ix);
+          m.gammaz.host(ispec, iz, iy, ix) = k.m.gammaz.host(ispec, iz, iy, ix);
+          m.jacobian.host(ispec, iz, iy, ix) =
+              k.m.jacobian.host(ispec, iz, iy, ix);
+          p.kappa.host(ispec, iz, iy, ix) = k.p.kappa.host(ispec, iz, iy, ix);
+          p.mu.host(ispec, iz, iy, ix)    = k.p.mu.host(ispec, iz, iy, ix);
+          p.rho.host(ispec, iz, iy, ix)   = k.p.rho.host(ispec, iz, iy, ix);
+        }
+  m.to_device();
+  p.to_device();
+
+  const GllViews q = make_gll_views();
+  k.g.to_device();
+  k.f.to_device();
+  Kokkos::deep_copy(k.f.acceleration, static_cast<real_t>(0));
+  DummyKernelArgs args{make_accessor(m), make_accessor(p), k.g.map,
+                       k.f.displacement, k.f.velocity,     k.f.acceleration,
+                       q.hprime,         q.weights,        k.set.nspec()};
   dummy_stiffness(args);
   Kokkos::fence();
   k.f.to_host();
@@ -204,6 +256,44 @@ TEST(SfppMinKernel, MatchesSerialOracleLayoutLeft) {
 
 TEST(SfppMinKernel, MatchesSerialOracleLayoutLeftDynamic) {
   expect_layout_invariant<LayoutLeftDynamicOffset>("LayoutLeft dynamic");
+}
+
+// The AoS container interleaves the ten metric and three property components
+// into one buffer; the numeric result must be storage-invariant.
+template <typename Off>
+void expect_aos_invariant(const char* name) {
+  auto k = make_case<Off>();
+  set_linear_field(k);
+  set_velocity(k);
+  const ErrorReport e = run_and_compare_aos(k);
+  std::printf(
+      "[ INFO     ] %s: max|diff| = %.3e, scale = %.3e, relative = %.3e\n",
+      name, e.worst_abs, e.scale, e.relative());
+  EXPECT_GT(e.scale, 0.0) << name << ": oracle produced an all-zero field";
+  EXPECT_LT(e.relative(), 1e-4) << name;
+}
+
+TEST(SfppMinKernel, MatchesSerialOracleAoSStaticExtents) {
+  expect_aos_invariant<ChunkTiledOffset>("AoS static extents");
+}
+
+TEST(SfppMinKernel, MatchesSerialOracleAoSDynamicExtents) {
+  expect_aos_invariant<ChunkTiledDynamicOffset>("AoS dynamic extents");
+}
+
+// Scratch LayoutRight is a reshuffle of team-scratch storage; the numeric
+// result must be scratch-layout-invariant.
+TEST(SfppMinKernel, MatchesSerialOracleScratchLayoutRight) {
+  auto k = make_case<ChunkTiledDynamicOffset>();
+  set_linear_field(k);
+  set_velocity(k);
+  const ErrorReport e = run_and_compare<Kokkos::LayoutRight>(k);
+  std::printf(
+      "[ INFO     ] scratch LayoutRight: max|diff| = %.3e, scale = %.3e, "
+      "relative = %.3e\n",
+      e.worst_abs, e.scale, e.relative());
+  EXPECT_GT(e.scale, 0.0);
+  EXPECT_LT(e.relative(), 1e-4);
 }
 
 // A rigid-body translation is in the operator's null space exactly, for any

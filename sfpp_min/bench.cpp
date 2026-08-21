@@ -14,10 +14,25 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 using namespace sfpp_min;
 
 namespace {
+
+struct SoA {
+  template <class Off>
+  using metrics_t = Metrics<Off>;
+  template <class Off>
+  using properties_t = Properties<Off>;
+};
+
+struct AoS {
+  template <class Off>
+  using metrics_t = MetricsAoS<Off>;
+  template <class Off>
+  using properties_t = PropertiesAoS<Off>;
+};
 
 template <class Fn>
 double best_ms(Fn&& fn, int warmup, int reps) {
@@ -33,7 +48,8 @@ double best_ms(Fn&& fn, int warmup, int reps) {
   return best * 1e3;
 }
 
-template <class Off>
+template <class Off, class Storage = SoA,
+          class ScratchLayout = Kokkos::LayoutLeft>
 int run_impl(int argc, char** argv, const char* layout_name) {
   const int  reps     = (argc > 1) ? std::atoi(argv[1]) : 5;
   const int  warmup   = (argc > 2) ? std::atoi(argv[2]) : 2;
@@ -50,8 +66,8 @@ int run_impl(int argc, char** argv, const char* layout_name) {
   const int nglob = renumber_access_order(d, set, g);
   g.to_device();
 
-  Metrics<Off>    m(nspec);
-  Properties<Off> p(nspec);
+  typename Storage::template metrics_t<Off>    m(nspec);
+  typename Storage::template properties_t<Off> p(nspec);
   fill_curved(d, set, m);
   fill_properties(d, set, p);
   m.to_device();
@@ -82,14 +98,14 @@ int run_impl(int argc, char** argv, const char* layout_name) {
     Kokkos::deep_copy(weights, hw);
   }
 
-  DummyKernelArgs<Off> args{make_accessor(m), make_accessor(p), g.map,
-                            f.displacement,   f.velocity,       f.acceleration,
-                            hprime,           weights,          nspec};
+  DummyKernelArgs args{make_accessor(m), make_accessor(p), g.map,
+                       f.displacement,   f.velocity,       f.acceleration,
+                       hprime,           weights,          nspec};
 
-  const int resolved = dummy_stiffness(args, team_arg);
+  const int resolved = dummy_stiffness<ScratchLayout>(args, team_arg);
   Kokkos::fence();
 
-  const std::size_t scratch = dummy_shmem_size();
+  const std::size_t scratch = dummy_shmem_size<ScratchLayout>();
   const std::size_t launch_shmem =
       scratch + 8u * (static_cast<std::size_t>(resolved) + 2u);
 
@@ -122,14 +138,14 @@ int run_impl(int argc, char** argv, const char* layout_name) {
 
   if (profile) {
     Kokkos::deep_copy(f.acceleration, static_cast<real_t>(0));
-    dummy_stiffness(args, team_arg);
+    dummy_stiffness<ScratchLayout>(args, team_arg);
     Kokkos::fence();
     std::printf("profile mode: one launch issued\n");
     return ok ? 0 : 1;
   }
 
-  const double ms =
-      best_ms([&]() { dummy_stiffness(args, team_arg); }, warmup, reps);
+  const double ms = best_ms(
+      [&]() { dummy_stiffness<ScratchLayout>(args, team_arg); }, warmup, reps);
   const double ns_per_element = ms * 1e6 / nspec;
   const double ns_per_point   = ns_per_element / kPointsPerElement;
 
@@ -142,26 +158,70 @@ int run_impl(int argc, char** argv, const char* layout_name) {
 }
 
 int run(int argc, char** argv) {
-  const char* layout = (argc > 5) ? argv[5] : "chunk_tiled_dynamic";
+  const char* layout  = (argc > 5) ? argv[5] : "chunk_tiled_dynamic";
+  const char* storage = (argc > 6) ? argv[6] : "soa";
+  const char* scratch = (argc > 7) ? argv[7] : "ll";
 
-  if (std::strcmp(layout, "chunk_tiled_static") == 0)
-    return run_impl<ChunkTiledOffset>(argc, argv, layout);
+  const std::string label = std::string(layout) + " " + storage + " " + scratch;
+  const char*       tag   = label.c_str();
+
+  const bool aos = std::strcmp(storage, "aos") == 0;
+  const bool lr  = std::strcmp(scratch, "lr") == 0;
+
+  // SoA x scratch-LayoutLeft: the full Sprint 3 offset plane (the incumbent is
+  // chunk_tiled_dynamic in this plane).
+  if (!aos && !lr) {
+    if (std::strcmp(layout, "chunk_tiled_static") == 0)
+      return run_impl<ChunkTiledOffset, SoA, Kokkos::LayoutLeft>(argc, argv,
+                                                                 tag);
+    if (std::strcmp(layout, "chunk_tiled_dynamic") == 0)
+      return run_impl<ChunkTiledDynamicOffset, SoA, Kokkos::LayoutLeft>(
+          argc, argv, tag);
+    if (std::strcmp(layout, "layout_right") == 0)
+      return run_impl<LayoutRightOffset, SoA, Kokkos::LayoutLeft>(argc, argv,
+                                                                  tag);
+    if (std::strcmp(layout, "layout_right_dynamic") == 0)
+      return run_impl<LayoutRightDynamicOffset, SoA, Kokkos::LayoutLeft>(
+          argc, argv, tag);
+    if (std::strcmp(layout, "layout_left") == 0)
+      return run_impl<LayoutLeftOffset, SoA, Kokkos::LayoutLeft>(argc, argv,
+                                                                 tag);
+    if (std::strcmp(layout, "layout_left_dynamic") == 0)
+      return run_impl<LayoutLeftDynamicOffset, SoA, Kokkos::LayoutLeft>(
+          argc, argv, tag);
+  }
+
+  // SoA x scratch-LayoutRight: the scratch axis, measured at the incumbent
+  // offset only.
+  if (!aos && lr) {
+    if (std::strcmp(layout, "chunk_tiled_dynamic") == 0)
+      return run_impl<ChunkTiledDynamicOffset, SoA, Kokkos::LayoutRight>(
+          argc, argv, tag);
+    std::printf("scratch=lr is measured only for chunk_tiled_dynamic\n");
+    return 2;
+  }
+
+  // AoS x scratch-LayoutLeft: the container axis, at static and dynamic extent.
+  if (aos && !lr) {
+    if (std::strcmp(layout, "chunk_tiled_static") == 0)
+      return run_impl<ChunkTiledOffset, AoS, Kokkos::LayoutLeft>(argc, argv,
+                                                                 tag);
+    if (std::strcmp(layout, "chunk_tiled_dynamic") == 0)
+      return run_impl<ChunkTiledDynamicOffset, AoS, Kokkos::LayoutLeft>(
+          argc, argv, tag);
+    std::printf(
+        "storage=aos is measured only for chunk_tiled_static and "
+        "chunk_tiled_dynamic\n");
+    return 2;
+  }
+
+  // AoS x scratch-LayoutRight: the AoS-scratch interaction, at the incumbent
+  // offset only.
   if (std::strcmp(layout, "chunk_tiled_dynamic") == 0)
-    return run_impl<ChunkTiledDynamicOffset>(argc, argv, layout);
-  if (std::strcmp(layout, "layout_right") == 0)
-    return run_impl<LayoutRightOffset>(argc, argv, layout);
-  if (std::strcmp(layout, "layout_right_dynamic") == 0)
-    return run_impl<LayoutRightDynamicOffset>(argc, argv, layout);
-  if (std::strcmp(layout, "layout_left") == 0)
-    return run_impl<LayoutLeftOffset>(argc, argv, layout);
-  if (std::strcmp(layout, "layout_left_dynamic") == 0)
-    return run_impl<LayoutLeftDynamicOffset>(argc, argv, layout);
-
+    return run_impl<ChunkTiledDynamicOffset, AoS, Kokkos::LayoutRight>(
+        argc, argv, tag);
   std::printf(
-      "unknown layout '%s'; valid: chunk_tiled_static, "
-      "chunk_tiled_dynamic, layout_right, layout_right_dynamic, "
-      "layout_left, layout_left_dynamic\n",
-      layout);
+      "storage=aos scratch=lr is measured only for chunk_tiled_dynamic\n");
   return 2;
 }
 

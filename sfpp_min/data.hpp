@@ -129,6 +129,118 @@ struct Properties {
   std::size_t bytes() const { return kArrays * kappa.bytes(); }
 };
 
+template <typename Offset>
+class InterleavedArray {
+ public:
+  using offset_type = Offset;
+  using view_type   = Kokkos::View<real_t*>;
+  using host_type   = typename view_type::host_mirror_type;
+
+  struct Component {
+    host_type h;
+    Offset    off;
+    int       narrays;
+    int       comp;
+
+    real_t& host(int ispec, int iz, int iy, int ix) const {
+      return h(off(ispec, iz, iy, ix) * static_cast<std::size_t>(narrays) +
+               comp);
+    }
+  };
+
+  InterleavedArray() = default;
+
+  InterleavedArray(const std::string& label, int nspec, int narrays)
+      : nspec_(nspec),
+        narrays_(narrays),
+        off_(nspec),
+        d_(label, off_.span() * static_cast<std::size_t>(narrays)),
+        h_(Kokkos::create_mirror_view(d_)) {}
+
+  Component component(int comp) const { return {h_, off_, narrays_, comp}; }
+
+  void to_device() { Kokkos::deep_copy(d_, h_); }
+  void to_host() { Kokkos::deep_copy(h_, d_); }
+
+  int         nspec() const { return nspec_; }
+  std::size_t span() const { return d_.extent(0); }
+  std::size_t bytes() const { return span() * sizeof(real_t); }
+
+  const view_type& device_view() const { return d_; }
+  const host_type& host_view() const { return h_; }
+
+ private:
+  int       nspec_   = 0;
+  int       narrays_ = 0;
+  Offset    off_;
+  view_type d_;
+  host_type h_;
+};
+
+template <typename Offset>
+struct MetricsAoS {
+  static constexpr int kArrays = 10;
+  using store_type             = InterleavedArray<Offset>;
+  using component_type         = typename store_type::Component;
+
+  store_type     store;
+  component_type xix, xiy, xiz;
+  component_type etax, etay, etaz;
+  component_type gammax, gammay, gammaz;
+  component_type jacobian;
+
+  MetricsAoS() = default;
+
+  explicit MetricsAoS(int nspec)
+      : store("metrics_aos", nspec, kArrays),
+        xix(store.component(0)),
+        xiy(store.component(1)),
+        xiz(store.component(2)),
+        etax(store.component(3)),
+        etay(store.component(4)),
+        etaz(store.component(5)),
+        gammax(store.component(6)),
+        gammay(store.component(7)),
+        gammaz(store.component(8)),
+        jacobian(store.component(9)) {}
+
+  void        to_device() { store.to_device(); }
+  void        to_host() { store.to_host(); }
+  int         nspec() const { return store.nspec(); }
+  std::size_t bytes() const { return store.bytes(); }
+
+  const typename store_type::view_type& device_view() const {
+    return store.device_view();
+  }
+};
+
+template <typename Offset>
+struct PropertiesAoS {
+  static constexpr int kArrays = 3;
+  using store_type             = InterleavedArray<Offset>;
+  using component_type         = typename store_type::Component;
+
+  store_type     store;
+  component_type kappa, mu, rho;
+
+  PropertiesAoS() = default;
+
+  explicit PropertiesAoS(int nspec)
+      : store("properties_aos", nspec, kArrays),
+        kappa(store.component(0)),
+        mu(store.component(1)),
+        rho(store.component(2)) {}
+
+  void        to_device() { store.to_device(); }
+  void        to_host() { store.to_host(); }
+  int         nspec() const { return store.nspec(); }
+  std::size_t bytes() const { return store.bytes(); }
+
+  const typename store_type::view_type& device_view() const {
+    return store.device_view();
+  }
+};
+
 inline constexpr int kComponents = 3;
 
 struct Fields {
