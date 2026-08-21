@@ -36,6 +36,23 @@ void expect_bijection(int nspec) {
   }
 }
 
+template <typename Offset>
+void expect_bijection_instance(int nspec) {
+  const Offset      off(nspec);
+  const std::size_t span = off.span();
+  std::vector<char> seen(span, 0);
+  for (int ispec = 0; ispec < nspec; ++ispec)
+    for (int iz = 0; iz < NGLL; ++iz)
+      for (int iy = 0; iy < NGLL; ++iy)
+        for (int ix = 0; ix < NGLL; ++ix) {
+          const std::size_t o = off(ispec, iz, iy, ix);
+          ASSERT_LT(o, span) << "escapes the allocation, nspec=" << nspec;
+          ASSERT_EQ(seen[o], 0)
+              << "offset " << o << " aliases, nspec=" << nspec;
+          seen[o] = 1;
+        }
+}
+
 std::size_t constructive_offset(int ispec, int iz, int iy, int ix) {
   const int   tile = ispec / kStorageChunk;
   std::size_t o =
@@ -116,6 +133,62 @@ TEST(SfppMinLayout, ChunkTiledIsBijective) {
 
 TEST(SfppMinLayout, PlainIsBijective) {
   for (int nspec : {1, 33, 64}) expect_bijection<PlainOffset>(nspec);
+}
+
+TEST(SfppMinLayout, LayoutLeftIsBijective) {
+  for (int nspec : {1, 4, 33, 64})
+    expect_bijection_instance<LayoutLeftOffset>(nspec);
+}
+
+TEST(SfppMinLayout, LayoutLeftDynamicIsBijective) {
+  for (int nspec : {1, 4, 33, 64})
+    expect_bijection_instance<LayoutLeftDynamicOffset>(nspec);
+}
+
+TEST(SfppMinLayout, LayoutRightDynamicIsBijective) {
+  for (int nspec : {1, 33, 64})
+    expect_bijection_instance<LayoutRightDynamicOffset>(nspec);
+}
+
+TEST(SfppMinLayout, LayoutRightDynamicMatchesPlainBitForBit) {
+  for (int nspec : {1, 4, 33, 64, 100}) {
+    const LayoutRightDynamicOffset dyn(nspec);
+    EXPECT_EQ(dyn.span(), PlainOffset::span(nspec)) << "nspec=" << nspec;
+    for (int ispec = 0; ispec < nspec; ++ispec)
+      for (int iz = 0; iz < NGLL; ++iz)
+        for (int iy = 0; iy < NGLL; ++iy)
+          for (int ix = 0; ix < NGLL; ++ix)
+            ASSERT_EQ(dyn(ispec, iz, iy, ix),
+                      PlainOffset::at(ispec, iz, iy, ix))
+                << "nspec=" << nspec << " ispec=" << ispec << " iz=" << iz
+                << " iy=" << iy << " ix=" << ix;
+  }
+}
+
+TEST(SfppMinLayout, LayoutLeftDynamicMatchesStaticBitForBit) {
+  for (int nspec : {1, 4, 33, 64, 100}) {
+    const LayoutLeftOffset        stat(nspec);
+    const LayoutLeftDynamicOffset dyn(nspec);
+    EXPECT_EQ(dyn.span(), stat.span()) << "nspec=" << nspec;
+    for (int ispec = 0; ispec < nspec; ++ispec)
+      for (int iz = 0; iz < NGLL; ++iz)
+        for (int iy = 0; iy < NGLL; ++iy)
+          for (int ix = 0; ix < NGLL; ++ix)
+            ASSERT_EQ(dyn(ispec, iz, iy, ix), stat(ispec, iz, iy, ix))
+                << "nspec=" << nspec << " ispec=" << ispec << " iz=" << iz
+                << " iy=" << iy << " ix=" << ix;
+  }
+}
+
+TEST(SfppMinLayout, LayoutLeftHasElementStrideOne) {
+  const int              nspec = 64;
+  const LayoutLeftOffset off(nspec);
+  for (int iz = 0; iz < NGLL; ++iz)
+    for (int iy = 0; iy < NGLL; ++iy)
+      for (int ix = 0; ix < NGLL; ++ix)
+        for (int e = 0; e + 1 < nspec; ++e)
+          ASSERT_EQ(off(e + 1, iz, iy, ix) - off(e, iz, iy, ix), 1u)
+              << "e=" << e;
 }
 
 TEST(SfppMinLayout, SpanRoundsUpToWholeTiles) {

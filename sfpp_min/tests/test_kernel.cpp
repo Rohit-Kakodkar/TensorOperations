@@ -177,6 +177,35 @@ TEST(SfppMinKernel, MatchesSerialOracleDynamicExtents) {
   EXPECT_LT(e.relative(), 1e-4);
 }
 
+template <typename Off>
+void expect_layout_invariant(const char* name) {
+  auto k = make_case<Off>();
+  set_linear_field(k);
+  set_velocity(k);
+  const ErrorReport e = run_and_compare(k);
+  std::printf(
+      "[ INFO     ] %s: max|diff| = %.3e, scale = %.3e, relative = %.3e\n",
+      name, e.worst_abs, e.scale, e.relative());
+  EXPECT_GT(e.scale, 0.0) << name << ": oracle produced an all-zero field";
+  EXPECT_LT(e.relative(), 1e-4) << name;
+}
+
+TEST(SfppMinKernel, MatchesSerialOracleLayoutRight) {
+  expect_layout_invariant<PlainOffset>("LayoutRight (PlainOffset)");
+}
+
+TEST(SfppMinKernel, MatchesSerialOracleLayoutRightDynamic) {
+  expect_layout_invariant<LayoutRightDynamicOffset>("LayoutRight dynamic");
+}
+
+TEST(SfppMinKernel, MatchesSerialOracleLayoutLeft) {
+  expect_layout_invariant<LayoutLeftOffset>("LayoutLeft");
+}
+
+TEST(SfppMinKernel, MatchesSerialOracleLayoutLeftDynamic) {
+  expect_layout_invariant<LayoutLeftDynamicOffset>("LayoutLeft dynamic");
+}
+
 // A rigid-body translation is in the operator's null space exactly, for any
 // metric field, because hprime's row sums vanish. On device the residual is not
 // zero but float roundoff, so the bound cannot be the double-precision floor

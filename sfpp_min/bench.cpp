@@ -13,12 +13,11 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 using namespace sfpp_min;
 
 namespace {
-
-using Off = ChunkTiledDynamicOffset;
 
 template <class Fn>
 double best_ms(Fn&& fn, int warmup, int reps) {
@@ -34,11 +33,14 @@ double best_ms(Fn&& fn, int warmup, int reps) {
   return best * 1e3;
 }
 
-int run(int argc, char** argv) {
+template <class Off>
+int run_impl(int argc, char** argv, const char* layout_name) {
   const int  reps     = (argc > 1) ? std::atoi(argv[1]) : 5;
   const int  warmup   = (argc > 2) ? std::atoi(argv[2]) : 2;
   const int  team_arg = (argc > 3) ? std::atoi(argv[3]) : -1;
-  const bool profile  = (argc > 4);
+  const bool profile  = (argc > 4) && std::strlen(argv[4]) > 0;
+
+  std::printf("layout      : %s\n", layout_name);
 
   const MeshDims d{60, 48, 9};
   const auto     set   = interior_elements(d);
@@ -137,6 +139,30 @@ int run(int argc, char** argv) {
       "ground truth: 19.49 ns/element (A100 PCIe, ncu-locked clocks "
       "excluded) -- compare only within one surface\n");
   return ok ? 0 : 1;
+}
+
+int run(int argc, char** argv) {
+  const char* layout = (argc > 5) ? argv[5] : "chunk_tiled_dynamic";
+
+  if (std::strcmp(layout, "chunk_tiled_static") == 0)
+    return run_impl<ChunkTiledOffset>(argc, argv, layout);
+  if (std::strcmp(layout, "chunk_tiled_dynamic") == 0)
+    return run_impl<ChunkTiledDynamicOffset>(argc, argv, layout);
+  if (std::strcmp(layout, "layout_right") == 0)
+    return run_impl<LayoutRightOffset>(argc, argv, layout);
+  if (std::strcmp(layout, "layout_right_dynamic") == 0)
+    return run_impl<LayoutRightDynamicOffset>(argc, argv, layout);
+  if (std::strcmp(layout, "layout_left") == 0)
+    return run_impl<LayoutLeftOffset>(argc, argv, layout);
+  if (std::strcmp(layout, "layout_left_dynamic") == 0)
+    return run_impl<LayoutLeftDynamicOffset>(argc, argv, layout);
+
+  std::printf(
+      "unknown layout '%s'; valid: chunk_tiled_static, "
+      "chunk_tiled_dynamic, layout_right, layout_right_dynamic, "
+      "layout_left, layout_left_dynamic\n",
+      layout);
+  return 2;
 }
 
 }  // namespace

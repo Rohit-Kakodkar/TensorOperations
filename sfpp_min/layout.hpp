@@ -133,4 +133,118 @@ struct ChunkTiledDynamicOffset {
   std::size_t chunk_span_ = 0;
 };
 
+using LayoutRightOffset = PlainOffset;
+
+struct LayoutRightDynamicOffset {
+  static constexpr std::size_t kRank = 4;
+
+  LayoutRightDynamicOffset() = default;
+
+  KOKKOS_INLINE_FUNCTION explicit LayoutRightDynamicOffset(int nspec)
+      : nspec_(static_cast<std::size_t>(nspec)),
+        nz_(NGLL),
+        ny_(NGLL),
+        nx_(NGLL) {}
+
+  KOKKOS_INLINE_FUNCTION std::size_t extent(std::size_t dim) const {
+    return dim == 0 ? nspec_ : (dim == 1 ? nz_ : (dim == 2 ? ny_ : nx_));
+  }
+
+  KOKKOS_INLINE_FUNCTION std::size_t stride(std::size_t idim) const {
+    std::size_t s = 1;
+    for (std::size_t j = idim + 1; j < kRank; ++j) s *= extent(j);
+    return s;
+  }
+
+  KOKKOS_INLINE_FUNCTION std::size_t operator()(int ispec, int iz, int iy,
+                                                int ix) const {
+    const std::size_t idx[kRank] = {
+        static_cast<std::size_t>(ispec), static_cast<std::size_t>(iz),
+        static_cast<std::size_t>(iy), static_cast<std::size_t>(ix)};
+    std::size_t off = 0;
+    for (std::size_t i = 0; i < kRank; ++i) off += idx[i] * stride(i);
+    return off;
+  }
+
+  KOKKOS_INLINE_FUNCTION std::size_t span() const {
+    return nspec_ * nz_ * ny_ * nx_;
+  }
+
+ private:
+  std::size_t nspec_ = 0;
+  std::size_t nz_    = 0;
+  std::size_t ny_    = 0;
+  std::size_t nx_    = 0;
+};
+
+struct LayoutLeftOffset {
+  static constexpr std::size_t kPointsPerElement = NGLL * NGLL * NGLL;
+
+  LayoutLeftOffset() = default;
+
+  KOKKOS_INLINE_FUNCTION explicit LayoutLeftOffset(int nspec)
+      : nspec_(static_cast<std::size_t>(nspec)) {}
+
+  KOKKOS_INLINE_FUNCTION std::size_t operator()(int ispec, int iz, int iy,
+                                                int ix) const {
+    return static_cast<std::size_t>(ispec) +
+           static_cast<std::size_t>(iz) * nspec_ +
+           static_cast<std::size_t>(iy) * nspec_ * NGLL +
+           static_cast<std::size_t>(ix) * nspec_ * NGLL * NGLL;
+  }
+
+  KOKKOS_INLINE_FUNCTION std::size_t span() const {
+    return nspec_ * kPointsPerElement;
+  }
+
+  KOKKOS_INLINE_FUNCTION static std::size_t span(int nspec) {
+    return static_cast<std::size_t>(nspec) * kPointsPerElement;
+  }
+
+ private:
+  std::size_t nspec_ = 0;
+};
+
+struct LayoutLeftDynamicOffset {
+  static constexpr std::size_t kRank = 4;
+
+  LayoutLeftDynamicOffset() = default;
+
+  KOKKOS_INLINE_FUNCTION explicit LayoutLeftDynamicOffset(int nspec)
+      : nspec_(static_cast<std::size_t>(nspec)),
+        nz_(NGLL),
+        ny_(NGLL),
+        nx_(NGLL) {}
+
+  KOKKOS_INLINE_FUNCTION std::size_t extent(std::size_t dim) const {
+    return dim == 0 ? nspec_ : (dim == 1 ? nz_ : (dim == 2 ? ny_ : nx_));
+  }
+
+  KOKKOS_INLINE_FUNCTION std::size_t stride(std::size_t idim) const {
+    std::size_t s = 1;
+    for (std::size_t j = 0; j < idim; ++j) s *= extent(j);
+    return s;
+  }
+
+  KOKKOS_INLINE_FUNCTION std::size_t operator()(int ispec, int iz, int iy,
+                                                int ix) const {
+    const std::size_t idx[kRank] = {
+        static_cast<std::size_t>(ispec), static_cast<std::size_t>(iz),
+        static_cast<std::size_t>(iy), static_cast<std::size_t>(ix)};
+    std::size_t off = 0;
+    for (std::size_t i = 0; i < kRank; ++i) off += idx[i] * stride(i);
+    return off;
+  }
+
+  KOKKOS_INLINE_FUNCTION std::size_t span() const {
+    return nspec_ * nz_ * ny_ * nx_;
+  }
+
+ private:
+  std::size_t nspec_ = 0;
+  std::size_t nz_    = 0;
+  std::size_t ny_    = 0;
+  std::size_t nx_    = 0;
+};
+
 }  // namespace sfpp_min
