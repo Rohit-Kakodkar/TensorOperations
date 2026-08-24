@@ -67,6 +67,69 @@ class Evaluator<TeamPolicyTag2<ES>, NodeHandle<InputTag, T, ModesSeq, HookOp>,
   team_member_t                               team_;
 };
 
+// Functional input: same contract as the InputTag evaluator above -- given a
+// tile coordinate, hand back a value evaluator over that tile -- but the tile
+// is a FunctionalView, which computes its elements instead of addressing them.
+//
+// TILING ACROSS TEAMS is the `origin` fold below: tile coordinate times tile
+// extent, per axis, which is the coordinate-space twin of what
+// subview_tile_params does in address space (`base += outer_idx[d] *
+// stride(d)`). It is spelled here rather than obtained from tile_layout()
+// because tile_layout builds a 2N-dimensional layout whose outer half resolves
+// to a FLAT OFFSET -- exactly the thing a functional input does not have. The
+// functor wants coordinates, so the tiling is done in coordinates.
+//
+// TRAVERSAL ORDER comes from the node, defaulting to LayoutRight. It is free
+// to differ from the destination's, because the copy is coordinate-indexed on
+// both sides; what it buys is control over which addresses consecutive lanes
+// make the functor touch.
+template <typename ES, typename Fn, typename ModesSeq, typename ValueType,
+          typename Layout, typename HookOp, typename Tile_>
+class Evaluator<
+    TeamPolicyTag2<ES>,
+    NodeHandle<FunctionalTag, Fn, ModesSeq, ValueType, ES, Layout, HookOp>,
+    Tile_> {
+ public:
+  using node_type =
+      NodeHandle<FunctionalTag, Fn, ModesSeq, ValueType, ES, Layout, HookOp>;
+  // The tile inherits the declared tensor's order, exactly as tiling a real
+  // view preserves that view's memory order.
+  using order_tag     = typename node_type::order_tag;
+  using policy_tag    = TeamPolicyTag2<ES>;
+  using tiling_type   = Tile_;
+  using exec_space    = ES;
+  using team_member_t = Impl::team_member_t<ES>;
+
+  static constexpr int Rank = node_type::Rank;
+  static_assert(static_cast<int>(Tile_::rank) == Rank,
+                "functional input: tile rank must equal the node's rank");
+
+  using layout_t =
+      decltype(make_tile_layout(std::declval<Tile_>(), order_tag{}));
+  using view_t = FunctionalView<Fn, layout_t, ValueType, ES>;
+
+  KOKKOS_FUNCTION Evaluator(node_type n, Tile_ t, const team_member_t& team)
+      : fn_(n.fn_), hook_(n.hook_op), tile_(t), team_(team) {}
+
+  KOKKOS_FUNCTION auto operator()(
+      Kokkos::Array<int, Tile_::rank> tile_idx) const {
+    // The functor is called at the GLOBAL coordinate, so the tile's element
+    // origin is folded in here rather than at every read.
+    Kokkos::Array<int, Rank> origin{};
+    for (int d = 0; d < Rank; ++d) origin[d] = tile_idx[d] * tile_.extent(d);
+    return make_value_evaluator(
+        make_interm_node(
+            view_t{fn_, make_tile_layout(tile_, order_tag{}), origin}, hook_),
+        team_);
+  }
+
+ private:
+  Fn                           fn_;
+  [[no_unique_address]] HookOp hook_;
+  Tile_                        tile_;
+  team_member_t                team_;
+};
+
 template <typename ES, typename BackingVT, typename Layout, typename IntRank,
           typename HookOp, int... Perm>
 class Evaluator<TeamPolicyTag2<ES>,

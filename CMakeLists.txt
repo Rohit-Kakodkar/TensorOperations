@@ -173,6 +173,12 @@ add_executable(test_level_graph tests/test_level_graph.cpp)
 target_link_libraries(test_level_graph PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_level_graph)
 
+# test_functional_input — a leaf whose elements are computed, not addressed.
+# Custom main() wraps Kokkos init/finalize; every case launches a graph.
+add_executable(test_functional_input tests/test_functional_input.cpp)
+target_link_libraries(test_functional_input PRIVATE tensor GTest::gtest)
+gtest_discover_tests(test_functional_input)
+
 # ---------------------------------------------------------------------------
 # Negative-compilation tests for the slot guards.
 #
@@ -237,6 +243,32 @@ set_tests_properties(LabelTilesGuardNegative.Case1 PROPERTIES
 set_tests_properties(LabelTilesGuardNegative.Case2 PROPERTIES
                      PASS_REGULAR_EXPRESSION
                      "must appear in the graph's tile")
+
+# ---------------------------------------------------------------------------
+# Negative-compilation tests for the FUNCTIONAL-INPUT guard. Same rationale and
+# same caveats as the guards above.
+#
+# A functional input answers at a coordinate and has no address, so it is legal
+# only as a stage operand. Without these guards the mistake still fails to
+# compile -- but deep inside evaluator instantiation, in a diagnostic naming
+# layout internals rather than the mistake. The contraction and combine cases
+# are pinned separately because they are independent factories: one guard
+# present and the other missing must not read as both working.
+# ---------------------------------------------------------------------------
+foreach(case 0 1 2)
+  add_executable(functional_guard_neg_${case} EXCLUDE_FROM_ALL
+                 tests/negative/functional_guard_negative.cpp)
+  target_link_libraries(functional_guard_neg_${case} PRIVATE tensor)
+  target_compile_definitions(functional_guard_neg_${case}
+                             PRIVATE FUNCTIONAL_NEG_CASE=${case})
+  add_test(NAME FunctionalGuardNegative.Case${case}
+           COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}
+                   --target functional_guard_neg_${case} --config $<CONFIG>)
+endforeach()
+set_tests_properties(FunctionalGuardNegative.Case1
+                     FunctionalGuardNegative.Case2
+                     PROPERTIES PASS_REGULAR_EXPRESSION
+                     "a functional input has no address")
 
 # ---------------------------------------------------------------------------
 # Negative-compilation tests for the ARENA guard. Same rationale and same

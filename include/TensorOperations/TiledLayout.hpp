@@ -629,6 +629,68 @@ struct View {
 };
 
 // ---------------------------------------------------------------------------
+// FunctionalView<Fn, Layout, ValueType, ExecSpace>
+//
+// A tile whose elements are COMPUTED rather than addressed. It presents
+// exactly the three things a staging copy asks of its source --
+//
+//   Impl::team_for_each_coord(team, sv, [=](auto c) { dst[c] = sv[c]; });
+//
+// layout() and size() to drive the traversal, operator[](coord) to produce the
+// value -- and nothing else.
+//
+// It deliberately has NO data() and NO stride(): there is no address to hand
+// out. That absence is the point. It is what lets an indirect read -- a mesh
+// gather through an index map, a computed field, a constant -- be staged
+// without the library learning anything about how the value is obtained. Every
+// consumer downstream reads the ordinary LayoutRight scratch tile the stage
+// wrote, so nothing past the stage can tell the difference.
+//
+// The flip side, and the reason a functional input is legal only as a stage
+// operand: a contraction reads its operands through regroup_view/slice, which
+// is affine arithmetic over data() and stride(). The factories in
+// NodeHandle.hpp reject a FunctionalTag operand for that reason.
+//
+// `origin_` is the tile's element origin, so the functor always sees a GLOBAL
+// coordinate. Without it every team but the first would read tile 0 -- the
+// same trap PR #34 fixed for combine functors.
+// ---------------------------------------------------------------------------
+template <typename Fn, typename Layout, typename ValueType, typename ExecSpace>
+struct FunctionalView {
+  static constexpr int rank = Layout::rank;
+  using value_type          = ValueType;
+  using layout_t            = Layout;
+  using execution_space     = ExecSpace;
+
+  Fn                       fn_;
+  Layout                   layout_;
+  Kokkos::Array<int, rank> origin_;
+
+  KOKKOS_FUNCTION int extent(int d) const noexcept { return layout_.extent(d); }
+  KOKKOS_FUNCTION const Layout& layout() const noexcept { return layout_; }
+  KOKKOS_FUNCTION int           size() const noexcept { return layout_.size(); }
+
+  KOKKOS_FUNCTION value_type operator[](Impl::Index<rank> idx) const {
+    return at(idx, std::make_index_sequence<static_cast<std::size_t>(rank)>{});
+  }
+
+  template <typename... Idx>
+    requires(sizeof...(Idx) == rank)
+  KOKKOS_FUNCTION value_type operator()(Idx... idx) const {
+    return operator[](Impl::Index<rank>{static_cast<int>(idx)...});
+  }
+
+ private:
+  // Pack-expanded rather than looped: the functor takes its indices as separate
+  // arguments, and a loop over Kokkos::Array would need a runtime unpack.
+  template <std::size_t... Is>
+  KOKKOS_FUNCTION value_type at(const Impl::Index<rank>& idx,
+                                std::index_sequence<Is...>) const {
+    return fn_(origin_[Is] + idx[Is]...);
+  }
+};
+
+// ---------------------------------------------------------------------------
 // TiledView<ViewType, Tile>
 //
 // Convenience alias: a View backed by TiledLayout<N, TileLayoutT>, where N and

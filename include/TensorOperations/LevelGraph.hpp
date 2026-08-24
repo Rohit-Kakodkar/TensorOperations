@@ -781,10 +781,8 @@ struct LevelGraph {
         g);
   }
 
-  template <std::size_t... Ss, std::size_t... Fs>
-  bool index_consistent_impl(std::index_sequence<Ss...>,
-                             std::index_sequence<Fs...>) const {
-    (void)std::index_sequence<Ss...>{};
+  template <std::size_t... Fs>
+  bool index_consistent_impl(std::index_sequence<Fs...>) const {
     return (member_index_consistent<Fs>() && ...);
   }
 };
