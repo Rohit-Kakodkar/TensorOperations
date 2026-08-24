@@ -179,6 +179,12 @@ add_executable(test_functional_input tests/test_functional_input.cpp)
 target_link_libraries(test_functional_input PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_functional_input)
 
+# test_sink_combine — a combine that returns void, scatters to global itself,
+# and leaves the graph with no outputs. Custom main() wraps Kokkos.
+add_executable(test_sink_combine tests/test_sink_combine.cpp)
+target_link_libraries(test_sink_combine PRIVATE tensor GTest::gtest)
+gtest_discover_tests(test_sink_combine)
+
 # ---------------------------------------------------------------------------
 # Negative-compilation tests for the slot guards.
 #

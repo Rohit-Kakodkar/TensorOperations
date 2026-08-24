@@ -247,20 +247,38 @@ KOKKOS_FUNCTION auto lg_make_combine_member_impl(
 
   Kokkos::Array<int, Node::Rank> origin{};
   for (int d = 0; d < Node::Rank; ++d) origin[d] = idx[d] * OutTile::extent(d);
-  using OutNode = decltype(make_interm_node(store.template get<Base>()));
-  Kokkos::Array<OutNode, static_cast<std::size_t>(Node::NumOut)> outs{
-      make_interm_node(store.template get<Base + Os>())...};
-  auto ops =
-      make_combine_operands(
-          lg_read_slot<LevelsT,
-                       tuple_element_t<Ks, typename Node::ops_tuple_t>::SlotIdx,
-                       typename tuple_element_t<
-                           Ks, typename Node::ops_tuple_t>::modes_seq,
-                       typename Node::modes_seq>(store, team)...,
-          outs)
-          .at(origin);
-  return make_evaluator<TeamPolicyTag2<ES>>(
-      levels.template get<L>().template get<M>(), ops, team);
+
+  if constexpr (Node::NumOut == 0) {
+    // Sink: no destination slot (Base would index past this level's slots), so
+    // build the operand reads only and let the fn scatter to global itself.
+    auto ops =
+        make_combine_sink_operands<Node::Rank>(
+            lg_read_slot<
+                LevelsT,
+                tuple_element_t<Ks, typename Node::ops_tuple_t>::SlotIdx,
+                typename tuple_element_t<Ks,
+                                         typename Node::ops_tuple_t>::modes_seq,
+                typename Node::modes_seq>(store, team)...)
+            .at(origin);
+    return make_evaluator<TeamPolicyTag2<ES>>(
+        levels.template get<L>().template get<M>(), ops, team);
+  } else {
+    using OutNode = decltype(make_interm_node(store.template get<Base>()));
+    Kokkos::Array<OutNode, static_cast<std::size_t>(Node::NumOut)> outs{
+        make_interm_node(store.template get<Base + Os>())...};
+    auto ops =
+        make_combine_operands(
+            lg_read_slot<
+                LevelsT,
+                tuple_element_t<Ks, typename Node::ops_tuple_t>::SlotIdx,
+                typename tuple_element_t<Ks,
+                                         typename Node::ops_tuple_t>::modes_seq,
+                typename Node::modes_seq>(store, team)...,
+            outs)
+            .at(origin);
+    return make_evaluator<TeamPolicyTag2<ES>>(
+        levels.template get<L>().template get<M>(), ops, team);
+  }
 }
 
 template <typename V, typename ES, typename LevelsT, typename GridModes,
@@ -289,18 +307,27 @@ KOKKOS_FUNCTION void lg_run_combine_level(
     const LevelsT& levels, const Store& store,
     const Kokkos::Array<int, RootR>& grid_idx, const Team& team,
     std::index_sequence<Ms...>) {
-  constexpr std::size_t Base0 = lg_member_base_v<LevelsT, L, 0>;
-
   auto evs = DeviceTuple<
       decltype(lg_make_combine_member<V, ES, LevelsT, GridModes, RootR, L, Ms>(
           levels, store, grid_idx, team))...>{
       lg_make_combine_member<V, ES, LevelsT, GridModes, RootR, L, Ms>(
           levels, store, grid_idx, team)...};
 
-  const auto out0 = store.template get<Base0>();
-  team_for_each_coord(team, out0, [=](auto coord) {
-    lg_store_coord(evs, coord, std::index_sequence<Ms...>{});
-  });
+  constexpr bool AllSink =
+      ((tuple_element_t<Ms, tuple_element_t<L, LevelsT>>::NumOut == 0) && ...);
+  if constexpr (AllSink) {
+    // No output slot exists; drive the tile from a sink's operand-0 storage.
+    const auto it = evs.template get<0>().iter_view();
+    team_for_each_coord(team, it, [=](auto coord) {
+      lg_store_coord(evs, coord, std::index_sequence<Ms...>{});
+    });
+  } else {
+    constexpr std::size_t Base0 = lg_member_base_v<LevelsT, L, 0>;
+    const auto            out0  = store.template get<Base0>();
+    team_for_each_coord(team, out0, [=](auto coord) {
+      lg_store_coord(evs, coord, std::index_sequence<Ms...>{});
+    });
+  }
   team.team_barrier();
 }
 
@@ -606,7 +633,11 @@ int lg_execute(const LevelsT& levels, std::size_t bytes, int team_size,
                     : Kokkos::TeamPolicy<ES>(wk, Kokkos::AUTO);
   policy.set_scratch_size(0, Kokkos::PerTeam(static_cast<int>(bytes)));
 
-  using ViewT = std::tuple_element_t<0, std::tuple<ViewTs...>>;
+  // Padded with `int` so index 0 exists even with zero views (a graph whose
+  // last level is all sinks). For any real view, index 0 is the first view and
+  // the pad is never selected; with zero views ViewT is int and varr is empty,
+  // so lg_store_roots (empty roots) is a no-op that never indexes it.
+  using ViewT = std::tuple_element_t<0, std::tuple<ViewTs..., int>>;
   static_assert((std::is_same_v<ViewT, ViewTs> && ...),
                 "LevelGraph::execute: output views must share one type");
   const Kokkos::Array<ViewT, sizeof...(ViewTs)> varr{views...};
@@ -735,13 +766,21 @@ struct LevelGraph {
  private:
   template <typename Level, std::size_t... Ms>
   auto add_impl(const Level& level, std::index_sequence<Ms...>) const {
-    using NewLevels         = decltype(tuple_append(levels, level));
-    constexpr std::size_t L = num_levels;
-    return std::tuple_cat(
-        std::make_tuple(
-            LevelGraph<ValueType, ExecSpace, LabelTilesT, NewLevels>{
-                tuple_append(levels, level)}),
-        member_handles<NewLevels, L, Ms>(level.template get<Ms>())...);
+    using NewLevels = decltype(tuple_append(levels, level));
+    constexpr std::size_t                                    L = num_levels;
+    LevelGraph<ValueType, ExecSpace, LabelTilesT, NewLevels> g{
+        tuple_append(levels, level)};
+    // A level of all sinks contributes zero handles; return the bare graph so
+    // the caller writes `auto g = g0.add(...)` instead of destructuring a
+    // 1-tuple. A mixed level still returns graph + its non-sink handles.
+    constexpr std::size_t NH =
+        (0 + ... + Impl::output_arity<tuple_element_t<Ms, Level>>::value);
+    if constexpr (NH == 0)
+      return g;
+    else
+      return std::tuple_cat(
+          std::make_tuple(g),
+          member_handles<NewLevels, L, Ms>(level.template get<Ms>())...);
   }
 
   template <typename NewLevels, std::size_t L, std::size_t M, typename Member>

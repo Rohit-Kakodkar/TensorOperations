@@ -787,6 +787,11 @@ struct combine_out<Kokkos::Array<U, M>> {  // Kokkos::Array<U, M> result
   static constexpr int num = static_cast<int>(M);
   using elem               = U;
 };
+template <>
+struct combine_out<void> {  // sink: fn returns nothing and scatters itself, so
+  static constexpr int num = 0;  // it contributes no output slot to the graph
+  using elem               = void;
+};
 
 // An operand's shape() gathered into the TargetSeq (output) axis order, so
 // operand extents can be compared mode-for-mode whatever each operand's own
@@ -836,9 +841,12 @@ auto make_combine_node_impl(CombineFn fn, Ops... ops) {
   using Ret            = combine_ret_t<CombineFn, Rank, N, ActualScalar>;
   using OutInfo        = combine_out<Ret>;
   constexpr int NumOut = OutInfo::num;
-  static_assert(std::is_convertible_v<typename OutInfo::elem, ActualScalar>,
+  static_assert(NumOut == 0 ||
+                    std::is_convertible_v<typename OutInfo::elem, ActualScalar>,
                 "combine fn output element type must be convertible to the "
-                "operand scalar (multi-output combine is homogeneous)");
+                "operand scalar (multi-output combine is homogeneous). A "
+                "void-returning fn is a SINK: it emits no output and writes to "
+                "global itself");
 
   // Operand 0 fixes the output extents (its axes gathered into output order);
   // every operand must agree on every mode extent.
