@@ -34,12 +34,12 @@ struct ReferenceOutput {
   }
 };
 
-template <typename Offset>
+template <typename Offset, typename MapT>
 ReferenceOutput reference_stiffness(const ElementSet&         set,
                                     const Metrics<Offset>&    m,
-                                    const Properties<Offset>& p,
-                                    const IglobMap& g, const Fields& f,
-                                    int nglob, bool record = false) {
+                                    const Properties<Offset>& p, const MapT& g,
+                                    const Fields& f, int nglob,
+                                    bool record = false) {
   ReferenceOutput out;
   out.nglob             = nglob;
   out.record_point_data = record;

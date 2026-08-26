@@ -463,3 +463,31 @@ target_link_libraries(sfpp_min_bench PRIVATE sfpp_min)
 add_executable(sfpp_min_bench_li sfpp_min/bench.cpp)
 target_link_libraries(sfpp_min_bench_li PRIVATE sfpp_min)
 target_compile_options(sfpp_min_bench_li PRIVATE -lineinfo)
+
+# --- Sprint 5: the LEVEL GRAPH kernel over the sfpp_min data model ---------
+# These are the first sfpp_min targets that link `tensor`: the dummy above must
+# stay uncontaminated by the library it is compared against, but the new kernel
+# IS that library, expressed over the same data structures.
+add_executable(sfpp_min_kernel_new sfpp_min/tests/test_kernel_new.cpp)
+target_link_libraries(sfpp_min_kernel_new PRIVATE sfpp_min tensor GTest::gtest)
+gtest_discover_tests(sfpp_min_kernel_new TEST_PREFIX sfpp_min.)
+
+add_executable(sfpp_min_bench_new sfpp_min/bench_new.cpp)
+target_link_libraries(sfpp_min_bench_new PRIVATE sfpp_min tensor)
+
+add_executable(sfpp_min_bench_new_li sfpp_min/bench_new.cpp)
+target_link_libraries(sfpp_min_bench_new_li PRIVATE sfpp_min tensor)
+target_compile_options(sfpp_min_bench_new_li PRIVATE -lineinfo)
+
+# The TE (tile-width) sweep. Its own binary because TE is a compile-time
+# parameter of the graph: folding it into bench_new would multiply that
+# harness's whole axis matrix by the number of TE values.
+add_executable(sfpp_min_bench_te sfpp_min/bench_te.cpp)
+target_link_libraries(sfpp_min_bench_te PRIVATE sfpp_min tensor)
+
+add_executable(sfpp_min_bench_te_li sfpp_min/bench_te.cpp)
+target_link_libraries(sfpp_min_bench_te_li PRIVATE sfpp_min tensor)
+target_compile_options(sfpp_min_bench_te_li PRIVATE -lineinfo)
+
+add_executable(sfpp_min_bench_mat sfpp_min/bench_mat.cpp)
+target_link_libraries(sfpp_min_bench_mat PRIVATE sfpp_min)

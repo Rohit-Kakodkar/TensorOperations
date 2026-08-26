@@ -281,16 +281,30 @@ struct Fields {
   }
 };
 
-struct IglobMap {
-  using view_type = Kokkos::View<int****, Kokkos::LayoutLeft>;
-  using host_type = typename view_type::host_mirror_type;
+// The mesh index map, over a LAYOUT that is a PER-KERNEL choice.
+//
+// LayoutLeft (the default, and the incumbent) puts ispec at stride 1 and ix at
+// stride 25*nspec. That is the right way round for a kernel whose threads walk
+// the ELEMENT axis fastest -- which is what decompose() does, and what
+// renumber_access_order numbers for. It is the wrong way round for a kernel
+// whose threads walk ix fastest, where it puts every lane of a warp in its own
+// sector.
+//
+// The two kernels are separate template instantiations over separate data, so
+// neither has to accept the other's answer. Nothing outside this type needs to
+// know which one it got: every reader indexes (ispec, iz, iy, ix).
+template <typename Layout>
+struct IglobMapT {
+  using layout_type = Layout;
+  using view_type   = Kokkos::View<int****, Layout>;
+  using host_type   = typename view_type::host_mirror_type;
 
   view_type map;
   host_type h_map;
 
-  IglobMap() = default;
+  IglobMapT() = default;
 
-  explicit IglobMap(int nspec)
+  explicit IglobMapT(int nspec)
       : map("iglob", nspec, NGLL, NGLL, NGLL),
         h_map(Kokkos::create_mirror_view(map)) {}
 
@@ -300,5 +314,9 @@ struct IglobMap {
   int         nspec() const { return static_cast<int>(map.extent(0)); }
   std::size_t bytes() const { return map.size() * sizeof(int); }
 };
+
+// The incumbent spelling. Every existing user keeps LayoutLeft by name.
+using IglobMap      = IglobMapT<Kokkos::LayoutLeft>;
+using IglobMapRight = IglobMapT<Kokkos::LayoutRight>;
 
 }  // namespace sfpp_min

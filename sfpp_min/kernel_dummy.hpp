@@ -260,17 +260,21 @@ inline std::size_t dummy_shmem_size() {
 using GlobalHPrime  = Kokkos::View<real_t**, Kokkos::LayoutRight>;
 using GlobalWeights = Kokkos::View<real_t*>;
 
-template <typename MetricsAcc, typename PropertiesAcc>
+// IglobView is deduced, and defaults to the incumbent LayoutLeft map, so every
+// existing construction site is unchanged. It exists so the level-graph kernel
+// can be handed a LayoutRight map without the dummy's instantiation moving.
+template <typename MetricsAcc, typename PropertiesAcc,
+          typename IglobView = IglobMap::view_type>
 struct DummyKernelArgs {
-  MetricsAcc          metrics;
-  PropertiesAcc       properties;
-  IglobMap::view_type iglob;
-  Fields::view_type   displacement;
-  Fields::view_type   velocity;
-  Fields::view_type   acceleration;
-  GlobalHPrime        hprime;
-  GlobalWeights       weights;
-  int                 nspec;
+  MetricsAcc        metrics;
+  PropertiesAcc     properties;
+  IglobView         iglob;
+  Fields::view_type displacement;
+  Fields::view_type velocity;
+  Fields::view_type acceleration;
+  GlobalHPrime      hprime;
+  GlobalWeights     weights;
+  int               nspec;
 };
 
 // Registers are the binding occupancy constraint on the real kernel: it is
@@ -292,9 +296,10 @@ struct DummyKernelArgs {
 using DummyLaunchBounds = Kokkos::LaunchBounds<kTeamSize, 5>;
 
 template <typename ScratchLayout = Kokkos::LayoutLeft, typename MetricsAcc,
-          typename PropertiesAcc>
-int dummy_stiffness(const DummyKernelArgs<MetricsAcc, PropertiesAcc>& args,
-                    int team_size = -1) {
+          typename PropertiesAcc, typename IglobView>
+int dummy_stiffness(
+    const DummyKernelArgs<MetricsAcc, PropertiesAcc, IglobView>& args,
+    int team_size = -1) {
   using policy_t    = Kokkos::TeamPolicy<DummyLaunchBounds>;
   using member_type = typename policy_t::member_type;
 

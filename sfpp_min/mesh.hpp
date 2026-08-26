@@ -69,8 +69,8 @@ inline ElementSet interior_elements(const MeshDims& d) {
   return s;
 }
 
-inline int renumber_access_order(const MeshDims& d, const ElementSet& set,
-                                 IglobMap& out) {
+template <typename MapT>
+int renumber_access_order(const MeshDims& d, const ElementSet& set, MapT& out) {
   const int        nspec = set.nspec();
   std::vector<int> dedup(d.nnode_grid(), -1);
   auto&            h     = out.h_map;
@@ -94,8 +94,8 @@ inline int renumber_access_order(const MeshDims& d, const ElementSet& set,
   return count;
 }
 
-inline int renumber_grid_order(const MeshDims& d, const ElementSet& set,
-                               IglobMap& out) {
+template <typename MapT>
+int renumber_grid_order(const MeshDims& d, const ElementSet& set, MapT& out) {
   const int        nspec = set.nspec();
   std::vector<int> dedup(d.nnode_grid(), -1);
   auto&            h     = out.h_map;
@@ -112,8 +112,27 @@ inline int renumber_grid_order(const MeshDims& d, const ElementSet& set,
   return count;
 }
 
-inline double predicted_atomic_sectors_per_point(const ElementSet& set,
-                                                 const IglobMap& g, int nglob) {
+// The LEVEL GRAPH's access order -- ix innermost.
+//
+// Its threads decode t = e*125 + k*25 + j*5 + i (the staging level inherits the
+// functional input's LayoutRight tile order), so ix varies fastest and the
+// element slowest. Ordering points by ascending t is therefore ispec-major with
+// (iz, iy, ix) row-major -- which is exactly what renumber_grid_order already
+// walks. The two COINCIDE BY DERIVATION, not by definition: grid order is a
+// property of the mesh, this is a property of the kernel's thread map, and if
+// the thread map changes this stops being grid order. Hence a name of its own
+// and a one-line body rather than a second copy of the loop nest.
+//
+// The dummy keeps renumber_access_order: decompose() walks the ELEMENT axis
+// fastest, and that numbering is built for it.
+template <typename MapT>
+int renumber_ix_fastest(const MeshDims& d, const ElementSet& set, MapT& out) {
+  return renumber_grid_order(d, set, out);
+}
+
+template <typename MapT>
+double predicted_atomic_sectors_per_point(const ElementSet& set, const MapT& g,
+                                          int nglob) {
   const auto& h     = g.h_map;
   const int   nspec = set.nspec();
   const int   teams = num_teams(nspec);
