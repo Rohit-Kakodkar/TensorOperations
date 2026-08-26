@@ -347,12 +347,32 @@ class Evaluator<TeamPolicyTag2<ES>,
         c2_(regroup_view(ops.c.storage_, Split<FreeA, RankC>{})),
         team_(team) {}
 
-  KOKKOS_FORCEINLINE_FUNCTION void operator()(int i, int j) const {
+  // Split so a level driver can issue every member's LOADS before any member's
+  // STORE. Fused, the members run load-compute-store in turn, and each store to
+  // shared sits between the next member's loads -- nvcc cannot prove the store
+  // misses the operator buffer, so it reloads. The nine members of a level all
+  // take their A row at the same index from the SAME operator slot, so those
+  // reloads are pure waste: measured 180 LDS per warp against 82 distinct
+  // addresses, the operator elements fetched 9x each.
+  //
+  // Restrict is not the fix -- nvcc does not use it for shared-memory aliasing.
+  // Hoisting the stores past the loads removes the ambiguity outright: with no
+  // store in between, eliminating a duplicate load is valid whatever aliases
+  // what.
+  KOKKOS_FORCEINLINE_FUNCTION value_type compute(int i, int j) const {
     const auto a_row = slice(a2_, i, ALL);
     const auto b_col = slice(b2_, ALL, j);
     value_type acc{};
     for (int k = 0; k < SK; ++k) acc += a_row(k) * b_col(k);
+    return acc;
+  }
+
+  KOKKOS_FORCEINLINE_FUNCTION void store(int i, int j, value_type acc) const {
     c2_(i, j) = acc;
+  }
+
+  KOKKOS_FORCEINLINE_FUNCTION void operator()(int i, int j) const {
+    store(i, j, compute(i, j));
   }
 
   KOKKOS_FUNCTION auto operator()() const {
@@ -552,12 +572,31 @@ class Evaluator<TeamPolicyTag2<ES>,
     return apply_at(Impl::Index<Rank>{static_cast<int>(idx)...});
   }
 
+  // Split for the same reason the contraction is: a level driver can then issue
+  // every member's operand GATHER before any member's STORE. Both sides are
+  // shared memory here, so a store between two members' gathers stops nvcc
+  // eliminating a load the members share. This graph has one combine member per
+  // level so there is nothing to collect today -- the split costs nothing and
+  // makes the win available to graphs whose combine levels are wider.
+  template <typename Coord>
+    requires(!std::is_integral_v<Coord>)
+  KOKKOS_FORCEINLINE_FUNCTION Kokkos::Array<value_type, NumOut> compute(
+      const Coord& coord) const {
+    return apply_at(coord);
+  }
+
+  template <typename Coord>
+    requires(!std::is_integral_v<Coord>)
+  KOKKOS_FORCEINLINE_FUNCTION void store(
+      const Coord& coord, const Kokkos::Array<value_type, NumOut>& r) const {
+    TENSOR_PRAGMA_UNROLL
+    for (int m = 0; m < NumOut; ++m) outs_[m].storage_[coord] = r[m];
+  }
+
   template <typename Coord>
     requires(!std::is_integral_v<Coord>)
   KOKKOS_FORCEINLINE_FUNCTION void operator()(const Coord& coord) const {
-    const Kokkos::Array<value_type, NumOut> r = apply_at(coord);
-    TENSOR_PRAGMA_UNROLL
-    for (int m = 0; m < NumOut; ++m) outs_[m].storage_[coord] = r[m];
+    store(coord, compute(coord));
   }
 
   // Team-parallel evaluation: apply fn over the whole output tile, scattering
@@ -685,15 +724,32 @@ class Evaluator<TeamPolicyTag2<ES>,
                             const team_member_t& team)
       : fn_(n.fn), ops_(t.ops), origin_(t.origin), team_(team) {}
 
-  // The per-element step a fused level driver calls: gather the operands at
-  // `coord`, apply fn at the global coordinate, drop the void result.
+  // The per-element step a fused level driver calls, split the same way: the
+  // operand GATHER is the compute, applying fn (which scatters) is the store.
+  // A sink's fn writes GLOBAL while its operands are shared, so the two are
+  // already reorderable across address spaces -- the split is for uniformity
+  // with the multi-output combine, so one driver phases every member kind.
   template <typename Coord>
     requires(!std::is_integral_v<Coord>)
-  KOKKOS_FORCEINLINE_FUNCTION void operator()(const Coord& coord) const {
+  KOKKOS_FORCEINLINE_FUNCTION Kokkos::Array<value_type, NumOps> compute(
+      const Coord& coord) const {
+    return gather_vals(coord, ops_seq{});
+  }
+
+  template <typename Coord>
+    requires(!std::is_integral_v<Coord>)
+  KOKKOS_FORCEINLINE_FUNCTION void store(
+      const Coord& coord, const Kokkos::Array<value_type, NumOps>& v) const {
     Kokkos::Array<int, Rank> gidx{};
     TENSOR_PRAGMA_UNROLL
     for (int d = 0; d < Rank; ++d) gidx[d] = origin_[d] + coord[d];
-    Impl::apply_combine(fn_, gidx, gather_vals(coord, ops_seq{}));
+    Impl::apply_combine(fn_, gidx, v);
+  }
+
+  template <typename Coord>
+    requires(!std::is_integral_v<Coord>)
+  KOKKOS_FORCEINLINE_FUNCTION void operator()(const Coord& coord) const {
+    store(coord, compute(coord));
   }
 
   // A sink-only level has no output slot to drive its traversal, so it drives

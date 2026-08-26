@@ -202,10 +202,24 @@ KOKKOS_FUNCTION auto lg_make_contraction_member(const LevelsT& levels,
                        make_interm_node(store.template get<SlotC>()), team);
 }
 
+// Every member's LOADS, then every member's STORE -- not member-by-member.
+//
+// A contraction level's members all read the SAME operator slot at the same row
+// index, so fusing load-compute-store per member puts a shared store between
+// consecutive members' loads and nvcc reloads the operator each time (measured:
+// 180 LDS/warp over 82 distinct addresses, operator elements fetched 9x). This
+// is a two-phase issue, not an aliasing promise: with no store between the
+// loads, eliminating the duplicates is valid regardless of what aliases what.
+//
+// Ms is make_index_sequence<members>, so it indexes `acc` directly.
 template <typename EvalsT, std::size_t... Ms>
 KOKKOS_FUNCTION void lg_store_ij(const EvalsT& evs, int i, int j,
                                  std::index_sequence<Ms...>) {
-  (evs.template get<Ms>()(i, j), ...);
+  using value_type =
+      typename std::decay_t<decltype(evs.template get<0>())>::value_type;
+  const Kokkos::Array<value_type, sizeof...(Ms)> acc{
+      evs.template get<Ms>().compute(i, j)...};
+  (evs.template get<Ms>().store(i, j, acc[Ms]), ...);
 }
 
 template <typename V, typename ES, typename LevelsT, std::size_t L,
@@ -294,10 +308,23 @@ KOKKOS_FUNCTION auto lg_make_combine_member(
       std::make_index_sequence<static_cast<std::size_t>(Node::NumOut)>{});
 }
 
+// Every member's GATHER, then every member's STORE -- the combine twin of
+// lg_store_ij. Both sides are shared memory for a multi-output combine, so a
+// member's store sitting between two members' gathers stops nvcc eliminating a
+// load they share, exactly as it did on the contraction levels.
+//
+// sfpp_min has ONE combine member per level, so this is a no-op for this kernel
+// and was measured as such. It is here for graphs whose combine levels are
+// wider, where the same redundancy is available to collect.
+//
+// Uniform over member kinds: a sink's compute is its operand gather and its
+// store is the fn application that scatters, so one driver phases both.
 template <typename EvalsT, typename Coord, std::size_t... Ms>
 KOKKOS_FUNCTION void lg_store_coord(const EvalsT& evs, const Coord& coord,
                                     std::index_sequence<Ms...>) {
-  (evs.template get<Ms>()(coord), ...);
+  const DeviceTuple<decltype(evs.template get<Ms>().compute(coord))...> vals{
+      evs.template get<Ms>().compute(coord)...};
+  (evs.template get<Ms>().store(coord, vals.template get<Ms>()), ...);
 }
 
 template <typename V, typename ES, typename LevelsT, typename GridModes,
