@@ -340,6 +340,13 @@ if(TENSOR_OPS_BUILD_BENCHMARKS)
   # The order is fixed at 5 (production NGLL) in the source, not a build
   # option: it sets every tile extent in the graph AND the register blocking
   # below, and the two have to agree.
+  #
+  # GPU BACKENDS ONLY. The CPU team GEMM hardcodes MT=NT=8 (the overrides
+  # below reach only the CUDA/HIP branch), 5 divides neither, and there is no
+  # remainder path -- the source's static_asserts reject the instantiation, so
+  # a host-only build must not even compile this target. See the "GPU ONLY"
+  # note in the benchmark's header.
+  if(Kokkos_ENABLE_CUDA OR Kokkos_ENABLE_HIP)
   add_executable(bench_sem_stiffness_3d
     benchmarks/sem_stiffness_3d/bench_sem_stiffness_3d.cpp)
   target_link_libraries(bench_sem_stiffness_3d PRIVATE tensor)
@@ -363,6 +370,7 @@ if(TENSOR_OPS_BUILD_BENCHMARKS)
   # NR=2 is also what forbids TE=1 in the benchmark's sweep -- SB = 25 is odd.
   target_compile_definitions(bench_sem_stiffness_3d PRIVATE
     TENSOR_GEMM_MT=5 TENSOR_GEMM_NT=5 TENSOR_GEMM_NR=2)
+  endif()
 
   # --- 3D SEM stiffness on the LEVEL GRAPH (Sprint 5) -----------------------
   # Note what is ABSENT, and that it is the point: no TENSOR_GEMM_* overrides.
