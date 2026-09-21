@@ -1,11 +1,11 @@
 #pragma once
 
 template <typename ES, typename Storage, typename IntRank, typename HookOp>
-class Evaluator<TeamPolicyTag2<ES>,
+class Evaluator<TeamPolicyTag<ES>,
                 NodeHandle<IntermTag, Storage, IntRank, ES, HookOp>, void> {
  public:
   using node_type   = NodeHandle<IntermTag, Storage, IntRank, ES, HookOp>;
-  using policy_tag  = TeamPolicyTag2<ES>;
+  using policy_tag  = TeamPolicyTag<ES>;
   using tiling_type = void;
   static constexpr int Rank = node_type::Rank;
   using storage_type        = Storage;
@@ -28,7 +28,7 @@ template <typename Storage, typename IntRank, typename ES, typename HookOp,
           typename Team>
 KOKKOS_FUNCTION auto make_value_evaluator(
     NodeHandle<IntermTag, Storage, IntRank, ES, HookOp> node, const Team& team)
-    -> Evaluator<TeamPolicyTag2<ES>,
+    -> Evaluator<TeamPolicyTag<ES>,
                  NodeHandle<IntermTag, Storage, IntRank, ES, HookOp>, void> {
   return {node, team};
 }
@@ -37,17 +37,17 @@ namespace Impl {
 
 template <typename Node>
 using value_evaluator_t =
-    Evaluator<TeamPolicyTag2<typename Node::exec_space>, Node, void>;
+    Evaluator<TeamPolicyTag<typename Node::exec_space>, Node, void>;
 
 }
 
 template <typename ES, TensorLike T, typename ModesSeq, typename HookOp,
           typename Tile_>
-class Evaluator<TeamPolicyTag2<ES>, NodeHandle<InputTag, T, ModesSeq, HookOp>,
+class Evaluator<TeamPolicyTag<ES>, NodeHandle<InputTag, T, ModesSeq, HookOp>,
                 Tile_> {
  public:
   using node_type     = NodeHandle<InputTag, T, ModesSeq, HookOp>;
-  using policy_tag    = TeamPolicyTag2<ES>;
+  using policy_tag    = TeamPolicyTag<ES>;
   using tiling_type   = Tile_;
   using exec_space    = ES;
   using team_member_t = Impl::team_member_t<ES>;
@@ -86,7 +86,7 @@ class Evaluator<TeamPolicyTag2<ES>, NodeHandle<InputTag, T, ModesSeq, HookOp>,
 template <typename ES, typename Fn, typename ModesSeq, typename ValueType,
           typename Layout, typename HookOp, typename Tile_>
 class Evaluator<
-    TeamPolicyTag2<ES>,
+    TeamPolicyTag<ES>,
     NodeHandle<FunctionalTag, Fn, ModesSeq, ValueType, ES, Layout, HookOp>,
     Tile_> {
  public:
@@ -95,7 +95,7 @@ class Evaluator<
   // The tile inherits the declared tensor's order, exactly as tiling a real
   // view preserves that view's memory order.
   using order_tag     = typename node_type::order_tag;
-  using policy_tag    = TeamPolicyTag2<ES>;
+  using policy_tag    = TeamPolicyTag<ES>;
   using tiling_type   = Tile_;
   using exec_space    = ES;
   using team_member_t = Impl::team_member_t<ES>;
@@ -132,8 +132,8 @@ class Evaluator<
 
 template <typename ES, typename BackingVT, typename Layout, typename IntRank,
           typename HookOp, int... Perm>
-class Evaluator<TeamPolicyTag2<ES>,
-                Evaluator<TeamPolicyTag2<ES>,
+class Evaluator<TeamPolicyTag<ES>,
+                Evaluator<TeamPolicyTag<ES>,
                           NodeHandle<IntermTag, View<BackingVT, Layout>,
                                      IntRank, ES, HookOp>,
                           void>,
@@ -142,7 +142,7 @@ class Evaluator<TeamPolicyTag2<ES>,
       NodeHandle<IntermTag, View<BackingVT, Layout>, IntRank, ES, HookOp>;
 
  public:
-  using policy_tag    = TeamPolicyTag2<ES>;
+  using policy_tag    = TeamPolicyTag<ES>;
   using source_type   = Impl::value_evaluator_t<source_node_type>;
   using perm_seq      = std::integer_sequence<int, Perm...>;
   using tiling_type   = perm_seq;
@@ -157,7 +157,7 @@ class Evaluator<TeamPolicyTag2<ES>,
       requires(typename source_node_type::storage_type v) {
         reorder_view(v, perm_seq{});
       },
-      "Tag2 relabel: this storage layout has neither a reorder_layout "
+      "relabel: this storage layout has neither a reorder_layout "
       "(global/subview tiles) nor a reorder_tile (scratch tiles) overload");
 
   KOKKOS_FUNCTION Evaluator(source_type, perm_seq, const team_member_t& team)
@@ -178,14 +178,14 @@ struct StageTag {};
 
 template <typename ES, typename ValueType, typename Layout, int Rank,
           typename HookOp>
-class Evaluator<TeamPolicyTag2<ES>,
+class Evaluator<TeamPolicyTag<ES>,
                 NodeHandle<IntermTag, ScratchView<ValueType, ES, Layout>,
                            std::integral_constant<int, Rank>, ES, HookOp>,
                 StageTag> {
  public:
   using node_type   = NodeHandle<IntermTag, ScratchView<ValueType, ES, Layout>,
                                  std::integral_constant<int, Rank>, ES, HookOp>;
-  using policy_tag  = TeamPolicyTag2<ES>;
+  using policy_tag  = TeamPolicyTag<ES>;
   using tiling_type = StageTag;
   using scratch_view_t = ScratchView<ValueType, ES, Layout>;
   using value_type     = ValueType;
@@ -217,13 +217,100 @@ class Evaluator<TeamPolicyTag2<ES>,
   team_member_t team_;
 };
 
+// ---------------------------------------------------------------------------
+// TeamPolicyTag + IntermTag(View) + StoreTag<Tile> — store-evaluator
+//
+// Writes a computed scratch tile back to the global output view, team-parallel.
+// The exact reverse of a staged load: same tile_view / subview_tile /
+// TeamVectorRange structure, writing instead of reading. Tiles are assumed to
+// divide the view extents evenly (no boundary guard), matching the rest of the
+// team tier.
+//
+// The tile travels in a StoreTag rather than as a bare Tile_ because the node
+// slot is already taken twice over for IntermTag: `void` is the value
+// evaluator and `StageTag` the stage destination, so a third specialization
+// with an unconstrained tiling parameter would be ambiguous against both.
+// ---------------------------------------------------------------------------
+template <typename Tile>
+struct StoreTag {
+  Tile tile;
+};
+
+template <typename ES, typename BackingVT, typename Layout, typename IntRank,
+          typename HookOp, typename Tile_>
+class Evaluator<
+    TeamPolicyTag<ES>,
+    NodeHandle<IntermTag, View<BackingVT, Layout>, IntRank, ES, HookOp>,
+    StoreTag<Tile_>> {
+ public:
+  using node_type =
+      NodeHandle<IntermTag, View<BackingVT, Layout>, IntRank, ES, HookOp>;
+  using policy_tag          = TeamPolicyTag<ES>;
+  using tiling_type         = StoreTag<Tile_>;
+  static constexpr int Rank = node_type::Rank;
+  using value_type          = typename node_type::value_type;
+  using exec_space          = ES;
+  using team_member_t       = Impl::team_member_t<ES>;
+
+  static_assert(Layout::rank == Rank,
+                "scratch layout rank must equal node rank");
+  static_assert(Tile_::rank == Rank,
+                "store tile must carry one extent per output mode");
+
+  // No scratch allocation: the storage is already live in node_.storage_.
+  KOKKOS_FUNCTION Evaluator(node_type n, tiling_type t,
+                            const team_member_t& team)
+      : node_(n), tile_(t.tile), team_(team) {}
+
+  // `view` is the NATIVE (user-order) global output and `tile_` its native
+  // tile, so subview_tile hits the compile-time-ordered OrderedSubviewLayout
+  // path (registers, no local-memory spill). The canonical result is written by
+  // reordering the ordered subview into canonical order via reorder_view
+  // instead of presenting the output as a strided PermutedView. `perm` is permC
+  // (maps canonical output mode i -> user position perm[i]); a full-rank
+  // identity seq for canonical / non-permuted outputs makes every step below a
+  // no-op.
+  template <typename ViewT, int... Perm>
+  KOKKOS_FUNCTION void operator()(
+      Kokkos::Array<int, Rank> tile_idx, const ViewT& view,
+      std::integer_sequence<int, Perm...> perm) const {
+    static_assert(sizeof...(Perm) == Rank,
+                  "store permutation must have one entry per output mode");
+    TIMING_SCOPE_ENTER(g_timing_stats.store_write_time,
+                       g_timing_stats.store_write_count);
+    team_.team_barrier();  // ensure the producer's scratch is fully visible
+
+    // Canonical tile index -> native (user-order) tile index: scatter by perm,
+    // since perm[i] = user position of canonical mode i.
+    const auto u_idx = Impl::scatter_index(tile_idx, perm);
+
+    const auto tv  = tile_view(view, tile_);   // native -> ordered backing
+    const auto sv0 = subview_tile(tv, u_idx);  // OrderedSubviewLayout (fast)
+    const auto sv  = reorder_view(sv0, perm);  // canonical order, still ordered
+    auto       scratch = node_.storage_;
+    Impl::apply_hook(node_.hook_op, team_, tile_idx, scratch);
+
+    // Traversal follows sv, the ordered global destination, so the global
+    // writes stay coalesced (scratch is contiguous either way).
+    Impl::team_for_each_coord(team_, sv,
+                              [=](auto coord) { sv[coord] = scratch[coord]; });
+    TIMING_SCOPE_EXIT(g_timing_stats.store_write_time,
+                      g_timing_stats.store_write_count);
+  }
+
+ private:
+  node_type     node_;
+  Tile_         tile_;
+  team_member_t team_;
+};
+
 template <typename ES, typename Operand, typename ModesSeq, typename NodeTile,
           typename Tile_>
-class Evaluator<TeamPolicyTag2<ES>,
+class Evaluator<TeamPolicyTag<ES>,
                 NodeHandle<StagedTag, Operand, ModesSeq, NodeTile>, Tile_> {
  public:
   using node_type     = NodeHandle<StagedTag, Operand, ModesSeq, NodeTile>;
-  using policy_tag    = TeamPolicyTag2<ES>;
+  using policy_tag    = TeamPolicyTag<ES>;
   using tiling_type   = Tile_;
   using value_type    = typename node_type::value_type;
   using exec_space    = ES;
@@ -248,10 +335,10 @@ class Evaluator<TeamPolicyTag2<ES>,
 
   KOKKOS_FUNCTION auto operator()(
       Kokkos::Array<int, Tile_::rank> tile_idx) const {
-    auto src    = make_evaluator<TeamPolicyTag2<ES>>(node_.operand_, tile_,
-                                                     team_)(tile_idx);
-    auto stager = make_evaluator<TeamPolicyTag2<ES>>(make_interm_node(dst_),
-                                                     StageTag{}, team_);
+    auto src    = make_evaluator<TeamPolicyTag<ES>>(node_.operand_, tile_,
+                                                    team_)(tile_idx);
+    auto stager = make_evaluator<TeamPolicyTag<ES>>(make_interm_node(dst_),
+                                                    StageTag{}, team_);
     return (stager = src);
   }
 
@@ -292,14 +379,14 @@ KOKKOS_FUNCTION constexpr bool extents_agree() noexcept {
 template <typename ES, typename NA, typename NB, typename IntCRank, typename S,
           typename HookOp, typename CModesSeq, typename PermCSeq,
           typename AEval, typename BEval, typename CNode>
-class Evaluator<TeamPolicyTag2<ES>,
+class Evaluator<TeamPolicyTag<ES>,
                 NodeHandle<ContractionTag, NA, NB, IntCRank, S, ES, HookOp,
                            CModesSeq, PermCSeq>,
                 ContractOperands<AEval, BEval, CNode>> {
  public:
   using node_type  = NodeHandle<ContractionTag, NA, NB, IntCRank, S, ES, HookOp,
                                 CModesSeq, PermCSeq>;
-  using policy_tag = TeamPolicyTag2<ES>;
+  using policy_tag = TeamPolicyTag<ES>;
   using tiling_type   = ContractOperands<AEval, BEval, CNode>;
   using value_type    = S;
   using exec_space    = ES;
@@ -400,18 +487,18 @@ class Evaluator<TeamPolicyTag2<ES>,
 };
 
 // ---------------------------------------------------------------------------
-// Tag2 CombineTag — P{modes} = fn(A{modes}, B{modes}, ...), pointwise, N-ary,
+// CombineTag — P{modes} = fn(A{modes}, B{modes}, ...), pointwise, N-ary,
 // multi-output.
 //
-// The Tag2 counterpart of Evaluator/Team.hpp's Specialization 5, decomposed the
-// same way the Tag2 contraction is: this evaluator neither carves scratch nor
+// Decomposed the same way the contraction evaluator is: this one neither
+// carves scratch nor
 // stages nor gathers axes. The caller hands it operands that are ALREADY
 // aligned with the output -- staged, relabeled, or read straight off a subview
 // -- plus the destination node(s) to write, and the evaluator only checks that
 // every operand presents the output's extents. A permuted operand is composed
 // upstream out of the relabel and StageTag evaluators above.
 //
-// fn is defined (NodeHandle.hpp) to see the GLOBAL output coordinate. Tag2
+// fn is defined (NodeHandle.hpp) to see the GLOBAL output coordinate. This
 // consumes tile_idx at the InputTag step and does not retain it, so the tile's
 // global offset is carried explicitly as CombineOperands::origin; the default
 // all-zero origin makes fn see tile-local coordinates.
@@ -514,14 +601,14 @@ inline constexpr bool combine_op_aligned_v = [] {
 template <typename ES, typename CombineFn, typename IntCRank, typename S,
           typename CModesSeq, typename IntNumOut, typename... Ops,
           typename OutArray, typename... OpEvals>
-class Evaluator<TeamPolicyTag2<ES>,
+class Evaluator<TeamPolicyTag<ES>,
                 NodeHandle<CombineTag, CombineFn, IntCRank, S, ES, CModesSeq,
                            IntNumOut, Ops...>,
                 CombineOperands<OutArray, OpEvals...>> {
  public:
   using node_type     = NodeHandle<CombineTag, CombineFn, IntCRank, S, ES,
                                    CModesSeq, IntNumOut, Ops...>;
-  using policy_tag    = TeamPolicyTag2<ES>;
+  using policy_tag    = TeamPolicyTag<ES>;
   using tiling_type   = CombineOperands<OutArray, OpEvals...>;
   using value_type    = S;
   using exec_space    = ES;
@@ -554,8 +641,9 @@ class Evaluator<TeamPolicyTag2<ES>,
                 "combine destination must carry one extent per output mode");
   static_assert(
       (Impl::combine_op_aligned_v<Rank, out_layout_t, OpEvals> && ...),
-      "Tag2 combine: every operand must already present the output's extents "
-      "on every mode -- Tag2 gathers no axes, so a permuted operand must be "
+      "combine: every operand must already present the output's extents "
+      "on every mode -- this evaluator gathers no axes, so a permuted operand "
+      "must be "
       "relabeled and staged into the output order before it gets here");
 
   KOKKOS_FUNCTION Evaluator(node_type n, tiling_type t,
@@ -685,7 +773,7 @@ KOKKOS_FUNCTION auto make_combine_sink_operands(OpEvals... ops) {
 template <typename ES, typename CombineFn, typename IntCRank, typename S,
           typename CModesSeq, typename... Ops, int SinkRank,
           typename... OpEvals>
-class Evaluator<TeamPolicyTag2<ES>,
+class Evaluator<TeamPolicyTag<ES>,
                 NodeHandle<CombineTag, CombineFn, IntCRank, S, ES, CModesSeq,
                            std::integral_constant<int, 0>, Ops...>,
                 CombineSinkOperands<SinkRank, OpEvals...>> {
@@ -693,7 +781,7 @@ class Evaluator<TeamPolicyTag2<ES>,
   using node_type =
       NodeHandle<CombineTag, CombineFn, IntCRank, S, ES, CModesSeq,
                  std::integral_constant<int, 0>, Ops...>;
-  using policy_tag    = TeamPolicyTag2<ES>;
+  using policy_tag    = TeamPolicyTag<ES>;
   using tiling_type   = CombineSinkOperands<SinkRank, OpEvals...>;
   using value_type    = S;
   using exec_space    = ES;
@@ -717,7 +805,7 @@ class Evaluator<TeamPolicyTag2<ES>,
       (Impl::combine_op_aligned_v<Rank, typename op0_t::storage_type::layout_t,
                                   OpEvals> &&
        ...),
-      "Tag2 sink combine: every operand must already present the same extents "
+      "sink combine: every operand must already present the same extents "
       "on every mode -- a permuted operand must be relabeled and staged first");
 
   KOKKOS_FUNCTION Evaluator(node_type n, tiling_type t,

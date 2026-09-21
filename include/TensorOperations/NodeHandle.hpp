@@ -197,6 +197,14 @@ struct is_functional_layout<
 template <typename T>
 inline constexpr bool is_functional_layout_v = is_functional_layout<T>::value;
 
+// Number of output tensors a node emits: 1 for every node except a multi-output
+// combine, which exposes `NumOut`.
+template <typename Node, typename = void>
+struct output_arity : std::integral_constant<int, 1> {};
+template <typename Node>
+struct output_arity<Node, std::void_t<decltype(Node::NumOut)>>
+    : std::integral_constant<int, Node::NumOut> {};
+
 }  // namespace Impl
 
 // ---------------------------------------------------------------------------
@@ -350,8 +358,8 @@ struct NodeHandle<StagedTag, Operand, ModesSeq, Tile> {
 //
 // This is the node kind that lets a consumer NAME its operand rather than nest
 // that operand's whole subtree by value. Nesting is what makes a shared subtree
-// evaluate once PER CONSUMER (each ScratchAllocator holds its own inner
-// Evaluator, ScratchAllocator.hpp); naming it evaluates it once, full stop.
+// evaluate once PER CONSUMER, since each consumer would hold its own inner
+// evaluator; naming it evaluates it once, full stop.
 //
 // Structurally this is an IntermTag node plus the two things an OPERAND needs
 // and IntermTag does not carry: `modes_seq`, from which the contraction
@@ -570,17 +578,18 @@ KOKKOS_FUNCTION auto make_stage_node(Operand op) {
 //
 // `shape` is the PRODUCER's full per-mode extents in the order the labels are
 // given, NOT the tile's: a consumer computes its k-tile counts against the
-// operand's global shape (Evaluator/Team.hpp, accumulate_block), exactly as it
+// operand's global shape, exactly as it
 // does for an input operand's tensor extents.
 //
 // Two slot nodes MAY alias one buffer with different labels, and that is the
 // relabel mechanism. When a shared result has to be spelled in two consumers'
 // differing canonical orders, declare it twice rather than moving data; the
 // consumer whose labels do not match the storage order resolves the difference
-// through its own gather permutation, zero-copy (Impl::operand_relabelable_v).
+// through its own gather permutation, zero-copy (the relabel evaluator in
+// Evaluator/Team2.hpp).
 // `SlotIdx` names the buffer within the driver's slot store. Standalone uses --
 // binding a buffer by hand, outside any driver -- can pass 0 and ignore it; it
-// only means something to a DagGraph.
+// only means something to a graph driver.
 template <std::size_t SlotIdx, typename ModesSeq, typename Storage>
 KOKKOS_FUNCTION auto make_slot_node_seq(
     Storage storage, Kokkos::Array<int, ModesSeq::size()> shape) {

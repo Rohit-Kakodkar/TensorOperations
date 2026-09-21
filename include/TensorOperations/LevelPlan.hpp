@@ -1,8 +1,7 @@
 #pragma once
-#include <TensorOperations/DagGraph.hpp>
+#include <TensorOperations/Liveness.hpp>
 #include <TensorOperations/DeviceTuple.hpp>
 #include <TensorOperations/Evaluator.hpp>
-#include <TensorOperations/Graph.hpp>
 #include <TensorOperations/NodeHandle.hpp>
 #include <TensorOperations/SlotStore.hpp>
 
@@ -167,8 +166,9 @@ inline constexpr std::size_t lg_total_members_v = lg_total_members<LevelsT>();
 // worth about 12%.
 //
 // THE TIMELINE IS LEVELS, NOT MEMBERS, AND THAT IS A CORRECTNESS REQUIREMENT.
-// A DagGraph node reads its operands and writes its outputs in ONE evaluation,
-// so ranges closed at both ends make reuse safe at a node. A level does not
+// A flat node list reads its operands and writes its outputs in ONE
+// evaluation, so ranges closed at both ends make reuse safe at a node. A level
+// does not
 // work that way: barriers exist only at level ends, and every member of a level
 // runs interleaved inside one TeamVectorRange, so every slot a level touches is
 // live for the whole level. Ranking members within a level would produce a plan
@@ -180,15 +180,16 @@ inline constexpr std::size_t lg_total_members_v = lg_total_members<LevelsT>();
 // Ranges are CLOSED at both ends, so a slot defined at level L and a slot last
 // read at level L overlap at L and can never pool together.
 //
-// The operand scan is DagGraph's: dag_note_node_reads dispatches on node tag,
-// and a level's members are the same ContractionTag / CombineTag nodes with the
-// same SlotTag operands. A stage node wraps an InputTag, so it reports no slot
-// reads and the branch is a no-op. Only the iteration is new.
+// The operand scan is shared (Impl::note_node_reads, Liveness.hpp): it
+// dispatches on node tag, and a level's members are the same ContractionTag /
+// CombineTag nodes with the same SlotTag operands. A stage node wraps an
+// InputTag, so it reports no slot reads and the branch is a no-op. Only the
+// iteration is new.
 
 template <typename LevelT, std::size_t NS, std::size_t... Ms>
 constexpr void lg_note_level_reads(std::array<std::size_t, NS>& last,
                                    std::size_t t, std::index_sequence<Ms...>) {
-  (dag_note_node_reads<tuple_element_t<Ms, LevelT>, NS>(last, t), ...);
+  (note_node_reads<tuple_element_t<Ms, LevelT>, NS>(last, t), ...);
 }
 
 template <typename LevelsT, std::size_t NS, std::size_t... Ls>
@@ -341,9 +342,8 @@ inline constexpr bool lg_level_space_agrees_v = lg_level_space_agrees<LevelT>();
 template <typename Node, std::size_t... Is>
 constexpr int lg_max_combine_slot(std::index_sequence<Is...>) {
   int m = -1;
-  ((m = dag_operand_slot<tuple_element_t<Is, typename Node::ops_tuple_t>>() > m
-            ? dag_operand_slot<
-                  tuple_element_t<Is, typename Node::ops_tuple_t>>()
+  ((m = operand_slot<tuple_element_t<Is, typename Node::ops_tuple_t>>() > m
+            ? operand_slot<tuple_element_t<Is, typename Node::ops_tuple_t>>()
             : m),
    ...);
   return m;
@@ -352,14 +352,14 @@ constexpr int lg_max_combine_slot(std::index_sequence<Is...>) {
 template <typename Node>
 constexpr int lg_max_operand_slot() {
   if constexpr (has_node_tag_v<ContractionTag, Node>) {
-    const int a = dag_operand_slot<typename Node::node_a_type>();
-    const int b = dag_operand_slot<typename Node::node_b_type>();
+    const int a = operand_slot<typename Node::node_a_type>();
+    const int b = operand_slot<typename Node::node_b_type>();
     return a > b ? a : b;
   } else if constexpr (has_node_tag_v<CombineTag, Node>) {
     return lg_max_combine_slot<Node>(
         std::make_index_sequence<static_cast<std::size_t>(Node::NumOps)>{});
   } else if constexpr (has_node_tag_v<StagedTag, Node>) {
-    return dag_operand_slot<typename Node::operand_type>();
+    return operand_slot<typename Node::operand_type>();
   } else {
     return -1;
   }

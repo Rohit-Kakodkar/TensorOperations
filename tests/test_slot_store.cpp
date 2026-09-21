@@ -215,15 +215,6 @@ TEST(SlotStoreTest, SlotTypeDependsOnlyOnTheTile) {
                      decltype(Impl::alloc_scratch_tile<float, ES>(
                          std::declval<team_t>(), std::declval<T0>()))>);
 
-  // And it is the SAME type a producing evaluator hands over, so a slot can be
-  // adopted by its producer (stage 3) and named by its consumers (stage 1)
-  // without any conversion. Reached here through the allocator, i.e. by a
-  // different route than the alias takes.
-  using ProducerOut =
-      typename ScratchAllocator<TeamPolicyTag<ES>, ContractionTag, IntermTag,
-                                float, T0>::scratch_view_t;
-  static_assert(std::is_same_v<SlotView<float, ES, T0>, ProducerOut>);
-
   // Distinct tiles give distinct slot types; equal tiles give equal ones.
   static_assert(
       !std::is_same_v<SlotView<float, ES, T0>, SlotView<float, ES, T1>>);

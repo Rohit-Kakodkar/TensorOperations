@@ -117,8 +117,8 @@ make_tile_layout(StaticTile<E...>,
 //     stride(d) and TensorLike but is not one of the four NAMED layout types.
 //   • A tile that does not divide the source extent is now a compile error
 //     rather than a truncating E/T that silently drops the remainder. This is
-//     intentional; Evaluator/Team.hpp already treats that truncation as a
-//     wrong-results hazard and guards it separately.
+//     intentional: that truncation is a wrong-results hazard, not a rounding
+//     convenience.
 //
 // The dynamic overloads keep their hand-rolled interleaving: the planner is
 // compile-time-only and cannot serve a runtime extent.

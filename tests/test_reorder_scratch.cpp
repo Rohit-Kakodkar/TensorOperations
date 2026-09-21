@@ -153,9 +153,8 @@ TEST(ReorderScratch, Permute3D_SwapWithFixedPoint) {
 }
 
 // ---------------------------------------------------------------------------
-// Evaluator<TeamPolicyTag, IntermTag(scratch view), plain perm_seq> — the
-// scratch-view relabel specialization (mirrors Specialization 7's global-view
-// relabel, but for ScratchView via reorder_tile). Unlike
+// The relabel evaluator on a scratch view: reorder_tile rather than the
+// global-view reorder_layout path. Unlike
 // Impl::reorder_scratch_in_place above, this is a true zero-copy retype: the
 // raw backing bytes are untouched, only the layout type changes.
 // ---------------------------------------------------------------------------
@@ -179,18 +178,17 @@ void run_relabel_transpose(Buf1D src_readback, Buf1D dst_readback) {
         });
         team.team_barrier();
 
-        auto src    = make_interm_node(scratch);  // NoHook
-        using NodeT = decltype(src);
-        using EvalT = Evaluator<TeamPolicyTag<ExecSpace>, NodeT,
-                                std::integer_sequence<int, 1, 0>>;
-        EvalT ev(std::integer_sequence<int, 1, 0>{}, team);
-        auto  result = (ev(team, Kokkos::Array<int, 2>{0, 0}) = src);
+        using Perm  = std::integer_sequence<int, 1, 0>;
+        auto src    = make_value_evaluator(make_interm_node(scratch), team);
+        using EvalT = Evaluator<TeamPolicyTag<ExecSpace>, decltype(src), Perm>;
+        EvalT ev(src, Perm{}, team);
+        auto  result = (ev = src);
         team.team_barrier();
 
         Kokkos::single(Kokkos::PerTeam(team), [=]() {
           for (int i = 0; i < 8; ++i)
             for (int j = 0; j < 4; ++j)
-              dst_readback(i * 4 + j) = result.storage_(i, j);
+              dst_readback(i * 4 + j) = result.node().storage_(i, j);
           for (int s = 0; s < 32; ++s) src_readback(s) = scratch.data()[s];
         });
       });
@@ -244,24 +242,36 @@ void run_relabel_hook(Buf1D dst_readback) {
         });
         team.team_barrier();
 
-        auto src    = make_interm_node(scratch, AddIndexHook{});
-        using NodeT = decltype(src);
-        using EvalT = Evaluator<TeamPolicyTag<ExecSpace>, NodeT,
-                                std::integer_sequence<int, 1, 0>>;
-        EvalT ev(std::integer_sequence<int, 1, 0>{}, team);
-        auto  result = (ev(team, Kokkos::Array<int, 2>{0, 0}) = src);
+        using Perm = std::integer_sequence<int, 1, 0>;
+        auto src   = make_value_evaluator(
+            make_interm_node(scratch, AddIndexHook{}), team);
+        using EvalT = Evaluator<TeamPolicyTag<ExecSpace>, decltype(src), Perm>;
+        EvalT ev(src, Perm{}, team);
+        auto  result = (ev = src);
         team.team_barrier();
 
         Kokkos::single(Kokkos::PerTeam(team), [=]() {
           for (int i = 0; i < 3; ++i)
             for (int j = 0; j < 2; ++j)
-              dst_readback(i * 2 + j) = result.storage_(i, j);
+              dst_readback(i * 2 + j) = result.node().storage_(i, j);
         });
       });
   Kokkos::fence();
 }
 
-TEST(RelabelScratchView, AppliesSourceHook) {
+// The relabel DEFERS the source hook rather than applying it.
+//
+// This is the one place the relabel differs observably from the removed
+// TeamPolicyTag v1 one, and the difference is the point of the design: v1's
+// assign() called apply_hook on the relabelled view and handed back a NoHook
+// node, so relabelling a shared buffer WROTE to it. It now only retypes the
+// layout and forwards the hook into the result node, leaving the bytes
+// untouched -- which is what lets a slot with other consumers be relabelled at
+// all. The hook is applied later, by whoever stages or stores the result.
+//
+// The type-level half of this is pinned in test_team2.cpp, which asserts the
+// relabelled node carries the source's hook_op rather than NoHook.
+TEST(RelabelScratchView, DefersSourceHook) {
   Buf1D dst_readback("dst_readback", 6);  // dst is 3x2 after perm{1,0}
 
   run_relabel_hook(dst_readback);
@@ -269,16 +279,12 @@ TEST(RelabelScratchView, AppliesSourceHook) {
   auto h = Kokkos::create_mirror_view(dst_readback);
   Kokkos::deep_copy(h, dst_readback);
 
-  // dst(i,j) reads native src(j,i) = j*3+i, then the hook adds
-  // 1000*(i+1)+(j+1) using dst's own local (i,j) as the global index
-  // (tile_idx = {0,0}).
+  // dst(i,j) reads native src(j,i) = j*3+i, unmodified: the AddIndexHook rides
+  // along on the node and has not run.
   for (int i = 0; i < 3; ++i)
-    for (int j = 0; j < 2; ++j) {
-      const float base = static_cast<float>(j * 3 + i);
-      const float expected =
-          base + 1000.f * static_cast<float>(i + 1) + static_cast<float>(j + 1);
-      EXPECT_FLOAT_EQ(h(i * 2 + j), expected) << "i=" << i << " j=" << j;
-    }
+    for (int j = 0; j < 2; ++j)
+      EXPECT_FLOAT_EQ(h(i * 2 + j), static_cast<float>(j * 3 + i))
+          << "i=" << i << " j=" << j;
 }
 
 int main(int argc, char* argv[]) {

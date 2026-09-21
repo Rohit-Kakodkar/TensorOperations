@@ -1,6 +1,8 @@
 #pragma once
 #include <TensorOperations/LabelTiles.hpp>
+#include <TensorOperations/Liveness.hpp>
 #include <TensorOperations/LevelPlan.hpp>
+#include <TensorOperations/ScratchTile.hpp>
 
 #include <array>
 #include <cstddef>
@@ -255,9 +257,9 @@ KOKKOS_FUNCTION auto lg_make_combine_member_impl(
   using Node                 = tuple_element_t<M, tuple_element_t<L, LevelsT>>;
   constexpr std::size_t Base = lg_member_base_v<LevelsT, L, M>;
 
-  using Gather   = dag_gather_seq_t<typename Node::modes_seq, GridModes>;
+  using Gather   = gather_seq_t<typename Node::modes_seq, GridModes>;
   using OutTile  = member_out_tile_t<Node>;
-  const auto idx = dag_node_index<Node::Rank, RootR>(grid_idx, Gather{});
+  const auto idx = node_index<Node::Rank, RootR>(grid_idx, Gather{});
 
   Kokkos::Array<int, Node::Rank> origin{};
   for (int d = 0; d < Node::Rank; ++d) origin[d] = idx[d] * OutTile::extent(d);
@@ -274,7 +276,7 @@ KOKKOS_FUNCTION auto lg_make_combine_member_impl(
                                          typename Node::ops_tuple_t>::modes_seq,
                 typename Node::modes_seq>(store, team)...)
             .at(origin);
-    return make_evaluator<TeamPolicyTag2<ES>>(
+    return make_evaluator<TeamPolicyTag<ES>>(
         levels.template get<L>().template get<M>(), ops, team);
   } else {
     using OutNode = decltype(make_interm_node(store.template get<Base>()));
@@ -290,7 +292,7 @@ KOKKOS_FUNCTION auto lg_make_combine_member_impl(
                 typename Node::modes_seq>(store, team)...,
             outs)
             .at(origin);
-    return make_evaluator<TeamPolicyTag2<ES>>(
+    return make_evaluator<TeamPolicyTag<ES>>(
         levels.template get<L>().template get<M>(), ops, team);
   }
 }
@@ -368,9 +370,9 @@ KOKKOS_FUNCTION auto lg_stage_src(const LevelsT&                   levels,
                                   const Kokkos::Array<int, RootR>& grid_idx,
                                   const Team&                      team) {
   using Node     = tuple_element_t<M, tuple_element_t<L, LevelsT>>;
-  using Gather   = dag_gather_seq_t<typename Node::modes_seq, GridModes>;
-  const auto idx = dag_node_index<Node::Rank, RootR>(grid_idx, Gather{});
-  return make_evaluator<TeamPolicyTag2<ES>>(
+  using Gather   = gather_seq_t<typename Node::modes_seq, GridModes>;
+  const auto idx = node_index<Node::Rank, RootR>(grid_idx, Gather{});
+  return make_evaluator<TeamPolicyTag<ES>>(
              levels.template get<L>().template get<M>().operand_,
              member_out_tile_t<Node>{}, team)(idx)
       .node()
@@ -457,13 +459,14 @@ KOKKOS_FUNCTION void lg_store_root(const LevelsT& levels, const Store& store,
   constexpr std::size_t L = lg_slot_level_v<LevelsT, R>;
   constexpr std::size_t M = lg_slot_member_v<LevelsT, R>;
   using Node              = tuple_element_t<M, tuple_element_t<L, LevelsT>>;
-  using Gather = dag_gather_seq_t<typename Node::modes_seq, GridModes>;
+  using Gather            = gather_seq_t<typename Node::modes_seq, GridModes>;
 
-  const auto idx   = dag_node_index<Node::Rank, RootR>(grid_idx, Gather{});
+  using Tile = typename lg_member_decl_tile<Node>::type;
+
+  const auto idx   = node_index<Node::Rank, RootR>(grid_idx, Gather{});
   auto       seval = make_evaluator<TeamPolicyTag<ES>>(
-      make_interm_node(store.template get<R>()),
-      typename lg_member_decl_tile<Node>::type{});
-  seval(team, idx, view, output_perm_seq<Node>());
+      make_interm_node(store.template get<R>()), StoreTag<Tile>{Tile{}}, team);
+  seval(idx, view, output_perm_seq<Node>());
 }
 
 template <typename V, typename ES, typename LevelsT, typename GridModes,
@@ -723,7 +726,7 @@ struct LevelOutputs {
       Impl::lg_pool_count_v<typename Graph::levels_type, roots_seq>;
 
   template <typename ES, TensorLike... Ts>
-  int execute(const TeamPolicyTag2<ES>&, const Ts&... views) const {
+  int execute(const TeamPolicyTag<ES>&, const Ts&... views) const {
     return graph.template launch<ES, Roots...>(team, views...);
   }
 };
@@ -833,8 +836,8 @@ struct LevelGraph {
   bool member_index_consistent() const {
     using Member = Impl::lg_flat_member_t<LevelsT, F>;
     using Gather =
-        Impl::dag_gather_seq_t<typename Member::modes_seq,
-                               Impl::lg_grid_modes_t<LabelTilesT, LevelsT>>;
+        Impl::gather_seq_t<typename Member::modes_seq,
+                           Impl::lg_grid_modes_t<LabelTilesT, LevelsT>>;
     constexpr auto        g = Impl::seq_to_array(Gather{});
     constexpr std::size_t L = Impl::lg_flat_level_of<LevelsT>(F);
     constexpr std::size_t M = Impl::lg_flat_member_of<LevelsT>(F);

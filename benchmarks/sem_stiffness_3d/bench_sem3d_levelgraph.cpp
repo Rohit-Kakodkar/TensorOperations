@@ -2,14 +2,10 @@
 // 3D SEM stiffness, NGLL=5: the DECLARATIVE level graph against a hand-written
 // fused kernel of the same shape.  (Sprint 5 of plans/level-graph-sprints.md.)
 //
-// The sibling benchmark, bench_sem_stiffness_3d.cpp, carries a Tag2
-// fused-per-level kernel called `library2` whose own header says:
-//
-//     "This is what Sprint 3's add() would generate; hand-writing it here is a
-//      measurement, not an API."
-//
-// It is 353 lines of caller-driven level walking. This file is that kernel
-// GENERATED from a declaration: four `.add()` calls, no barriers, no scratch
+// A caller-driven version of this pipeline -- walking the levels by hand
+// rather than declaring them -- took 353 lines, and the removed TeamPolicyTag
+// DAG took 210. This file is that kernel GENERATED from a declaration: four
+// `.add()` calls, no barriers, no scratch
 // arithmetic, no index decoding.
 //
 // THE PIPELINE (identical to the sibling file, same shared physics):
@@ -25,7 +21,7 @@
 // members | 3 combines.
 //
 // THE ONE IDEA WORTH READING THE FILE FOR: every contraction declares its
-// output as <'e','k','j','i'>. Declared-order output (PR #33) lets a Tag2
+// output as <'e','k','j','i'>. Declared-order output (PR #33) lets a
 // contraction keep STORING C canonically (freeA ++ freeB) while the declared
 // labels ride in the slot's view type, so a gradient whose canonical storage is
 // (i,e,k,j) is READ as the element-major frame everyone else speaks. The
@@ -79,9 +75,9 @@ inline constexpr bool kIsGPU =
 inline constexpr int N = 5;  // GLL points per direction (production NGLL)
 inline constexpr int C = 3;  // displacement components
 
-// Unlike the sibling benchmark, TE=1 is LEGAL here and TE=16 is not.
+// Unlike the removed register-blocked GEMM, TE=1 is LEGAL here; TE=16 is not.
 //
-// TE=1: the Tag2 contraction is a plain dot product with no register blocking,
+// TE=1: the contraction is a plain dot product with no register blocking,
 // so SB = TE*N*N = 25 being odd is irrelevant. The sibling file cannot express
 // this tile at all -- its CMake target pins NR=2, which requires SB even.
 //
@@ -347,7 +343,7 @@ void levelgraph_sem3d(Fields d, int team) {
 
   g6.outputs(r0, r1, r2)
       .team_size(team)
-      .execute(TeamPolicyTag2<ES>{}, d.f0, d.f1, d.f2);
+      .execute(TeamPolicyTag<ES>{}, d.f0, d.f1, d.f2);
 }
 inline constexpr int kGraphEnd = __LINE__;
 
@@ -698,8 +694,9 @@ double best_ms(Fn&& fn, int warmup, int reps) {
 }  // namespace
 
 // TE as a compile-time fold, since it is a template parameter of both kernels.
-// TE=1 is the row the sibling benchmark CANNOT express (its pinned NR=2 needs
-// SB even); TE=16 is the row that will not launch (264 KB of scratch).
+// TE=1 is the row the removed register-blocked GEMM could NOT express (its
+// pinned NR=2 needed SB even); TE=16 is the row that will not launch (264 KB of
+// scratch).
 template <typename Fn>
 void for_each_TE(Fn&& fn) {
   fn(std::integral_constant<int, 1>{});
@@ -902,9 +899,9 @@ int run(int argc, char* argv[]) {
     std::printf("%-12s %9d %9d   %s\n", "hand4", 0, kHandEnd - kHandBegin - 1,
                 "scratch views, 4 ranges, 4 barriers, index decode");
     std::printf(
-        "\nFor reference, the sibling benchmark spends 210 lines "
-        "(library, Tag1 DAG)\nand 353 (library2, caller-driven Tag2) "
-        "on this same pipeline.\n");
+        "\nFor reference, a caller-driven walk of the same levels spent 353 "
+        "lines\nand the removed TeamPolicyTag DAG 210, on this same "
+        "pipeline.\n");
 
     return (graph.err < 1e-4 && hand.err < 1e-4) ? 0 : 1;
   }

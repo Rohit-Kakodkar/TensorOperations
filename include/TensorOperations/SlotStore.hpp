@@ -1,6 +1,7 @@
 #pragma once
 #include <TensorOperations/DeviceTuple.hpp>
 #include <TensorOperations/Evaluator.hpp>
+#include <TensorOperations/ScratchTile.hpp>
 
 #include <cstddef>
 #include <type_traits>
@@ -27,7 +28,7 @@ namespace TensorOperations {
 // buffer exists: `make_slot_node<'i','k'>(SlotView<float, ES, Tile>{}, shape)`
 // declares the node with a placeholder, and the driver assigns the real buffer
 // on device (node factories are host-only, so the graph cannot be assembled
-// where team scratch lives -- see tests/test_slot_node.cpp).
+// where team scratch lives).
 // ---------------------------------------------------------------------------
 template <typename ValueType, typename ExecSpace, typename Tile>
 using SlotView = decltype(Impl::alloc_scratch_tile<ValueType, ExecSpace>(
@@ -43,10 +44,9 @@ using SlotView = decltype(Impl::alloc_scratch_tile<ValueType, ExecSpace>(
 // This is the inversion that makes sharing possible. An evaluator that carves
 // its own output decides that buffer's identity by CONSTRUCTION ORDER, so a
 // result cannot outlive its evaluator and no other node can name it. Here the
-// driver carves everything up front, hands node K its own buffer to adopt (see
-// the adopting constructors in Evaluator/Team.hpp), and hands the SAME buffer
-// to every later node that names K as an operand (SlotTag). One buffer, one
-// evaluation, N readers.
+// driver carves everything up front, hands member K its own buffer to write
+// into, and hands the SAME buffer to every later member that names K as an
+// operand (SlotTag). One buffer, one evaluation, N readers.
 //
 // The invariant this type carries, and which its tests check rather than
 // assume: the buffers are pairwise DISJOINT, and together they occupy no more
@@ -72,15 +72,16 @@ struct SlotStore {
 // the CALLER chose.
 //
 // The store with NO allocator at all: slot I is built at base[I], and NOTHING
-// requires those pointers to be distinct -- a liveness plan (DagGraph.hpp) may
-// point two slots at one buffer when their live ranges do not overlap.
+// requires those pointers to be distinct -- a liveness plan (Liveness.hpp,
+// LevelPlan.hpp) may point two slots at one buffer when their live ranges do
+// not overlap.
 //
 // THE INVARIANT IS THEREFORE WEAKER THAN carve_arena_slot_store's, and
 // deliberately. The arena lays slots end to end and so guarantees them pairwise
 // disjoint; this guarantees only what its caller's plan guarantees, which is
 // that slots whose live ranges OVERLAP are disjoint. A plan that got that wrong
 // would not crash -- it would silently feed one node another node's data -- so
-// the plan is checked directly in tests/test_slot_liveness.cpp rather than
+// the plan is checked directly in tests/test_level_liveness.cpp rather than
 // trusted.
 //
 // The returned type is identical to the arena's for the same tiles: a slot's
@@ -219,9 +220,9 @@ struct slot_arena_offset<ValueType, ExecSpace, SlotTiles<Tiles...>, I> {
 // per team: on the SEM3D level graph (35 slots) it measured 5,718,016 warp
 // instructions against the hand-written kernel's 753,664, i.e. 70% of that
 // kernel's whole instruction deficit. One carve plus 35 compile-time offsets
-// replaces all of it. This is DagGraph's dag_carve_pools with the pool count
-// fixed at one -- and unlike pooling, it needs no liveness analysis, because it
-// is not trying to make the store SMALLER.
+// replaces all of it. This is the pooled carve below with the pool count fixed
+// at one -- and unlike pooling, it needs no liveness analysis, because it is
+// not trying to make the store SMALLER.
 //
 // Pairwise disjointness is still guaranteed, now by the prefix sum being
 // strictly increasing rather than by the allocator's cursor.

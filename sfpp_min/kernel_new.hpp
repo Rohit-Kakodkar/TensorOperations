@@ -384,7 +384,7 @@ int new_stiffness(
   if (hw.extent(0) == 0) hw = make_hprimewgll(args.hprime, args.weights);
 
   auto g6 = build_new_graph<KeepRedundantLoads, TE>(args, hw);
-  return g6.outputs().team_size(team_size).execute(TeamPolicyTag2<ES>{});
+  return g6.outputs().team_size(team_size).execute(TeamPolicyTag<ES>{});
 }
 
 }  // namespace sfpp_min

@@ -65,20 +65,10 @@ add_executable(test_contraction_node tests/test_contraction_node.cpp)
 target_link_libraries(test_contraction_node PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_contraction_node)
 
-# test_graph — custom main() wraps Kokkos init/finalize
-add_executable(test_graph tests/test_graph.cpp)
-target_link_libraries(test_graph PRIVATE tensor GTest::gtest)
-gtest_discover_tests(test_graph)
-
 # test_device_tuple — custom main() wraps Kokkos init/finalize
 add_executable(test_device_tuple tests/test_device_tuple.cpp)
 target_link_libraries(test_device_tuple PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_device_tuple)
-
-# test_combine_node — custom main() wraps Kokkos init/finalize
-add_executable(test_combine_node tests/test_combine_node.cpp)
-target_link_libraries(test_combine_node PRIVATE tensor GTest::gtest)
-gtest_discover_tests(test_combine_node)
 
 add_executable(test_team2 tests/test_team2.cpp)
 target_link_libraries(test_team2 PRIVATE tensor GTest::gtest)
@@ -107,10 +97,6 @@ add_executable(test_tiled_layout tests/test_tiled_layout.cpp)
 target_link_libraries(test_tiled_layout PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_tiled_layout)
 
-# test_scratch_allocator — custom main() wraps Kokkos init/finalize
-add_executable(test_scratch_allocator tests/test_scratch_allocator.cpp)
-target_link_libraries(test_scratch_allocator PRIVATE tensor GTest::gtest)
-gtest_discover_tests(test_scratch_allocator)
 # test_tile_layout_stride — custom main() wraps Kokkos init/finalize
 add_executable(test_tile_layout_stride tests/test_tile_layout_stride.cpp)
 target_link_libraries(test_tile_layout_stride PRIVATE tensor GTest::gtest)
@@ -130,30 +116,10 @@ add_executable(test_reorder_scratch tests/test_reorder_scratch.cpp)
 target_link_libraries(test_reorder_scratch PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_reorder_scratch)
 
-# test_slot_node — custom main() wraps Kokkos init/finalize
-add_executable(test_slot_node tests/test_slot_node.cpp)
-target_link_libraries(test_slot_node PRIVATE tensor GTest::gtest)
-gtest_discover_tests(test_slot_node)
-
-# test_adopted_output — custom main() wraps Kokkos init/finalize
-add_executable(test_adopted_output tests/test_adopted_output.cpp)
-target_link_libraries(test_adopted_output PRIVATE tensor GTest::gtest)
-gtest_discover_tests(test_adopted_output)
-
 # test_slot_store — custom main() wraps Kokkos init/finalize
 add_executable(test_slot_store tests/test_slot_store.cpp)
 target_link_libraries(test_slot_store PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_slot_store)
-
-# test_dag_graph — custom main() wraps Kokkos init/finalize
-add_executable(test_dag_graph tests/test_dag_graph.cpp)
-target_link_libraries(test_dag_graph PRIVATE tensor GTest::gtest)
-gtest_discover_tests(test_dag_graph)
-
-# test_slot_liveness — custom main() wraps Kokkos init/finalize
-add_executable(test_slot_liveness tests/test_slot_liveness.cpp)
-target_link_libraries(test_slot_liveness PRIVATE tensor GTest::gtest)
-gtest_discover_tests(test_slot_liveness)
 
 # test_label_tiles — one tile extent per label; the equivalence asserts that
 # justify replacing per-node tile derivation with a graph-wide lookup.
@@ -184,46 +150,6 @@ gtest_discover_tests(test_functional_input)
 add_executable(test_sink_combine tests/test_sink_combine.cpp)
 target_link_libraries(test_sink_combine PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_sink_combine)
-
-# ---------------------------------------------------------------------------
-# Negative-compilation tests for the slot guards.
-#
-# Asserting a guard predicate is false proves the predicate; it does NOT prove
-# the evaluator consults it, and a guard that is defined but never read looks
-# identical from inside a static_assert. These targets build a configuration the
-# guard forbids and ctest asserts the BUILD fails.
-#
-# EXCLUDE_FROM_ALL so `make` stays green; each is built on demand by its test.
-# Case 0 is the control -- the same shape without the violation -- and must
-# build, so a file that breaks for unrelated reasons cannot masquerade as every
-# guard passing.
-#
-# NOTE: unlike every other test here, these INVOKE THE COMPILER AT TEST TIME.
-# On the CUDA build that means `module load cudatoolkit/<ver>` must be in effect
-# when ctest runs, not merely when cmake --build ran; without it nvcc_wrapper
-# fails with "nvcc: command not found" and the cases report as failures that
-# have nothing to do with the guards.
-# ---------------------------------------------------------------------------
-foreach(case 0 1 2)
-  add_executable(slot_guard_neg_${case} EXCLUDE_FROM_ALL
-                 tests/negative/slot_guard_negative.cpp)
-  target_link_libraries(slot_guard_neg_${case} PRIVATE tensor)
-  target_compile_definitions(slot_guard_neg_${case}
-                             PRIVATE SLOT_NEG_CASE=${case})
-  add_test(NAME SlotGuardNegative.Case${case}
-           COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}
-                   --target slot_guard_neg_${case} --config $<CONFIG>)
-endforeach()
-# Case 0 must compile. Cases 1 and 2 must fail, and must fail FOR THE RIGHT
-# REASON: WILL_FAIL alone is satisfied by any nonzero exit, so an unrelated
-# breakage in the file would masquerade as both guards working. Matching the
-# guard's own diagnostic pins it to the intended static_assert -- in particular
-# to the slot-specific message rather than the fused-operand extent one, which
-# is the mistake a reader of a bare failure would most likely make.
-# PASS_REGULAR_EXPRESSION supersedes the exit code, so WILL_FAIL is not also set.
-set_tests_properties(SlotGuardNegative.Case1 SlotGuardNegative.Case2
-                     PROPERTIES PASS_REGULAR_EXPRESSION
-                     "operand [AB] is a SLOT and perm[AB] is not the identity")
 
 # ---------------------------------------------------------------------------
 # Negative-compilation tests for the LABEL-TILE MAP guards. Same rationale and
@@ -333,75 +259,6 @@ set_tests_properties(LevelGuardNegative.Case4 PROPERTIES
 
 # Benchmarks (opt-in: -DTENSOR_OPS_BUILD_BENCHMARKS=ON). No gtest; own main().
 if(TENSOR_OPS_BUILD_BENCHMARKS)
-  # KokkosKernels — needed for bench_matrix_multiply's BLAS3 GEMM path.
-  # KokkosKernels calls find_package(Kokkos) internally; point it at the
-  # build-tree KokkosConfig.cmake rather than a system install.
-  set(Kokkos_DIR "${kokkos_BINARY_DIR}" CACHE PATH "" FORCE)
-  set(KokkosKernels_ENABLE_TESTS     OFF CACHE BOOL "" FORCE)
-  set(KokkosKernels_ENABLE_EXAMPLES  OFF CACHE BOOL "" FORCE)
-  set(KokkosKernels_ENABLE_PERFTESTS OFF CACHE BOOL "" FORCE)
-  set(KokkosKernels_ENABLE_DOCS      OFF CACHE BOOL "" FORCE)
-  set(KokkosKernels_ENABLE_TPL_CUBLAS   OFF CACHE BOOL "" FORCE)
-  set(KokkosKernels_ENABLE_TPL_CUSOLVER OFF CACHE BOOL "" FORCE)
-  FetchContent_Declare(
-      kokkoskernels
-      GIT_REPOSITORY https://github.com/kokkos/kokkos-kernels.git
-      GIT_TAG        develop
-  )
-  FetchContent_MakeAvailable(kokkoskernels)
-
-  add_executable(bench_team_contraction
-    benchmarks/team_contraction/bench_team_contraction.cpp)
-  target_link_libraries(bench_team_contraction PRIVATE tensor)
-
-  add_executable(bench_sem_stiffness
-    benchmarks/sem_stiffness/bench_sem_stiffness.cpp)
-  target_link_libraries(bench_sem_stiffness PRIVATE tensor)
-
-  add_executable(bench_multilevel_contraction
-    benchmarks/multilevel_contraction/bench_multilevel_contraction.cpp)
-  target_link_libraries(bench_multilevel_contraction PRIVATE tensor)
-
-  add_executable(bench_permuted_contraction
-    benchmarks/permuted_contraction/bench_permuted_contraction.cpp)
-  target_link_libraries(bench_permuted_contraction PRIVATE tensor)
-
-  add_executable(bench_permuted_combine
-    benchmarks/permuted_combine/bench_permuted_combine.cpp)
-  target_link_libraries(bench_permuted_combine PRIVATE tensor)
-
-  add_executable(bench_matrix_multiply
-    benchmarks/matrix_multiply/bench_matrix_multiply.cpp)
-  target_link_libraries(bench_matrix_multiply PRIVATE tensor Kokkos::kokkoskernels)
-
-  # --- 3D SEM stiffness, NGLL=5 --------------------------------------------
-  # The order is fixed at 5 (production NGLL) in the source, not a build
-  # option: it sets every tile extent in the graph AND the register blocking
-  # below, and the two have to agree.
-  add_executable(bench_sem_stiffness_3d
-    benchmarks/sem_stiffness_3d/bench_sem_stiffness_3d.cpp)
-  target_link_libraries(bench_sem_stiffness_3d PRIVATE tensor)
-
-  # THE REGISTER BLOCKING IS PART OF THIS TARGET, NOT A TUNING PREFERENCE.
-  #
-  # The team GEMM register-blocks by (MT, NT, NR) and has NO REMAINDER PATH:
-  # validate_gemm_tile_dims requires each staged extent to be a multiple of its
-  # factor. This kernel stages SA = SK = N = 5 and SB = TE*N*N.
-  #
-  # 5 is prime, so the library defaults (MT=4, NT=2) divide neither SA nor SK
-  # and the benchmark DOES NOT COMPILE without these overrides. 5/5/2 is the
-  # measured best of the legal blockings (one 3D gradient, H100, E=262144,
-  # TE=16: 5/5/2 = 1792 GF/s, 5/1/2 = 1784, 1/5/2 = 1747, 5/5/4 = 1565), so the
-  # spread is small and there is no cliff being tuned around.
-  #
-  # Read that as the finding it is: as shipped, this library cannot express a
-  # production-order SEM kernel without retuning its GEMM per target. The
-  # general fix is a GEMM remainder path, which does not exist yet.
-  #
-  # NR=2 is also what forbids TE=1 in the benchmark's sweep -- SB = 25 is odd.
-  target_compile_definitions(bench_sem_stiffness_3d PRIVATE
-    TENSOR_GEMM_MT=5 TENSOR_GEMM_NT=5 TENSOR_GEMM_NR=2)
-
   # --- 3D SEM stiffness on the LEVEL GRAPH (Sprint 5) -----------------------
   # Note what is ABSENT, and that it is the point: no TENSOR_GEMM_* overrides.
   # The Tag2 contraction is a plain dot product with no register blocking, so

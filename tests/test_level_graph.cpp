@@ -226,24 +226,26 @@ static_assert(Impl::lg_max_operand_slot_v<Ga> == 1);
 static_assert(Impl::lg_max_operand_slot_v<Ga> <
               static_cast<int>(Impl::lg_level_base_v<SemLevels, 2>));
 
-// --- 4. the staged-node read, in the DAG liveness fold ---------------------
+// --- 4. the staged-node read, in the liveness fold -------------------------
 //
-// dag_note_node_reads is a CLOSED set of node kinds, and it had no StagedTag
-// branch -- so it silently stopped being closed the moment a staged node
-// appeared, and a slot a staged node reads looked dead at its definition.
+// Impl::note_node_reads (Liveness.hpp) is a CLOSED set of node kinds, and it
+// had no StagedTag branch -- so it silently stopped being closed the moment a
+// staged node appeared, and a slot a staged node reads looked dead at its
+// definition.
 //
-// This lives here rather than in test_slot_liveness.cpp on purpose: that file
-// is the CONTROL on the same three-line edit, and a control that changed
-// alongside the code it controls is not one. Neither it nor test_dag_graph.cpp
-// exercises a staged node, which is exactly why the hole survived.
+// One member per level, so the level timeline is the member timeline and the
+// pool assignment is readable directly:
 //
-//   node 0  a contraction              -> slot 0
-//   node 1  a stage node reading slot 0 -> slot 1
-//   node 2  a contraction              -> slot 2, the root
+//   level 0  a contraction               -> slot 0
+//   level 1  a stage node reading slot 0 -> slot 1
+//   level 2  a contraction               -> slot 2, the root
 //
-// With the branch, slot 0 is live to node 1 and slot 1 cannot share its pool.
+// With the branch, slot 0 is live to level 1 and slot 1 cannot share its pool.
 // Without it, slot 0 dies at its own definition and all three slots collapse
 // into one pool -- which is the silent miscompilation, not a lost optimization.
+//
+// test_level_liveness.cpp is the CONTROL on the same edit: it exercises no
+// staged member, which is exactly why the hole survived there.
 
 using View2 = Kokkos::View<float**, Kokkos::LayoutRight, ES>;
 
@@ -258,19 +260,20 @@ using Cnx2 = decltype(make_contraction_node<'x', 'z'>(
 using Reads0 = Slot<0, Modes<'i', 'l'>, StaticTile<4, 6>>;
 using Staged = decltype(make_stage_node(std::declval<Reads0>()));
 
-using StagedNodes = DeviceTuple<Cnx0, Staged, Cnx2>;
+using StagedLevels =
+    DeviceTuple<DeviceTuple<Cnx0>, DeviceTuple<Staged>, DeviceTuple<Cnx2>>;
 
-static_assert(Impl::dag_num_slots<StagedNodes>() == 3);
-static_assert(Impl::dag_operand_slot<Reads0>() == 0,
+static_assert(Impl::lg_num_slots_v<StagedLevels> == 3);
+static_assert(Impl::operand_slot<Reads0>() == 0,
               "the staged node's operand names slot 0");
 
-constexpr auto kStagedPlan = Impl::dag_pool_of_slot<StagedNodes, 2>();
+constexpr auto kStagedPlan = Impl::lg_pool_of_slot<StagedLevels, 2>();
 static_assert(kStagedPlan[0] == 0);
 static_assert(kStagedPlan[1] == 1,
               "slot 1 may not take slot 0's buffer: the staged node READS slot "
               "0 while writing slot 1");
 static_assert(kStagedPlan[2] == 0, "slot 2 is free to reclaim slot 0");
-static_assert(Impl::dag_pool_count<StagedNodes, 2>() == 2,
+static_assert(Impl::lg_pool_count<StagedLevels, 2>() == 2,
               "one pool here would mean the staged read went unrecorded");
 
 }  // namespace
@@ -351,7 +354,7 @@ TEST(LevelGraphRuntime, SingleContractionMemberEqualsReference) {
   auto ga       = make_contraction_node<'q', 'e', 'b', 'c'>(h, u);
   auto [g3, ca] = g2.add(ga);
 
-  g3.outputs(ca).execute(TeamPolicyTag2<ES>{}, Cd);
+  g3.outputs(ca).execute(TeamPolicyTag<ES>{}, Cd);
   Kokkos::fence();
 
   auto Ch = Kokkos::create_mirror_view(Cd);
@@ -400,7 +403,7 @@ TEST(LevelGraphRuntime, ThreeMemberFusedGradientLevelEqualsReference) {
       make_contraction_node<'q', 'e', 'a', 'b'>(h.template as<'q', 'c'>(), u);
   auto [g3, ha, hb, hc] = g2.add(gax, gbx, gcx);
 
-  g3.outputs(ha, hb, hc).execute(TeamPolicyTag2<ES>{}, Ax, Bx, Cx);
+  g3.outputs(ha, hb, hc).execute(TeamPolicyTag<ES>{}, Ax, Bx, Cx);
   Kokkos::fence();
 
   auto Ah  = Kokkos::create_mirror_view(Ax);
@@ -477,7 +480,7 @@ TEST(LevelGraphRuntime, CombineLevelReadingContractionEqualsReference) {
   auto cmb      = make_combine_node<'q', 'e', 'b', 'c'>(ca, ScaleG{});
   auto [g4, pa] = g3.add(cmb);
 
-  g4.outputs(pa).execute(TeamPolicyTag2<ES>{}, Px);
+  g4.outputs(pa).execute(TeamPolicyTag<ES>{}, Px);
   Kokkos::fence();
 
   auto Ph = Kokkos::create_mirror_view(Px);
@@ -527,7 +530,7 @@ TEST(LevelGraphRuntime, MultiOutputCombineEqualsReference) {
   auto cmb          = make_combine_node<'q', 'e', 'b', 'c'>(ca, DupG{});
   auto [g4, o0, o1] = g3.add(cmb);
 
-  g4.outputs(o0, o1).execute(TeamPolicyTag2<ES>{}, O0, O1);
+  g4.outputs(o0, o1).execute(TeamPolicyTag<ES>{}, O0, O1);
   Kokkos::fence();
 
   auto H0 = Kokkos::create_mirror_view(O0);
@@ -631,7 +634,7 @@ TEST(LevelGraphDeclaredOrder, NonCanonicalContractionRootEqualsReference) {
   auto ga       = make_contraction_node<'e', 'b', 'q', 'c'>(h, u);
   auto [g3, ca] = g2.add(ga);
 
-  g3.outputs(ca).execute(TeamPolicyTag2<ES>{}, Od);
+  g3.outputs(ca).execute(TeamPolicyTag<ES>{}, Od);
   Kokkos::fence();
 
   auto Oh = Kokkos::create_mirror_view(Od);
@@ -667,7 +670,7 @@ TEST(LevelGraphDeclaredOrder, CombineReadsDeclaredSlotInItsOwnOrder) {
   auto cmb      = make_combine_node<'q', 'c', 'e', 'b'>(ca, ScaleD{});
   auto [g4, pa] = g3.add(cmb);
 
-  g4.outputs(pa).execute(TeamPolicyTag2<ES>{}, Od);
+  g4.outputs(pa).execute(TeamPolicyTag<ES>{}, Od);
   Kokkos::fence();
 
   auto Oh = Kokkos::create_mirror_view(Od);
@@ -713,7 +716,7 @@ TEST(LevelGraphDeclaredOrder, ContractionReadsDeclaredSlotOperand) {
   auto gb       = make_contraction_node<'e', 'b', 'p', 'c'>(w, ca);
   auto [g5, cb] = g4.add(gb);
 
-  g5.outputs(cb).execute(TeamPolicyTag2<ES>{}, Od);
+  g5.outputs(cb).execute(TeamPolicyTag<ES>{}, Od);
   Kokkos::fence();
 
   auto Oh = Kokkos::create_mirror_view(Od);
@@ -759,7 +762,7 @@ TEST(LevelGraphDeclaredOrder, CombineFnSeesGlobalCoordinate) {
   auto cmb      = make_combine_node<'e', 'b', 'q', 'c'>(ca, OriginProbe{});
   auto [g4, pa] = g3.add(cmb);
 
-  g4.outputs(pa).execute(TeamPolicyTag2<ES>{}, Od);
+  g4.outputs(pa).execute(TeamPolicyTag<ES>{}, Od);
   Kokkos::fence();
 
   auto Oh = Kokkos::create_mirror_view(Od);

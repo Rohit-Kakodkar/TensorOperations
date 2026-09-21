@@ -22,9 +22,9 @@
 // liveness and wrong about where it points, and the numeric test alone would
 // pass a plan that simply never reuses anything.
 //
-// WHAT THIS FILE COVERS THAT test_slot_liveness.cpp CANNOT: the timeline is
-// LEVELS, not members. A DagGraph node reads its operands and writes its output
-// in one evaluation; a level does not, because barriers exist only at level
+// WHAT MAKES THE LEVEL TIMELINE DIFFERENT: the timeline is LEVELS, not
+// members. A flat node list reads its operands and writes its output in one
+// evaluation; a level does not, because barriers exist only at level
 // ends and every member of a level runs interleaved inside one TeamVectorRange.
 // So every slot a level touches is live for the whole level, and the two
 // SameLevel tests below pin exactly that.
@@ -45,8 +45,8 @@ using ES = Kokkos::DefaultExecutionSpace;
 
 namespace {
 
-// i is multi-tiled (32 over a 16 tile) for the same reason as test_dag_graph:
-// a single work item would let a wrong index still produce the right answer.
+// i is multi-tiled (32 over a 16 tile) deliberately: a single work item would
+// let a wrong index still produce the right answer.
 constexpr int kI = 32, kK = 8, kL = 32, kM = 32;
 constexpr int kTI = 16;
 
@@ -202,7 +202,7 @@ TEST(LevelLivenessTest, PooledChainEqualsReference) {
   View2 out("C2", kI, kM);
 
   auto [g, c2] = level_chain(a, b, e, f);
-  g.outputs(c2).execute(TeamPolicyTag2<ES>{}, out);
+  g.outputs(c2).execute(TeamPolicyTag<ES>{}, out);
   Kokkos::fence();
 
   ViewH oh("oh", kI, kM);
