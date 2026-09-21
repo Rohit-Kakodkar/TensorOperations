@@ -352,7 +352,7 @@ inline constexpr bool reads_foreign_scratch_v = has_node_tag_v<SlotTag, Node>;
 // all: the buffer may have other consumers, and an in-place reorder would
 // permute it under them. So a slot admits ONLY the identity -- the true
 // zero-copy passthrough -- and a differently-ordered consumer must take the
-// relabel path (the relabel evaluator, Evaluator/Team2.hpp) or name the
+// relabel path (the relabel evaluator, Evaluator/Team.hpp) or name the
 // buffer through a second slot node carrying its own labels. This is why the
 // branch leads: the `!produces_own_scratch_v` test that follows would
 // otherwise answer "unconstrained" for a slot, on the reasoning that it is
@@ -407,7 +407,7 @@ KOKKOS_FUNCTION auto make_evaluator(NodeType node, Tile tile,
   return Evaluator<PolicyTag, NodeType, Tile>(node, tile, team);
 }
 
-#include <TensorOperations/Evaluator/Team2.hpp>
+#include <TensorOperations/Evaluator/Team.hpp>
 #include <TensorOperations/Evaluator/Level.hpp>
 
 }  // namespace TensorOperations

@@ -70,31 +70,33 @@ using NodeH =
 using Node3 = decltype(make_input_node(make_handle<'i', 'j', 'k'>(T3{})));
 
 template <typename Node>
-using Eval2 = Evaluator<TeamPolicyTag<ES>, Node, TileT>;
+using Eval = Evaluator<TeamPolicyTag<ES>, Node, TileT>;
 
-// Tag2 hands back a value evaluator, not a node; the node it wraps is what
-// corresponds to Tag1's result_type.
+// The InputTag evaluator hands back a VALUE EVALUATOR, not a node; the node it
+// wraps is what carries the staged storage.
 template <typename Node>
-using tag2_result_t = decltype(std::declval<const Eval2<Node>&>()(
+using eval_result_t = decltype(std::declval<const Eval<Node>&>()(
     std::declval<Kokkos::Array<int, 2>>()));
 template <typename Node>
-using tag2_result_node_t = typename tag2_result_t<Node>::node_type;
+using eval_result_node_t = typename eval_result_t<Node>::node_type;
 
 // The wrapper really is an Evaluator, keyed on the node with a void tiling.
-static_assert(std::is_same_v<tag2_result_t<NodeNH>,
+static_assert(std::is_same_v<eval_result_t<NodeNH>,
                              Evaluator<TeamPolicyTag<ES>,
-                                       tag2_result_node_t<NodeNH>, void>>,
-              "Tag2 InputTag operator() must return a value evaluator");
-static_assert(std::is_void_v<typename tag2_result_t<NodeNH>::tiling_type>);
+                                       eval_result_node_t<NodeNH>, void>>,
+              "InputTag operator() must return a value evaluator");
+static_assert(std::is_void_v<typename eval_result_t<NodeNH>::tiling_type>);
 
-static_assert(std::is_same_v<typename Eval2<NodeNH>::node_type, NodeNH>);
+static_assert(std::is_same_v<typename Eval<NodeNH>::node_type, NodeNH>);
 
 static_assert(std::is_same_v<decltype(make_evaluator<TeamPolicyTag<ES>>(
                                  std::declval<NodeNH>(), std::declval<TileT>(),
                                  std::declval<const team_t&>())),
-                             Eval2<NodeNH>>);
+                             Eval<NodeNH>>);
 
-TEST(Team2InputTag, ReturnTypeMatchesTeamPolicyTag) { SUCCEED(); }
+// The file's content here is its static_asserts; this pins them at runtime so
+// a green ctest run reports on them rather than on an empty binary.
+TEST(TeamInputTag, ValueEvaluatorShapeHolds) { SUCCEED(); }
 
 int run_subview_kernel(int ti, int tj) {
   auto                  node = make_input_node(make_handle<'i', 'j'>(T2{}));
@@ -103,14 +105,14 @@ int run_subview_kernel(int ti, int tj) {
   Kokkos::parallel_for(
       Kokkos::TeamPolicy<ES>(1, Kokkos::AUTO),
       KOKKOS_LAMBDA(const team_t& team) {
-        Eval2<NodeNH>               e2(node, TileT{}, team);
+        Eval<NodeNH>                ev(node, TileT{}, team);
         const Kokkos::Array<int, 2> idx{ti, tj};
-        auto                        r2 = e2(idx);
+        auto                        res = ev(idx);
         Kokkos::single(Kokkos::PerTeam(team), [&] {
           int good = 1;
           for (int a = 0; a < 2; ++a)
             for (int b = 0; b < 4; ++b) {
-              const float v2 = r2.node().storage_(a, b);
+              const float v2 = res.node().storage_(a, b);
               const float expect =
                   static_cast<float>((ti * 2 + a) * 8 + (tj * 4 + b));
               if (v2 != expect) good = 0;
@@ -124,7 +126,7 @@ int run_subview_kernel(int ti, int tj) {
   return ok_h;
 }
 
-TEST(Team2InputTag, SubviewTileAliasesExpectedElements) {
+TEST(TeamInputTag, SubviewTileAliasesExpectedElements) {
   EXPECT_EQ(run_subview_kernel(0, 0), 1);
   EXPECT_EQ(run_subview_kernel(1, 1), 1);
   EXPECT_EQ(run_subview_kernel(0, 1), 1);
@@ -132,18 +134,18 @@ TEST(Team2InputTag, SubviewTileAliasesExpectedElements) {
 }
 
 // ---------------------------------------------------------------------------
-// Tag2 IntermTag + perm seq — relabel, both storage families
+// IntermTag + perm seq — relabel, both storage families
 // ---------------------------------------------------------------------------
 
 using Swap   = std::integer_sequence<int, 1, 0>;
 using Ident2 = std::integer_sequence<int, 0, 1>;
 
-// Tag1 keys the relabel on the NODE; Tag2 keys it on the value evaluator that
+// The relabel is keyed on the VALUE EVALUATOR, not the node, because that
 // wraps it, so each family gets its source spelled in its own terms.
-using SrcNode  = tag2_result_node_t<NodeNH>;
-using SrcNodeH = tag2_result_node_t<NodeH>;
-using SrcVal   = tag2_result_t<NodeNH>;
-using SrcValH  = tag2_result_t<NodeH>;
+using SrcNode  = eval_result_node_t<NodeNH>;
+using SrcNodeH = eval_result_node_t<NodeH>;
+using SrcVal   = eval_result_t<NodeNH>;
+using SrcValH  = eval_result_t<NodeH>;
 
 using ScratchTile  = StaticTile<4, 8>;
 using ScratchViewT = decltype(Impl::alloc_scratch_tile<float, ES>(
@@ -157,52 +159,52 @@ using ScratchValH = decltype(make_value_evaluator(
     std::declval<ScratchNodeH>(), std::declval<const team_t&>()));
 
 template <typename Src, typename Perm>
-using Relabel2 = Evaluator<TeamPolicyTag<ES>, Src, Perm>;
+using Relabel = Evaluator<TeamPolicyTag<ES>, Src, Perm>;
 
 // The relabel also yields a value evaluator, so a relabel composes onto the
-// next step like any other Tag2 result.
+// next step like any other result.
 template <typename Src, typename Perm>
-using relabel2_result_t = decltype(std::declval<const Relabel2<Src, Perm>&>() =
-                                       std::declval<const Src&>());
+using relabel_result_t = decltype(std::declval<const Relabel<Src, Perm>&>() =
+                                      std::declval<const Src&>());
 template <typename Src, typename Perm>
-using relabel2_result_node_t = typename relabel2_result_t<Src, Perm>::node_type;
+using relabel_result_node_t = typename relabel_result_t<Src, Perm>::node_type;
 
 static_assert(
-    std::is_same_v<relabel2_result_t<SrcVal, Swap>,
+    std::is_same_v<relabel_result_t<SrcVal, Swap>,
                    Evaluator<TeamPolicyTag<ES>,
-                             relabel2_result_node_t<SrcVal, Swap>, void>>,
-    "Tag2 relabel must return a value evaluator");
+                             relabel_result_node_t<SrcVal, Swap>, void>>,
+    "relabel must return a value evaluator");
 
 // The relabelled storage is exactly reorder_view's result: a retyped layout
 // over the SAME backing, never a copy.
 static_assert(std::is_same_v<
-              typename relabel2_result_node_t<SrcVal, Swap>::storage_type,
+              typename relabel_result_node_t<SrcVal, Swap>::storage_type,
               decltype(reorder_view(
                   std::declval<typename SrcNode::storage_type>(), Swap{}))>);
 static_assert(
     std::is_same_v<
-        typename relabel2_result_node_t<ScratchVal, Swap>::storage_type,
+        typename relabel_result_node_t<ScratchVal, Swap>::storage_type,
         decltype(reorder_view(
             std::declval<typename ScratchNode::storage_type>(), Swap{}))>);
 
 static_assert(
     std::is_same_v<
-        decltype(std::declval<relabel2_result_node_t<SrcValH, Swap>>().hook_op),
+        decltype(std::declval<relabel_result_node_t<SrcValH, Swap>>().hook_op),
         ScaleHook>);
 static_assert(std::is_same_v<
-              decltype(std::declval<relabel2_result_node_t<ScratchValH, Swap>>()
+              decltype(std::declval<relabel_result_node_t<ScratchValH, Swap>>()
                            .hook_op),
               AddIndexHook>);
 
 // An identity relabel round-trips to the very same value evaluator type.
-static_assert(std::is_same_v<relabel2_result_t<SrcVal, Ident2>, SrcVal>);
+static_assert(std::is_same_v<relabel_result_t<SrcVal, Ident2>, SrcVal>);
 
 static_assert(std::is_same_v<decltype(make_evaluator<TeamPolicyTag<ES>>(
                                  std::declval<SrcVal>(), std::declval<Swap>(),
                                  std::declval<const team_t&>())),
-                             Relabel2<SrcVal, Swap>>);
+                             Relabel<SrcVal, Swap>>);
 
-TEST(Team2Relabel, TypesMatchTeamPolicyTagSpecialization7) { SUCCEED(); }
+TEST(TeamRelabel, RelabeledTypesHold) { SUCCEED(); }
 
 void run_relabel_global(int ti, int tj, Buf1D dst_readback,
                         Kokkos::View<int, ES> same_data) {
@@ -210,10 +212,10 @@ void run_relabel_global(int ti, int tj, Buf1D dst_readback,
   Kokkos::parallel_for(
       Kokkos::TeamPolicy<ES>(1, Kokkos::AUTO),
       KOKKOS_LAMBDA(const team_t& team) {
-        Eval2<NodeNH> e2(node, TileT{}, team);
-        auto          src = e2(Kokkos::Array<int, 2>{ti, tj});
-        auto rel = make_evaluator<TeamPolicyTag<ES>>(src, Swap{}, team);
-        auto dst = (rel = src);
+        Eval<NodeNH> ev(node, TileT{}, team);
+        auto         src = ev(Kokkos::Array<int, 2>{ti, tj});
+        auto         rel = make_evaluator<TeamPolicyTag<ES>>(src, Swap{}, team);
+        auto         dst = (rel = src);
         Kokkos::single(Kokkos::PerTeam(team), [&] {
           const auto dv = dst.node().storage_;
           const auto sv = src.node().storage_;
@@ -227,7 +229,7 @@ void run_relabel_global(int ti, int tj, Buf1D dst_readback,
   Kokkos::fence();
 }
 
-TEST(Team2Relabel, GlobalTransposeIsZeroCopy) {
+TEST(TeamRelabel, GlobalTransposeIsZeroCopy) {
   const int             ti = 1, tj = 1;
   Buf1D                 dst("dst", 8);
   Kokkos::View<int, ES> same("same");
@@ -251,8 +253,8 @@ void run_relabel_global3(Buf1D dst_readback, Buf1D src_readback) {
   Kokkos::parallel_for(
       Kokkos::TeamPolicy<ES>(1, Kokkos::AUTO),
       KOKKOS_LAMBDA(const team_t& team) {
-        Evaluator<TeamPolicyTag<ES>, Node3, TileT3> e2(node, TileT3{}, team);
-        auto src = e2(Kokkos::Array<int, 3>{1, 1, 1});
+        Evaluator<TeamPolicyTag<ES>, Node3, TileT3> ev(node, TileT3{}, team);
+        auto src = ev(Kokkos::Array<int, 3>{1, 1, 1});
         auto rel = make_evaluator<TeamPolicyTag<ES>>(
             src, std::integer_sequence<int, 2, 0, 1>{}, team);
         auto dst = (rel = src);
@@ -272,7 +274,7 @@ void run_relabel_global3(Buf1D dst_readback, Buf1D src_readback) {
   Kokkos::fence();
 }
 
-TEST(Team2Relabel, GlobalRank3CyclePermutation) {
+TEST(TeamRelabel, GlobalRank3CyclePermutation) {
   Buf1D dst("dst", 16), src("src", 16);
   run_relabel_global3(dst, src);
 
@@ -326,7 +328,7 @@ void run_relabel_scratch(Buf1D dst_readback, Buf1D src_readback, Hook hook) {
   Kokkos::fence();
 }
 
-TEST(Team2Relabel, ScratchTransposeIsZeroCopyRetype) {
+TEST(TeamRelabel, ScratchTransposeIsZeroCopyRetype) {
   Buf1D dst("dst", 32), src("src", 32);
   run_relabel_scratch(dst, src, NoHook{});
 
@@ -343,7 +345,7 @@ TEST(Team2Relabel, ScratchTransposeIsZeroCopyRetype) {
           << "i=" << i << " j=" << j;
 }
 
-TEST(Team2Relabel, ScratchSourceHookIsDeferred) {
+TEST(TeamRelabel, ScratchSourceHookIsDeferred) {
   Buf1D dst("dst", 32), src("src", 32);
   run_relabel_scratch(dst, src, AddIndexHook{});
 
@@ -391,17 +393,17 @@ static_assert(
         stage_result_t<NodeNH, FullTile>,
         Evaluator<TeamPolicyTag<ES>,
                   typename stage_result_t<NodeNH, FullTile>::node_type, void>>,
-    "Tag2 staging must return a value evaluator");
+    "staging must return a value evaluator");
 static_assert(std::is_same_v<decltype(std::declval<typename stage_result_t<
                                           NodeH, FullTile>::node_type>()
                                           .hook_op),
                              ScaleHook>,
-              "Tag2 staging must carry the source hook forward unapplied");
+              "staging must carry the source hook forward unapplied");
 static_assert(
     std::is_same_v<typename stage_result_t<NodeNH, FullTile>::storage_type,
                    scratch_view_for_t<FullTile>>);
 
-TEST(Team2Stage, ResultTypesAreAsExpected) { SUCCEED(); }
+TEST(TeamStage, ResultTypesAreAsExpected) { SUCCEED(); }
 
 template <typename NodeT, typename Tile, std::size_t R>
 void run_stage(NodeT node, Kokkos::Array<int, R> tidx, Buf1D out) {
@@ -441,7 +443,7 @@ std::vector<float> stage(NodeT node, Kokkos::Array<int, R> tidx) {
   return vals;
 }
 
-TEST(Team2Stage, FullTileCopiesEveryElement) {
+TEST(TeamStage, FullTileCopiesEveryElement) {
   const auto vals =
       stage<NodeNH, FullTile>(make_input_node(make_handle<'i', 'j'>(T2{})),
                               Kokkos::Array<int, 2>{0, 0});
@@ -451,7 +453,7 @@ TEST(Team2Stage, FullTileCopiesEveryElement) {
           << "i=" << i << " j=" << j;
 }
 
-TEST(Team2Stage, PartialTileCopiesItsWindow) {
+TEST(TeamStage, PartialTileCopiesItsWindow) {
   const auto vals =
       stage<NodeNH, PartTile>(make_input_node(make_handle<'i', 'j'>(T2{})),
                               Kokkos::Array<int, 2>{1, 1});
@@ -462,7 +464,7 @@ TEST(Team2Stage, PartialTileCopiesItsWindow) {
           << "a=" << a << " b=" << b;
 }
 
-TEST(Team2Stage, Rank3FullTileCopiesEveryElement) {
+TEST(TeamStage, Rank3FullTileCopiesEveryElement) {
   const auto vals =
       stage<Node3, FullTile3>(make_input_node(make_handle<'i', 'j', 'k'>(T3{})),
                               Kokkos::Array<int, 3>{1, 0, 0});
@@ -474,7 +476,7 @@ TEST(Team2Stage, Rank3FullTileCopiesEveryElement) {
             << "a=" << a << " b=" << b << " c=" << c;
 }
 
-TEST(Team2Stage, Rank3PartialTileCopiesItsWindow) {
+TEST(TeamStage, Rank3PartialTileCopiesItsWindow) {
   const auto vals =
       stage<Node3, PartTile3>(make_input_node(make_handle<'i', 'j', 'k'>(T3{})),
                               Kokkos::Array<int, 3>{1, 1, 1});
@@ -487,7 +489,7 @@ TEST(Team2Stage, Rank3PartialTileCopiesItsWindow) {
             << "a=" << a << " b=" << b << " c=" << c;
 }
 
-TEST(Team2Stage, HookedSourceStagesRawValues) {
+TEST(TeamStage, HookedSourceStagesRawValues) {
   const auto vals = stage<NodeH, FullTile>(
       make_input_node(make_handle<'i', 'j'>(T2{}), ScaleHook{}),
       Kokkos::Array<int, 2>{0, 0});
@@ -523,7 +525,7 @@ void run_stage_relabeled(Buf1D out) {
   Kokkos::fence();
 }
 
-TEST(Team2Stage, RelabeledSourceTransposes) {
+TEST(TeamStage, RelabeledSourceTransposes) {
   Buf1D out("out", 32);
   run_stage_relabeled(out);
   auto h_out = Kokkos::create_mirror_view(out);
@@ -722,7 +724,7 @@ void run_element_vs_driver_matmul(V2 a, V2 b, Buf1D driver_out,
 using contract::a_val;
 using contract::b_val;
 
-TEST(Team2Contract, MatmulMatchesHostReference) {
+TEST(TeamContract, MatmulMatchesHostReference) {
   using namespace contract;
   V2   a("a", kI, kK), b("b", kK, kL);
   auto ah = Kokkos::create_mirror_view(a);
@@ -748,7 +750,7 @@ TEST(Team2Contract, MatmulMatchesHostReference) {
     }
 }
 
-TEST(Team2Contract, HookRidesForwardUnapplied) {
+TEST(TeamContract, HookRidesForwardUnapplied) {
   using namespace contract;
   V2   a("a", kI, kK), b("b", kK, kL);
   auto ah = Kokkos::create_mirror_view(a);
@@ -776,7 +778,7 @@ TEST(Team2Contract, HookRidesForwardUnapplied) {
     }
 }
 
-TEST(Team2Contract, MultipleContractedModesCollapseIntoSK) {
+TEST(TeamContract, MultipleContractedModesCollapseIntoSK) {
   using namespace contract;
   V3   a("a", mI, mJ, mK), b("b", mJ, mK, mL);
   auto ah = Kokkos::create_mirror_view(a);
@@ -807,7 +809,7 @@ TEST(Team2Contract, MultipleContractedModesCollapseIntoSK) {
     }
 }
 
-TEST(Team2Contract, MultipleFreeAModesCollapseIntoSA) {
+TEST(TeamContract, MultipleFreeAModesCollapseIntoSA) {
   using namespace contract;
   V3   a("a", rI, rJ, rK);
   V2   b("b", rK, rL);
@@ -838,15 +840,15 @@ TEST(Team2Contract, MultipleFreeAModesCollapseIntoSA) {
 }
 
 // ---------------------------------------------------------------------------
-// Tag2 ContractionTag over PERMUTED operands — the capability the regroup
+// ContractionTag over PERMUTED operands — the capability the regroup
 // exists for. A relabeled operand is a zero-copy strided view, so the row and
 // column groups the contraction collapses are no longer contiguous runs of the
 // operand's memory-order stream; reshape could not express these at all.
 //
 // reorder_view's permutation reads perm[d] = the SOURCE axis that becomes
-// destination axis d, matching Team2Relabel.GlobalRank3CyclePermutation.
+// destination axis d, matching TeamRelabel.GlobalRank3CyclePermutation.
 // ---------------------------------------------------------------------------
-TEST(Team2Contract, ElementOperatorMatchesDriver) {
+TEST(TeamContract, ElementOperatorMatchesDriver) {
   using namespace contract;
   V2   a("a", kI, kK), b("b", kK, kL);
   auto ah = Kokkos::create_mirror_view(a);
@@ -1052,7 +1054,7 @@ void run_square_free_group(PV3 s, PV2 h, Buf1D out) {
 
 }  // namespace permuted
 
-TEST(Team2ContractPermuted, SquareFreeGroupKeepsItsAxisOrder) {
+TEST(TeamContractPermuted, SquareFreeGroupKeepsItsAxisOrder) {
   using namespace permuted;
   PV3  s("s", sA, sB, sC);
   PV2  h("h", sM, sB);
@@ -1083,7 +1085,7 @@ TEST(Team2ContractPermuted, SquareFreeGroupKeepsItsAxisOrder) {
       }
 }
 
-TEST(Team2ContractPermuted, ThreeDirectionsShareOneStagedTensor) {
+TEST(TeamContractPermuted, ThreeDirectionsShareOneStagedTensor) {
   using namespace permuted;
   PV3  u("u", uP, uQ, uR);
   PV2  h0("h0", hM, uP), h1("h1", hM, uQ), h2("h2", hM, uR);
@@ -1138,7 +1140,7 @@ TEST(Team2ContractPermuted, ThreeDirectionsShareOneStagedTensor) {
   }
 }
 
-TEST(Team2ContractPermuted, PermutedAOperandGapsTheRowGroup) {
+TEST(TeamContractPermuted, PermutedAOperandGapsTheRowGroup) {
   using namespace permuted;
   PV3  w("w", wX, wY, wZ);
   PV2  b("b", wY, wL);
@@ -1168,7 +1170,7 @@ TEST(Team2ContractPermuted, PermutedAOperandGapsTheRowGroup) {
 }
 
 // ---------------------------------------------------------------------------
-// Tag2 CombineTag — pointwise, N-ary, multi-output
+// CombineTag — pointwise, N-ary, multi-output
 // ---------------------------------------------------------------------------
 namespace combine {
 
@@ -1263,7 +1265,7 @@ static_assert(
                              std::declval<Kokkos::Array<CNode, 1>>()))>,
     "a bare destination node must normalize to a 1-output pack");
 
-// Both operators return one component per output, exactly like Tag1's combine.
+// Both operators return one component per output.
 static_assert(
     std::is_same_v<typename Comb1::result_type, Kokkos::Array<CVal, 1>>,
     "a scalar-returning fn is the NumOut == 1 case");
@@ -1453,7 +1455,8 @@ void run_rank3(V3 a, V3 b, Buf1D out) {
   Kokkos::fence();
 }
 
-// Operand B is declared {'j','i'} over a cJ x cI view. Tag2 gathers no axes, so
+// Operand B is declared {'j','i'} over a cJ x cI view. The evaluator gathers
+// no axes, so
 // the caller relabels and stages it into the output order first.
 void run_relabeled(V2 a, V2 bt, Buf1D out) {
   auto node = make_combine_node<'i', 'j'>(
@@ -1589,9 +1592,9 @@ void run_element_vs_driver_multi_out(V2 a, V2 b, Buf1D d0, Buf1D d1, Buf1D m0,
 
 }  // namespace combine
 
-TEST(Team2Combine, ResultTypesAreAsExpected) { SUCCEED(); }
+TEST(TeamCombine, ResultTypesAreAsExpected) { SUCCEED(); }
 
-TEST(Team2Combine, PointwiseMatchesHostReference) {
+TEST(TeamCombine, PointwiseMatchesHostReference) {
   using namespace combine;
   V2   a("a", cI, cJ), b("b", cI, cJ);
   auto ah = fill2(a, p_val);
@@ -1613,7 +1616,7 @@ TEST(Team2Combine, PointwiseMatchesHostReference) {
     }
 }
 
-TEST(Team2Combine, GlobalOriginIsVisibleToFn) {
+TEST(TeamCombine, GlobalOriginIsVisibleToFn) {
   using namespace combine;
   V2   a("a", 2 * cI, cJ), b("b", 2 * cI, cJ);
   auto ah = fill2(a, p_val);
@@ -1640,7 +1643,7 @@ TEST(Team2Combine, GlobalOriginIsVisibleToFn) {
   EXPECT_GT(std::abs(got_g[0] - got_l[0]), 0.0f);
 }
 
-TEST(Team2Combine, MultiOutputWritesEveryTile) {
+TEST(TeamCombine, MultiOutputWritesEveryTile) {
   using namespace combine;
   V2   a("a", cI, cJ), b("b", cI, cJ);
   auto ah = fill2(a, p_val);
@@ -1662,7 +1665,7 @@ TEST(Team2Combine, MultiOutputWritesEveryTile) {
     }
 }
 
-TEST(Team2Combine, ThreeOperandCombine) {
+TEST(TeamCombine, ThreeOperandCombine) {
   using namespace combine;
   V2   a("a", cI, cJ), b("b", cI, cJ), c("c", cI, cJ);
   auto ah = fill2(a, p_val);
@@ -1682,7 +1685,7 @@ TEST(Team2Combine, ThreeOperandCombine) {
           << "i=" << i << " j=" << j;
 }
 
-TEST(Team2Combine, Rank3Combine) {
+TEST(TeamCombine, Rank3Combine) {
   using namespace combine;
   V3   a("a", gI, gJ, gK), b("b", gI, gJ, gK);
   auto ah = Kokkos::create_mirror_view(a);
@@ -1710,7 +1713,7 @@ TEST(Team2Combine, Rank3Combine) {
             << "i=" << i << " j=" << j << " k=" << k;
 }
 
-TEST(Team2Combine, RelabeledOperandAligns) {
+TEST(TeamCombine, RelabeledOperandAligns) {
   using namespace combine;
   V2   a("a", cI, cJ), bt("bt", cJ, cI);
   auto ah = fill2(a, p_val);
@@ -1729,7 +1732,7 @@ TEST(Team2Combine, RelabeledOperandAligns) {
           << "i=" << i << " j=" << j;
 }
 
-TEST(Team2Combine, DestHookRidesForwardUnapplied) {
+TEST(TeamCombine, DestHookRidesForwardUnapplied) {
   using namespace combine;
   V2   a("a", cI, cJ), b("b", cI, cJ);
   auto ah = fill2(a, p_val);
@@ -1756,7 +1759,7 @@ int main(int argc, char* argv[]) {
   return result;
 }
 
-TEST(Team2Combine, ElementOperatorMatchesDriver) {
+TEST(TeamCombine, ElementOperatorMatchesDriver) {
   using namespace combine;
   V2   a("a", cI, cJ), b("b", cI, cJ);
   auto ah = Kokkos::create_mirror_view(a);
