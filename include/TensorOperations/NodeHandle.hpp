@@ -1,6 +1,7 @@
 #pragma once
 #include <TensorOperations/DeviceTuple.hpp>
 #include <TensorOperations/TensorHandle.hpp>
+#include <TensorOperations/TileLayout.hpp>
 #include <array>
 #include <cassert>
 #include <cstdint>
@@ -13,6 +14,7 @@ namespace TensorOperations {
 
 // Tags for NodeHandle specializations
 struct InputTag {};
+struct FunctionalTag {};
 struct IntermTag {};
 struct ContractionTag {};
 struct CombineTag {};
@@ -101,6 +103,100 @@ struct exec_space_of<TensorOperations::View<ViewType, Layout>, void> {
   using type = typename exec_space_of<ViewType>::type;
 };
 
+// The traversal order a layout's tiles inherit from it. A functional input is
+// declared as a LAYOUT -- extents and order together, in the library's own
+// vocabulary -- and its tiles are then walked the way the tensor says, exactly
+// as tiling a real view preserves that view's memory order.
+//
+// This is a TYPE-level projection on purpose. The order has to survive into the
+// evaluator, where it selects make_tile_layout's overload at compile time; a
+// runtime layout value could not do that, and the tile's traversal would be a
+// branch instead of an addressing mode.
+template <typename Layout>
+struct layout_order;
+template <int N>
+struct layout_order<DynamicTileLayoutRight<N>> {
+  using type = LayoutRight;
+};
+template <int N>
+struct layout_order<DynamicTileLayoutLeft<N>> {
+  using type = LayoutLeft;
+};
+template <int... E>
+struct layout_order<StaticTileLayoutRight<E...>> {
+  using type = LayoutRight;
+};
+template <int... E>
+struct layout_order<StaticTileLayoutLeft<E...>> {
+  using type = LayoutLeft;
+};
+// The arbitrary-order case: a static layout naming its own permutation hands
+// that permutation straight through, so a tile of it is walked the same way.
+template <typename Tile, int... Ord>
+struct layout_order<StaticTileLayoutStride<Tile, Ord...>> {
+  using type = std::integer_sequence<int, Ord...>;
+};
+template <typename Layout>
+using layout_order_t = typename layout_order<
+    std::remove_cv_t<std::remove_reference_t<Layout>>>::type;
+
+// Kokkos's own layout tags, accepted as a convenience. They ARE layouts in the
+// sense that matters here -- Kokkos::LayoutRight{nE,nA,nB} carries extents as
+// well as order -- but they are distinct types from this library's own
+// LayoutRight/LayoutLeft markers, so they get their own mapping and are
+// converted to the native layout at the factory boundary. The node and the
+// evaluator never see a Kokkos layout.
+//
+// LayoutStride is deliberately absent: its order lives in runtime strides, and
+// the traversal order has to be a TYPE for make_tile_layout to select on it.
+template <typename KL, int N>
+struct kokkos_layout_as;
+template <int N>
+struct kokkos_layout_as<Kokkos::LayoutRight, N> {
+  using type = DynamicTileLayoutRight<N>;
+};
+template <int N>
+struct kokkos_layout_as<Kokkos::LayoutLeft, N> {
+  using type = DynamicTileLayoutLeft<N>;
+};
+
+template <typename T>
+inline constexpr bool is_kokkos_layout_v =
+    std::is_same_v<std::remove_cv_t<std::remove_reference_t<T>>,
+                   Kokkos::LayoutRight> ||
+    std::is_same_v<std::remove_cv_t<std::remove_reference_t<T>>,
+                   Kokkos::LayoutLeft>;
+
+// Kokkos layouts carry no rank -- a View supplies it -- so the label count
+// does, and the dimensions past it are the constructor's unset sentinel. Read
+// exactly Rank of them and reject the sentinel, because a zero extent would
+// collapse the league to no teams: a silent wrong answer, not an error.
+template <int Rank, typename KL>
+Kokkos::Array<int, Rank> kokkos_layout_extents(const KL& layout) {
+  Kokkos::Array<int, Rank> ext{};
+  for (int d = 0; d < Rank; ++d) {
+    const auto n = static_cast<long long>(layout.dimension[d]);
+    assert(n > 0 &&
+           "functional input: the Kokkos layout has no extent for one of the "
+           "node's labels -- pass one dimension per label");
+    ext[d] = static_cast<int>(n);
+  }
+  return ext;
+}
+
+// Is T a layout this node accepts, i.e. one layout_order knows an order for?
+// Separates the two public spellings -- `(layout, fn)` and `(extents, fn)` --
+// which are otherwise distinguished only by argument type.
+template <typename T, typename = void>
+struct is_functional_layout : std::false_type {};
+template <typename T>
+struct is_functional_layout<
+    T, std::void_t<typename layout_order<
+           std::remove_cv_t<std::remove_reference_t<T>>>::type>>
+    : std::true_type {};
+template <typename T>
+inline constexpr bool is_functional_layout_v = is_functional_layout<T>::value;
+
 }  // namespace Impl
 
 // ---------------------------------------------------------------------------
@@ -120,6 +216,71 @@ struct NodeHandle<InputTag, T, ModesSeq, HookOp> {
   KOKKOS_FUNCTION Kokkos::Array<int, Rank> shape() const {
     Kokkos::Array<int, Rank> s{};
     for (int i = 0; i < Rank; ++i) s[i] = static_cast<int>(handle.extent(i));
+    return s;
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Functional input specialization — a leaf whose value at a coordinate is
+// COMPUTED by a caller-supplied functor instead of read from an address.
+//
+// This exists because a tensor is not always a strided array. A spectral-
+// element field, for instance, lives in global-node order and is reached
+// element-wise through a mesh index map: u(iglob(e,k,j,i), c). No stride
+// expresses that, and a hook cannot either -- a hook fires AFTER the load, so
+// it can transform a value but not redirect an address.
+//
+// The node carries the functor and the tensor's extents; it has no handle and
+// no data pointer, because there is nothing to point at. Extents must be given
+// explicitly for the same reason: LevelGraph sizes its league from the extents
+// its stage members report, and a functor has none to read off.
+//
+// LEGAL ONLY AS A STAGE OPERAND. The contraction and combine factories reject
+// it, because they read operands through regroup_view/slice, which is affine
+// arithmetic over data() and stride(). Stage it first; everything downstream
+// then reads the ordinary scratch tile the stage wrote.
+//
+// DECLARED AS A LAYOUT, not as bare extents. A layout carries the shape AND
+// the order in one object, which is what a tensor actually is -- and it is the
+// same vocabulary the rest of the library speaks, so a caller who already has
+// a layout hands it over rather than taking it apart.
+//
+// The order is the TUNING KNOB, and for a functional input it is the only
+// thing the layout decides. Correctness is order-independent: the staging copy
+// is `dst[coord] = sv[coord]`, coordinate-indexed on both sides, so permuting
+// the order permutes who does what and never what gets written. What it
+// decides instead is COALESCING. Consecutive lanes take consecutive flat
+// indices, so the order chooses which coordinate they differ in -- and for a
+// gather that picks which addresses the functor's own reads land on.
+// ---------------------------------------------------------------------------
+template <typename Fn, typename ModesSeq, typename ValueType,
+          typename ExecSpace, typename Layout, typename HookOp>
+struct NodeHandle<FunctionalTag, Fn, ModesSeq, ValueType, ExecSpace, Layout,
+                  HookOp> {
+  Fn                           fn_;
+  Layout                       layout_;
+  [[no_unique_address]] HookOp hook_op;
+
+  using node_tag            = FunctionalTag;
+  static constexpr int Rank = static_cast<int>(ModesSeq::size());
+  using value_type          = ValueType;
+  using exec_space          = ExecSpace;
+  using modes_seq           = ModesSeq;
+  using functor_type        = Fn;
+  using layout_type         = Layout;
+  using order_tag           = Impl::layout_order_t<Layout>;
+
+  static_assert(Impl::labels_distinct_v<ModesSeq>,
+                "functional input node: labels must be distinct");
+  static_assert(static_cast<int>(Layout::rank) == Rank,
+                "functional input node: the layout must have one axis per "
+                "label");
+
+  // Derived from the layout rather than stored alongside it, so the two cannot
+  // disagree. LevelGraph sizes its league from this.
+  KOKKOS_FUNCTION Kokkos::Array<int, Rank> shape() const {
+    Kokkos::Array<int, Rank> s{};
+    for (int d = 0; d < Rank; ++d) s[d] = layout_.extent(d);
     return s;
   }
 };
@@ -266,6 +427,124 @@ KOKKOS_FUNCTION NodeHandle<InputTag, T, ModesSeq, HookOp> make_input_node(
   return {std::move(h), std::move(hook)};
 }
 
+// Functional input node — a leaf backed by a functor rather than a view.
+//
+//   make_functional_input_node<'e','k','j','i'>(extents, fn)
+//   make_functional_input_node<ExecSpace, 'e','k','j','i'>(extents, fn)
+//
+// `fn(i_0, ..., i_{Rank-1})` is called at the GLOBAL coordinate and returns the
+// element; the value type is deduced from it. `extents` is the tensor's full
+// per-mode shape, in label order.
+//
+// The exec-space overload takes its type argument FIRST, mirroring
+// make_contraction_node's. That order is forced: a non-type pack is greedy, so
+// `make_functional_input_node<'e','k', ExecSpace>` cannot work -- the pack
+// swallows the whole list and ExecSpace has no slot to land in. Both public
+// overloads therefore delegate to one Impl that puts the space first, rather
+// than one forwarding to the other.
+namespace Impl {
+
+template <typename ExecSpace, int32_t... Modes, typename Layout, typename Fn,
+          typename HookOp>
+KOKKOS_FUNCTION auto make_functional_input_node_impl(Layout layout, Fn fn,
+                                                     HookOp hook) {
+  constexpr int Rank = static_cast<int>(sizeof...(Modes));
+  static_assert(Rank > 0, "functional input node: needs at least one label");
+  static_assert(FunctionalSourceLike<Fn, Rank>,
+                "functional input source must be callable (const) as "
+                "fn(i_0, ..., i_{Rank-1})");
+  static_assert(is_functional_layout_v<Layout>,
+                "functional input: the layout must be one of "
+                "DynamicTileLayout{Right,Left}, StaticTileLayout{Right,Left}, "
+                "or StaticTileLayoutStride -- these are the layouts whose "
+                "traversal order a tile can inherit");
+  using ValueType = functional_value_t<Fn, Rank>;
+  static_assert(
+      std::same_as<HookOp, NoHook> || HookLike<HookOp, Rank, ValueType>,
+      "functional input hook must be callable as op(i_0, ..., i_{Rank-1}, "
+      "value_type&)");
+  return NodeHandle<FunctionalTag, Fn, std::integer_sequence<int32_t, Modes...>,
+                    ValueType, ExecSpace, Layout, HookOp>{std::move(fn), layout,
+                                                          std::move(hook)};
+}
+
+}  // namespace Impl
+
+// The layout spelling: extents and traversal order together.
+//
+//   make_functional_input_node<'e','a','b'>(
+//       DynamicTileLayoutLeft<3>{{nE, nA, nB}}, fn);
+template <int32_t... Modes, typename Layout, typename Fn,
+          typename HookOp = NoHook>
+  requires(Impl::is_functional_layout_v<Layout>)
+KOKKOS_FUNCTION auto make_functional_input_node(Layout layout, Fn fn,
+                                                HookOp hook = {}) {
+  return Impl::make_functional_input_node_impl<Kokkos::DefaultExecutionSpace,
+                                               Modes...>(layout, std::move(fn),
+                                                         std::move(hook));
+}
+
+// The Kokkos spelling, for callers who already think in Kokkos layouts:
+//
+//   make_functional_input_node<'e','a','b'>(Kokkos::LayoutLeft{nE,nA,nB}, fn);
+//
+// Converted here to the native layout; nothing downstream sees a Kokkos one.
+template <int32_t... Modes, typename KL, typename Fn, typename HookOp = NoHook>
+  requires(Impl::is_kokkos_layout_v<KL>)
+KOKKOS_FUNCTION auto make_functional_input_node(KL layout, Fn fn,
+                                                HookOp hook = {}) {
+  constexpr int Rank = static_cast<int>(sizeof...(Modes));
+  using Native       = typename Impl::kokkos_layout_as<KL, Rank>::type;
+  return Impl::make_functional_input_node_impl<Kokkos::DefaultExecutionSpace,
+                                               Modes...>(
+      Native{Impl::kokkos_layout_extents<Rank>(layout)}, std::move(fn),
+      std::move(hook));
+}
+
+template <typename ExecSpace, int32_t... Modes, typename KL, typename Fn,
+          typename HookOp = NoHook>
+  requires(Impl::is_kokkos_layout_v<KL>)
+KOKKOS_FUNCTION auto make_functional_input_node(KL layout, Fn fn,
+                                                HookOp hook = {}) {
+  constexpr int Rank = static_cast<int>(sizeof...(Modes));
+  using Native       = typename Impl::kokkos_layout_as<KL, Rank>::type;
+  return Impl::make_functional_input_node_impl<ExecSpace, Modes...>(
+      Native{Impl::kokkos_layout_extents<Rank>(layout)}, std::move(fn),
+      std::move(hook));
+}
+
+// Extents only: LayoutRight is assumed, i.e. the last label varies fastest.
+// Shorthand for the layout spelling above, and the only difference is that the
+// order is chosen for you.
+template <int32_t... Modes, typename Fn, typename HookOp = NoHook>
+  requires(!Impl::is_functional_layout_v<Fn> && !Impl::is_kokkos_layout_v<Fn>)
+KOKKOS_FUNCTION auto make_functional_input_node(
+    Kokkos::Array<int, sizeof...(Modes)> extents, Fn fn, HookOp hook = {}) {
+  return Impl::make_functional_input_node_impl<Kokkos::DefaultExecutionSpace,
+                                               Modes...>(
+      DynamicTileLayoutRight<static_cast<int>(sizeof...(Modes))>{extents},
+      std::move(fn), std::move(hook));
+}
+
+template <typename ExecSpace, int32_t... Modes, typename Layout, typename Fn,
+          typename HookOp = NoHook>
+  requires(Impl::is_functional_layout_v<Layout>)
+KOKKOS_FUNCTION auto make_functional_input_node(Layout layout, Fn fn,
+                                                HookOp hook = {}) {
+  return Impl::make_functional_input_node_impl<ExecSpace, Modes...>(
+      layout, std::move(fn), std::move(hook));
+}
+
+template <typename ExecSpace, int32_t... Modes, typename Fn,
+          typename HookOp = NoHook>
+  requires(!Impl::is_functional_layout_v<Fn> && !Impl::is_kokkos_layout_v<Fn>)
+KOKKOS_FUNCTION auto make_functional_input_node(
+    Kokkos::Array<int, sizeof...(Modes)> extents, Fn fn, HookOp hook = {}) {
+  return Impl::make_functional_input_node_impl<ExecSpace, Modes...>(
+      DynamicTileLayoutRight<static_cast<int>(sizeof...(Modes))>{extents},
+      std::move(fn), std::move(hook));
+}
+
 // Intermediate node — wraps an existing storage View (a scratch/team tile, or
 // an empty View for a deferred full-tensor intermediate).
 template <typename Storage, typename HookOp = NoHook>
@@ -372,6 +651,11 @@ auto make_contraction_node_impl(NodeA a, NodeB b, HookOp hook) {
                 "contraction operands must be node handles; a multi-output "
                 "slice (CombineOutputHandle) is a terminal output, not an "
                 "operand");
+  static_assert(!Impl::has_node_tag_v<FunctionalTag, NodeA> &&
+                    !Impl::has_node_tag_v<FunctionalTag, NodeB>,
+                "a functional input has no address, and a contraction reads "
+                "its operands as strided memory. Wrap it in make_stage_node "
+                "first; the contraction then reads the staged tile");
   constexpr int Rank = static_cast<int>(sizeof...(OutModes));
   static_assert((NodeA::Rank + NodeB::Rank - Rank) % 2 == 0,
                 "Output rank is inconsistent with input ranks");
@@ -503,6 +787,11 @@ struct combine_out<Kokkos::Array<U, M>> {  // Kokkos::Array<U, M> result
   static constexpr int num = static_cast<int>(M);
   using elem               = U;
 };
+template <>
+struct combine_out<void> {  // sink: fn returns nothing and scatters itself, so
+  static constexpr int num = 0;  // it contributes no output slot to the graph
+  using elem               = void;
+};
 
 // An operand's shape() gathered into the TargetSeq (output) axis order, so
 // operand extents can be compared mode-for-mode whatever each operand's own
@@ -526,6 +815,10 @@ auto make_combine_node_impl(CombineFn fn, Ops... ops) {
   static_assert((Impl::is_node_handle_v<Ops> && ...),
                 "combine operands must be node handles; a multi-output slice "
                 "(CombineOutputHandle) is a terminal output, not an operand");
+  static_assert((!Impl::has_node_tag_v<FunctionalTag, Ops> && ...),
+                "a functional input has no address, and a combine reads its "
+                "operands as strided memory. Wrap it in make_stage_node "
+                "first; the combine then reads the staged tile");
   static_assert(((static_cast<int>(Ops::Rank) == Rank) && ...),
                 "combine node: every operand and the output must have equal "
                 "rank");
@@ -548,9 +841,12 @@ auto make_combine_node_impl(CombineFn fn, Ops... ops) {
   using Ret            = combine_ret_t<CombineFn, Rank, N, ActualScalar>;
   using OutInfo        = combine_out<Ret>;
   constexpr int NumOut = OutInfo::num;
-  static_assert(std::is_convertible_v<typename OutInfo::elem, ActualScalar>,
+  static_assert(NumOut == 0 ||
+                    std::is_convertible_v<typename OutInfo::elem, ActualScalar>,
                 "combine fn output element type must be convertible to the "
-                "operand scalar (multi-output combine is homogeneous)");
+                "operand scalar (multi-output combine is homogeneous). A "
+                "void-returning fn is a SINK: it emits no output and writes to "
+                "global itself");
 
   // Operand 0 fixes the output extents (its axes gathered into output order);
   // every operand must agree on every mode extent.

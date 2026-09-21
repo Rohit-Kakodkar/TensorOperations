@@ -1,6 +1,7 @@
 #pragma once
 #include <concepts>
 #include <cstdint>
+#include <type_traits>
 #include <utility>
 
 namespace TensorOperations {
@@ -36,6 +37,63 @@ concept TensorLike = requires(T t) {
   t.data();
   { t.stride(0) } -> std::convertible_to<std::ptrdiff_t>;
 } && Impl::CallableWithRank<T>;
+
+namespace Impl {
+
+// The functional-source call shape: invoke a const Fn with one int index per
+// rank, fn(i_0, ..., i_{Rank-1}). Declaration-only, used unevaluated as both
+// the SFINAE probe behind FunctionalSourceLike and the return-type
+// introspection behind functional_value_t. Fn is invoked const because the
+// evaluator calls it through a const by-value kernel capture. Rank is supplied
+// explicitly rather than read off Fn::rank — a plain functor has no rank of
+// its own, it borrows the node's, exactly as a hook does.
+//
+// Fn is DEDUCED from a dummy first argument rather than named explicitly, and
+// that is a portability requirement, not a style choice. nvcc's EDG frontend
+// (CUDA 13.2) rejects `f<Fn>(seq)` where a leading type parameter is given
+// explicitly and a trailing non-type pack must still be deduced from the
+// argument -- "substituting explicit template arguments <Fn> ... failed" --
+// even for a plain host functor of the right arity. GCC accepts it, so the
+// explicit form compiles on the Serial build and fails only under nvcc.
+template <typename Fn, std::size_t... Is>
+auto functional_ret(const Fn&, std::index_sequence<Is...>)
+    -> decltype(std::declval<const Fn&>()((void(Is), 0)...));
+
+template <typename Fn, int Rank>
+using functional_ret_t = decltype(functional_ret(
+    std::declval<const Fn&>(),
+    std::make_index_sequence<static_cast<std::size_t>(Rank)>{}));
+
+// Probe-with-ellipsis-fallback over functional_ret, so validity and
+// return-type introspection cannot diverge.
+template <typename Fn, int Rank>
+struct FunctionalSourceLikeImpl {
+ private:
+  template <typename F, typename Seq>
+  static auto probe(const F& f, Seq s)
+      -> decltype((void)functional_ret(f, s), std::true_type{});
+  static std::false_type probe(...);
+
+ public:
+  static constexpr bool value = decltype(probe(
+      std::declval<const Fn&>(),
+      std::make_index_sequence<static_cast<std::size_t>(Rank)>{}))::value;
+};
+
+}  // namespace Impl
+
+// Is Fn usable as the source of a Rank-dimensional functional input, i.e.
+// callable (const) as fn(i_0, ..., i_{Rank-1})? The return type is
+// deliberately NOT constrained here; the factory deduces the node's value type
+// from it via functional_value_t.
+template <typename Fn, int Rank>
+concept FunctionalSourceLike = Impl::FunctionalSourceLikeImpl<Fn, Rank>::value;
+
+// What a functional source yields at a coordinate, with cv-ref stripped: a
+// functor returning `const float&` still backs a float-valued node.
+template <typename Fn, int Rank>
+using functional_value_t =
+    std::remove_cv_t<std::remove_reference_t<Impl::functional_ret_t<Fn, Rank>>>;
 
 namespace Impl {
 

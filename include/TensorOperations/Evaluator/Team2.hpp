@@ -67,6 +67,69 @@ class Evaluator<TeamPolicyTag2<ES>, NodeHandle<InputTag, T, ModesSeq, HookOp>,
   team_member_t                               team_;
 };
 
+// Functional input: same contract as the InputTag evaluator above -- given a
+// tile coordinate, hand back a value evaluator over that tile -- but the tile
+// is a FunctionalView, which computes its elements instead of addressing them.
+//
+// TILING ACROSS TEAMS is the `origin` fold below: tile coordinate times tile
+// extent, per axis, which is the coordinate-space twin of what
+// subview_tile_params does in address space (`base += outer_idx[d] *
+// stride(d)`). It is spelled here rather than obtained from tile_layout()
+// because tile_layout builds a 2N-dimensional layout whose outer half resolves
+// to a FLAT OFFSET -- exactly the thing a functional input does not have. The
+// functor wants coordinates, so the tiling is done in coordinates.
+//
+// TRAVERSAL ORDER comes from the node, defaulting to LayoutRight. It is free
+// to differ from the destination's, because the copy is coordinate-indexed on
+// both sides; what it buys is control over which addresses consecutive lanes
+// make the functor touch.
+template <typename ES, typename Fn, typename ModesSeq, typename ValueType,
+          typename Layout, typename HookOp, typename Tile_>
+class Evaluator<
+    TeamPolicyTag2<ES>,
+    NodeHandle<FunctionalTag, Fn, ModesSeq, ValueType, ES, Layout, HookOp>,
+    Tile_> {
+ public:
+  using node_type =
+      NodeHandle<FunctionalTag, Fn, ModesSeq, ValueType, ES, Layout, HookOp>;
+  // The tile inherits the declared tensor's order, exactly as tiling a real
+  // view preserves that view's memory order.
+  using order_tag     = typename node_type::order_tag;
+  using policy_tag    = TeamPolicyTag2<ES>;
+  using tiling_type   = Tile_;
+  using exec_space    = ES;
+  using team_member_t = Impl::team_member_t<ES>;
+
+  static constexpr int Rank = node_type::Rank;
+  static_assert(static_cast<int>(Tile_::rank) == Rank,
+                "functional input: tile rank must equal the node's rank");
+
+  using layout_t =
+      decltype(make_tile_layout(std::declval<Tile_>(), order_tag{}));
+  using view_t = FunctionalView<Fn, layout_t, ValueType, ES>;
+
+  KOKKOS_FUNCTION Evaluator(node_type n, Tile_ t, const team_member_t& team)
+      : fn_(n.fn_), hook_(n.hook_op), tile_(t), team_(team) {}
+
+  KOKKOS_FUNCTION auto operator()(
+      Kokkos::Array<int, Tile_::rank> tile_idx) const {
+    // The functor is called at the GLOBAL coordinate, so the tile's element
+    // origin is folded in here rather than at every read.
+    Kokkos::Array<int, Rank> origin{};
+    for (int d = 0; d < Rank; ++d) origin[d] = tile_idx[d] * tile_.extent(d);
+    return make_value_evaluator(
+        make_interm_node(
+            view_t{fn_, make_tile_layout(tile_, order_tag{}), origin}, hook_),
+        team_);
+  }
+
+ private:
+  Fn                           fn_;
+  [[no_unique_address]] HookOp hook_;
+  Tile_                        tile_;
+  team_member_t                team_;
+};
+
 template <typename ES, typename BackingVT, typename Layout, typename IntRank,
           typename HookOp, int... Perm>
 class Evaluator<TeamPolicyTag2<ES>,
@@ -539,6 +602,117 @@ class Evaluator<TeamPolicyTag2<ES>,
   [[no_unique_address]] CombineFn fn_;
   DeviceTuple<OpEvals...>         ops_;
   OutArray                        outs_;
+  Kokkos::Array<int, Rank>        origin_;
+  team_member_t                   team_;
+};
+
+// The sink tiling: a combine whose fn returns void writes to global itself and
+// keeps no destination. It carries only the operand value evaluators and the
+// output tile's global origin -- there is no output node to derive Rank from,
+// so Rank is a template parameter here (CombineOperands reads it off
+// out_node_t).
+template <int SinkRank, typename... OpEvals>
+struct CombineSinkOperands {
+  using ops_tuple_t           = DeviceTuple<OpEvals...>;
+  static constexpr int NumOut = 0;
+  static constexpr int Rank   = SinkRank;
+
+  ops_tuple_t                  ops;
+  Kokkos::Array<int, SinkRank> origin{};  // {} == tile-local coordinates
+
+  KOKKOS_FUNCTION CombineSinkOperands at(Kokkos::Array<int, SinkRank> o) const {
+    CombineSinkOperands out = *this;
+    out.origin              = o;
+    return out;
+  }
+};
+
+// make_combine_sink_operands<Rank>(a, b, ...) -- operands only, no destination.
+// The mirror of make_combine_operands for the NumOut == 0 case.
+template <int SinkRank, typename... OpEvals>
+KOKKOS_FUNCTION auto make_combine_sink_operands(OpEvals... ops) {
+  static_assert(sizeof...(OpEvals) >= 1,
+                "a sink combine still needs at least one operand to read");
+  return CombineSinkOperands<SinkRank, OpEvals...>{
+      DeviceTuple<OpEvals...>(ops...), {}};
+}
+
+// The sink evaluator: gather every operand at a coordinate, apply fn at the
+// GLOBAL coordinate, and discard the void result. The functor performs the
+// scatter (e.g. Kokkos::atomic_add into a global view) itself; the library
+// neither allocates a destination nor learns the index map. Matched by the
+// NumOut == 0 node (IntNumOut == integral_constant<int, 0>) paired with the
+// sink tiling, so the NumOut >= 1 evaluator above is never perturbed.
+template <typename ES, typename CombineFn, typename IntCRank, typename S,
+          typename CModesSeq, typename... Ops, int SinkRank,
+          typename... OpEvals>
+class Evaluator<TeamPolicyTag2<ES>,
+                NodeHandle<CombineTag, CombineFn, IntCRank, S, ES, CModesSeq,
+                           std::integral_constant<int, 0>, Ops...>,
+                CombineSinkOperands<SinkRank, OpEvals...>> {
+ public:
+  using node_type =
+      NodeHandle<CombineTag, CombineFn, IntCRank, S, ES, CModesSeq,
+                 std::integral_constant<int, 0>, Ops...>;
+  using policy_tag    = TeamPolicyTag2<ES>;
+  using tiling_type   = CombineSinkOperands<SinkRank, OpEvals...>;
+  using value_type    = S;
+  using exec_space    = ES;
+  using team_member_t = Impl::team_member_t<ES>;
+
+  static constexpr int Rank   = node_type::Rank;
+  static constexpr int NumOps = node_type::NumOps;
+  static constexpr int NumOut = 0;
+
+ private:
+  using ops_seq = std::make_index_sequence<NumOps>;
+  using op0_t   = std::tuple_element_t<0, std::tuple<OpEvals...>>;
+
+ public:
+  static_assert(sizeof...(OpEvals) == NumOps,
+                "combine operands must supply one value evaluator per node "
+                "operand");
+  static_assert(SinkRank == Rank,
+                "sink tiling rank must match the combine node's output rank");
+  static_assert(
+      (Impl::combine_op_aligned_v<Rank, typename op0_t::storage_type::layout_t,
+                                  OpEvals> &&
+       ...),
+      "Tag2 sink combine: every operand must already present the same extents "
+      "on every mode -- a permuted operand must be relabeled and staged first");
+
+  KOKKOS_FUNCTION Evaluator(node_type n, tiling_type t,
+                            const team_member_t& team)
+      : fn_(n.fn), ops_(t.ops), origin_(t.origin), team_(team) {}
+
+  // The per-element step a fused level driver calls: gather the operands at
+  // `coord`, apply fn at the global coordinate, drop the void result.
+  template <typename Coord>
+    requires(!std::is_integral_v<Coord>)
+  KOKKOS_FORCEINLINE_FUNCTION void operator()(const Coord& coord) const {
+    Kokkos::Array<int, Rank> gidx{};
+    TENSOR_PRAGMA_UNROLL
+    for (int d = 0; d < Rank; ++d) gidx[d] = origin_[d] + coord[d];
+    Impl::apply_combine(fn_, gidx, gather_vals(coord, ops_seq{}));
+  }
+
+  // A sink-only level has no output slot to drive its traversal, so it drives
+  // from operand 0's storage tile instead: every operand presents the output
+  // extents, so any of them enumerates the output coordinate set.
+  KOKKOS_FUNCTION auto iter_view() const {
+    return ops_.template get<0>().node().storage_;
+  }
+
+ private:
+  template <typename Coord, std::size_t... Ks>
+  KOKKOS_FUNCTION Kokkos::Array<value_type, NumOps> gather_vals(
+      const Coord& coord, std::index_sequence<Ks...>) const {
+    return {static_cast<value_type>(
+        ops_.template get<Ks>().node().storage_[coord])...};
+  }
+
+  [[no_unique_address]] CombineFn fn_;
+  DeviceTuple<OpEvals...>         ops_;
   Kokkos::Array<int, Rank>        origin_;
   team_member_t                   team_;
 };
