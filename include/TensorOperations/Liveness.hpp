@@ -5,7 +5,7 @@
 // Extracted from DagGraph.hpp when the TeamPolicyTag v1 path was removed. Every
 // function here is a constexpr pass over integer arrays and node TYPES: nothing
 // allocates, launches, or names an evaluator. LevelPlan.hpp builds a LEVEL
-// timeline on top of it; LevelGraph.hpp uses the gather half.
+// timeline on top of it; LevelGraph/Team.hpp uses the gather half.
 #include <TensorOperations/NodeHandle.hpp>
 #include <TensorOperations/Permute.hpp>
 
