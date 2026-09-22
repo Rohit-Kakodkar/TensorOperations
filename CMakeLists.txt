@@ -151,6 +151,17 @@ add_executable(test_sink_combine tests/test_sink_combine.cpp)
 target_link_libraries(test_sink_combine PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_sink_combine)
 
+set(TENSOR_OPS_CUTLASS_DIR "" CACHE PATH
+    "CUTLASS checkout for the CuTe backend (CUDA builds only)")
+if(TENSOR_OPS_CUTLASS_DIR AND Kokkos_ENABLE_CUDA)
+  target_include_directories(tensor INTERFACE ${TENSOR_OPS_CUTLASS_DIR}/include)
+  target_compile_definitions(tensor INTERFACE TENSOR_OPS_ENABLE_CUTE)
+
+  add_executable(test_cute_input tests/test_cute_input.cpp)
+  target_link_libraries(test_cute_input PRIVATE tensor GTest::gtest)
+  gtest_discover_tests(test_cute_input)
+endif()
+
 # ---------------------------------------------------------------------------
 # Negative-compilation tests for the LABEL-TILE MAP guards. Same rationale and
 # same caveats as the slot guards below.
