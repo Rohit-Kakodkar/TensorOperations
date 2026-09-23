@@ -191,7 +191,8 @@ constexpr void dag_note_node_reads(std::array<std::size_t, NS>& last,
   if constexpr (has_node_tag_v<ContractionTag, Node>) {
     dag_note_read<NS>(last, dag_operand_slot<typename Node::node_a_type>(), k);
     dag_note_read<NS>(last, dag_operand_slot<typename Node::node_b_type>(), k);
-  } else if constexpr (has_node_tag_v<CombineTag, Node>) {
+  } else if constexpr (has_node_tag_v<CombineTag, Node> ||
+                       has_node_tag_v<ReduceTag, Node>) {
     dag_note_combine_reads<Node, NS>(
         last, k,
         std::make_index_sequence<static_cast<std::size_t>(Node::NumOps)>{});

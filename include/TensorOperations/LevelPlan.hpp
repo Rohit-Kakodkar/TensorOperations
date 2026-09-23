@@ -285,6 +285,10 @@ template <typename LevelT, std::size_t... Ms>
 constexpr bool lg_all_staged_impl(std::index_sequence<Ms...>) {
   return (has_node_tag_v<StagedTag, tuple_element_t<Ms, LevelT>> && ...);
 }
+template <typename LevelT, std::size_t... Ms>
+constexpr bool lg_all_reduce_impl(std::index_sequence<Ms...>) {
+  return (has_node_tag_v<ReduceTag, tuple_element_t<Ms, LevelT>> && ...);
+}
 template <typename LevelT>
 inline constexpr bool lg_all_contraction_v = lg_all_contraction_impl<LevelT>(
     std::make_index_sequence<tuple_size_v<LevelT>>{});
@@ -294,6 +298,9 @@ inline constexpr bool lg_all_combine_v = lg_all_combine_impl<LevelT>(
 template <typename LevelT>
 inline constexpr bool lg_all_staged_v = lg_all_staged_impl<LevelT>(
     std::make_index_sequence<tuple_size_v<LevelT>>{});
+template <typename LevelT>
+inline constexpr bool lg_all_reduce_v = lg_all_reduce_impl<LevelT>(
+    std::make_index_sequence<tuple_size_v<LevelT>>{});
 
 template <typename LevelT>
 inline constexpr bool lg_level_nonempty_v = tuple_size_v<LevelT> > 0;
@@ -302,7 +309,7 @@ template <typename LevelT>
 inline constexpr bool lg_level_homogeneous_v =
     lg_level_nonempty_v<LevelT> &&
     (lg_all_contraction_v<LevelT> || lg_all_combine_v<LevelT> ||
-     lg_all_staged_v<LevelT>);
+     lg_all_staged_v<LevelT> || lg_all_reduce_v<LevelT>);
 
 template <typename LevelT, std::size_t... Ms>
 constexpr bool lg_contraction_space_impl(std::index_sequence<Ms...>) {
@@ -355,7 +362,8 @@ constexpr int lg_max_operand_slot() {
     const int a = dag_operand_slot<typename Node::node_a_type>();
     const int b = dag_operand_slot<typename Node::node_b_type>();
     return a > b ? a : b;
-  } else if constexpr (has_node_tag_v<CombineTag, Node>) {
+  } else if constexpr (has_node_tag_v<CombineTag, Node> ||
+                       has_node_tag_v<ReduceTag, Node>) {
     return lg_max_combine_slot<Node>(
         std::make_index_sequence<static_cast<std::size_t>(Node::NumOps)>{});
   } else if constexpr (has_node_tag_v<StagedTag, Node>) {
@@ -415,8 +423,9 @@ struct LevelPlan {
 
   static_assert(Impl::lg_levels_homogeneous_v<LevelsT>,
                 "level graph: a level must be NON-EMPTY and HOMOGENEOUS -- "
-                "every member a contraction, every member a combine, or every "
-                "member a stage. The decodes are different objects, so a mixed "
+                "every member a contraction, every member a combine, every "
+                "member a reduce, or every member a stage. The decodes are "
+                "different objects, so a mixed "
                 "level computes "
                 "both and banks neither");
 

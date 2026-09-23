@@ -185,6 +185,12 @@ add_executable(test_sink_combine tests/test_sink_combine.cpp)
 target_link_libraries(test_sink_combine PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_sink_combine)
 
+# test_reduce_node — a combine generalized to broadcast operands and reduction
+# labels (make_reduce_node), in a level graph. Custom main() wraps Kokkos.
+add_executable(test_reduce_node tests/test_reduce_node.cpp)
+target_link_libraries(test_reduce_node PRIVATE tensor GTest::gtest)
+gtest_discover_tests(test_reduce_node)
+
 # ---------------------------------------------------------------------------
 # Negative-compilation tests for the slot guards.
 #

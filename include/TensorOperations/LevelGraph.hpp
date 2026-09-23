@@ -72,6 +72,49 @@ struct lg_resolve_member<LT, Member, StagedTag> {
                           tile_from_labels_t<LT, typename Member::modes_seq>>;
   static type get(const Member& m) { return type{m.operand_}; }
 };
+// A reduce member: its output tile is the map's tile over its output labels,
+// and an output label no operand carries takes its extent from that tile --
+// which is only meaningful if the label is LabelWhole (one tile), so a gridded
+// uncarried label is rejected here.
+template <typename LT, typename OutSeq, typename... OpSeqs>
+constexpr bool lg_reduce_uncarried_gridded() {
+  constexpr auto out = seq_to_array(OutSeq{});
+  for (std::size_t i = 0; i < out.size(); ++i) {
+    bool carried = false;
+    ((carried = carried || arr_contains(seq_to_array(OpSeqs{}), out[i])), ...);
+    if (!carried && label_gridded_of<LT>(out[i])) return true;
+  }
+  return false;
+}
+template <typename LT, typename Member, typename OpsTuple>
+struct lg_resolve_reduce;
+template <typename LT, typename Member, typename... Ops>
+struct lg_resolve_reduce<LT, Member, DeviceTuple<Ops...>> {
+  static_assert(
+      !lg_reduce_uncarried_gridded<LT, typename Member::modes_seq,
+                                   typename Ops::modes_seq...>(),
+      "level graph: a reduce node's output label that no operand carries "
+      "must be LabelWhole -- its extent can only come from its tile");
+  using type = NodeHandle<ReduceTag, typename Member::reduce_type,
+                          std::integral_constant<int, Member::Rank>,
+                          typename Member::value_type,
+                          typename Member::exec_space,
+                          typename Member::modes_seq,
+                          typename Member::reduce_seq,
+                          std::integral_constant<int, Member::NumOut>,
+                          tile_from_labels_t<LT, typename Member::modes_seq>,
+                          Ops...>;
+  static type get(const Member& m) {
+    constexpr auto out = seq_to_array(typename Member::modes_seq{});
+    auto           shape = m.shape_;
+    for (std::size_t i = 0; i < out.size(); ++i)
+      if (shape[i] < 0) shape[i] = label_tile_of<LT>(out[i]);
+    return type{m.fn, m.operands, shape, m.red_shape_};
+  }
+};
+template <typename LT, typename Member>
+struct lg_resolve_member<LT, Member, ReduceTag>
+    : lg_resolve_reduce<LT, Member, typename Member::ops_tuple_t> {};
 template <typename LT, typename Member>
 using lg_resolve_member_t = typename lg_resolve_member<LT, Member>::type;
 
@@ -358,6 +401,94 @@ KOKKOS_FUNCTION void lg_run_combine_level(
   team.team_barrier();
 }
 
+// A reduce member: every operand slot read in its OWN declared order (the
+// evaluator projects the full coordinate onto each operand's labels), the
+// destinations at this member's slots, and the output tile's global origin.
+template <typename RedSeq, typename GridModes>
+constexpr bool lg_reduction_labels_gridded() {
+  constexpr auto red  = seq_to_array(RedSeq{});
+  constexpr auto grid = seq_to_array(GridModes{});
+  for (std::size_t i = 0; i < red.size(); ++i)
+    if (arr_contains(grid, red[i])) return true;
+  return false;
+}
+
+template <typename V, typename ES, typename LevelsT, typename GridModes,
+          std::size_t RootR, std::size_t L, std::size_t M, typename Store,
+          typename Team, std::size_t... Ks, std::size_t... Os>
+KOKKOS_FUNCTION auto lg_make_reduce_member_impl(
+    const LevelsT& levels, const Store& store,
+    const Kokkos::Array<int, RootR>& grid_idx, const Team& team,
+    std::index_sequence<Ks...>, std::index_sequence<Os...>) {
+  using Node                 = tuple_element_t<M, tuple_element_t<L, LevelsT>>;
+  constexpr std::size_t Base = lg_member_base_v<LevelsT, L, M>;
+
+  static_assert(
+      !lg_reduction_labels_gridded<typename Node::reduce_seq, GridModes>(),
+      "level graph: a reduce node's reduction label is gridded (LabelTile), "
+      "which would split the sum across teams. Declare it LabelWhole");
+
+  using Gather   = dag_gather_seq_t<typename Node::modes_seq, GridModes>;
+  using OutTile  = member_out_tile_t<Node>;
+  const auto idx = dag_node_index<Node::Rank, RootR>(grid_idx, Gather{});
+
+  Kokkos::Array<int, Node::Rank> origin{};
+  for (int d = 0; d < Node::Rank; ++d) origin[d] = idx[d] * OutTile::extent(d);
+
+  using OutNode = decltype(make_interm_node(store.template get<Base>()));
+  Kokkos::Array<OutNode, static_cast<std::size_t>(Node::NumOut)> outs{
+      make_interm_node(store.template get<Base + Os>())...};
+  auto ops =
+      make_reduce_operands(
+          lg_read_slot<
+              LevelsT,
+              tuple_element_t<Ks, typename Node::ops_tuple_t>::SlotIdx,
+              typename tuple_element_t<Ks, typename Node::ops_tuple_t>::modes_seq,
+              typename tuple_element_t<Ks,
+                                       typename Node::ops_tuple_t>::modes_seq>(
+              store, team)...,
+          outs)
+          .at(origin);
+  return make_evaluator<TeamPolicyTag2<ES>>(
+      levels.template get<L>().template get<M>(), ops, team);
+}
+
+template <typename V, typename ES, typename LevelsT, typename GridModes,
+          std::size_t RootR, std::size_t L, std::size_t M, typename Store,
+          typename Team>
+KOKKOS_FUNCTION auto lg_make_reduce_member(
+    const LevelsT& levels, const Store& store,
+    const Kokkos::Array<int, RootR>& grid_idx, const Team& team) {
+  using Node = tuple_element_t<M, tuple_element_t<L, LevelsT>>;
+  return lg_make_reduce_member_impl<V, ES, LevelsT, GridModes, RootR, L, M>(
+      levels, store, grid_idx, team,
+      std::make_index_sequence<static_cast<std::size_t>(Node::NumOps)>{},
+      std::make_index_sequence<static_cast<std::size_t>(Node::NumOut)>{});
+}
+
+// A REDUCE level: the combine driver's shape (every member's compute, then
+// every member's store, one range over the shared output tile).
+template <typename V, typename ES, typename LevelsT, typename GridModes,
+          std::size_t RootR, std::size_t L, typename Store, typename Team,
+          std::size_t... Ms>
+KOKKOS_FUNCTION void lg_run_reduce_level(
+    const LevelsT& levels, const Store& store,
+    const Kokkos::Array<int, RootR>& grid_idx, const Team& team,
+    std::index_sequence<Ms...>) {
+  auto evs = DeviceTuple<
+      decltype(lg_make_reduce_member<V, ES, LevelsT, GridModes, RootR, L, Ms>(
+          levels, store, grid_idx, team))...>{
+      lg_make_reduce_member<V, ES, LevelsT, GridModes, RootR, L, Ms>(
+          levels, store, grid_idx, team)...};
+
+  constexpr std::size_t Base0 = lg_member_base_v<LevelsT, L, 0>;
+  const auto            out0  = store.template get<Base0>();
+  team_for_each_coord(team, out0, [=](auto coord) {
+    lg_store_coord(evs, coord, std::index_sequence<Ms...>{});
+  });
+  team.team_barrier();
+}
+
 // One staged member's SOURCE view: the global subview it copies FROM. This is
 // exactly what the staged evaluator builds internally before its own copy loop
 // (Evaluator/Team2.hpp), lifted out so a whole level's sources can be built
@@ -431,6 +562,9 @@ KOKKOS_FUNCTION void lg_run_level(const LevelsT& levels, const Store& store,
   } else if constexpr (lg_all_contraction_v<LevelT>) {
     lg_run_contraction_level<V, ES, LevelsT, L>(levels, store, team,
                                                 std::make_index_sequence<NM>{});
+  } else if constexpr (lg_all_reduce_v<LevelT>) {
+    lg_run_reduce_level<V, ES, LevelsT, GridModes, RootR, L>(
+        levels, store, grid_idx, team, std::make_index_sequence<NM>{});
   } else {
     lg_run_combine_level<V, ES, LevelsT, GridModes, RootR, L>(
         levels, store, grid_idx, team, std::make_index_sequence<NM>{});
