@@ -246,8 +246,8 @@ KOKKOS_FUNCTION auto place_arena_slot_store(const Team& team,
     -> SlotStore<SlotView<ValueType, ExecSpace, Tiles>...> {
   constexpr std::size_t elems =
       Impl::slot_arena_prefix<ValueType, ExecSpace, Tiles...>(sizeof...(Tiles));
-  Impl::scratch_backing_t<ValueType, ExecSpace> arena(team.team_scratch(0),
-                                                      elems);
+  Impl::scratch_backing_t<ValueType, ExecSpace> arena(
+      team.team_scratch(0), elems);
   ValueType*                                    base = arena.data();
   return {DeviceTuple<SlotView<ValueType, ExecSpace, Tiles>...>{
       Impl::alloc_scratch_tile_at<ValueType, ExecSpace>(
@@ -288,14 +288,15 @@ std::size_t pooled_arena_slot_store_bytes(const Tiles&...) {
 template <typename ValueType, typename ExecSpace, typename PoolsList,
           typename Team, typename... Tiles, std::size_t... Is>
 KOKKOS_FUNCTION auto place_pooled_arena_slot_store(const Team& team,
+                                                   const int   scratch_level,
                                                    std::index_sequence<Is...>,
                                                    const Tiles&... tiles)
     -> SlotStore<SlotView<ValueType, ExecSpace, Tiles>...> {
   constexpr std::size_t elems =
       Impl::slot_pool_arena<ValueType, ExecSpace, PoolsList,
                             Impl::SlotTiles<Tiles...>>::total();
-  Impl::scratch_backing_t<ValueType, ExecSpace> arena(team.team_scratch(0),
-                                                      elems);
+  Impl::scratch_backing_t<ValueType, ExecSpace> arena(
+      team.team_scratch(scratch_level), elems);
   ValueType*                                    base = arena.data();
   return {DeviceTuple<SlotView<ValueType, ExecSpace, Tiles>...>{
       Impl::alloc_scratch_tile_at<ValueType, ExecSpace>(
@@ -304,13 +305,17 @@ KOKKOS_FUNCTION auto place_pooled_arena_slot_store(const Team& team,
           tiles)...}};
 }
 
+// `scratch_level` is the team scratch level the arena is carved from: 0 (the
+// default, on-chip on GPU) or 1 (host backends cap level 0 at 32 KB and allow
+// tens of MB at level 1; on GPU level 1 is global memory).
 template <typename ValueType, typename ExecSpace, typename PoolsList,
           typename Team, typename... Tiles>
 KOKKOS_FUNCTION auto carve_pooled_arena_slot_store(const Team& team,
+                                                   const int   scratch_level,
                                                    const Tiles&... tiles)
     -> SlotStore<SlotView<ValueType, ExecSpace, Tiles>...> {
   return place_pooled_arena_slot_store<ValueType, ExecSpace, PoolsList>(
-      team, std::index_sequence_for<Tiles...>{}, tiles...);
+      team, scratch_level, std::index_sequence_for<Tiles...>{}, tiles...);
 }
 
 }  // namespace TensorOperations
