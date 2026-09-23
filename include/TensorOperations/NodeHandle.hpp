@@ -586,7 +586,7 @@ KOKKOS_FUNCTION auto make_stage_node(Operand op) {
 // differing canonical orders, declare it twice rather than moving data; the
 // consumer whose labels do not match the storage order resolves the difference
 // through its own gather permutation, zero-copy (the relabel evaluator in
-// Evaluator/Team2.hpp).
+// Evaluator/Team.hpp).
 // `SlotIdx` names the buffer within the driver's slot store. Standalone uses --
 // binding a buffer by hand, outside any driver -- can pass 0 and ignore it; it
 // only means something to a graph driver.

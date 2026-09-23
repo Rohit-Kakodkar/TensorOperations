@@ -4,7 +4,7 @@
 // Extracted from Evaluator/Team.hpp when the TeamPolicyTag v1 path was removed.
 // Nothing here is tied to an execution mode: these are functions of a tile spec
 // and a team handle, used by the slot store (SlotStore.hpp), the level graph's
-// grid sizing (LevelGraph.hpp) and the evaluators (Evaluator/Team2.hpp).
+// grid sizing (LevelGraph.hpp) and the evaluators (Evaluator/Team.hpp).
 #include <TensorOperations/TiledLayout.hpp>
 #include <TensorOperations/Tiling.hpp>
 

@@ -563,7 +563,7 @@ TEST(LevelGraphRuntime, MultiOutputCombineEqualsReference) {
 // Every extent here is pairwise distinct and every permutation is a 3-CYCLE,
 // both deliberately. An involution cannot test a permutation's direction (it
 // passes against its own inverse), and equal extents hide a direction error
-// outright: the extents-only wall in Team2.hpp cannot see axis order, so with
+// outright: the extents-only wall in Team.hpp cannot see axis order, so with
 // rt's (5,2,5,5) shapes a fully inverted perm still type-checks.
 // ===========================================================================
 namespace declared {

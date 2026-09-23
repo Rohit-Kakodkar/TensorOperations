@@ -269,7 +269,7 @@ void run_relabel_hook(Buf1D dst_readback) {
 // untouched -- which is what lets a slot with other consumers be relabelled at
 // all. The hook is applied later, by whoever stages or stores the result.
 //
-// The type-level half of this is pinned in test_team2.cpp, which asserts the
+// The type-level half of this is pinned in test_team.cpp, which asserts the
 // relabelled node carries the source's hook_op rather than NoHook.
 TEST(RelabelScratchView, DefersSourceHook) {
   Buf1D dst_readback("dst_readback", 6);  // dst is 3x2 after perm{1,0}

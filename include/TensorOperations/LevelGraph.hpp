@@ -362,7 +362,7 @@ KOKKOS_FUNCTION void lg_run_combine_level(
 
 // One staged member's SOURCE view: the global subview it copies FROM. This is
 // exactly what the staged evaluator builds internally before its own copy loop
-// (Evaluator/Team2.hpp), lifted out so a whole level's sources can be built
+// (Evaluator/Team.hpp), lifted out so a whole level's sources can be built
 // before any of them is stored.
 template <typename V, typename ES, typename LevelsT, typename GridModes,
           std::size_t RootR, std::size_t L, std::size_t M, typename Team>

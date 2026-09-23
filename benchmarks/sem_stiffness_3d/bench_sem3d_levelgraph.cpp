@@ -104,7 +104,8 @@ using V1  = Kokkos::View<const float*, Kokkos::LayoutRight>;
 using V4H = V4::host_mirror_type;
 
 // ===========================================================================
-// SHARED PHYSICS -- verbatim from bench_sem_stiffness_3d.cpp, and verified
+// SHARED PHYSICS -- carried over from the removed bench_sem_stiffness_3d.cpp,
+// verified
 // against the real SPECFEM++ source this time rather than reconstructed:
 // core/specfem/medium/dim3/elastic/isotropic/stress.hpp writes
 //   sigma_ii = (lambda+2mu)*du(i,i) + lambda*(du(j,j)+du(k,k))
@@ -576,8 +577,9 @@ std::size_t hand4_scratch() {
 }
 
 // ===========================================================================
-// Setup, host reference, timing -- verbatim from bench_sem_stiffness_3d.cpp so
-// the two files' PASS/FAIL and timings mean the same thing.
+// Setup, host reference, timing -- carried over unchanged from the removed
+// bench_sem_stiffness_3d.cpp, so historical PASS/FAIL and timings from that
+// benchmark remain comparable with these.
 // ===========================================================================
 namespace {
 

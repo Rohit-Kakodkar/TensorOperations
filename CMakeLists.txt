@@ -70,9 +70,9 @@ add_executable(test_device_tuple tests/test_device_tuple.cpp)
 target_link_libraries(test_device_tuple PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_device_tuple)
 
-add_executable(test_team2 tests/test_team2.cpp)
-target_link_libraries(test_team2 PRIVATE tensor GTest::gtest)
-gtest_discover_tests(test_team2)
+add_executable(test_team tests/test_team.cpp)
+target_link_libraries(test_team PRIVATE tensor GTest::gtest)
+gtest_discover_tests(test_team)
 
 add_executable(test_regroup_view tests/test_regroup_view.cpp)
 target_link_libraries(test_regroup_view PRIVATE tensor GTest::gtest)
@@ -260,12 +260,12 @@ set_tests_properties(LevelGuardNegative.Case4 PROPERTIES
 # Benchmarks (opt-in: -DTENSOR_OPS_BUILD_BENCHMARKS=ON). No gtest; own main().
 if(TENSOR_OPS_BUILD_BENCHMARKS)
   # --- 3D SEM stiffness on the LEVEL GRAPH (Sprint 5) -----------------------
-  # Note what is ABSENT, and that it is the point: no TENSOR_GEMM_* overrides.
-  # The Tag2 contraction is a plain dot product with no register blocking, so
-  # NGLL=5 needs no per-target GEMM retuning and TE=1 becomes legal -- neither
-  # is true of bench_sem_stiffness_3d above, whose target must pin MT/NT/NR and
-  # therefore cannot express TE=1 at all. TE=1 is where both this benchmark's
-  # implementations are fastest.
+  # Note what is ABSENT, and that it is the point: no GEMM tuning knobs. The
+  # contraction is a plain dot product with no register blocking, so NGLL=5
+  # needs no per-target retuning and TE=1 is legal -- neither was true of the
+  # removed register-blocked GEMM, whose target had to pin MT/NT/NR and
+  # therefore could not express TE=1 at all. TE=1 is where both this
+  # benchmark's implementations are fastest.
   #
   # The sweep stops at TE=8: LevelGraph carves 35 slots with no liveness pooling
   # (that is Sprint 4), so scratch is 200 + 16500*TE bytes and TE=16 (264 KB)
