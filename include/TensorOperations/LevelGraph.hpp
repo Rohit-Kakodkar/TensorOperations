@@ -773,6 +773,7 @@ struct LevelGraph {
 
   bool index_consistent() const {
     return index_consistent_impl(
+        std::index_sequence<>{},
         std::make_index_sequence<Impl::lg_total_members_v<LevelsT>>{});
   }
 
