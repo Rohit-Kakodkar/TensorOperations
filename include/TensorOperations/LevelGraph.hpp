@@ -204,9 +204,10 @@ using lg_pools_t = typename lg_pools_of<
 
 template <typename V, typename ES, typename LevelsT, typename RootsSeq,
           typename Team, std::size_t... Ls>
-KOKKOS_FUNCTION auto lg_carve(const Team& team, std::index_sequence<Ls...>) {
+KOKKOS_FUNCTION auto lg_carve(const Team& team, const int scratch_level,
+                              std::index_sequence<Ls...>) {
   return carve_pooled_arena_slot_store<V, ES, lg_pools_t<LevelsT, RootsSeq>>(
-      team, lg_slot_tile_t<LevelsT, Ls>{}...);
+      team, scratch_level, lg_slot_tile_t<LevelsT, Ls>{}...);
 }
 
 template <typename V, typename ES, typename LevelsT, typename RootsSeq,
@@ -764,7 +765,7 @@ int lg_league_size(const Kokkos::Array<int, N>& shape) {
 template <typename V, typename ES, typename LT, typename LevelsT,
           typename RootsSeq, typename... ViewTs>
 int lg_execute(const LevelsT& levels, std::size_t bytes, int team_size,
-               RootsSeq roots, const ViewTs&... views) {
+               int scratch_level, RootsSeq roots, const ViewTs&... views) {
   using member_t            = team_member_t<ES>;
   constexpr std::size_t NL  = tuple_size_v<LevelsT>;
   constexpr std::size_t NLS = lg_num_slots_v<LevelsT>;
@@ -792,7 +793,8 @@ int lg_execute(const LevelsT& levels, std::size_t bytes, int team_size,
   Kokkos::TeamPolicy<ES> policy =
       team_size > 0 ? Kokkos::TeamPolicy<ES>(wk, team_size)
                     : Kokkos::TeamPolicy<ES>(wk, Kokkos::AUTO);
-  policy.set_scratch_size(0, Kokkos::PerTeam(static_cast<int>(bytes)));
+  policy.set_scratch_size(scratch_level,
+                          Kokkos::PerTeam(static_cast<int>(bytes)));
 
   // Padded with `int` so index 0 exists even with zero views (a graph whose
   // last level is all sinks). For any real view, index 0 is the first view and
@@ -809,7 +811,8 @@ int lg_execute(const LevelsT& levels, std::size_t bytes, int team_size,
         const auto grid_idx = decode_tile_index<RootR>(
             static_cast<int>(team.league_rank()), grid_shape, GridTile{});
 
-        auto store = lg_carve<V, ES, LevelsT, RootsSeq>(team, level_slot_seq{});
+        auto store = lg_carve<V, ES, LevelsT, RootsSeq>(team, scratch_level,
+                                                        level_slot_seq{});
 
         lg_run_all_levels<V, ES, LevelsT, GridModes, RootR>(ld, store, grid_idx,
                                                             team, level_seq{});
@@ -840,9 +843,13 @@ bool lg_index_ok(const NodeTile& nt, const Kokkos::Array<int, Rank>& nshape,
 template <typename Graph, std::size_t... Roots>
 struct LevelOutputs {
   Graph graph;
-  int   team = -1;
+  int   team  = -1;
+  int   level = 0;  // team scratch level the slot store is carved from
 
-  LevelOutputs team_size(int n) const { return {graph, n}; }
+  LevelOutputs team_size(int n) const { return {graph, n, level}; }
+  // Host backends cap level-0 team scratch at 32 KB and allow tens of MB at
+  // level 1; on GPU level 1 is global memory. Pick per backend.
+  LevelOutputs scratch_level(int l) const { return {graph, team, l}; }
 
   using roots_seq = std::index_sequence<Roots...>;
 
@@ -858,7 +865,7 @@ struct LevelOutputs {
 
   template <typename ES, TensorLike... Ts>
   int execute(const TeamPolicyTag2<ES>&, const Ts&... views) const {
-    return graph.template launch<ES, Roots...>(team, views...);
+    return graph.template launch<ES, Roots...>(team, level, views...);
   }
 };
 
@@ -908,7 +915,8 @@ struct LevelGraph {
   }
 
   template <typename ES, std::size_t... Roots, typename... ViewTs>
-  int launch(int team_size, const ViewTs&... views) const {
+  int launch(int team_size, int scratch_level,
+             const ViewTs&... views) const {
     static_assert(sizeof...(Roots) == sizeof...(ViewTs),
                   "LevelGraph::execute needs one view per designated output");
     static_assert(std::is_same_v<ES, ExecSpace>,
@@ -921,7 +929,7 @@ struct LevelGraph {
            "must have exactly one tile.");
     return Impl::lg_execute<ValueType, ExecSpace, LabelTilesT, LevelsT>(
         levels, scratch_bytes<std::index_sequence<Roots...>>(), team_size,
-        std::index_sequence<Roots...>{}, views...);
+        scratch_level, std::index_sequence<Roots...>{}, views...);
   }
 
  private:

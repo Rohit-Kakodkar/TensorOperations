@@ -466,6 +466,80 @@ TEST(ReduceNode, RankEightOutput) {
   EXPECT_LT(max_err, 1e-5) << "rank-8 reduce != reference";
 }
 
+// ---------------------------------------------------------------------------
+// 8. Scratch level 1. The host backends cap level-0 team scratch at 32 KB;
+//    a whole-tile output of 5^6 floats is 62.5 KB. Carving from level 1 is
+//    what lets the same tile map run on host and GPU.
+// ---------------------------------------------------------------------------
+namespace big {
+constexpr int N = 5, NE = 3, TE = 1;
+using MapB = LabelTiles<LabelTile<'E', TE>, LabelWhole<'k', N>,
+                        LabelWhole<'j', N>, LabelWhole<'i', N>,
+                        LabelWhole<'K', N>, LabelWhole<'J', N>,
+                        LabelWhole<'I', N>, LabelWhole<'q', N>>;
+using View7 = Kokkos::View<float*[N][N][N][N][N][N], Kokkos::LayoutRight, ES>;
+using ViewH = Kokkos::View<float**, Kokkos::LayoutRight, ES>;
+using ViewM = Kokkos::View<float**, Kokkos::LayoutRight, ES>;
+float hb(int q, int i) { return 0.2f + 0.7f * q - 0.3f * i; }
+float mb(int E, int q) { return 0.4f + 0.15f * E + 0.1f * q; }
+struct Term {
+  KOKKOS_FUNCTION float operator()(int, int k, int j, int, int K, int J, int,
+                                   int, float hqi, float hqI, float m) const {
+    return (k == K && j == J) ? hqi * hqI * m : 0.0f;
+  }
+};
+}  // namespace big
+
+TEST(ReduceNode, ScratchLevelOneCarriesAWholeTileAboveTheHostLevelZeroCap) {
+  using namespace big;
+  ViewH Hd("hb", N, N);
+  ViewM Md("mb", NE, N);
+  {
+    auto hm = Kokkos::create_mirror_view(Hd);
+    for (int q = 0; q < N; ++q)
+      for (int i = 0; i < N; ++i) hm(q, i) = hb(q, i);
+    Kokkos::deep_copy(Hd, hm);
+    auto mm = Kokkos::create_mirror_view(Md);
+    for (int E = 0; E < NE; ++E)
+      for (int q = 0; q < N; ++q) mm(E, q) = mb(E, q);
+    Kokkos::deep_copy(Md, mm);
+  }
+  View7 Kd("K7", NE);
+
+  auto g0 = make_level_graph<float, ES>(MapB{});
+  auto [g1, h] =
+      g0.add(make_stage_node(make_input_node(make_handle<'q', 'i'>(Hd))));
+  auto [g2, m] =
+      g1.add(make_stage_node(make_input_node(make_handle<'E', 'q'>(Md))));
+  auto [g3, k] = g2.add(make_reduce_node<'E', 'k', 'j', 'i', 'K', 'J', 'I'>(
+      h.template as<'q', 'i'>(), h.template as<'q', 'I'>(), m, Term{}));
+  const auto out = g3.outputs(k);
+  EXPECT_GT(out.scratch_bytes(), std::size_t{32} * 1024)
+      << "the case must exceed the host level-0 cap to prove anything";
+  constexpr bool on_host =
+      Kokkos::SpaceAccessibility<ES, Kokkos::HostSpace>::accessible;
+  out.scratch_level(on_host ? 1 : 0).execute(TeamPolicyTag2<ES>{}, Kd);
+  Kokkos::fence();
+
+  auto Kh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, Kd);
+  double max_err = 0.0;
+  for (int E = 0; E < NE; ++E)
+    for (int k_ = 0; k_ < N; ++k_)
+      for (int j = 0; j < N; ++j)
+        for (int i = 0; i < N; ++i)
+          for (int K = 0; K < N; ++K)
+            for (int J = 0; J < N; ++J)
+              for (int I = 0; I < N; ++I) {
+                double ref = 0.0;
+                if (k_ == K && j == J)
+                  for (int q = 0; q < N; ++q)
+                    ref += static_cast<double>(hb(q, i)) * hb(q, I) * mb(E, q);
+                max_err = std::max(max_err,
+                                   std::abs(ref - Kh(E, k_, j, i, K, J, I)));
+              }
+  EXPECT_LT(max_err, 1e-4) << "level-1 scratch reduce != reference";
+}
+
 int main(int argc, char* argv[]) {
   ::testing::InitGoogleTest(&argc, argv);
   Kokkos::initialize(argc, argv);
