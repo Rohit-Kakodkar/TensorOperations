@@ -44,10 +44,10 @@ __global__ void round_trip_tiles(Node node, OutHandle out, Hook hook,
 
   const auto coord  = cute::make_coord(ti, tj);
   auto       src    = make_evaluator<CutePolicyTag<>>(node, Tiler{})(coord);
-  auto       stager = make_evaluator<CutePolicyTag<>>(
+  auto       loader = make_evaluator<CutePolicyTag<>>(
       make_cute_interm_node<Kokkos::Cuda>(stile),
-      CuteStageTag<ThrLayout>{ThrLayout{}, thr});
-  stager = src;
+      CuteSmemLoadTag<ThrLayout>{ThrLayout{}, thr});
+  loader = src;
   __syncthreads();
 
   auto store = make_evaluator<CutePolicyTag<>>(

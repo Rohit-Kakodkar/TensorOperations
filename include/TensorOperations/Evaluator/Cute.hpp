@@ -123,7 +123,7 @@ struct CuteThreadTag {
 };
 
 template <typename ThrLayout>
-struct CuteStageTag : CuteThreadTag<ThrLayout> {};
+struct CuteSmemLoadTag : CuteThreadTag<ThrLayout> {};
 
 template <typename ThrLayout>
 struct CuteStoreTag : CuteThreadTag<ThrLayout> {};
@@ -180,11 +180,11 @@ template <typename ES, typename Storage, int R, typename HookOp,
 class Evaluator<
     CutePolicyTag<ES>,
     NodeHandle<IntermTag, Storage, std::integral_constant<int, R>, ES, HookOp>,
-    CuteStageTag<ThrLayout>>
+    CuteSmemLoadTag<ThrLayout>>
     : public Impl::CuteThreadTileEvaluator<ES, Storage, R, HookOp, ThrLayout,
-                                           CuteStageTag<ThrLayout>> {
+                                           CuteSmemLoadTag<ThrLayout>> {
   using base = Impl::CuteThreadTileEvaluator<ES, Storage, R, HookOp, ThrLayout,
-                                             CuteStageTag<ThrLayout>>;
+                                             CuteSmemLoadTag<ThrLayout>>;
 
  public:
   using base::base;
