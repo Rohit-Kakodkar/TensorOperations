@@ -7,32 +7,47 @@
 
 using namespace TensorOperations;
 
+namespace {
+
+using Tiler     = cute::Shape<cute::_4, cute::_4>;
+constexpr int I = 8, J = 12, TI = 4, TJ = 4;
+
+template <typename Node, typename View>
+__global__ void copy_tiles(Node node, View out) {
+  const int  ti = blockIdx.x, tj = blockIdx.y;
+  const int  a = threadIdx.x / TJ, b = threadIdx.x % TJ;
+  const auto tile =
+      make_evaluator<CutePolicyTag<>>(node, Tiler{})(cute::make_coord(ti, tj))
+          .node()
+          .storage_;
+  out(TI * ti + a, TJ * tj + b) = tile(a, b);
+}
+
 template <typename Layout>
 int count_tile_mismatches() {
-  using View      = Kokkos::View<float**, Layout, Kokkos::Cuda>;
-  using Tiler     = cute::Shape<cute::_4, cute::_4>;
-  constexpr int I = 8, J = 12, TI = 4, TJ = 4;
+  using View = Kokkos::View<float**, Layout, Kokkos::Cuda>;
 
-  View v("v", I, J);
-  Kokkos::parallel_for(
-      Kokkos::MDRangePolicy<Kokkos::Cuda, Kokkos::Rank<2>>({0, 0}, {I, J}),
-      KOKKOS_LAMBDA(int i, int j) { v(i, j) = 100.0f * i + j; });
+  View v("v", I, J), out("out", I, J);
+  auto hv = Kokkos::create_mirror_view(v);
+  for (int i = 0; i < I; ++i)
+    for (int j = 0; j < J; ++j) hv(i, j) = 100.0f * i + j;
+  Kokkos::deep_copy(v, hv);
 
   auto node = make_input_node(make_handle<'i', 'j'>(v));
-  int  bad  = 0;
-  Kokkos::parallel_reduce(
-      Kokkos::RangePolicy<Kokkos::Cuda>(0, (I / TI) * (J / TJ)),
-      KOKKOS_LAMBDA(int t, int& acc) {
-        const int ti = t / (J / TJ), tj = t % (J / TJ);
-        auto      ev   = make_evaluator<CutePolicyTag<>>(node, Tiler{});
-        auto      tile = ev(cute::make_coord(ti, tj)).node().storage_;
-        for (int a = 0; a < TI; ++a)
-          for (int b = 0; b < TJ; ++b)
-            if (tile(a, b) != v(TI * ti + a, TJ * tj + b)) ++acc;
-      },
-      bad);
+  copy_tiles<<<dim3(I / TI, J / TJ), TI * TJ>>>(node, out);
+  if (cudaGetLastError() != cudaSuccess ||
+      cudaDeviceSynchronize() != cudaSuccess)
+    return -1;
+
+  auto ho  = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, out);
+  int  bad = 0;
+  for (int i = 0; i < I; ++i)
+    for (int j = 0; j < J; ++j)
+      if (ho(i, j) != hv(i, j)) ++bad;
   return bad;
 }
+
+}  // namespace
 
 TEST(CuteInput, TilesMatchView) {
   EXPECT_EQ(count_tile_mismatches<Kokkos::LayoutRight>(), 0);
