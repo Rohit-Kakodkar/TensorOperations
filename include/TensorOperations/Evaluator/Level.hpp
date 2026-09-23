@@ -105,6 +105,19 @@ struct MemberOutTile<Node, CombineTag> {
   using type = combine_out_tile_t<Node>;
 };
 
+// An einsum's output tile is the map's tile over its output labels, resolved
+// by LevelGraph::add (an output label no operand carries has no other source
+// of extent). `void` means the node was never added to a graph.
+template <typename Node>
+struct MemberOutTile<Node, EinsumTag> {
+  static_assert(
+      !std::is_same_v<typename Node::tile_type, void>,
+      "einsum member: its tile is unresolved, which means this node was "
+      "never handed to LevelGraph::add -- add() is what looks the tile up "
+      "in the graph's label map");
+  using type = typename Node::tile_type;
+};
+
 // A stage's tile cannot be derived -- it has no operands to derive from -- so
 // it is carried on the node, resolved by LevelGraph::add from the graph's label
 // map. `void` means the node was never added to a graph.

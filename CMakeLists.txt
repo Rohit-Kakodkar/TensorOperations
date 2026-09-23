@@ -139,6 +139,11 @@ add_executable(test_level_graph tests/test_level_graph.cpp)
 target_link_libraries(test_level_graph PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_level_graph)
 
+# test_einsum_node — labels decide the sum; delta-structured operands.
+add_executable(test_einsum_node tests/test_einsum_node.cpp)
+target_link_libraries(test_einsum_node PRIVATE tensor GTest::gtest)
+gtest_discover_tests(test_einsum_node)
+
 # test_functional_input — a leaf whose elements are computed, not addressed.
 # Custom main() wraps Kokkos init/finalize; every case launches a graph.
 add_executable(test_functional_input tests/test_functional_input.cpp)

@@ -1,4 +1,5 @@
 #pragma once
+#include <TensorOperations/Einsum.hpp>
 #include <TensorOperations/LabelTiles.hpp>
 #include <TensorOperations/Liveness.hpp>
 #include <TensorOperations/LevelPlan.hpp>
@@ -74,6 +75,93 @@ struct lg_resolve_member<LT, Member, StagedTag> {
                           tile_from_labels_t<LT, typename Member::modes_seq>>;
   static type get(const Member& m) { return type{m.operand_}; }
 };
+// An einsum member: its output tile is the map's tile over its output labels,
+// its summed extents the map's tiles. The term expansion runs here, where the
+// map is known, and its errors surface as static_asserts at add().
+template <typename Structure>
+struct lg_einsum_leaf_labels;
+template <typename Out, typename LeafLabels, typename Plain, typename Deltas>
+struct lg_einsum_leaf_labels<EinsumStructure<Out, LeafLabels, Plain, Deltas>> {
+  using type = LeafLabels;
+};
+template <std::size_t K, typename List>
+struct lg_list_at;
+template <std::size_t K, typename T, typename... Ts>
+struct lg_list_at<K, EinsumTypeList<T, Ts...>>
+    : lg_list_at<K - 1, EinsumTypeList<Ts...>> {};
+template <typename T, typename... Ts>
+struct lg_list_at<0, EinsumTypeList<T, Ts...>> {
+  using type = T;
+};
+// Node-space labels of leaf K of an einsum member, in the leaf's axis order.
+template <typename Node, std::size_t K>
+using lg_einsum_leaf_labels_t = typename lg_list_at<
+    K, typename lg_einsum_leaf_labels<
+           typename Node::structure_type>::type>::type;
+
+template <typename LT, typename OutSeq, typename LeafLabels>
+struct lg_einsum_uncarried_gridded;
+template <typename LT, typename OutSeq, typename... Ls>
+struct lg_einsum_uncarried_gridded<LT, OutSeq, EinsumTypeList<Ls...>> {
+  static constexpr bool value = [] {
+    constexpr auto out = seq_to_array(OutSeq{});
+    for (std::size_t i = 0; i < out.size(); ++i) {
+      bool carried = false;
+      ((carried = carried || arr_contains(seq_to_array(Ls{}), out[i])), ...);
+      if (!carried && label_gridded_of<LT>(out[i])) return true;
+    }
+    return false;
+  }();
+};
+
+template <typename LT, typename Member, typename LeavesTuple>
+struct lg_resolve_einsum;
+template <typename LT, typename Member, typename... Leaves>
+struct lg_resolve_einsum<LT, Member, DeviceTuple<Leaves...>> {
+  using S = typename Member::structure_type;
+  static constexpr int err =
+      einsum_first_error<S, LT>(std::make_index_sequence<Member::NumTerms>{});
+  static_assert(err != einsum_err_overflow,
+                "einsum node: the term expansion exceeds a fixed capacity "
+                "(labels, leaves, cases or loops); raise the einsum_max_* "
+                "constants in Einsum.hpp");
+  static_assert(err != einsum_err_sum_not_in_map,
+                "einsum node: a summed label is not in the graph's label map, "
+                "so its extent is unknown");
+  static_assert(err != einsum_err_sum_gridded,
+                "einsum node: a summed label is gridded (LabelTile) -- a sum "
+                "cannot be split across teams; declare it LabelWhole");
+  static_assert(err != einsum_err_sum_extent,
+                "einsum node: labels joined by a delta (or summed together) "
+                "have different extents in the label map");
+  static_assert(err != einsum_err_gridded_merged,
+                "einsum node: a gridded (LabelTile) label must be an output "
+                "label that no delta or selector touches -- anything else "
+                "would index a partial tile");
+  static_assert(err != einsum_err_selector_ext,
+                "einsum node: a selector label's extent in the label map must "
+                "equal its operand's number of cases");
+  static_assert(!lg_einsum_uncarried_gridded<
+                    LT, typename Member::modes_seq,
+                    typename lg_einsum_leaf_labels<S>::type>::value,
+                "einsum node: an output label that no operand carries must be "
+                "LabelWhole -- its extent can only come from its tile");
+  using type =
+      NodeHandle<EinsumTag, typename Member::value_type,
+                 typename Member::exec_space, typename Member::modes_seq, S,
+                 LT, Leaves...>;
+  static type get(const Member& m) {
+    constexpr auto out   = seq_to_array(typename Member::modes_seq{});
+    auto           shape = m.shape_;
+    for (std::size_t i = 0; i < out.size(); ++i)
+      if (shape[i] < 0) shape[i] = label_tile_of<LT>(out[i]);
+    return type{m.operands, shape};
+  }
+};
+template <typename LT, typename Member>
+struct lg_resolve_member<LT, Member, EinsumTag>
+    : lg_resolve_einsum<LT, Member, typename Member::ops_tuple_t> {};
+
 template <typename LT, typename Member>
 using lg_resolve_member_t = typename lg_resolve_member<LT, Member>::type;
 
@@ -163,9 +251,10 @@ using lg_pools_t = typename lg_pools_of<
 
 template <typename V, typename ES, typename LevelsT, typename RootsSeq,
           typename Team, std::size_t... Ls>
-KOKKOS_FUNCTION auto lg_carve(const Team& team, std::index_sequence<Ls...>) {
+KOKKOS_FUNCTION auto lg_carve(const Team& team, const int scratch_level,
+                              std::index_sequence<Ls...>) {
   return carve_pooled_arena_slot_store<V, ES, lg_pools_t<LevelsT, RootsSeq>>(
-      team, lg_slot_tile_t<LevelsT, Ls>{}...);
+      team, scratch_level, lg_slot_tile_t<LevelsT, Ls>{}...);
 }
 
 template <typename V, typename ES, typename LevelsT, typename RootsSeq,
@@ -360,6 +449,87 @@ KOKKOS_FUNCTION void lg_run_combine_level(
   team.team_barrier();
 }
 
+// One leaf of an einsum member as its evaluator reads it. A slot leaf is its
+// scratch view with the node-space label of each STORAGE axis (a contraction
+// producer stores canonically, so the storage order is looked up, not
+// assumed); a functional leaf is the node itself, called at the global
+// coordinate.
+template <typename LevelsT, typename Node, std::size_t K, typename Store>
+KOKKOS_FUNCTION auto lg_einsum_leaf(const Node& node, const Store& store) {
+  using Leaf       = tuple_element_t<K, typename Node::ops_tuple_t>;
+  using NodeLabels = lg_einsum_leaf_labels_t<Node, K>;
+  if constexpr (has_node_tag_v<FunctionalTag, Leaf>) {
+    return EinsumFuncLeaf<Leaf, NodeLabels>{node.operands.template get<K>()};
+  } else {
+    constexpr std::size_t S = Leaf::SlotIdx;
+    using Canon =
+        typename lg_slot_canon_modes<LevelsT, S,
+                                     typename Leaf::modes_seq>::type;
+    using StorageLabels =
+        map_labels_t<Canon, typename Leaf::modes_seq, NodeLabels>;
+    const auto view = store.template get<S>();
+    return EinsumSlotLeaf<std::decay_t<decltype(view)>, StorageLabels>{view};
+  }
+}
+
+template <typename V, typename ES, typename LevelsT, typename GridModes,
+          std::size_t RootR, std::size_t L, std::size_t M, typename Store,
+          std::size_t... Ks>
+KOKKOS_FUNCTION auto lg_make_einsum_member_impl(
+    const LevelsT& levels, const Store& store,
+    const Kokkos::Array<int, RootR>& grid_idx, std::index_sequence<Ks...>) {
+  using Node                 = tuple_element_t<M, tuple_element_t<L, LevelsT>>;
+  constexpr std::size_t Base = lg_member_base_v<LevelsT, L, M>;
+
+  using Gather   = gather_seq_t<typename Node::modes_seq, GridModes>;
+  using OutTile  = member_out_tile_t<Node>;
+  const auto idx = node_index<Node::Rank, RootR>(grid_idx, Gather{});
+
+  Kokkos::Array<int, Node::Rank> origin{};
+  for (int d = 0; d < Node::Rank; ++d) origin[d] = idx[d] * OutTile::extent(d);
+
+  const auto& node = levels.template get<L>().template get<M>();
+  const auto  leaves =
+      DeviceTuple<decltype(lg_einsum_leaf<LevelsT, Node, Ks>(node, store))...>{
+          lg_einsum_leaf<LevelsT, Node, Ks>(node, store)...};
+  return make_einsum_evaluator<Node>(leaves, store.template get<Base>(),
+                                     origin);
+}
+
+template <typename V, typename ES, typename LevelsT, typename GridModes,
+          std::size_t RootR, std::size_t L, std::size_t M, typename Store>
+KOKKOS_FUNCTION auto lg_make_einsum_member(
+    const LevelsT& levels, const Store& store,
+    const Kokkos::Array<int, RootR>& grid_idx) {
+  using Node = tuple_element_t<M, tuple_element_t<L, LevelsT>>;
+  return lg_make_einsum_member_impl<V, ES, LevelsT, GridModes, RootR, L, M>(
+      levels, store, grid_idx,
+      std::make_index_sequence<static_cast<std::size_t>(Node::NumOps)>{});
+}
+
+// An EINSUM level: the combine driver's shape -- every member's compute, then
+// every member's store, one range over the shared output tile.
+template <typename V, typename ES, typename LevelsT, typename GridModes,
+          std::size_t RootR, std::size_t L, typename Store, typename Team,
+          std::size_t... Ms>
+KOKKOS_FUNCTION void lg_run_einsum_level(
+    const LevelsT& levels, const Store& store,
+    const Kokkos::Array<int, RootR>& grid_idx, const Team& team,
+    std::index_sequence<Ms...>) {
+  auto evs = DeviceTuple<
+      decltype(lg_make_einsum_member<V, ES, LevelsT, GridModes, RootR, L, Ms>(
+          levels, store, grid_idx))...>{
+      lg_make_einsum_member<V, ES, LevelsT, GridModes, RootR, L, Ms>(
+          levels, store, grid_idx)...};
+
+  constexpr std::size_t Base0 = lg_member_base_v<LevelsT, L, 0>;
+  const auto            out0  = store.template get<Base0>();
+  team_for_each_coord(team, out0, [=](auto coord) {
+    lg_store_coord(evs, coord, std::index_sequence<Ms...>{});
+  });
+  team.team_barrier();
+}
+
 // One staged member's SOURCE view: the global subview it copies FROM. This is
 // exactly what the staged evaluator builds internally before its own copy loop
 // (Evaluator/Team.hpp), lifted out so a whole level's sources can be built
@@ -433,6 +603,9 @@ KOKKOS_FUNCTION void lg_run_level(const LevelsT& levels, const Store& store,
   } else if constexpr (lg_all_contraction_v<LevelT>) {
     lg_run_contraction_level<V, ES, LevelsT, L>(levels, store, team,
                                                 std::make_index_sequence<NM>{});
+  } else if constexpr (lg_all_einsum_v<LevelT>) {
+    lg_run_einsum_level<V, ES, LevelsT, GridModes, RootR, L>(
+        levels, store, grid_idx, team, std::make_index_sequence<NM>{});
   } else {
     lg_run_combine_level<V, ES, LevelsT, GridModes, RootR, L>(
         levels, store, grid_idx, team, std::make_index_sequence<NM>{});
@@ -492,17 +665,29 @@ KOKKOS_FUNCTION void lg_store_roots(const LevelsT& levels, const Store& store,
 // than an error. (That is not hypothetical; it is what the first version of
 // this did, and LevelGraphDeclaredOrder.CombineFnSeesGlobalCoordinate caught
 // it.)
+// An einsum member reads its functional leaves directly, so they are inputs
+// too: their labels (in the node's label space) enter the grid like a stage's.
+template <typename Node, std::size_t... Ks>
+constexpr bool lg_einsum_carries(int32_t l, std::index_sequence<Ks...>) {
+  return ((has_node_tag_v<FunctionalTag,
+                          tuple_element_t<Ks, typename Node::ops_tuple_t>> &&
+           arr_contains(seq_to_array(lg_einsum_leaf_labels_t<Node, Ks>{}),
+                        l)) ||
+          ...);
+}
+template <typename Node>
+constexpr bool lg_member_carries(int32_t l) {
+  if constexpr (has_node_tag_v<StagedTag, Node>)
+    return arr_contains(seq_to_array(typename Node::modes_seq{}), l);
+  else if constexpr (has_node_tag_v<EinsumTag, Node>)
+    return lg_einsum_carries<Node>(
+        l, std::make_index_sequence<static_cast<std::size_t>(Node::NumOps)>{});
+  else
+    return false;
+}
 template <typename LevelT, std::size_t... Ms>
 constexpr bool lg_level_carries(int32_t l, std::index_sequence<Ms...>) {
-  bool found = false;
-  ((found =
-        found ||
-        (has_node_tag_v<StagedTag, tuple_element_t<Ms, LevelT>> &&
-         arr_contains(
-             seq_to_array(typename tuple_element_t<Ms, LevelT>::modes_seq{}),
-             l))),
-   ...);
-  return found;
+  return (false || ... || lg_member_carries<tuple_element_t<Ms, LevelT>>(l));
 }
 
 // Extents enter the graph through STAGED members -- they are the only ones that
@@ -557,11 +742,12 @@ using lg_grid_tile_t =
 // it carries, that input's extent along it. Two inputs disagreeing about a
 // label is a graph-level error: the label would have two different tile counts
 // and no single grid could index both.
-template <typename LT, typename GridModes, std::size_t N, typename StageNode>
+template <typename LT, typename GridModes, typename ModesSeq, std::size_t N,
+          typename StageNode>
 void lg_note_extents(std::array<int, N>& ext, std::array<bool, N>& seen,
                      const StageNode& n) {
   constexpr auto grid  = seq_to_array(GridModes{});
-  constexpr auto modes = seq_to_array(typename StageNode::modes_seq{});
+  constexpr auto modes = seq_to_array(ModesSeq{});
   const auto     shape = n.shape();
   for (std::size_t d = 0; d < modes.size(); ++d) {
     int slot = -1;
@@ -587,13 +773,32 @@ void lg_note_extents(std::array<int, N>& ext, std::array<bool, N>& seen,
   }
 }
 
+template <typename LT, typename GridModes, std::size_t N, typename Node,
+          std::size_t... Ks>
+void lg_note_einsum_extents(std::array<int, N>& ext, std::array<bool, N>& seen,
+                            const Node& node, std::index_sequence<Ks...>) {
+  ((void)([&] {
+     using Leaf = tuple_element_t<Ks, typename Node::ops_tuple_t>;
+     if constexpr (has_node_tag_v<FunctionalTag, Leaf>)
+       lg_note_extents<LT, GridModes, lg_einsum_leaf_labels_t<Node, Ks>, N>(
+           ext, seen, node.operands.template get<Ks>());
+   }()),
+   ...);
+}
+
 template <typename LT, typename GridModes, std::size_t N, typename LevelT,
           std::size_t... Ms>
 void lg_note_level_extents(std::array<int, N>& ext, std::array<bool, N>& seen,
                            const LevelT& lv, std::index_sequence<Ms...>) {
   ((void)([&] {
-     if constexpr (has_node_tag_v<StagedTag, tuple_element_t<Ms, LevelT>>)
-       lg_note_extents<LT, GridModes, N>(ext, seen, lv.template get<Ms>());
+     using Member = tuple_element_t<Ms, LevelT>;
+     if constexpr (has_node_tag_v<StagedTag, Member>)
+       lg_note_extents<LT, GridModes, typename Member::modes_seq, N>(
+           ext, seen, lv.template get<Ms>());
+     else if constexpr (has_node_tag_v<EinsumTag, Member>)
+       lg_note_einsum_extents<LT, GridModes, N, Member>(
+           ext, seen, lv.template get<Ms>(),
+           std::make_index_sequence<static_cast<std::size_t>(Member::NumOps)>{});
    }()),
    ...);
 }
@@ -633,7 +838,7 @@ int lg_league_size(const Kokkos::Array<int, N>& shape) {
 template <typename V, typename ES, typename LT, typename LevelsT,
           typename RootsSeq, typename... ViewTs>
 int lg_execute(const LevelsT& levels, std::size_t bytes, int team_size,
-               RootsSeq roots, const ViewTs&... views) {
+               int scratch_level, RootsSeq roots, const ViewTs&... views) {
   using member_t            = team_member_t<ES>;
   constexpr std::size_t NL  = tuple_size_v<LevelsT>;
   constexpr std::size_t NLS = lg_num_slots_v<LevelsT>;
@@ -661,7 +866,8 @@ int lg_execute(const LevelsT& levels, std::size_t bytes, int team_size,
   Kokkos::TeamPolicy<ES> policy =
       team_size > 0 ? Kokkos::TeamPolicy<ES>(wk, team_size)
                     : Kokkos::TeamPolicy<ES>(wk, Kokkos::AUTO);
-  policy.set_scratch_size(0, Kokkos::PerTeam(static_cast<int>(bytes)));
+  policy.set_scratch_size(scratch_level,
+                          Kokkos::PerTeam(static_cast<int>(bytes)));
 
   // Padded with `int` so index 0 exists even with zero views (a graph whose
   // last level is all sinks). For any real view, index 0 is the first view and
@@ -678,7 +884,8 @@ int lg_execute(const LevelsT& levels, std::size_t bytes, int team_size,
         const auto grid_idx = decode_tile_index<RootR>(
             static_cast<int>(team.league_rank()), grid_shape, GridTile{});
 
-        auto store = lg_carve<V, ES, LevelsT, RootsSeq>(team, level_slot_seq{});
+        auto store = lg_carve<V, ES, LevelsT, RootsSeq>(team, scratch_level,
+                                                        level_slot_seq{});
 
         lg_run_all_levels<V, ES, LevelsT, GridModes, RootR>(ld, store, grid_idx,
                                                             team, level_seq{});
@@ -709,9 +916,13 @@ bool lg_index_ok(const NodeTile& nt, const Kokkos::Array<int, Rank>& nshape,
 template <typename Graph, std::size_t... Roots>
 struct LevelOutputs {
   Graph graph;
-  int   team = -1;
+  int   team  = -1;
+  int   level = 0;  // team scratch level the slot store is carved from
 
-  LevelOutputs team_size(int n) const { return {graph, n}; }
+  LevelOutputs team_size(int n) const { return {graph, n, level}; }
+  // Host backends cap level-0 team scratch at 32 KB and allow tens of MB at
+  // level 1; on GPU level 1 is global memory. Pick per backend.
+  LevelOutputs scratch_level(int l) const { return {graph, team, l}; }
 
   using roots_seq = std::index_sequence<Roots...>;
 
@@ -727,7 +938,7 @@ struct LevelOutputs {
 
   template <typename ES, TensorLike... Ts>
   int execute(const TeamPolicyTag<ES>&, const Ts&... views) const {
-    return graph.template launch<ES, Roots...>(team, views...);
+    return graph.template launch<ES, Roots...>(team, level, views...);
   }
 };
 
@@ -773,12 +984,11 @@ struct LevelGraph {
 
   bool index_consistent() const {
     return index_consistent_impl(
-        std::index_sequence<>{},
         std::make_index_sequence<Impl::lg_total_members_v<LevelsT>>{});
   }
 
   template <typename ES, std::size_t... Roots, typename... ViewTs>
-  int launch(int team_size, const ViewTs&... views) const {
+  int launch(int team_size, int scratch_level, const ViewTs&... views) const {
     static_assert(sizeof...(Roots) == sizeof...(ViewTs),
                   "LevelGraph::execute needs one view per designated output");
     static_assert(std::is_same_v<ES, ExecSpace>,
@@ -791,7 +1001,7 @@ struct LevelGraph {
            "must have exactly one tile.");
     return Impl::lg_execute<ValueType, ExecSpace, LabelTilesT, LevelsT>(
         levels, scratch_bytes<std::index_sequence<Roots...>>(), team_size,
-        std::index_sequence<Roots...>{}, views...);
+        scratch_level, std::index_sequence<Roots...>{}, views...);
   }
 
  private:

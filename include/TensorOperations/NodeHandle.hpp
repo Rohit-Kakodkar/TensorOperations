@@ -18,6 +18,7 @@ struct FunctionalTag {};
 struct IntermTag {};
 struct ContractionTag {};
 struct CombineTag {};
+struct EinsumTag {};
 struct SlotTag {};
 struct StagedTag {};
 

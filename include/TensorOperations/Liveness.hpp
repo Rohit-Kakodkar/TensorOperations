@@ -72,7 +72,8 @@ constexpr void note_node_reads(std::array<std::size_t, NS>& last,
   if constexpr (has_node_tag_v<ContractionTag, Node>) {
     note_read<NS>(last, operand_slot<typename Node::node_a_type>(), k);
     note_read<NS>(last, operand_slot<typename Node::node_b_type>(), k);
-  } else if constexpr (has_node_tag_v<CombineTag, Node>) {
+  } else if constexpr (has_node_tag_v<CombineTag, Node> ||
+                       has_node_tag_v<EinsumTag, Node>) {
     note_combine_reads<Node, NS>(
         last, k,
         std::make_index_sequence<static_cast<std::size_t>(Node::NumOps)>{});
