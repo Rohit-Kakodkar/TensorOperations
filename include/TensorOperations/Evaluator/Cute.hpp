@@ -128,6 +128,11 @@ struct CuteSmemLoadTag : CuteThreadTag<ThrLayout> {};
 template <typename ThrLayout>
 struct CuteStoreTag : CuteThreadTag<ThrLayout> {};
 
+template <typename Smem, typename ThrLayout>
+struct CuteStagedTag : CuteThreadTag<ThrLayout> {
+  Smem dst;
+};
+
 namespace Impl {
 
 template <typename ES, typename Storage, int R, typename HookOp,
@@ -199,6 +204,49 @@ class Evaluator<
 
     return Impl::make_cute_value_evaluator<ES>(dst, src.node().hook_op);
   }
+};
+
+template <typename ES, typename Operand, typename ModesSeq, typename NodeTile,
+          typename Smem, typename ThrLayout>
+class Evaluator<CutePolicyTag<ES>,
+                NodeHandle<StagedTag, Operand, ModesSeq, NodeTile>,
+                CuteStagedTag<Smem, ThrLayout>> {
+  static_assert(cute::is_tensor<Smem>::value,
+                "CuTe staged: destination must be a cute::Tensor");
+  static_assert(cute::is_static<typename Smem::layout_type>::value,
+                "CuTe staged: destination layout must be static");
+
+ public:
+  using node_type    = NodeHandle<StagedTag, Operand, ModesSeq, NodeTile>;
+  using policy_tag   = CutePolicyTag<ES>;
+  using tiling_type  = CuteStagedTag<Smem, ThrLayout>;
+  using value_type   = typename node_type::value_type;
+  using exec_space   = ES;
+  using modes_seq    = typename node_type::modes_seq;
+  using storage_type = Smem;
+  static constexpr int Rank = node_type::Rank;
+
+  static_assert(Smem::rank == Rank,
+                "CuTe staged: destination rank must equal the operand's rank");
+
+  KOKKOS_FUNCTION Evaluator(node_type n, tiling_type tag)
+      : node_(n), tag_(tag) {}
+
+  template <typename Coord>
+  KOKKOS_FUNCTION auto operator()(const Coord& coord) const {
+    auto src = make_evaluator<CutePolicyTag<ES>>(node_.operand_,
+                                                 cute::shape(tag_.dst))(coord);
+    auto stager = make_evaluator<CutePolicyTag<ES>>(
+        make_cute_interm_node<ES>(tag_.dst),
+        CuteSmemLoadTag<ThrLayout>{{tag_.thr_layout, tag_.thr_idx}});
+    return (stager = src);
+  }
+
+  KOKKOS_FUNCTION const storage_type& storage() const { return tag_.dst; }
+
+ private:
+  node_type   node_;
+  tiling_type tag_;
 };
 
 template <typename ES, typename Storage, int R, typename HookOp,
