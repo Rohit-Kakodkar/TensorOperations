@@ -73,9 +73,14 @@ struct lg_resolve_member<LT, Member, StagedTag> {
   static type get(const Member& m) { return type{m.operand_}; }
 };
 // A reduce member: its output tile is the map's tile over its output labels,
-// and an output label no operand carries takes its extent from that tile --
-// which is only meaningful if the label is LabelWhole (one tile), so a gridded
-// uncarried label is rejected here.
+// its reduction extents the map's tiles over its declared reduction labels.
+// Checked here, where the map is known:
+//   * an output label no operand carries takes its extent from its tile, so
+//     it must be LabelWhole;
+//   * a reduction label must be in the map and LabelWhole (a gridded one
+//     would split the sum across teams);
+//   * a gridded label an operand carries must be an output label (a free or
+//     reduced gridded axis would index a partial tile).
 template <typename LT, typename OutSeq, typename... OpSeqs>
 constexpr bool lg_reduce_uncarried_gridded() {
   constexpr auto out = seq_to_array(OutSeq{});
@@ -86,6 +91,26 @@ constexpr bool lg_reduce_uncarried_gridded() {
   }
   return false;
 }
+template <typename LT, typename RedSeq>
+constexpr bool lg_reduce_labels_whole() {
+  constexpr auto red = seq_to_array(RedSeq{});
+  for (std::size_t i = 0; i < red.size(); ++i)
+    if (label_index_of<LT>(red[i]) < 0 || label_gridded_of<LT>(red[i]))
+      return false;
+  return true;
+}
+template <typename LT, typename OutSeq, typename OpSeq>
+constexpr bool lg_reduce_op_gridded_bound() {
+  constexpr auto m   = seq_to_array(OpSeq{});
+  constexpr auto out = seq_to_array(OutSeq{});
+  for (std::size_t d = 0; d < m.size(); ++d)
+    if (label_gridded_of<LT>(m[d]) && !arr_contains(out, m[d])) return false;
+  return true;
+}
+template <typename LT, int32_t... Ls>
+auto lg_reduce_extents(std::integer_sequence<int32_t, Ls...>)
+    -> std::integer_sequence<int, label_tile_v<LT, Ls>...>;
+
 template <typename LT, typename Member, typename OpsTuple>
 struct lg_resolve_reduce;
 template <typename LT, typename Member, typename... Ops>
@@ -95,21 +120,31 @@ struct lg_resolve_reduce<LT, Member, DeviceTuple<Ops...>> {
                                    typename Ops::modes_seq...>(),
       "level graph: a reduce node's output label that no operand carries "
       "must be LabelWhole -- its extent can only come from its tile");
-  using type = NodeHandle<ReduceTag, typename Member::reduce_type,
-                          std::integral_constant<int, Member::Rank>,
-                          typename Member::value_type,
-                          typename Member::exec_space,
-                          typename Member::modes_seq,
-                          typename Member::reduce_seq,
-                          std::integral_constant<int, Member::NumOut>,
-                          tile_from_labels_t<LT, typename Member::modes_seq>,
-                          Ops...>;
+  static_assert(lg_reduce_labels_whole<LT, typename Member::reduce_seq>(),
+                "level graph: a reduce node's reduction labels must be in the "
+                "label map and LabelWhole -- a gridded one would split the "
+                "sum across teams");
+  static_assert((lg_reduce_op_gridded_bound<LT, typename Member::modes_seq,
+                                            typename Ops::modes_seq>() &&
+                 ...),
+                "level graph: a gridded (LabelTile) label an operand of a "
+                "reduce node carries must be one of its output labels -- a "
+                "free or reduced gridded axis would index a partial tile");
+  using type = NodeHandle<
+      ReduceTag, typename Member::reduce_type,
+      std::integral_constant<int, Member::Rank>, typename Member::value_type,
+      typename Member::exec_space, typename Member::modes_seq,
+      typename Member::reduce_seq,
+      std::integral_constant<int, Member::NumOut>,
+      typename Member::reducer_type,
+      tile_from_labels_t<LT, typename Member::modes_seq>,
+      decltype(lg_reduce_extents<LT>(typename Member::reduce_seq{})), Ops...>;
   static type get(const Member& m) {
-    constexpr auto out = seq_to_array(typename Member::modes_seq{});
+    constexpr auto out   = seq_to_array(typename Member::modes_seq{});
     auto           shape = m.shape_;
     for (std::size_t i = 0; i < out.size(); ++i)
       if (shape[i] < 0) shape[i] = label_tile_of<LT>(out[i]);
-    return type{m.fn, m.operands, shape, m.red_shape_};
+    return type{m.fn, m.operands, shape};
   }
 };
 template <typename LT, typename Member>
@@ -402,17 +437,9 @@ KOKKOS_FUNCTION void lg_run_combine_level(
   team.team_barrier();
 }
 
-// A reduce member: every operand slot read in its OWN declared order (the
-// evaluator projects the full coordinate onto each operand's labels), the
-// destinations at this member's slots, and the output tile's global origin.
-template <typename RedSeq, typename GridModes>
-constexpr bool lg_reduction_labels_gridded() {
-  constexpr auto red  = seq_to_array(RedSeq{});
-  constexpr auto grid = seq_to_array(GridModes{});
-  for (std::size_t i = 0; i < red.size(); ++i)
-    if (arr_contains(grid, red[i])) return true;
-  return false;
-}
+// A reduce member: every operand slot read in its OWN declared order (its
+// accessor binds axes by label), the destinations at this member's slots, and
+// the output tile's global origin.
 
 template <typename V, typename ES, typename LevelsT, typename GridModes,
           std::size_t RootR, std::size_t L, std::size_t M, typename Store,
@@ -423,11 +450,6 @@ KOKKOS_FUNCTION auto lg_make_reduce_member_impl(
     std::index_sequence<Ks...>, std::index_sequence<Os...>) {
   using Node                 = tuple_element_t<M, tuple_element_t<L, LevelsT>>;
   constexpr std::size_t Base = lg_member_base_v<LevelsT, L, M>;
-
-  static_assert(
-      !lg_reduction_labels_gridded<typename Node::reduce_seq, GridModes>(),
-      "level graph: a reduce node's reduction label is gridded (LabelTile), "
-      "which would split the sum across teams. Declare it LabelWhole");
 
   using Gather   = dag_gather_seq_t<typename Node::modes_seq, GridModes>;
   using OutTile  = member_out_tile_t<Node>;

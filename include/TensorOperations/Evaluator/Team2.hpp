@@ -774,21 +774,32 @@ class Evaluator<TeamPolicyTag2<ES>,
 };
 
 // ---------------------------------------------------------------------------
-// Tag2 ReduceTag -- out{Out} = sum_{R} fn(Out..., R..., v_0, ..., v_{N-1}),
-// broadcast operands, multi-output. See the node's comment in NodeHandle.hpp.
+// Tag2 ReduceTag -- the parallel_reduce-shaped node (see NodeHandle.hpp).
 //
-// The combine evaluator's shape, with two differences that are the whole
-// point: every operand is indexed by the PROJECTION of the full (output ++
-// reduction) coordinate onto its own labels (a pinned axis reads a constant),
-// and the per-coordinate step loops over the reduction extents and sums.
-//
-// Operands arrive in their OWN declared axis order (the level driver reads
-// each slot with an identity relabel); the projection does the rest. So the
-// alignment check here is per operand axis: its extent must equal the extent
-// of the label it names, whether that label is an output axis (read off the
-// destination layout) or a reduction axis (read off the first operand that
-// carries it).
+// Per output coordinate: each operand's pointer is advanced ONCE by its
+// output-bound axes; per reduction coordinate it is advanced by its
+// reduction-bound axes (constant strides, unrolled constexpr loop); fn then
+// reads through accessors whose free axes are constant-stride offsets.
+// Nothing is loaded unless fn asks for it.
 // ---------------------------------------------------------------------------
+
+/// An operand as fn sees it: its bound axes are already folded into `ptr`,
+/// and operator() takes the FREE axes in the operand's own order.
+template <typename V, typename FreeStridesSeq>
+struct ReduceAccessor;
+template <typename V, int... S>
+struct ReduceAccessor<V, std::integer_sequence<int, S...>> {
+  using value_type          = V;
+  static constexpr int rank = static_cast<int>(sizeof...(S));
+  const V*             ptr;
+
+  template <typename... I>
+    requires(sizeof...(I) == sizeof...(S))
+  KOKKOS_FORCEINLINE_FUNCTION const V& operator()(I... i) const {
+    return ptr[(0 + ... + (S * static_cast<int>(i)))];
+  }
+};
+
 template <typename OutArray, typename... OpEvals>
 struct ReduceOperands {
   using out_node_t  = typename Impl::out_array_info<OutArray>::node_type;
@@ -820,87 +831,86 @@ KOKKOS_FUNCTION auto reduce_operands_from(const Tup& t,
       {}};
 }
 
-// Extent of the label at position `pos` of the full coordinate, read off the
-// first operand carrying it. Compile-time: operand storages are static tiles.
-template <typename Node, typename FullSeq, std::size_t... Ks, typename... OpEvals>
-constexpr int reduce_full_extent(int pos, std::index_sequence<Ks...>,
-                                 DeviceTuple<OpEvals...>*) {
-  int e = -1;
-  ((void)([&] {
-     using Op  = tuple_element_t<Ks, typename Node::ops_tuple_t>;
-     using L   = typename tuple_element_t<Ks, DeviceTuple<OpEvals...>>::
-         storage_type::layout_t;
-     constexpr auto proj = reduce_projection<typename Op::modes_seq, FullSeq>();
-     for (std::size_t d = 0; d < proj.size(); ++d)
-       if (e < 0 && proj[d] == pos) e = L::extent(static_cast<int>(d));
-   }()),
-   ...);
-  return e;
+// Axis classification of one operand against (Out, Red): for axis d, the
+// position of its label in Out (or -1), in Red (or -1), and its stride.
+template <typename OpModes, typename Seq>
+constexpr auto reduce_axis_positions() {
+  constexpr auto            m = seq_to_array(OpModes{});
+  constexpr auto            f = seq_to_array(Seq{});
+  std::array<int, m.size()> pos{};
+  for (std::size_t d = 0; d < m.size(); ++d) {
+    pos[d] = -1;
+    for (std::size_t j = 0; j < f.size(); ++j)
+      if (f[j] == m[d]) pos[d] = static_cast<int>(j);
+  }
+  return pos;
+}
+template <typename OpModes, typename Seq>
+using reduce_axis_positions_seq_t =
+    array_to_seq_t<reduce_axis_positions<OpModes, Seq>()>;
+
+template <typename Layout, std::size_t... Ds>
+constexpr std::array<int, sizeof...(Ds)> layout_strides(
+    std::index_sequence<Ds...>) {
+  return {Layout::stride(static_cast<int>(Ds))...};
+}
+template <typename Layout>
+using layout_strides_seq_t = array_to_seq_t<layout_strides<Layout>(
+    std::make_index_sequence<static_cast<std::size_t>(Layout::rank)>{})>;
+
+template <typename OpModes, typename OutSeq, typename RedSeq, typename Layout>
+constexpr std::size_t reduce_free_count() {
+  constexpr auto po = reduce_axis_positions<OpModes, OutSeq>();
+  constexpr auto pr = reduce_axis_positions<OpModes, RedSeq>();
+  std::size_t    n  = 0;
+  for (std::size_t d = 0; d < po.size(); ++d)
+    if (po[d] < 0 && pr[d] < 0) ++n;
+  return n;
+}
+template <typename OpModes, typename OutSeq, typename RedSeq, typename Layout>
+constexpr auto reduce_free_strides() {
+  constexpr auto po = reduce_axis_positions<OpModes, OutSeq>();
+  constexpr auto pr = reduce_axis_positions<OpModes, RedSeq>();
+  std::array<int, reduce_free_count<OpModes, OutSeq, RedSeq, Layout>()> fs{};
+  std::size_t n = 0;
+  for (std::size_t d = 0; d < po.size(); ++d)
+    if (po[d] < 0 && pr[d] < 0) fs[n++] = Layout::stride(static_cast<int>(d));
+  return fs;
+}
+template <typename OpModes, typename OutSeq, typename RedSeq, typename Layout>
+using reduce_free_strides_seq_t =
+    array_to_seq_t<reduce_free_strides<OpModes, OutSeq, RedSeq, Layout>()>;
+
+// Every bound axis must present the extent of what it is bound to.
+template <typename OpModes, typename OutSeq, typename RedSeq, typename Layout,
+          typename OutLayout, typename RedExtSeq>
+constexpr bool reduce_bound_extents_agree() {
+  constexpr auto po  = reduce_axis_positions<OpModes, OutSeq>();
+  constexpr auto pr  = reduce_axis_positions<OpModes, RedSeq>();
+  constexpr auto rex = seq_to_array(RedExtSeq{});
+  for (std::size_t d = 0; d < po.size(); ++d) {
+    const int e = Layout::extent(static_cast<int>(d));
+    if (po[d] >= 0 && e != OutLayout::extent(po[d])) return false;
+    if (pr[d] >= 0 && e != rex[static_cast<std::size_t>(pr[d])]) return false;
+  }
+  return true;
 }
 
-template <typename Node, typename FullSeq, typename OpsEvalTuple,
-          std::size_t... Js>
-constexpr auto reduce_red_extents_impl(std::index_sequence<Js...>) {
-  constexpr int Rank = Node::Rank;
-  return std::array<int, sizeof...(Js)>{reduce_full_extent<Node, FullSeq>(
-      Rank + static_cast<int>(Js),
-      std::make_index_sequence<static_cast<std::size_t>(Node::NumOps)>{},
-      static_cast<OpsEvalTuple*>(nullptr))...};
-}
-// The reduction extents as a sequence type, so device code can materialize
-// them with seq_to_karray instead of naming a host constexpr object.
-template <typename Node, typename FullSeq, typename OpsEvalTuple>
-using reduce_red_extents_seq_t =
-    array_to_seq_t<reduce_red_extents_impl<Node, FullSeq, OpsEvalTuple>(
-        std::make_index_sequence<static_cast<std::size_t>(Node::RedRank)>{})>;
-template <typename Node, typename FullSeq, typename OpsEvalTuple>
-inline constexpr int reduce_red_count_v = [] {
-  constexpr auto e = reduce_red_extents_impl<Node, FullSeq, OpsEvalTuple>(
-      std::make_index_sequence<static_cast<std::size_t>(Node::RedRank)>{});
-  int p = 1;
-  for (std::size_t j = 0; j < e.size(); ++j) p *= e[j];
+template <typename Seq>
+constexpr int seq_product() {
+  constexpr auto a = seq_to_array(Seq{});
+  int            p = 1;
+  for (std::size_t i = 0; i < a.size(); ++i) p *= a[i];
   return p;
-}();
-
-// Every operand axis must present the extent of the label it names; a pinned
-// axis must be pinned inside its extent.
-template <typename Node, typename FullSeq, typename OutLayout,
-          typename OpsEvalTuple, std::size_t... Ks>
-constexpr bool reduce_ops_aligned(std::index_sequence<Ks...>) {
-  constexpr int Rank = Node::Rank;
-  bool          ok   = true;
-  ((void)([&] {
-     using Op  = tuple_element_t<Ks, typename Node::ops_tuple_t>;
-     using L   = typename tuple_element_t<Ks, OpsEvalTuple>::storage_type::layout_t;
-     constexpr auto proj = reduce_projection<typename Op::modes_seq, FullSeq>();
-     constexpr auto pin  = reduce_pinned<typename Op::modes_seq>();
-     if (static_cast<int>(L::rank) != static_cast<int>(proj.size())) {
-       ok = false;
-       return;
-     }
-     for (std::size_t d = 0; d < proj.size(); ++d) {
-       const int e = L::extent(static_cast<int>(d));
-       if (proj[d] < 0) {
-         ok = ok && (pin[d] >= 0 && pin[d] < e);
-       } else if (proj[d] < Rank) {
-         ok = ok && (e == OutLayout::extent(proj[d]));
-       } else {
-         ok = ok && (e == reduce_full_extent<Node, FullSeq>(
-                              proj[d],
-                              std::make_index_sequence<
-                                  static_cast<std::size_t>(Node::NumOps)>{},
-                              static_cast<OpsEvalTuple*>(nullptr)));
-       }
-     }
-   }()),
-   ...);
-  return ok;
 }
-template <typename Node, typename FullSeq, typename OutLayout,
-          typename OpsEvalTuple>
-inline constexpr bool reduce_ops_aligned_v =
-    reduce_ops_aligned<Node, FullSeq, OutLayout, OpsEvalTuple>(
-        std::make_index_sequence<static_cast<std::size_t>(Node::NumOps)>{});
+
+// Is fn callable as fn(int x FullRank, const Acc&..., AccT&)?
+template <typename Fn, typename AccT, typename IdxSeq, typename... Accs>
+struct reduce_fn_callable;
+template <typename Fn, typename AccT, std::size_t... Is, typename... Accs>
+struct reduce_fn_callable<Fn, AccT, std::index_sequence<Is...>, Accs...>
+    : std::bool_constant<std::is_invocable_v<
+          const Fn&, decltype((void(Is), 0))..., const Accs&..., AccT&>> {};
 
 }  // namespace Impl
 
@@ -916,15 +926,17 @@ KOKKOS_FUNCTION auto make_reduce_operands(Args... args) {
 
 template <typename ES, typename ReduceFn, typename IntCRank, typename S,
           typename RModesSeq, typename RedSeq, typename IntNumOut,
-          typename TileT, typename... Ops, typename OutArray,
-          typename... OpEvals>
+          typename Reducer, typename TileT, typename RedExtSeq,
+          typename... Ops, typename OutArray, typename... OpEvals>
 class Evaluator<TeamPolicyTag2<ES>,
                 NodeHandle<ReduceTag, ReduceFn, IntCRank, S, ES, RModesSeq,
-                           RedSeq, IntNumOut, TileT, Ops...>,
+                           RedSeq, IntNumOut, Reducer, TileT, RedExtSeq,
+                           Ops...>,
                 ReduceOperands<OutArray, OpEvals...>> {
  public:
-  using node_type     = NodeHandle<ReduceTag, ReduceFn, IntCRank, S, ES,
-                                   RModesSeq, RedSeq, IntNumOut, TileT, Ops...>;
+  using node_type =
+      NodeHandle<ReduceTag, ReduceFn, IntCRank, S, ES, RModesSeq, RedSeq,
+                 IntNumOut, Reducer, TileT, RedExtSeq, Ops...>;
   using policy_tag    = TeamPolicyTag2<ES>;
   using tiling_type   = ReduceOperands<OutArray, OpEvals...>;
   using value_type    = S;
@@ -941,85 +953,103 @@ class Evaluator<TeamPolicyTag2<ES>,
   using out_layout_t = typename out_node_t::storage_type::layout_t;
   using result_type =
       Kokkos::Array<Impl::value_evaluator_t<out_node_t>, NumOut>;
-  using full_seq    = Impl::concat_label_seq_t<RModesSeq, RedSeq>;
-  using ops_evals_t = DeviceTuple<OpEvals...>;
+  using acc_type =
+      std::conditional_t<NumOut == 1, value_type,
+                         Kokkos::Array<value_type, NumOut>>;
+
+  static_assert(!std::is_same_v<RedExtSeq, void>,
+                "reduce member: its reduction extents are unresolved, which "
+                "means this node was never handed to LevelGraph::add");
 
  private:
-  using ops_seq  = std::make_index_sequence<NumOps>;
-  using outs_seq = std::make_index_sequence<NumOut>;
-  using red_seq  = std::make_index_sequence<static_cast<std::size_t>(RedRank)>;
+  using ops_seq = std::make_index_sequence<NumOps>;
+
+  template <std::size_t K>
+  using op_modes_t =
+      typename tuple_element_t<K, typename node_type::ops_tuple_t>::modes_seq;
+  template <std::size_t K>
+  using op_layout_t =
+      typename tuple_element_t<K, DeviceTuple<OpEvals...>>::storage_type::
+          layout_t;
+  template <std::size_t K>
+  using accessor_t = ReduceAccessor<
+      value_type, Impl::reduce_free_strides_seq_t<op_modes_t<K>, RModesSeq,
+                                                  RedSeq, op_layout_t<K>>>;
+
+  template <std::size_t... Ks>
+  static constexpr bool extents_agree(std::index_sequence<Ks...>) {
+    return (Impl::reduce_bound_extents_agree<op_modes_t<Ks>, RModesSeq,
+                                             RedSeq, op_layout_t<Ks>,
+                                             out_layout_t, RedExtSeq>() &&
+            ...);
+  }
+  template <std::size_t... Ks>
+  static constexpr bool fn_callable(std::index_sequence<Ks...>) {
+    return Impl::reduce_fn_callable<
+        ReduceFn, acc_type,
+        std::make_index_sequence<static_cast<std::size_t>(FullRank)>,
+        accessor_t<Ks>...>::value;
+  }
 
  public:
   static_assert(sizeof...(OpEvals) == NumOps,
-                "reduce operands must supply one value evaluator per node "
-                "operand");
+                "reduce operands must supply one evaluator per operand");
   static_assert(tiling_type::NumOut == NumOut,
-                "reduce operands must supply one destination node per output "
-                "the reduce fn emits");
+                "reduce operands must supply one destination per output");
   static_assert(Impl::has_node_tag_v<IntermTag, out_node_t>,
-                "a reduce destination must be an intermediate node wrapping "
-                "the storage to write");
+                "a reduce destination must be an intermediate node");
   static_assert(out_layout_t::rank == Rank,
                 "reduce destination must carry one extent per output mode");
-  static_assert(
-      Impl::reduce_ops_aligned_v<node_type, full_seq, out_layout_t,
-                                 ops_evals_t>,
-      "Tag2 reduce: every operand axis must present the extent of the label "
-      "it names (an output label's extent from the destination, a reduction "
-      "label's from the first operand carrying it), and a pinned axis must be "
-      "pinned inside its extent. Operands are read in their own declared axis "
-      "order");
+  static_assert(extents_agree(ops_seq{}),
+                "Tag2 reduce: an operand axis bound to an output or "
+                "reduction label must have that label's extent");
+  static_assert(fn_callable(ops_seq{}),
+                "reduce fn must be const-callable as fn(o_0, ..., o_{R-1}, "
+                "rho_0, ..., rho_{RR-1}, acc_0, ..., acc_{N-1}, acc&): the "
+                "output coordinate, the reduction coordinate, one accessor "
+                "per operand (called with that operand's FREE axes), and the "
+                "accumulator (V&, or Kokkos::Array<V, M>& with outputs<M>)");
 
-  // The reduction extents (as a sequence, materialized on device below) and
-  // their product: the trip count of the inner loop every output coordinate
-  // runs.
-  using red_extents_seq =
-      Impl::reduce_red_extents_seq_t<node_type, full_seq, ops_evals_t>;
-  static constexpr int red_count =
-      Impl::reduce_red_count_v<node_type, full_seq, ops_evals_t>;
+  static constexpr int red_count = Impl::seq_product<RedExtSeq>();
 
   KOKKOS_FUNCTION Evaluator(node_type n, tiling_type t,
                             const team_member_t& team)
       : fn_(n.fn), ops_(t.ops), outs_(t.outs), origin_(t.origin), team_(team) {}
 
-  template <typename... Idx>
-    requires(sizeof...(Idx) == Rank)
-  KOKKOS_FUNCTION Kokkos::Array<value_type, NumOut> operator()(
-      Idx... idx) const {
-    return compute(Impl::Index<Rank>{static_cast<int>(idx)...});
-  }
-
-  // compute / store split, so a level driver can issue every member's
-  // gathers before any member's store (see lg_store_coord).
   template <typename Coord>
     requires(!std::is_integral_v<Coord>)
   KOKKOS_FORCEINLINE_FUNCTION Kokkos::Array<value_type, NumOut> compute(
       const Coord& coord) const {
-    Kokkos::Array<int, FullRank> full{};
-    Kokkos::Array<int, FullRank> gidx{};
+    Kokkos::Array<int, Rank> gidx{};
     TENSOR_PRAGMA_UNROLL
-    for (int d = 0; d < Rank; ++d) {
-      full[d] = coord[d];
-      gidx[d] = origin_[d] + coord[d];
-    }
-    constexpr auto red_extents = Impl::seq_to_karray(red_extents_seq{});
-    Kokkos::Array<value_type, NumOut> acc{};
+    for (int d = 0; d < Rank; ++d) gidx[d] = origin_[d] + coord[d];
+
+    // Hoisted: each operand's pointer advanced by its output-bound axes.
+    const Kokkos::Array<const value_type*, NumOps> base =
+        bases(coord, ops_seq{});
+
+    acc_type acc = init_acc();
+    constexpr auto red_ext = Impl::seq_to_karray(RedExtSeq{});
+    TENSOR_PRAGMA_UNROLL
     for (int lin = 0; lin < red_count; ++lin) {
-      // Reduction coordinate, last label fastest. A reduction label is
-      // LabelWhole (one tile), so its tile-local coordinate IS the global one.
+      // Reduction coordinate, last label fastest (LabelWhole: tile-local ==
+      // global). Constant extents, so the unrolled decode folds away.
+      Kokkos::Array<int, static_cast<std::size_t>(RedRank > 0 ? RedRank : 1)>
+          rho{};
       int rem = lin;
-      for (int j = RedRank - 1; j >= 0; --j) {
-        const int e    = red_extents[static_cast<std::size_t>(j)];
-        full[Rank + j] = rem % e;
-        gidx[Rank + j] = full[Rank + j];
-        rem /= e;
-      }
-      const auto r = Impl::as_output_array<value_type>(
-          Impl::apply_combine(fn_, gidx, gather_vals(full, ops_seq{})));
       TENSOR_PRAGMA_UNROLL
-      for (int m = 0; m < NumOut; ++m) acc[m] += r[m];
+      for (int j = RedRank - 1; j >= 0; --j) {
+        rho[j] = rem % red_ext[j];
+        rem /= red_ext[j];
+      }
+      call(gidx, rho, base, acc, ops_seq{},
+           std::make_index_sequence<static_cast<std::size_t>(Rank)>{},
+           std::make_index_sequence<static_cast<std::size_t>(RedRank)>{});
     }
-    return acc;
+    if constexpr (NumOut == 1)
+      return {acc};
+    else
+      return acc;
   }
 
   template <typename Coord>
@@ -1036,40 +1066,71 @@ class Evaluator<TeamPolicyTag2<ES>,
     store(coord, compute(coord));
   }
 
-  // Team-parallel evaluation over the whole output tile; no barrier of its
-  // own, the caller fences around it.
   KOKKOS_FUNCTION auto operator()() const {
     const auto self = *this;
     const auto out0 = outs_[0].storage_;
     Impl::team_for_each_coord(team_, out0, [=](auto coord) { self(coord); });
-    return make_results(outs_seq{});
+    return make_results(std::make_index_sequence<NumOut>{});
   }
 
  private:
-  // Operand K's coordinate: the full coordinate projected onto its labels; a
-  // pinned axis reads its constant.
-  template <std::size_t K>
-  KOKKOS_FORCEINLINE_FUNCTION auto project(
-      const Kokkos::Array<int, FullRank>& full) const {
-    using Op               = tuple_element_t<K, typename node_type::ops_tuple_t>;
-    constexpr int  OpRank  = Op::Rank;
-    constexpr auto proj    = Impl::seq_to_karray(
-        Impl::reduce_projection_seq_t<typename Op::modes_seq, full_seq>{});
-    constexpr auto pin =
-        Impl::seq_to_karray(Impl::reduce_pinned_seq_t<typename Op::modes_seq>{});
-    Kokkos::Array<int, OpRank> idx{};
-    TENSOR_PRAGMA_UNROLL
-    for (int d = 0; d < OpRank; ++d)
-      idx[d] = proj[d] >= 0 ? full[static_cast<std::size_t>(proj[d])] : pin[d];
-    return Impl::Index<OpRank>{idx};
+  KOKKOS_FORCEINLINE_FUNCTION static acc_type init_acc() {
+    if constexpr (NumOut == 1) {
+      return Reducer::init();
+    } else {
+      acc_type a{};
+      for (int m = 0; m < NumOut; ++m) a[m] = Reducer::init();
+      return a;
+    }
   }
 
-  template <std::size_t... Ks>
-  KOKKOS_FORCEINLINE_FUNCTION Kokkos::Array<value_type, NumOps> gather_vals(
-      const Kokkos::Array<int, FullRank>& full,
-      std::index_sequence<Ks...>) const {
-    return {static_cast<value_type>(
-        ops_.template get<Ks>().node().storage_[project<Ks>(full)])...};
+  // Operand K's pointer at the output coordinate: data() plus the output-
+  // bound axes' strides times their coordinates (tile-local).
+  template <std::size_t K, typename Coord>
+  KOKKOS_FORCEINLINE_FUNCTION const value_type* base_of(
+      const Coord& coord) const {
+    constexpr auto pos = Impl::seq_to_karray(
+        Impl::reduce_axis_positions_seq_t<op_modes_t<K>, RModesSeq>{});
+    constexpr auto str =
+        Impl::seq_to_karray(Impl::layout_strides_seq_t<op_layout_t<K>>{});
+    constexpr int OpRank = op_layout_t<K>::rank;
+    int           off    = 0;
+    TENSOR_PRAGMA_UNROLL
+    for (int d = 0; d < OpRank; ++d)
+      if (pos[d] >= 0) off += str[d] * coord[pos[d]];
+    return ops_.template get<K>().node().storage_.data() + off;
+  }
+
+  template <typename Coord, std::size_t... Ks>
+  KOKKOS_FORCEINLINE_FUNCTION Kokkos::Array<const value_type*, NumOps> bases(
+      const Coord& coord, std::index_sequence<Ks...>) const {
+    return {base_of<Ks>(coord)...};
+  }
+
+  // Operand K's accessor at a reduction coordinate.
+  template <std::size_t K, typename RhoArr>
+  KOKKOS_FORCEINLINE_FUNCTION accessor_t<K> accessor_at(
+      const value_type* base, const RhoArr& rho) const {
+    constexpr auto pos = Impl::seq_to_karray(
+        Impl::reduce_axis_positions_seq_t<op_modes_t<K>, RedSeq>{});
+    constexpr auto str =
+        Impl::seq_to_karray(Impl::layout_strides_seq_t<op_layout_t<K>>{});
+    constexpr int OpRank = op_layout_t<K>::rank;
+    int           off    = 0;
+    TENSOR_PRAGMA_UNROLL
+    for (int d = 0; d < OpRank; ++d)
+      if (pos[d] >= 0) off += str[d] * rho[pos[d]];
+    return accessor_t<K>{base + off};
+  }
+
+  template <typename RhoArr, std::size_t... Ks, std::size_t... Is,
+            std::size_t... Js>
+  KOKKOS_FORCEINLINE_FUNCTION void call(
+      const Kokkos::Array<int, Rank>& gidx, const RhoArr& rho,
+      const Kokkos::Array<const value_type*, NumOps>& base, acc_type& acc,
+      std::index_sequence<Ks...>, std::index_sequence<Is...>,
+      std::index_sequence<Js...>) const {
+    fn_(gidx[Is]..., rho[Js]..., accessor_at<Ks>(base[Ks], rho)..., acc);
   }
 
   template <std::size_t... Ms>

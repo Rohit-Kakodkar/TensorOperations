@@ -907,54 +907,104 @@ auto make_combine_node(Args... args) {
 }
 
 // ---------------------------------------------------------------------------
-// Reduce specialization — out{Out} = sum_{R} fn(Out..., R..., A[..], B[..], ...)
+// Reduce specialization -- a Kokkos::parallel_reduce-shaped node
 // ---------------------------------------------------------------------------
-// A combine generalized on two axes:
 //
-//   * BROADCAST. An operand carries any SUBSET of the output labels, in any
-//     order; it is read at the projection of the output coordinate onto its own
-//     labels. A combine requires every operand to carry exactly the output
-//     label set; here that is the special case.
+//   make_reduce_node<Out...>(over<Red...>{}, [outputs<M>{},] ops..., fn
+//                            [, reducer])
 //
-//   * REDUCTION. A label an operand carries that the output does not is a
-//     reduction label. The node evaluates fn once per (output coordinate x
-//     reduction coordinate) and SUMS the results into the output:
+// For every output coordinate o, the node initializes an accumulator with the
+// reducer's identity (Sum by default) and, for every reduction coordinate rho
+// over the DECLARED labels Red..., calls
 //
-//         out[o] = sum_{rho in R} fn(o_0..o_{Rank-1}, rho_0..rho_{RedRank-1},
-//                                    v_0(o, rho), ..., v_{N-1}(o, rho))
+//   fn(o_0, ..., o_{R-1}, rho_0, ..., rho_{RR-1}, acc_0, ..., acc_{N-1}, acc)
 //
-//     R is the union of the operands' non-output labels, in first-appearance
-//     order across the operand list. With R empty and full-rank operands this
-//     is exactly a combine.
+// which updates `acc` in place, exactly as a parallel_reduce functor does
+// (`acc += ...`, `acc = max(acc, ...)`). With outputs<M>, `acc` is a
+// Kokkos::Array<Scalar, M>& and the node emits M slots sharing its labels.
 //
-//   * PINNED AXES. An operand may name an axis `fixed<I>` instead of a label:
-//     that axis is read at the constant index I and contributes no label. This
-//     is how a slot produced with an extra axis is consumed one slice at a
-//     time (M.as<'e', fixed<0>, 's', 'q'>() reads M at r == 0), zero-copy.
+// Operands arrive as ACCESSORS, not values, so nothing is loaded unless fn
+// asks for it. Each operand axis binds by label name:
+//   * an Out label is bound to the current output coordinate;
+//   * a Red label is bound to the current reduction coordinate;
+//   * any other label is FREE, passed by fn positionally in the operand's own
+//     axis order: M(z, y, x), h(q, f), w().
+// A relabel (.as<>()) chooses which axes bind, zero-copy.
 //
-// fn sees the GLOBAL output coordinate followed by the reduction coordinate,
-// then the operand values, and returns a scalar (NumOut == 1) or a
-// Kokkos::Array<Scalar, M> (NumOut == M). There is no sink form: a reduction
-// that scatters itself would have nothing to sum into.
+// Extents: output tile and reduction extents come from the graph's label map,
+// resolved in LevelGraph::add (the tile_type/red_extents parameters stay void
+// until then). A gridded (LabelTile) label must be an Out label wherever an
+// operand carries it -- a free or reduced gridded axis would index a partial
+// tile -- and reduction labels must be LabelWhole; both are checked at add().
+// An Out label no operand carries takes its extent from its tile (predicate
+// labels of a sum-factored stencil, say).
 //
-// Contraction is the two-operand, fn = product, disjoint-free-labels case and
-// keeps its own GEMM evaluator; the reduce evaluator is a coordinate loop, so
-// it pays for generality with no blocking. Use it where a contraction cannot
-// be written (shared free labels, broadcast operands, predicates on the
-// reduction coordinate), not where one can.
-// TileT is the OUTPUT TILE, void until LevelGraph::add resolves it from the
-// graph's label map (the same handshake a stage node has). It has to come from
-// the map rather than from the operands: an output label no operand carries --
-// the predicate labels of a sum-factored stencil, say -- has no operand extent
-// to read, and the map is the graph's single source of truth for tiles anyway.
-// Such a label must be LabelWhole; add() rejects a gridded one.
+// A combine is the case over<> with fully bound operands; a contraction keeps
+// its own GEMM evaluator. Use this node where a contraction cannot be written.
+
+/// Declared reduction labels, the node's parallel_reduce range.
+template <int32_t... Labels>
+struct over {
+  using seq = std::integer_sequence<int32_t, Labels...>;
+};
+
+/// Number of outputs a reduce emits (default 1).
+template <int M>
+struct outputs {
+  static_assert(M >= 1, "outputs<M>: a reduce emits at least one output");
+  static constexpr int value = M;
+};
+
+/// Reducers: the accumulator's identity. Each thread owns one output
+/// coordinate and runs its reduction serially, so no join is needed -- fn
+/// applies the reduction itself, as a parallel_reduce functor does.
+template <typename V>
+struct Sum {
+  using value_type = V;
+  KOKKOS_FUNCTION static constexpr V init() { return static_cast<V>(0); }
+};
+template <typename V>
+struct Max {
+  using value_type = V;
+  KOKKOS_FUNCTION static V init() {
+    return Kokkos::reduction_identity<V>::max();
+  }
+};
+template <typename V>
+struct Min {
+  using value_type = V;
+  KOKKOS_FUNCTION static V init() {
+    return Kokkos::reduction_identity<V>::min();
+  }
+};
+
+namespace Impl {
+template <typename T>
+struct is_over : std::false_type {};
+template <int32_t... Ls>
+struct is_over<over<Ls...>> : std::true_type {};
+template <typename T>
+struct is_outputs : std::false_type {};
+template <int M>
+struct is_outputs<outputs<M>> : std::true_type {};
+template <typename T>
+struct is_reducer : std::false_type {};
+template <typename V>
+struct is_reducer<Sum<V>> : std::true_type {};
+template <typename V>
+struct is_reducer<Max<V>> : std::true_type {};
+template <typename V>
+struct is_reducer<Min<V>> : std::true_type {};
+}  // namespace Impl
+
+// RedExtSeq / TileT are void until LevelGraph::add resolves them from the map.
 template <typename ReduceFn, typename IntRank, typename Scalar,
           typename ExecSpace, typename ModesSeq, typename RedSeq,
-          typename IntNumOut, typename TileT, typename... Ops>
+          typename IntNumOut, typename Reducer, typename TileT,
+          typename RedExtSeq, typename... Ops>
 struct NodeHandle<ReduceTag, ReduceFn, IntRank, Scalar, ExecSpace, ModesSeq,
-                  RedSeq, IntNumOut, TileT, Ops...> {
+                  RedSeq, IntNumOut, Reducer, TileT, RedExtSeq, Ops...> {
   using node_tag               = ReduceTag;
-  using tile_type              = TileT;  // void: not yet added to a graph
   static constexpr int Rank    = IntRank::value;
   static constexpr int RedRank = static_cast<int>(RedSeq::size());
   static constexpr int NumOps  = static_cast<int>(sizeof...(Ops));
@@ -962,35 +1012,23 @@ struct NodeHandle<ReduceTag, ReduceFn, IntRank, Scalar, ExecSpace, ModesSeq,
   using value_type             = Scalar;
   using exec_space             = ExecSpace;
   using reduce_type            = ReduceFn;
-  using modes_seq              = ModesSeq;  // output labels (== stored order)
-  using reduce_seq             = RedSeq;    // reduction labels
+  using reducer_type           = Reducer;
+  using modes_seq              = ModesSeq;   // output labels (== stored order)
+  using reduce_seq             = RedSeq;     // declared reduction labels
+  using tile_type              = TileT;      // void: not yet added to a graph
+  using red_extents_seq        = RedExtSeq;  // void: not yet added to a graph
   using ops_tuple_t            = DeviceTuple<Ops...>;
 
   [[no_unique_address]] ReduceFn fn;
   ops_tuple_t                    operands;
-  Kokkos::Array<int, Rank>       shape_;      // output extents; -1 where no
-                                              // operand carries the label,
-                                              // until add() fills it in
-  Kokkos::Array<int, RedRank>    red_shape_;  // reduction extents
+  Kokkos::Array<int, Rank>       shape_;  // output extents; -1 where no
+                                          // operand carries the label, until
+                                          // add() fills it in from the map
 
   KOKKOS_FUNCTION Kokkos::Array<int, Rank> shape() const { return shape_; }
-  KOKKOS_FUNCTION Kokkos::Array<int, RedRank> reduce_shape() const {
-    return red_shape_;
-  }
 };
 
-// A pinned axis in an operand label list: `fixed<I>` reads that axis at index
-// I. Encoded as a reserved negative label so it travels through the ordinary
-// relabel (`.as<>()`) machinery; only the reduce node interprets it. Two axes
-// of one operand pinned at the same index would collide with the
-// distinct-labels rule where it is enforced -- pin them on separate relabels.
-template <int I>
-inline constexpr int32_t fixed = static_cast<int32_t>(-1 - I);
-
 namespace Impl {
-
-constexpr bool is_fixed_label(int32_t l) { return l < 0; }
-constexpr int  fixed_label_index(int32_t l) { return -1 - static_cast<int>(l); }
 
 // Position of label L in ModesSeq, or -1.
 template <int32_t L, typename ModesSeq>
@@ -1001,49 +1039,7 @@ constexpr int label_position() {
   return -1;
 }
 
-// The reduction labels: every non-fixed operand label the output does not
-// carry, in first-appearance order over the operand list. Two passes (count,
-// then fill) because the array's size must be a constant expression.
-template <typename OutSeq, typename... OpSeqs>
-constexpr std::size_t reduce_label_count() {
-  constexpr auto out = seq_to_array(OutSeq{});
-  int32_t        seen[1 + (0 + ... + OpSeqs::size())] = {};
-  std::size_t    n                                    = 0;
-  auto           visit = [&](auto seq) {
-    constexpr auto m = seq_to_array(decltype(seq){});
-    for (std::size_t i = 0; i < m.size(); ++i) {
-      if (is_fixed_label(m[i]) || arr_contains(out, m[i])) continue;
-      bool dup = false;
-      for (std::size_t k = 0; k < n; ++k) dup = dup || (seen[k] == m[i]);
-      if (!dup) seen[n++] = m[i];
-    }
-  };
-  (visit(OpSeqs{}), ...);
-  return n;
-}
-
-template <typename OutSeq, typename... OpSeqs>
-constexpr auto reduce_labels() {
-  constexpr auto out = seq_to_array(OutSeq{});
-  std::array<int32_t, reduce_label_count<OutSeq, OpSeqs...>()> red{};
-  std::size_t n     = 0;
-  auto        visit = [&](auto seq) {
-    constexpr auto m = seq_to_array(decltype(seq){});
-    for (std::size_t i = 0; i < m.size(); ++i) {
-      if (is_fixed_label(m[i]) || arr_contains(out, m[i])) continue;
-      bool dup = false;
-      for (std::size_t k = 0; k < n; ++k) dup = dup || (red[k] == m[i]);
-      if (!dup) red[n++] = m[i];
-    }
-  };
-  (visit(OpSeqs{}), ...);
-  return red;
-}
-
-template <typename OutSeq, typename... OpSeqs>
-using reduce_labels_seq_t = array_to_seq_t<reduce_labels<OutSeq, OpSeqs...>()>;
-
-// Out ++ R: the full coordinate the reduce evaluator walks.
+// Out ++ Red: the full coordinate the reduce evaluator walks.
 template <typename A, typename B>
 struct concat_label_seq;
 template <int32_t... As, int32_t... Bs>
@@ -1054,53 +1050,12 @@ struct concat_label_seq<std::integer_sequence<int32_t, As...>,
 template <typename A, typename B>
 using concat_label_seq_t = typename concat_label_seq<A, B>::type;
 
-// Per operand axis: its position in the full (Out ++ R) coordinate, or -1 for
-// a pinned axis; and the pinned index (0 where the axis is a label).
-template <typename OpModes, typename FullSeq>
-constexpr auto reduce_projection() {
-  constexpr auto m = seq_to_array(OpModes{});
-  constexpr auto f = seq_to_array(FullSeq{});
-  std::array<int, m.size()> proj{};
-  for (std::size_t d = 0; d < m.size(); ++d) {
-    proj[d] = -1;
-    if (is_fixed_label(m[d])) continue;
-    for (std::size_t j = 0; j < f.size(); ++j)
-      if (f[j] == m[d]) proj[d] = static_cast<int>(j);
-  }
-  return proj;
-}
-template <typename OpModes>
-constexpr auto reduce_pinned() {
-  constexpr auto            m = seq_to_array(OpModes{});
-  std::array<int, m.size()> pin{};
-  for (std::size_t d = 0; d < m.size(); ++d)
-    pin[d] = is_fixed_label(m[d]) ? fixed_label_index(m[d]) : 0;
-  return pin;
-}
-template <typename OpModes, typename FullSeq>
-using reduce_projection_seq_t =
-    array_to_seq_t<reduce_projection<OpModes, FullSeq>()>;
-template <typename OpModes>
-using reduce_pinned_seq_t = array_to_seq_t<reduce_pinned<OpModes>()>;
-
-// Is output label L carried (unpinned) by at least one operand? A label no
-// operand carries takes its extent from the graph's label map at add().
-template <int32_t L, typename... OpSeqs>
-constexpr bool reduce_label_carried() {
-  bool found = false;
-  ((found = found || arr_contains(seq_to_array(OpSeqs{}), L)), ...);
-  return found;
-}
-
-// Every non-fixed operand label must be an output or reduction label -- true
-// by construction of R, stated for the reader; and no operand may repeat a
-// non-fixed label.
-template <typename OpSeq>
-constexpr bool reduce_op_labels_distinct() {
-  constexpr auto m = seq_to_array(OpSeq{});
-  for (std::size_t i = 0; i < m.size(); ++i)
-    for (std::size_t j = i + 1; j < m.size(); ++j)
-      if (!is_fixed_label(m[i]) && m[i] == m[j]) return false;
+template <typename A, typename B>
+constexpr bool label_sets_disjoint() {
+  constexpr auto a = seq_to_array(A{});
+  constexpr auto b = seq_to_array(B{});
+  for (std::size_t i = 0; i < a.size(); ++i)
+    if (arr_contains(b, a[i])) return false;
   return true;
 }
 
@@ -1117,11 +1072,11 @@ template <int32_t L, typename... Ops>
 int reduce_extent_of(const Ops&... ops) {
   int e = -1;
   ((e = (e < 0 ? reduce_extent_or_neg<L>(ops) : e)), ...);
-  // Every operand carrying L must agree with the first.
   ((void)([&] {
      const int f = reduce_extent_or_neg<L>(ops);
      assert((f < 0 || f == e) &&
             "reduce node: operands disagree on a label's extent");
+     (void)f;
    }()),
    ...);
   return e;
@@ -1132,89 +1087,120 @@ Kokkos::Array<int, sizeof...(Ls)> reduce_shape_of(
   return {reduce_extent_of<Ls>(ops...)...};
 }
 
-template <typename ActualScalar, typename ExecSpace, int32_t... OutModes,
+template <typename ActualScalar, typename ExecSpace, int NumOut,
+          typename Reducer, typename RedSeq, int32_t... OutModes,
           typename ReduceFn, typename... Ops>
 auto make_reduce_node_impl(ReduceFn fn, Ops... ops) {
   constexpr int Rank = static_cast<int>(sizeof...(OutModes));
   constexpr int N    = static_cast<int>(sizeof...(Ops));
   static_assert(N >= 1, "reduce node needs at least one operand");
   static_assert((Impl::is_node_handle_v<Ops> && ...),
-                "reduce operands must be node handles");
+                "reduce operands must be node handles (slots of the graph)");
   static_assert((!Impl::has_node_tag_v<FunctionalTag, Ops> && ...),
-                "a functional input has no address, and a reduce reads its "
-                "operands as strided memory. Wrap it in make_stage_node "
-                "first; the reduce then reads the staged tile");
+                "a functional input has no address; wrap it in "
+                "make_stage_node first and pass the staged slot");
 
   using OutSeq = std::integer_sequence<int32_t, OutModes...>;
   static_assert(Impl::all_distinct(Impl::seq_to_array(OutSeq{})),
                 "reduce node: output labels must be pairwise distinct");
-  static_assert((!Impl::is_fixed_label(OutModes) && ...),
-                "reduce node: an output label cannot be pinned");
-  static_assert((Impl::reduce_op_labels_distinct<typename Ops::modes_seq>() &&
-                 ...),
+  static_assert(Impl::all_distinct(Impl::seq_to_array(RedSeq{})),
+                "reduce node: reduction labels must be pairwise distinct");
+  static_assert(Impl::label_sets_disjoint<OutSeq, RedSeq>(),
+                "reduce node: a label cannot be both an output and a "
+                "reduction label");
+  static_assert((Impl::labels_distinct_v<typename Ops::modes_seq> && ...),
                 "reduce node: an operand's labels must be pairwise distinct");
-  using RedSeq = Impl::reduce_labels_seq_t<OutSeq, typename Ops::modes_seq...>;
-  constexpr int RedRank  = static_cast<int>(RedSeq::size());
-  constexpr int FullRank = Rank + RedRank;
+  static_assert(std::is_same_v<typename Reducer::value_type, ActualScalar>,
+                "reduce node: the reducer's value_type must be the node's "
+                "scalar");
 
-  static_assert(CombineLike<ReduceFn, FullRank, N, ActualScalar>,
-                "reduce fn must be const-callable as fn(o_0, ..., o_{Rank-1}, "
-                "r_0, ..., r_{RedRank-1}, v_0, ..., v_{N-1}) -> value_type: "
-                "the output coordinate, then the reduction coordinate, then "
-                "one value per operand");
-
-  using Ret            = combine_ret_t<ReduceFn, FullRank, N, ActualScalar>;
-  using OutInfo        = combine_out<Ret>;
-  constexpr int NumOut = OutInfo::num;
-  static_assert(NumOut >= 1,
-                "reduce fn must return a value (scalar or Kokkos::Array): a "
-                "reduction has nothing to sum into for a void fn");
-  static_assert(std::is_convertible_v<typename OutInfo::elem, ActualScalar>,
-                "reduce fn output element type must be convertible to the "
-                "operand scalar (multi-output reduce is homogeneous)");
-
-  const auto shape     = reduce_shape_of(OutSeq{}, ops...);
-  const auto red_shape = reduce_shape_of(RedSeq{}, ops...);
-
+  const auto shape = reduce_shape_of(OutSeq{}, ops...);
   return NodeHandle<ReduceTag, ReduceFn, std::integral_constant<int, Rank>,
                     ActualScalar, ExecSpace, OutSeq, RedSeq,
-                    std::integral_constant<int, NumOut>, void, Ops...>{
-      std::move(fn), DeviceTuple<Ops...>(ops...), shape, red_shape};
+                    std::integral_constant<int, NumOut>, Reducer, void, void,
+                    Ops...>{std::move(fn), DeviceTuple<Ops...>(ops...), shape};
+}
+
+// Argument parsing: over<> first, an optional outputs<M> second, then the
+// operands, the fn, and an optional trailing reducer.
+template <typename Tuple>
+constexpr bool reduce_has_outputs() {
+  if constexpr (std::tuple_size_v<Tuple> < 2)
+    return false;
+  else
+    return is_outputs<std::tuple_element_t<1, Tuple>>::value;
+}
+template <typename Tuple>
+constexpr bool reduce_has_reducer() {
+  return is_reducer<
+      std::tuple_element_t<std::tuple_size_v<Tuple> - 1, Tuple>>::value;
 }
 
 template <typename ActualScalar, typename ExecSpace, int32_t... OutModes,
           typename Tuple, std::size_t... Is>
 auto reduce_from_args(Tuple args, std::index_sequence<Is...>) {
-  return make_reduce_node_impl<ActualScalar, ExecSpace, OutModes...>(
-      std::get<sizeof...(Is)>(std::move(args)),  // fn (last)
-      std::get<Is>(std::move(args))...);         // operands (leading)
+  constexpr std::size_t First = reduce_has_outputs<Tuple>() ? 2 : 1;
+  constexpr std::size_t Last  = std::tuple_size_v<Tuple> - 1;
+  constexpr bool        HasR  = reduce_has_reducer<Tuple>();
+  constexpr std::size_t FnIdx = HasR ? Last - 1 : Last;
+  using OverT                 = std::tuple_element_t<0, Tuple>;
+  static_assert(is_over<OverT>::value,
+                "make_reduce_node: the first argument must be over<...>{} "
+                "(the declared reduction labels; over<>{} for none)");
+  constexpr int NumOut = [] {
+    if constexpr (reduce_has_outputs<Tuple>())
+      return std::tuple_element_t<1, Tuple>::value;
+    else
+      return 1;
+  }();
+  using Reducer = std::conditional_t<
+      HasR, std::tuple_element_t<Last, Tuple>, Sum<ActualScalar>>;
+  return make_reduce_node_impl<ActualScalar, ExecSpace, NumOut, Reducer,
+                               typename OverT::seq, OutModes...>(
+      std::get<FnIdx>(std::move(args)),
+      std::get<First + Is>(std::move(args))...);
 }
+
+template <typename Tuple>
+constexpr std::size_t reduce_num_operands() {
+  constexpr std::size_t First = reduce_has_outputs<Tuple>() ? 2 : 1;
+  constexpr std::size_t Tail  = reduce_has_reducer<Tuple>() ? 2 : 1;
+  return std::tuple_size_v<Tuple> - First - Tail;
+}
+
+template <typename Tuple>
+struct reduce_first_operand {
+  static constexpr std::size_t First = reduce_has_outputs<Tuple>() ? 2 : 1;
+  using type = std::tuple_element_t<First, Tuple>;
+};
 
 }  // namespace Impl
 
-// make_reduce_node<'e','i','I'>(a, b, ..., fn)   // operands first, fn last
+// make_reduce_node<'e','i','l'>(over<'q'>{}, a, b, ..., fn)
 template <int32_t... OutModes, typename... Args>
 auto make_reduce_node(Args... args) {
-  constexpr std::size_t N = sizeof...(Args);
-  static_assert(N >= 2,
-                "make_reduce_node needs at least one operand and a reduce fn");
-  using FirstOp = std::tuple_element_t<0, std::tuple<Args...>>;
+  using Tuple = std::tuple<Args...>;
+  static_assert(sizeof...(Args) >= 3,
+                "make_reduce_node needs over<...>{}, at least one operand and "
+                "a reduce fn");
+  using FirstOp = typename Impl::reduce_first_operand<Tuple>::type;
   return Impl::reduce_from_args<typename FirstOp::value_type,
                                 Kokkos::DefaultExecutionSpace, OutModes...>(
-      std::tuple<Args...>(std::move(args)...),
-      std::make_index_sequence<N - 1>{});
+      Tuple(std::move(args)...),
+      std::make_index_sequence<Impl::reduce_num_operands<Tuple>()>{});
 }
 
 // Explicit scalar (and execution-space) override.
 template <typename Scalar, typename ExecSpace = Kokkos::DefaultExecutionSpace,
           int32_t... OutModes, typename... Args>
 auto make_reduce_node(Args... args) {
-  constexpr std::size_t N = sizeof...(Args);
-  static_assert(N >= 2,
-                "make_reduce_node needs at least one operand and a reduce fn");
+  using Tuple = std::tuple<Args...>;
+  static_assert(sizeof...(Args) >= 3,
+                "make_reduce_node needs over<...>{}, at least one operand and "
+                "a reduce fn");
   return Impl::reduce_from_args<Scalar, ExecSpace, OutModes...>(
-      std::tuple<Args...>(std::move(args)...),
-      std::make_index_sequence<N - 1>{});
+      Tuple(std::move(args)...),
+      std::make_index_sequence<Impl::reduce_num_operands<Tuple>()>{});
 }
 
 // ---------------------------------------------------------------------------

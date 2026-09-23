@@ -1,34 +1,37 @@
 // ===========================================================================
-// test_reduce_node.cpp -- a combine generalized to BROADCAST operands and
-// REDUCTION labels, in a level graph.
+// test_reduce_node.cpp -- make_reduce_node, a parallel_reduce-shaped node.
 //
-//   out[o] = sum_{rho in R} fn(o..., rho..., op_k[proj_k(o, rho)]...)
+//   make_reduce_node<Out...>(over<Red...>{}, [outputs<M>{},] ops..., fn
+//                            [, reducer])
+//   fn(o..., rho..., accessor_0, ..., accessor_{N-1}, acc&)
 //
-// Each test holds the graph to a hand-written host loop. Extents are pairwise
-// distinct wherever the math allows (a transposed argument cannot hide behind
-// two equal axes), and the gridded label has more than one tile so a dropped
-// origin duplicates tile 0's answer instead of passing by luck.
+// Operands arrive as accessors: axes whose labels are output or reduction
+// labels are bound; the remaining (free) axes are passed by fn. Each test
+// holds a graph to a hand-written host loop. The gridded label 'e' has three
+// tiles, so a dropped tile origin shows up as a duplicated answer, and no
+// two labels differ only by case.
 //
-// What each test pins:
-//   1. R empty, full-rank operands: bitwise identical to a combine.
+//   1. over<>, fully bound operands == make_combine_node, bitwise.
 //   2. Broadcast: operands carrying strict subsets of the output labels.
-//   3. One reduction label with a predicate on the OUTPUT coordinate and one
-//      staged operand relabeled twice (the stiffness kernel's h(q,i) h(q,I)).
-//   4. Two reduction labels and PINNED axes (fixed<I>) on one staged slot.
-//   5. Multi-output reduce.
-//   6. A reduce reading a level output (not only staged leaves) and the
-//      LevelPlan guards firing on a reduce level.
-//   7. A rank-8 output over a rank-8 alias view.
+//   3. A declared reduction label, bound on the operands.
+//   4. Free axes indexed by fn itself, with an early-return predicate.
+//   5. outputs<2>.
+//   6. Max reducer.
+//   7. A reduce reading a level output, LevelPlan guards instantiated.
+//   8. Rank-9 output through StridedAlias, output labels no operand carries,
+//      whole tile above the host level-0 scratch cap (scratch level 1).
 // ===========================================================================
 #include <TensorOperations/Evaluator.hpp>
 #include <TensorOperations/LevelGraph.hpp>
 #include <TensorOperations/LevelPlan.hpp>
 #include <TensorOperations/NodeHandle.hpp>
+#include <TensorOperations/StridedAlias.hpp>
 #include <TensorOperations/Tiling.hpp>
 
 #include <Kokkos_Core.hpp>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cmath>
 
 using namespace TensorOperations;
@@ -36,37 +39,31 @@ using ES = Kokkos::DefaultExecutionSpace;
 
 namespace reduce_test {
 
-constexpr int kE = 6, kTE = 2;  // 3 teams
-constexpr int kQ = 4, kA = 3, kI = 5, kS = 3, kR = 3;
+constexpr int kE = 6, kTE = 2;  // 3 teams along 'e'
+constexpr int kQ = 4, kA = 3, kN = 5;
 
 using View2 = Kokkos::View<float**, Kokkos::LayoutRight, ES>;
 using View3 = Kokkos::View<float***, Kokkos::LayoutRight, ES>;
-using View4 = Kokkos::View<float****, Kokkos::LayoutRight, ES>;
 
-// Map: 'e' gridded; everything else whole. 'i' and 'I' share an extent
-// because the predicate tests compare them.
+// 'i' and 'l' are the two point labels an output compares; 'f' is the free
+// function axis of h.
 using Map = LabelTiles<LabelTile<'e', kTE>, LabelWhole<'q', kQ>,
-                       LabelWhole<'a', kA>, LabelWhole<'i', kI>,
-                       LabelWhole<'I', kI>, LabelWhole<'s', kS>,
-                       LabelWhole<'r', kR>>;
+                       LabelWhole<'a', kA>, LabelWhole<'i', kN>,
+                       LabelWhole<'l', kN>, LabelWhole<'f', kN>>;
 
 float hval(int q, int i) { return 0.1f + 0.3f * q - 0.2f * i + 0.05f * q * i; }
 float uval(int e, int a) { return 0.2f + 0.11f * e - 0.07f * a; }
 float mval(int e, int q) { return 0.5f + 0.13f * e - 0.09f * q + 0.02f * e * q; }
-float m4val(int e, int r, int s, int q) {
-  return 0.3f + 0.07f * e + 0.11f * r - 0.05f * s + 0.03f * q +
-         0.01f * (r + 1) * (s + 2) * q;
-}
 
-View2 make_h() {
-  View2 v("h", kQ, kI);
+View2 make_h() {  // (q, f)
+  View2 v("h", kQ, kN);
   auto  m = Kokkos::create_mirror_view(v);
   for (int q = 0; q < kQ; ++q)
-    for (int i = 0; i < kI; ++i) m(q, i) = hval(q, i);
+    for (int i = 0; i < kN; ++i) m(q, i) = hval(q, i);
   Kokkos::deep_copy(v, m);
   return v;
 }
-View2 make_u() {
+View2 make_u() {  // (e, a)
   View2 v("u", kE, kA);
   auto  m = Kokkos::create_mirror_view(v);
   for (int e = 0; e < kE; ++e)
@@ -74,7 +71,7 @@ View2 make_u() {
   Kokkos::deep_copy(v, m);
   return v;
 }
-View2 make_m() {
+View2 make_m() {  // (e, q)
   View2 v("m", kE, kQ);
   auto  m = Kokkos::create_mirror_view(v);
   for (int e = 0; e < kE; ++e)
@@ -82,462 +79,387 @@ View2 make_m() {
   Kokkos::deep_copy(v, m);
   return v;
 }
-View4 make_m4() {
-  View4 v("m4", kE, kR, kS, kQ);
-  auto  m = Kokkos::create_mirror_view(v);
-  for (int e = 0; e < kE; ++e)
-    for (int r = 0; r < kR; ++r)
-      for (int s = 0; s < kS; ++s)
-        for (int q = 0; q < kQ; ++q) m(e, r, s, q) = m4val(e, r, s, q);
-  Kokkos::deep_copy(v, m);
-  return v;
+
+double ref_diag(int e, int i, int l, double mscale = 1.0, double mshift = 0.0) {
+  if ((i + l) % 2 != 0) return 0.0;
+  double r = 0.0;
+  for (int q = 0; q < kQ; ++q)
+    r += static_cast<double>(hval(q, i)) * hval(q, l) *
+         (mscale * mval(e, q) + mshift);
+  return r;
 }
 
 // --- functors (named structs: a KOKKOS_LAMBDA in a private TestBody cannot
 // be a device functor) ------------------------------------------------------
 
-// 1. P(e,a) = fn(e, a, u(e,a), u(e,a)) with no reduction.
-struct AffineTwo {
+struct AffineCombine {
   KOKKOS_FUNCTION float operator()(int e, int a, float x, float y) const {
     return 2.0f * x - 0.5f * y + 100.0f * e + a;
   }
 };
+struct AffineReduce {
+  template <typename U>
+  KOKKOS_FUNCTION void operator()(int e, int a, const U& x, const U& y,
+                                  float& acc) const {
+    acc += 2.0f * x() - 0.5f * y() + 100.0f * e + a;
+  }
+};
 
-// 2. B(e,a,i) = h(a? no: uses h(q->a slot) ...) -- broadcast: h carries (a,i)
-// as a (kA x kI) tile, u carries (e,a).
 struct Broadcast {
-  KOKKOS_FUNCTION float operator()(int e, int a, int i, float h,
-                                   float u) const {
-    return h * u + 0.001f * (e * 100 + a * 10 + i);
+  template <typename H, typename U>
+  KOKKOS_FUNCTION void operator()(int e, int a, int i, const H& h, const U& u,
+                                  float& acc) const {
+    acc += h() * u() + 0.001f * (e * 100 + a * 10 + i);
   }
 };
 
-// 3. K(e,i,I) = sum_q [ (i + I) even ] h(q,i) h(q,I) M(e,q)
-struct DiagonalTerm {
-  KOKKOS_FUNCTION float operator()(int, int i, int I, int, float hqi,
-                                   float hqI, float m) const {
-    return ((i + I) % 2 == 0) ? hqi * hqI * m : 0.0f;
+// sum_q [ (i + l) even ] h(q, i) h(q, l) m(e, q), with q a declared label.
+struct BoundDiagonal {
+  template <typename H1, typename H2, typename M>
+  KOKKOS_FUNCTION void operator()(int, int i, int l, int, const H1& hqi,
+                                  const H2& hql, const M& m,
+                                  float& acc) const {
+    if ((i + l) % 2 != 0) return;
+    acc += hqi() * hql() * m();
   }
 };
 
-// 4. K(e,i,I) = sum_{s,q} h(q,i) h(q,I) (M(e,0,s,q) + (s+1) M(e,2,s,q))
-//    with a predicate on the reduction coordinate: only q != I. The reduction
-//    coordinates arrive in FIRST-APPEARANCE order over the operand list -- q
-//    (from h) before s (from M) -- which the static_assert in the test pins.
-struct TwoRedPinned {
-  KOKKOS_FUNCTION float operator()(int, int, int I, int q, int s, float hqi,
-                                   float hqI, float m0, float m2) const {
-    if (q == I) return 0.0f;
-    return hqi * hqI * (m0 + static_cast<float>(s + 1) * m2);
+// The same sum with q looped by fn over FREE axes: h(q, f), m(q).
+struct FreeDiagonal {
+  template <typename H, typename M>
+  KOKKOS_FUNCTION void operator()(int, int i, int l, const H& h, const M& m,
+                                  float& acc) const {
+    if ((i + l) % 2 != 0) return;
+    for (int q = 0; q < kQ; ++q) acc += h(q, i) * h(q, l) * m(q);
   }
 };
 
-// 5. Two outputs from one pass.
 struct TwoOut {
-  KOKKOS_FUNCTION Kokkos::Array<float, 2> operator()(int, int i, int I, int q,
-                                                     float hqi, float hqI,
-                                                     float m) const {
-    return {hqi * hqI * m, (i == I ? 1.0f : 0.0f) * hqI * m};
+  template <typename H1, typename H2, typename M>
+  KOKKOS_FUNCTION void operator()(int, int i, int l, int, const H1& hqi,
+                                  const H2& hql, const M& m,
+                                  Kokkos::Array<float, 2>& acc) const {
+    acc[0] += hqi() * hql() * m();
+    acc[1] += (i == l ? 1.0f : 0.0f) * hql() * m();
   }
 };
 
-// 6. A level-1 reduce feeding a level-2 reduce.
-struct Scale {
-  KOKKOS_FUNCTION float operator()(int, int, float m) const {
-    return 3.0f * m + 1.0f;
+struct MaxTerm {
+  template <typename H1, typename H2, typename M>
+  KOKKOS_FUNCTION void operator()(int, int, int, int, const H1& hqi,
+                                  const H2& hql, const M& m,
+                                  float& acc) const {
+    acc = Kokkos::max(acc, hqi() * hql() * m());
   }
 };
+
+struct ScaleShift {
+  template <typename M>
+  KOKKOS_FUNCTION void operator()(int, int, const M& m, float& acc) const {
+    acc += 3.0f * m() + 1.0f;
+  }
+};
+
+template <typename View>
+double max_diff_3(const View& d, double (*ref)(int, int, int)) {
+  auto   h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, d);
+  double err = 0.0;
+  for (int e = 0; e < kE; ++e)
+    for (int i = 0; i < kN; ++i)
+      for (int l = 0; l < kN; ++l)
+        err = std::max(err, std::abs(ref(e, i, l) - h(e, i, l)));
+  return err;
+}
+double ref_diag_plain(int e, int i, int l) { return ref_diag(e, i, l); }
+double ref_diag_scaled(int e, int i, int l) {
+  return ref_diag(e, i, l, 3.0, 1.0);
+}
 
 }  // namespace reduce_test
 
 using namespace reduce_test;
 
 // ---------------------------------------------------------------------------
-// 1. R empty, full-rank operands == combine, bitwise.
-// ---------------------------------------------------------------------------
 TEST(ReduceNode, NoReductionLabelsIsACombine) {
   auto  Ud = make_u();
   View2 Pr("Pr", kE, kA), Pc("Pc", kE, kA);
-
   {
     auto g0 = make_level_graph<float, ES>(Map{});
     auto [g1, u] =
         g0.add(make_stage_node(make_input_node(make_handle<'e', 'a'>(Ud))));
-    auto [g2, p] = g1.add(make_reduce_node<'e', 'a'>(u, u, AffineTwo{}));
-    static_assert(decltype(g2)::num_levels == 2);
-    using Plan = LevelPlan<std::decay_t<decltype(g2.levels)>>;
-    static_assert(Plan::num_slots == 2);
+    auto [g2, p] =
+        g1.add(make_reduce_node<'e', 'a'>(over<>{}, u, u, AffineReduce{}));
     g2.outputs(p).execute(TeamPolicyTag2<ES>{}, Pr);
   }
   {
     auto g0 = make_level_graph<float, ES>(Map{});
     auto [g1, u] =
         g0.add(make_stage_node(make_input_node(make_handle<'e', 'a'>(Ud))));
-    auto [g2, p] = g1.add(make_combine_node<'e', 'a'>(u, u, AffineTwo{}));
+    auto [g2, p] = g1.add(make_combine_node<'e', 'a'>(u, u, AffineCombine{}));
     g2.outputs(p).execute(TeamPolicyTag2<ES>{}, Pc);
   }
   Kokkos::fence();
-
   auto Hr = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, Pr);
   auto Hc = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, Pc);
   for (int e = 0; e < kE; ++e)
     for (int a = 0; a < kA; ++a) {
       EXPECT_EQ(Hr(e, a), Hc(e, a)) << "e=" << e << " a=" << a;
-      const float ref = 2.0f * uval(e, a) - 0.5f * uval(e, a) + 100.0f * e + a;
-      EXPECT_NEAR(Hr(e, a), ref, 1e-4f);
+      EXPECT_NEAR(Hr(e, a), 1.5f * uval(e, a) + 100.0f * e + a, 1e-4f);
     }
 }
 
 // ---------------------------------------------------------------------------
-// 2. Broadcast operands: h carries (a,i) but not e; u carries (e,a) but not i.
-// ---------------------------------------------------------------------------
 TEST(ReduceNode, BroadcastOperandsMatchHostLoop) {
-  // h staged over (a, i): reuse hval but with the 'a' extent.
-  View2 Hd("h_ai", kA, kI);
+  View2 Hd("h_ai", kA, kN);
   {
     auto m = Kokkos::create_mirror_view(Hd);
     for (int a = 0; a < kA; ++a)
-      for (int i = 0; i < kI; ++i) m(a, i) = hval(a, i);
+      for (int i = 0; i < kN; ++i) m(a, i) = hval(a, i);
     Kokkos::deep_copy(Hd, m);
   }
   auto  Ud = make_u();
-  View3 Bd("B", kE, kA, kI);
+  View3 Bd("B", kE, kA, kN);
 
   auto g0 = make_level_graph<float, ES>(Map{});
   auto [g1, h] =
       g0.add(make_stage_node(make_input_node(make_handle<'a', 'i'>(Hd))));
   auto [g2, u] =
       g1.add(make_stage_node(make_input_node(make_handle<'e', 'a'>(Ud))));
-  auto [g3, b] = g2.add(make_reduce_node<'e', 'a', 'i'>(h, u, Broadcast{}));
-  static_assert(std::is_same_v<member_out_tile_t<std::decay_t<decltype(
-                                   g3.levels.template get<2>().template get<0>())>>,
-                               StaticTile<kTE, kA, kI>>);
+  auto [g3, b] =
+      g2.add(make_reduce_node<'e', 'a', 'i'>(over<>{}, h, u, Broadcast{}));
   g3.outputs(b).execute(TeamPolicyTag2<ES>{}, Bd);
   Kokkos::fence();
 
-  auto Bh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, Bd);
-  double max_err = 0.0;
+  auto   Bh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, Bd);
+  double err = 0.0;
   for (int e = 0; e < kE; ++e)
     for (int a = 0; a < kA; ++a)
-      for (int i = 0; i < kI; ++i) {
+      for (int i = 0; i < kN; ++i) {
         const double ref = static_cast<double>(hval(a, i)) * uval(e, a) +
                            0.001 * (e * 100 + a * 10 + i);
-        max_err = std::max(max_err, std::abs(ref - Bh(e, a, i)));
+        err = std::max(err, std::abs(ref - Bh(e, a, i)));
       }
-  EXPECT_LT(max_err, 1e-4) << "broadcast reduce != reference";
+  EXPECT_LT(err, 1e-4);
 }
 
 // ---------------------------------------------------------------------------
-// 3. One reduction label, a predicate on the output coordinate, one staged
-//    operand relabeled twice.
-// ---------------------------------------------------------------------------
-TEST(ReduceNode, ReductionWithPredicateMatchesHostLoop) {
+TEST(ReduceNode, DeclaredReductionLabelBoundOnOperands) {
   auto  Hd = make_h();
   auto  Md = make_m();
-  View3 Kd("K", kE, kI, kI);
+  View3 Kd("K", kE, kN, kN);
 
   auto g0 = make_level_graph<float, ES>(Map{});
   auto [g1, h] =
-      g0.add(make_stage_node(make_input_node(make_handle<'q', 'i'>(Hd))));
+      g0.add(make_stage_node(make_input_node(make_handle<'q', 'f'>(Hd))));
   auto [g2, m] =
       g1.add(make_stage_node(make_input_node(make_handle<'e', 'q'>(Md))));
-  auto node = make_reduce_node<'e', 'i', 'I'>(
-      h.template as<'q', 'i'>(), h.template as<'q', 'I'>(), m, DiagonalTerm{});
+  auto node = make_reduce_node<'e', 'i', 'l'>(
+      over<'q'>{}, h.template as<'q', 'i'>(), h.template as<'q', 'l'>(), m,
+      BoundDiagonal{});
   static_assert(decltype(node)::RedRank == 1);
-  static_assert(std::is_same_v<typename decltype(node)::reduce_seq,
-                               std::integer_sequence<int32_t, 'q'>>);
   auto [g3, k] = g2.add(node);
   g3.outputs(k).execute(TeamPolicyTag2<ES>{}, Kd);
   Kokkos::fence();
-
-  auto Kh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, Kd);
-  double max_err = 0.0, scale = 0.0;
-  for (int e = 0; e < kE; ++e)
-    for (int i = 0; i < kI; ++i)
-      for (int I = 0; I < kI; ++I) {
-        double ref = 0.0;
-        if ((i + I) % 2 == 0)
-          for (int q = 0; q < kQ; ++q)
-            ref += static_cast<double>(hval(q, i)) * hval(q, I) * mval(e, q);
-        scale   = std::max(scale, std::abs(ref));
-        max_err = std::max(max_err, std::abs(ref - Kh(e, i, I)));
-      }
-  ASSERT_GT(scale, 0.0);
-  EXPECT_LT(max_err, 1e-4 * scale) << "reduction != reference";
+  EXPECT_LT(max_diff_3(Kd, ref_diag_plain), 1e-4);
 }
 
 // ---------------------------------------------------------------------------
-// 4. Two reduction labels and pinned axes on one staged slot.
-// ---------------------------------------------------------------------------
-TEST(ReduceNode, TwoReductionLabelsAndPinnedAxes) {
+TEST(ReduceNode, FreeAxesIndexedByTheFunctor) {
   auto  Hd = make_h();
-  auto  M4 = make_m4();
-  View3 Kd("K", kE, kI, kI);
+  auto  Md = make_m();
+  View3 Kd("K", kE, kN, kN);
 
   auto g0 = make_level_graph<float, ES>(Map{});
   auto [g1, h] =
-      g0.add(make_stage_node(make_input_node(make_handle<'q', 'i'>(Hd))));
-  auto [g2, m] = g1.add(
-      make_stage_node(make_input_node(make_handle<'e', 'r', 's', 'q'>(M4))));
-  auto node = make_reduce_node<'e', 'i', 'I'>(
-      h.template as<'q', 'i'>(), h.template as<'q', 'I'>(),
-      m.template as<'e', fixed<0>, 's', 'q'>(),
-      m.template as<'e', fixed<2>, 's', 'q'>(), TwoRedPinned{});
-  static_assert(decltype(node)::RedRank == 2);
-  // First appearance order over the operand list: q (from h), then s.
-  static_assert(std::is_same_v<typename decltype(node)::reduce_seq,
-                               std::integer_sequence<int32_t, 'q', 's'>>);
-  auto [g3, k] = g2.add(node);
+      g0.add(make_stage_node(make_input_node(make_handle<'q', 'f'>(Hd))));
+  auto [g2, m] =
+      g1.add(make_stage_node(make_input_node(make_handle<'e', 'q'>(Md))));
+  // h fully free, m bound on 'e' and free on 'q'.
+  auto [g3, k] = g2.add(
+      make_reduce_node<'e', 'i', 'l'>(over<>{}, h, m, FreeDiagonal{}));
   g3.outputs(k).execute(TeamPolicyTag2<ES>{}, Kd);
   Kokkos::fence();
-
-  auto Kh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, Kd);
-  double max_err = 0.0, scale = 0.0;
-  for (int e = 0; e < kE; ++e)
-    for (int i = 0; i < kI; ++i)
-      for (int I = 0; I < kI; ++I) {
-        double ref = 0.0;
-        for (int s = 0; s < kS; ++s)
-          for (int q = 0; q < kQ; ++q) {
-            if (q == I) continue;
-            ref += static_cast<double>(hval(q, i)) * hval(q, I) *
-                   (m4val(e, 0, s, q) + (s + 1) * m4val(e, 2, s, q));
-          }
-        scale   = std::max(scale, std::abs(ref));
-        max_err = std::max(max_err, std::abs(ref - Kh(e, i, I)));
-      }
-  ASSERT_GT(scale, 0.0);
-  EXPECT_LT(max_err, 1e-4 * scale) << "two-label reduction != reference";
+  EXPECT_LT(max_diff_3(Kd, ref_diag_plain), 1e-4);
 }
 
-// ---------------------------------------------------------------------------
-// 5. Multi-output reduce.
 // ---------------------------------------------------------------------------
 TEST(ReduceNode, MultiOutputReduce) {
   auto  Hd = make_h();
   auto  Md = make_m();
-  View3 K0("K0", kE, kI, kI), K1("K1", kE, kI, kI);
+  View3 K0("K0", kE, kN, kN), K1("K1", kE, kN, kN);
 
   auto g0 = make_level_graph<float, ES>(Map{});
   auto [g1, h] =
-      g0.add(make_stage_node(make_input_node(make_handle<'q', 'i'>(Hd))));
+      g0.add(make_stage_node(make_input_node(make_handle<'q', 'f'>(Hd))));
   auto [g2, m] =
       g1.add(make_stage_node(make_input_node(make_handle<'e', 'q'>(Md))));
-  auto [g3, k0, k1] = g2.add(make_reduce_node<'e', 'i', 'I'>(
-      h.template as<'q', 'i'>(), h.template as<'q', 'I'>(), m, TwoOut{}));
+  auto [g3, k0, k1] = g2.add(make_reduce_node<'e', 'i', 'l'>(
+      over<'q'>{}, outputs<2>{}, h.template as<'q', 'i'>(),
+      h.template as<'q', 'l'>(), m, TwoOut{}));
   g3.outputs(k0, k1).execute(TeamPolicyTag2<ES>{}, K0, K1);
   Kokkos::fence();
 
-  auto H0 = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, K0);
-  auto H1 = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, K1);
+  auto   H0 = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, K0);
+  auto   H1 = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, K1);
   double e0 = 0.0, e1 = 0.0;
   for (int e = 0; e < kE; ++e)
-    for (int i = 0; i < kI; ++i)
-      for (int I = 0; I < kI; ++I) {
+    for (int i = 0; i < kN; ++i)
+      for (int l = 0; l < kN; ++l) {
         double r0 = 0.0, r1 = 0.0;
         for (int q = 0; q < kQ; ++q) {
-          r0 += static_cast<double>(hval(q, i)) * hval(q, I) * mval(e, q);
-          if (i == I) r1 += static_cast<double>(hval(q, I)) * mval(e, q);
+          r0 += static_cast<double>(hval(q, i)) * hval(q, l) * mval(e, q);
+          if (i == l) r1 += static_cast<double>(hval(q, l)) * mval(e, q);
         }
-        e0 = std::max(e0, std::abs(r0 - H0(e, i, I)));
-        e1 = std::max(e1, std::abs(r1 - H1(e, i, I)));
+        e0 = std::max(e0, std::abs(r0 - H0(e, i, l)));
+        e1 = std::max(e1, std::abs(r1 - H1(e, i, l)));
       }
-  EXPECT_LT(e0, 1e-4) << "multi-output reduce o0";
-  EXPECT_LT(e1, 1e-4) << "multi-output reduce o1";
+  EXPECT_LT(e0, 1e-4);
+  EXPECT_LT(e1, 1e-4);
 }
 
 // ---------------------------------------------------------------------------
-// 6. A reduce reading a LEVEL OUTPUT, with the plan guards instantiated.
+TEST(ReduceNode, MaxReducer) {
+  auto  Hd = make_h();
+  auto  Md = make_m();
+  View3 Kd("K", kE, kN, kN);
+
+  auto g0 = make_level_graph<float, ES>(Map{});
+  auto [g1, h] =
+      g0.add(make_stage_node(make_input_node(make_handle<'q', 'f'>(Hd))));
+  auto [g2, m] =
+      g1.add(make_stage_node(make_input_node(make_handle<'e', 'q'>(Md))));
+  auto [g3, k] = g2.add(make_reduce_node<'e', 'i', 'l'>(
+      over<'q'>{}, h.template as<'q', 'i'>(), h.template as<'q', 'l'>(), m,
+      MaxTerm{}, Max<float>{}));
+  g3.outputs(k).execute(TeamPolicyTag2<ES>{}, Kd);
+  Kokkos::fence();
+
+  auto   Kh  = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, Kd);
+  double err = 0.0;
+  for (int e = 0; e < kE; ++e)
+    for (int i = 0; i < kN; ++i)
+      for (int l = 0; l < kN; ++l) {
+        float r = -std::numeric_limits<float>::max();
+        for (int q = 0; q < kQ; ++q)
+          r = std::max(r, hval(q, i) * hval(q, l) * mval(e, q));
+        err = std::max(err, static_cast<double>(std::abs(r - Kh(e, i, l))));
+      }
+  EXPECT_LT(err, 1e-5);
+}
+
 // ---------------------------------------------------------------------------
 TEST(ReduceNode, ReadsALevelOutputAndPassesThePlanGuards) {
   auto  Hd = make_h();
   auto  Md = make_m();
-  View3 Kd("K", kE, kI, kI);
+  View3 Kd("K", kE, kN, kN);
 
   auto g0 = make_level_graph<float, ES>(Map{});
   auto [g1, h] =
-      g0.add(make_stage_node(make_input_node(make_handle<'q', 'i'>(Hd))));
+      g0.add(make_stage_node(make_input_node(make_handle<'q', 'f'>(Hd))));
   auto [g2, m] =
       g1.add(make_stage_node(make_input_node(make_handle<'e', 'q'>(Md))));
-  auto [g3, m2] = g2.add(make_reduce_node<'e', 'q'>(m, Scale{}));
-  auto [g4, k]  = g3.add(make_reduce_node<'e', 'i', 'I'>(
-      h.template as<'q', 'i'>(), h.template as<'q', 'I'>(), m2,
-      DiagonalTerm{}));
+  auto [g3, m2] =
+      g2.add(make_reduce_node<'e', 'q'>(over<>{}, m, ScaleShift{}));
+  auto [g4, k] = g3.add(make_reduce_node<'e', 'i', 'l'>(
+      over<'q'>{}, h.template as<'q', 'i'>(), h.template as<'q', 'l'>(), m2,
+      BoundDiagonal{}));
   using Plan = LevelPlan<std::decay_t<decltype(g4.levels)>>;
   static_assert(Plan::num_levels == 4);
   static_assert(Plan::num_slots == 4);
   g4.outputs(k).execute(TeamPolicyTag2<ES>{}, Kd);
   Kokkos::fence();
-
-  auto Kh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, Kd);
-  double max_err = 0.0, scale = 0.0;
-  for (int e = 0; e < kE; ++e)
-    for (int i = 0; i < kI; ++i)
-      for (int I = 0; I < kI; ++I) {
-        double ref = 0.0;
-        if ((i + I) % 2 == 0)
-          for (int q = 0; q < kQ; ++q)
-            ref += static_cast<double>(hval(q, i)) * hval(q, I) *
-                   (3.0 * mval(e, q) + 1.0);
-        scale   = std::max(scale, std::abs(ref));
-        max_err = std::max(max_err, std::abs(ref - Kh(e, i, I)));
-      }
-  ASSERT_GT(scale, 0.0);
-  EXPECT_LT(max_err, 1e-4 * scale) << "reduce over a level output";
+  EXPECT_LT(max_diff_3(Kd, ref_diag_scaled), 1e-4);
 }
 
 // ---------------------------------------------------------------------------
-// 7. Rank-8 output: the shape the element-stiffness block needs
-//    (E, k, j, i, b, K, J, I). Tiny extents; the point is that the frame,
-//    the broadcast operands and the rank-8 root write all go through.
+// 8. Rank 9: (e, a, k, j, i, b, n, m, l) -- the element-stiffness frame.
+//    k, j, n, m are carried by no operand (their extents come from the map);
+//    the whole tile (2 x 4^3 x 2 x 4^3 floats = 64 KB) is above the host
+//    level-0 scratch cap, so the host run carves from level 1.
 // ---------------------------------------------------------------------------
-namespace r8 {
-constexpr int N = 2, NE = 4, TE = 2;
-using Map8 = LabelTiles<LabelTile<'E', TE>, LabelWhole<'k', N>,
+namespace r9 {
+constexpr int N = 4, NC = 2, NE = 3;
+using Map9 = LabelTiles<LabelTile<'e', 1>, LabelWhole<'a', NC>,
+                        LabelWhole<'b', NC>, LabelWhole<'k', N>,
                         LabelWhole<'j', N>, LabelWhole<'i', N>,
-                        LabelWhole<'b', N>, LabelWhole<'K', N>,
-                        LabelWhole<'J', N>, LabelWhole<'I', N>,
-                        LabelWhole<'q', N>>;
-using View8 =
-    Kokkos::View<float*[N][N][N][N][N][N][N], Kokkos::LayoutRight, ES>;
+                        LabelWhole<'n', N>, LabelWhole<'m', N>,
+                        LabelWhole<'l', N>, LabelWhole<'q', N>,
+                        LabelWhole<'f', N>>;
 using ViewH = Kokkos::View<float**, Kokkos::LayoutRight, ES>;
-using ViewM = Kokkos::View<float***, Kokkos::LayoutRight, ES>;
-
-float h8(int q, int i) { return 0.2f + 0.7f * q - 0.3f * i; }
-float m8(int E, int b, int q) { return 0.4f + 0.15f * E - 0.25f * b + 0.1f * q; }
-
-struct Term {
-  KOKKOS_FUNCTION float operator()(int, int k, int j, int, int, int K, int J,
-                                   int, int, float hqi, float hqI,
-                                   float m) const {
-    return (k == K && j == J) ? hqi * hqI * m : 0.0f;
-  }
-};
-}  // namespace r8
-
-TEST(ReduceNode, RankEightOutput) {
-  using namespace r8;
-  ViewH Hd("h8", N, N);
-  ViewM Md("m8", NE, N, N);
-  {
-    auto hm = Kokkos::create_mirror_view(Hd);
-    for (int q = 0; q < N; ++q)
-      for (int i = 0; i < N; ++i) hm(q, i) = h8(q, i);
-    Kokkos::deep_copy(Hd, hm);
-    auto mm = Kokkos::create_mirror_view(Md);
-    for (int E = 0; E < NE; ++E)
-      for (int b = 0; b < N; ++b)
-        for (int q = 0; q < N; ++q) mm(E, b, q) = m8(E, b, q);
-    Kokkos::deep_copy(Md, mm);
-  }
-  View8 Kd("K8", NE);
-
-  auto g0 = make_level_graph<float, ES>(Map8{});
-  auto [g1, h] =
-      g0.add(make_stage_node(make_input_node(make_handle<'q', 'i'>(Hd))));
-  auto [g2, m] =
-      g1.add(make_stage_node(make_input_node(make_handle<'E', 'b', 'q'>(Md))));
-  // k, j, K, J are carried by NO operand: their extents come from the map.
-  auto [g3, k] = g2.add(make_reduce_node<'E', 'k', 'j', 'i', 'b', 'K', 'J', 'I'>(
-      h.template as<'q', 'i'>(), h.template as<'q', 'I'>(), m, Term{}));
-  using Plan8 = LevelPlan<std::decay_t<decltype(g3.levels)>>;
-  static_assert(Plan8::num_levels == 3);
-  g3.outputs(k).execute(TeamPolicyTag2<ES>{}, Kd);
-  Kokkos::fence();
-
-  auto Kh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, Kd);
-  double max_err = 0.0;
-  for (int E = 0; E < NE; ++E)
-    for (int k_ = 0; k_ < N; ++k_)
-      for (int j = 0; j < N; ++j)
-        for (int i = 0; i < N; ++i)
-          for (int b = 0; b < N; ++b)
-            for (int K = 0; K < N; ++K)
-              for (int J = 0; J < N; ++J)
-                for (int I = 0; I < N; ++I) {
-                  double ref = 0.0;
-                  if (k_ == K && j == J)
-                    for (int q = 0; q < N; ++q)
-                      ref += static_cast<double>(h8(q, i)) * h8(q, I) *
-                             m8(E, b, q);
-                  max_err = std::max(
-                      max_err, std::abs(ref - Kh(E, k_, j, i, b, K, J, I)));
-                }
-  EXPECT_LT(max_err, 1e-5) << "rank-8 reduce != reference";
+using ViewM = Kokkos::View<float****, Kokkos::LayoutRight, ES>;
+using View1 = Kokkos::View<float*, Kokkos::LayoutRight, ES>;
+float h9(int q, int i) { return 0.2f + 0.7f * q - 0.3f * i; }
+float m9(int e, int a, int b, int q) {
+  return 0.4f + 0.15f * e - 0.25f * a + 0.35f * b + 0.1f * q;
 }
-
-// ---------------------------------------------------------------------------
-// 8. Scratch level 1. The host backends cap level-0 team scratch at 32 KB;
-//    a whole-tile output of 5^6 floats is 62.5 KB. Carving from level 1 is
-//    what lets the same tile map run on host and GPU.
-// ---------------------------------------------------------------------------
-namespace big {
-constexpr int N = 5, NE = 3, TE = 1;
-using MapB = LabelTiles<LabelTile<'E', TE>, LabelWhole<'k', N>,
-                        LabelWhole<'j', N>, LabelWhole<'i', N>,
-                        LabelWhole<'K', N>, LabelWhole<'J', N>,
-                        LabelWhole<'I', N>, LabelWhole<'q', N>>;
-using View7 = Kokkos::View<float*[N][N][N][N][N][N], Kokkos::LayoutRight, ES>;
-using ViewH = Kokkos::View<float**, Kokkos::LayoutRight, ES>;
-using ViewM = Kokkos::View<float**, Kokkos::LayoutRight, ES>;
-float hb(int q, int i) { return 0.2f + 0.7f * q - 0.3f * i; }
-float mb(int E, int q) { return 0.4f + 0.15f * E + 0.1f * q; }
 struct Term {
-  KOKKOS_FUNCTION float operator()(int, int k, int j, int, int K, int J, int,
-                                   int, float hqi, float hqI, float m) const {
-    return (k == K && j == J) ? hqi * hqI * m : 0.0f;
+  template <typename H1, typename H2, typename M>
+  KOKKOS_FUNCTION void operator()(int, int, int k, int j, int, int, int n,
+                                  int m, int, int, const H1& hqi,
+                                  const H2& hql, const M& mm,
+                                  float& acc) const {
+    if (k == n && j == m) acc += hqi() * hql() * mm();
   }
 };
-}  // namespace big
+}  // namespace r9
 
-TEST(ReduceNode, ScratchLevelOneCarriesAWholeTileAboveTheHostLevelZeroCap) {
-  using namespace big;
-  ViewH Hd("hb", N, N);
-  ViewM Md("mb", NE, N);
+TEST(ReduceNode, RankNineOutputThroughAStridedAlias) {
+  using namespace r9;
+  ViewH Hd("h9", N, N);
+  ViewM Md("m9", NE, NC, NC, N);
   {
     auto hm = Kokkos::create_mirror_view(Hd);
     for (int q = 0; q < N; ++q)
-      for (int i = 0; i < N; ++i) hm(q, i) = hb(q, i);
+      for (int i = 0; i < N; ++i) hm(q, i) = h9(q, i);
     Kokkos::deep_copy(Hd, hm);
     auto mm = Kokkos::create_mirror_view(Md);
-    for (int E = 0; E < NE; ++E)
-      for (int q = 0; q < N; ++q) mm(E, q) = mb(E, q);
+    for (int e = 0; e < NE; ++e)
+      for (int a = 0; a < NC; ++a)
+        for (int b = 0; b < NC; ++b)
+          for (int q = 0; q < N; ++q) mm(e, a, b, q) = m9(e, a, b, q);
     Kokkos::deep_copy(Md, mm);
   }
-  View7 Kd("K7", NE);
+  constexpr int block = NC * N * N * N * NC * N * N * N;
+  View1         flat("K9", NE * block);
+  const auto    alias =
+      make_strided_alias<ES, NC, N, N, N, NC, N, N, N>(flat.data(), NE);
 
-  auto g0 = make_level_graph<float, ES>(MapB{});
+  auto g0 = make_level_graph<float, ES>(Map9{});
   auto [g1, h] =
-      g0.add(make_stage_node(make_input_node(make_handle<'q', 'i'>(Hd))));
-  auto [g2, m] =
-      g1.add(make_stage_node(make_input_node(make_handle<'E', 'q'>(Md))));
-  auto [g3, k] = g2.add(make_reduce_node<'E', 'k', 'j', 'i', 'K', 'J', 'I'>(
-      h.template as<'q', 'i'>(), h.template as<'q', 'I'>(), m, Term{}));
+      g0.add(make_stage_node(make_input_node(make_handle<'q', 'f'>(Hd))));
+  auto [g2, m] = g1.add(
+      make_stage_node(make_input_node(make_handle<'e', 'a', 'b', 'q'>(Md))));
+  auto [g3, k] = g2.add(
+      make_reduce_node<'e', 'a', 'k', 'j', 'i', 'b', 'n', 'm', 'l'>(
+          over<'q'>{}, h.template as<'q', 'i'>(), h.template as<'q', 'l'>(),
+          m, Term{}));
   const auto out = g3.outputs(k);
-  EXPECT_GT(out.scratch_bytes(), std::size_t{32} * 1024)
-      << "the case must exceed the host level-0 cap to prove anything";
+  EXPECT_GT(out.scratch_bytes(), std::size_t{32} * 1024);
   constexpr bool on_host =
       Kokkos::SpaceAccessibility<ES, Kokkos::HostSpace>::accessible;
-  out.scratch_level(on_host ? 1 : 0).execute(TeamPolicyTag2<ES>{}, Kd);
+  out.scratch_level(on_host ? 1 : 0).execute(TeamPolicyTag2<ES>{}, alias);
   Kokkos::fence();
 
-  auto Kh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, Kd);
-  double max_err = 0.0;
-  for (int E = 0; E < NE; ++E)
-    for (int k_ = 0; k_ < N; ++k_)
-      for (int j = 0; j < N; ++j)
-        for (int i = 0; i < N; ++i)
-          for (int K = 0; K < N; ++K)
-            for (int J = 0; J < N; ++J)
-              for (int I = 0; I < N; ++I) {
-                double ref = 0.0;
-                if (k_ == K && j == J)
-                  for (int q = 0; q < N; ++q)
-                    ref += static_cast<double>(hb(q, i)) * hb(q, I) * mb(E, q);
-                max_err = std::max(max_err,
-                                   std::abs(ref - Kh(E, k_, j, i, K, J, I)));
-              }
-  EXPECT_LT(max_err, 1e-4) << "level-1 scratch reduce != reference";
+  auto   Kh  = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, flat);
+  double err = 0.0;
+  int    lin = 0;
+  for (int e = 0; e < NE; ++e)
+    for (int a = 0; a < NC; ++a)
+      for (int kk = 0; kk < N; ++kk)
+        for (int j = 0; j < N; ++j)
+          for (int i = 0; i < N; ++i)
+            for (int b = 0; b < NC; ++b)
+              for (int n = 0; n < N; ++n)
+                for (int mm = 0; mm < N; ++mm)
+                  for (int l = 0; l < N; ++l, ++lin) {
+                    double ref = 0.0;
+                    if (kk == n && j == mm)
+                      for (int q = 0; q < N; ++q)
+                        ref += static_cast<double>(h9(q, i)) * h9(q, l) *
+                               m9(e, a, b, q);
+                    err = std::max(err, std::abs(ref - Kh(lin)));
+                  }
+  EXPECT_LT(err, 1e-5);
 }
 
 int main(int argc, char* argv[]) {
