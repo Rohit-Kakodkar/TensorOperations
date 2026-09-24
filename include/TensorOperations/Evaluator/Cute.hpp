@@ -68,15 +68,19 @@ class Evaluator<
   node_type node_;
 };
 
+template <typename ES, typename Storage, typename HookOp = NoHook>
+KOKKOS_FUNCTION auto make_cute_interm_node(Storage tensor, HookOp hook = {}) {
+  return NodeHandle<IntermTag, Storage,
+                    std::integral_constant<int, Storage::rank>, ES, HookOp>{
+      std::move(tensor), std::move(hook)};
+}
+
 namespace Impl {
 
 template <typename ES, typename Storage, typename HookOp>
 KOKKOS_FUNCTION auto make_cute_value_evaluator(Storage tile, HookOp hook) {
-  using node_t =
-      NodeHandle<IntermTag, Storage, std::integral_constant<int, Storage::rank>,
-                 ES, HookOp>;
-  return Evaluator<CutePolicyTag<ES>, node_t, void>(
-      node_t{std::move(tile), std::move(hook)});
+  auto node = make_cute_interm_node<ES>(std::move(tile), std::move(hook));
+  return Evaluator<CutePolicyTag<ES>, decltype(node), void>(node);
 }
 
 }  // namespace Impl
@@ -110,6 +114,56 @@ class Evaluator<CutePolicyTag<ES>, NodeHandle<InputTag, T, ModesSeq, HookOp>,
   Impl::CuteHandle<T, ModesSeq> handle_;
   Tiler                         tiler_;
   [[no_unique_address]] HookOp  hook_;
+};
+
+template <typename ThrLayout>
+struct CuteStageTag {
+  ThrLayout thr_layout;
+  int       thr_idx;
+};
+
+template <typename ES, typename Storage, int R, typename HookOp,
+          typename ThrLayout>
+class Evaluator<
+    CutePolicyTag<ES>,
+    NodeHandle<IntermTag, Storage, std::integral_constant<int, R>, ES, HookOp>,
+    CuteStageTag<ThrLayout>> {
+  static_assert(cute::is_tensor<Storage>::value,
+                "CuTe stage: destination must be a cute::Tensor");
+  static_assert(cute::is_static<ThrLayout>::value,
+                "CuTe stage: thread layout must be static");
+  static_assert(cute::rank_v<ThrLayout> == R,
+                "CuTe stage: thread layout rank must equal the tile's rank");
+
+ public:
+  using node_type   = NodeHandle<IntermTag, Storage,
+                                 std::integral_constant<int, R>, ES, HookOp>;
+  using policy_tag  = CutePolicyTag<ES>;
+  using tiling_type = CuteStageTag<ThrLayout>;
+  static constexpr int Rank = R;
+  using storage_type        = Storage;
+  using value_type          = typename node_type::value_type;
+  using exec_space          = ES;
+
+  KOKKOS_FUNCTION Evaluator(node_type n, tiling_type tag)
+      : node_(n), tag_(tag) {}
+
+  template <typename SrcEval>
+  KOKKOS_FUNCTION auto operator=(const SrcEval& src) const {
+    static_assert(SrcEval::Rank == R,
+                  "staged source and destination must have equal rank");
+
+    const auto dst = node_.storage_;
+    cute::copy(cute::local_partition(src.node().storage_, tag_.thr_layout,
+                                     tag_.thr_idx),
+               cute::local_partition(dst, tag_.thr_layout, tag_.thr_idx));
+
+    return Impl::make_cute_value_evaluator<ES>(dst, src.node().hook_op);
+  }
+
+ private:
+  node_type   node_;
+  tiling_type tag_;
 };
 
 }  // namespace TensorOperations
