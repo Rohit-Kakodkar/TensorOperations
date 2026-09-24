@@ -174,19 +174,19 @@ class Evaluator<TeamPolicyTag<ES>,
   team_member_t team_;
 };
 
-struct StageTag {};
+struct ScratchLoadTag {};
 
 template <typename ES, typename ValueType, typename Layout, int Rank,
           typename HookOp>
 class Evaluator<TeamPolicyTag<ES>,
                 NodeHandle<IntermTag, ScratchView<ValueType, ES, Layout>,
                            std::integral_constant<int, Rank>, ES, HookOp>,
-                StageTag> {
+                ScratchLoadTag> {
  public:
   using node_type   = NodeHandle<IntermTag, ScratchView<ValueType, ES, Layout>,
                                  std::integral_constant<int, Rank>, ES, HookOp>;
   using policy_tag  = TeamPolicyTag<ES>;
-  using tiling_type = StageTag;
+  using tiling_type = ScratchLoadTag;
   using scratch_view_t = ScratchView<ValueType, ES, Layout>;
   using value_type     = ValueType;
   using exec_space     = ES;
@@ -195,7 +195,8 @@ class Evaluator<TeamPolicyTag<ES>,
   static_assert(Layout::rank == Rank,
                 "destination scratch layout rank must equal node rank");
 
-  KOKKOS_FUNCTION Evaluator(node_type n, StageTag, const team_member_t& team)
+  KOKKOS_FUNCTION Evaluator(node_type            n, ScratchLoadTag,
+                            const team_member_t& team)
       : node_(n), team_(team) {}
 
   template <typename SrcEval>
@@ -228,8 +229,9 @@ class Evaluator<TeamPolicyTag<ES>,
 //
 // The tile travels in a StoreTag rather than as a bare Tile_ because the node
 // slot is already taken twice over for IntermTag: `void` is the value
-// evaluator and `StageTag` the stage destination, so a third specialization
-// with an unconstrained tiling parameter would be ambiguous against both.
+// evaluator and `ScratchLoadTag` the scratch-load destination, so a third
+// specialization with an unconstrained tiling parameter would be ambiguous
+// against both.
 // ---------------------------------------------------------------------------
 template <typename Tile>
 struct StoreTag {
@@ -338,7 +340,7 @@ class Evaluator<TeamPolicyTag<ES>,
     auto src    = make_evaluator<TeamPolicyTag<ES>>(node_.operand_, tile_,
                                                     team_)(tile_idx);
     auto stager = make_evaluator<TeamPolicyTag<ES>>(make_interm_node(dst_),
-                                                    StageTag{}, team_);
+                                                    ScratchLoadTag{}, team_);
     return (stager = src);
   }
 
@@ -496,7 +498,7 @@ class Evaluator<TeamPolicyTag<ES>,
 // aligned with the output -- staged, relabeled, or read straight off a subview
 // -- plus the destination node(s) to write, and the evaluator only checks that
 // every operand presents the output's extents. A permuted operand is composed
-// upstream out of the relabel and StageTag evaluators above.
+// upstream out of the relabel and ScratchLoadTag evaluators above.
 //
 // fn is defined (NodeHandle.hpp) to see the GLOBAL output coordinate. This
 // consumes tile_idx at the InputTag step and does not retain it, so the tile's
