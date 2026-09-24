@@ -85,6 +85,78 @@ KOKKOS_FUNCTION auto make_cute_value_evaluator(Storage tile, HookOp hook) {
 
 }  // namespace Impl
 
+struct FragmentTag {};
+
+template <typename Frag, typename Coords, typename IntRank, typename ExecSpace,
+          typename HookOp>
+struct NodeHandle<FragmentTag, Frag, Coords, IntRank, ExecSpace, HookOp> {
+  static_assert(cute::is_tensor<Frag>::value && cute::is_rmem<Frag>::value,
+                "fragment node: storage must be a register cute::Tensor");
+  static_assert(cute::is_tensor<Coords>::value,
+                "fragment node: coordinates must be a cute::Tensor");
+  static_assert(std::is_same_v<decltype(cute::shape(std::declval<Frag>())),
+                               decltype(cute::shape(std::declval<Coords>()))>,
+                "fragment node: fragment and coordinates must share a shape");
+
+  using node_tag            = FragmentTag;
+  static constexpr int Rank = IntRank::value;
+  using storage_type        = Frag;
+  using coords_type         = Coords;
+  using value_type          = typename Frag::value_type;
+  using exec_space          = ExecSpace;
+  using hook_type           = HookOp;
+
+  Frag                         frag_;
+  Coords                       coords_;
+  [[no_unique_address]] HookOp hook_op;
+};
+
+template <typename ES, int R, typename Frag, typename Coords,
+          typename HookOp = NoHook>
+KOKKOS_FUNCTION auto make_cute_fragment_node(Frag frag, Coords coords,
+                                             HookOp hook = {}) {
+  return NodeHandle<FragmentTag, Frag, Coords, std::integral_constant<int, R>,
+                    ES, HookOp>{std::move(frag), std::move(coords),
+                                std::move(hook)};
+}
+
+template <typename ES, typename Frag, typename Coords, int R, typename HookOp>
+class Evaluator<CutePolicyTag<ES>,
+                NodeHandle<FragmentTag, Frag, Coords,
+                           std::integral_constant<int, R>, ES, HookOp>,
+                void> {
+ public:
+  using node_type    = NodeHandle<FragmentTag, Frag, Coords,
+                                  std::integral_constant<int, R>, ES, HookOp>;
+  using policy_tag   = CutePolicyTag<ES>;
+  using tiling_type  = void;
+  using storage_type = Frag;
+  using coords_type  = Coords;
+  using value_type   = typename node_type::value_type;
+  using exec_space   = ES;
+  static constexpr int Rank = R;
+
+  KOKKOS_FUNCTION explicit Evaluator(node_type n) : node_(n) {}
+
+  KOKKOS_FUNCTION const node_type& node() const { return node_; }
+
+ private:
+  node_type node_;
+};
+
+namespace Impl {
+
+template <typename ES, int R, typename Frag, typename Coords, typename HookOp>
+KOKKOS_FUNCTION auto make_cute_fragment_value_evaluator(Frag   frag,
+                                                        Coords coords,
+                                                        HookOp hook) {
+  auto node = make_cute_fragment_node<ES, R>(std::move(frag), std::move(coords),
+                                             std::move(hook));
+  return Evaluator<CutePolicyTag<ES>, decltype(node), void>(node);
+}
+
+}  // namespace Impl
+
 template <typename ES, TensorLike T, typename ModesSeq, typename HookOp,
           typename Tiler>
 class Evaluator<CutePolicyTag<ES>, NodeHandle<InputTag, T, ModesSeq, HookOp>,
@@ -131,6 +203,14 @@ struct CuteStoreTag : CuteThreadTag<ThrLayout> {};
 template <typename Smem, typename ThrLayout>
 struct CuteStagedTag : CuteThreadTag<ThrLayout> {
   Smem dst;
+};
+
+template <typename AEval, typename BEval, typename TiledMma>
+struct CuteContractTag {
+  AEval    a;
+  BEval    b;
+  TiledMma mma;
+  int      thr_idx;
 };
 
 namespace Impl {
@@ -292,6 +372,120 @@ class Evaluator<
       }
     }
   }
+};
+
+namespace Impl {
+
+template <typename Layout, typename T, T... P>
+KOKKOS_FUNCTION auto select_seq(const Layout& l,
+                                std::integer_sequence<T, P...>) {
+  return cute::select<static_cast<int>(P)...>(l);
+}
+
+template <int Shift, int N, std::size_t... I>
+auto rotate_seq_impl(std::index_sequence<I...>)
+    -> std::integer_sequence<int, static_cast<int>((I + Shift) % N)...>;
+
+template <int Shift, int N>
+using rotate_seq_t =
+    decltype(rotate_seq_impl<Shift, N>(std::make_index_sequence<N>{}));
+
+template <int Free, int NumK, typename Tensor>
+KOKKOS_FUNCTION auto group_free_contracted(const Tensor& t) {
+  return cute::group_modes<1, 1 + NumK>(cute::group_modes<0, Free>(t));
+}
+
+}  // namespace Impl
+
+template <typename ES, typename NA, typename NB, typename IntCRank, typename S,
+          typename HookOp, typename CModesSeq, typename PermCSeq,
+          typename AEval, typename BEval, typename TiledMma>
+class Evaluator<CutePolicyTag<ES>,
+                NodeHandle<ContractionTag, NA, NB, IntCRank, S, ES, HookOp,
+                           CModesSeq, PermCSeq>,
+                CuteContractTag<AEval, BEval, TiledMma>> {
+ public:
+  using node_type  = NodeHandle<ContractionTag, NA, NB, IntCRank, S, ES, HookOp,
+                                CModesSeq, PermCSeq>;
+  using policy_tag = CutePolicyTag<ES>;
+  using tiling_type = CuteContractTag<AEval, BEval, TiledMma>;
+  using value_type  = S;
+  using exec_space  = ES;
+
+  static constexpr int RankC = node_type::Rank;
+  static constexpr int NumK  = node_type::NumContracted;
+  static constexpr int RankA = NA::Rank;
+  static constexpr int RankB = NB::Rank;
+  static constexpr int FreeA = RankA - NumK;
+  static constexpr int FreeB = RankB - NumK;
+  static constexpr int Rank  = RankC;
+
+ private:
+  using a_storage_t = typename AEval::storage_type;
+  using b_storage_t = typename BEval::storage_type;
+  using permA_t     = Impl::node_permA_t<node_type>;
+  using permB_t     = Impl::node_permB_t<node_type>;
+
+  static_assert(cute::is_smem<a_storage_t>::value &&
+                    cute::is_smem<b_storage_t>::value,
+                "CuTe contraction: operands must be shared-memory tensors");
+  static_assert(cute::is_static<typename a_storage_t::layout_type>::value &&
+                    cute::is_static<typename b_storage_t::layout_type>::value,
+                "CuTe contraction: operand layouts must be static");
+  static_assert(a_storage_t::rank == RankA && b_storage_t::rank == RankB,
+                "CuTe contraction: operand tensor ranks must equal the "
+                "operand nodes' ranks");
+  static_assert(FreeA + FreeB == RankC,
+                "CuTe contraction: free-mode counts must sum to the output "
+                "rank");
+  static_assert(FreeA > 0 && FreeB > 0 && NumK > 0,
+                "CuTe contraction: needs a free mode on each operand and at "
+                "least one contracted mode");
+  static_assert(std::is_same_v<typename TiledMma::ValTypeC, S>,
+                "CuTe contraction: the MMA accumulator type must be the "
+                "node's scalar");
+
+  using a_canon_t = decltype(Impl::select_seq(
+      std::declval<typename a_storage_t::layout_type>(), permA_t{}));
+  using b_canon_t = decltype(Impl::select_seq(
+      Impl::select_seq(std::declval<typename b_storage_t::layout_type>(),
+                       permB_t{}),
+      Impl::rotate_seq_t<NumK, RankB>{}));
+
+  static_assert(std::is_same_v<decltype(cute::take<FreeA, RankA>(
+                                   cute::shape(std::declval<a_canon_t>()))),
+                               decltype(cute::take<FreeB, RankB>(
+                                   cute::shape(std::declval<b_canon_t>())))>,
+                "CuTe contraction: A's and B's contracted extents must match");
+
+ public:
+  KOKKOS_FUNCTION Evaluator(node_type n, tiling_type tag)
+      : node_(n), tag_(tag) {}
+
+  KOKKOS_FUNCTION auto operator()() const {
+    const auto a  = tag_.a.node().storage_;
+    const auto b  = tag_.b.node().storage_;
+    const auto sA = Impl::group_free_contracted<FreeA, NumK>(
+        cute::make_tensor(a.data(), Impl::select_seq(a.layout(), permA_t{})));
+    const auto sB = Impl::group_free_contracted<FreeB, NumK>(cute::make_tensor(
+        b.data(), Impl::select_seq(Impl::select_seq(b.layout(), permB_t{}),
+                                   Impl::rotate_seq_t<NumK, RankB>{})));
+
+    const auto thr = tag_.mma.get_slice(tag_.thr_idx);
+    const auto idC = cute::make_identity_tensor(
+        cute::make_shape(cute::shape<0>(sA), cute::shape<0>(sB)));
+    const auto cC   = thr.partition_C(idC);
+    auto       frag = thr.partition_fragment_C(idC);
+    cute::clear(frag);
+    cute::gemm(tag_.mma, thr.partition_A(sA), thr.partition_B(sB), frag);
+
+    return Impl::make_cute_fragment_value_evaluator<ES, RankC>(frag, cC,
+                                                               node_.hook_op);
+  }
+
+ private:
+  node_type   node_;
+  tiling_type tag_;
 };
 
 }  // namespace TensorOperations
