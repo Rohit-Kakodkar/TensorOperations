@@ -89,9 +89,10 @@ KOKKOS_FUNCTION auto make_cute_value_evaluator(Storage tile, HookOp hook) {
 
 struct FragmentTag {};
 
-template <typename Frag, typename Coords, typename IntRank, typename ExecSpace,
-          typename HookOp>
-struct NodeHandle<FragmentTag, Frag, Coords, IntRank, ExecSpace, HookOp> {
+template <typename Frag, typename Coords, typename TileShape, typename IntRank,
+          typename ExecSpace, typename HookOp>
+struct NodeHandle<FragmentTag, Frag, Coords, TileShape, IntRank, ExecSpace,
+                  HookOp> {
   static_assert(cute::is_tensor<Frag>::value && cute::is_rmem<Frag>::value,
                 "fragment node: storage must be a register cute::Tensor");
   static_assert(cute::is_tensor<Coords>::value,
@@ -99,11 +100,16 @@ struct NodeHandle<FragmentTag, Frag, Coords, IntRank, ExecSpace, HookOp> {
   static_assert(std::is_same_v<decltype(cute::shape(std::declval<Frag>())),
                                decltype(cute::shape(std::declval<Coords>()))>,
                 "fragment node: fragment and coordinates must share a shape");
+  static_assert(cute::is_static<TileShape>::value &&
+                    cute::rank_v<TileShape> == IntRank::value,
+                "fragment node: the tile shape must be static and flat with "
+                "one mode per node mode");
 
   using node_tag            = FragmentTag;
   static constexpr int Rank = IntRank::value;
   using storage_type        = Frag;
   using coords_type         = Coords;
+  using tile_shape_type     = TileShape;
   using value_type          = typename Frag::value_type;
   using exec_space          = ExecSpace;
   using hook_type           = HookOp;
@@ -113,29 +119,31 @@ struct NodeHandle<FragmentTag, Frag, Coords, IntRank, ExecSpace, HookOp> {
   [[no_unique_address]] HookOp hook_op;
 };
 
-template <typename ES, int R, typename Frag, typename Coords,
-          typename HookOp = NoHook>
+template <typename ES, int R, typename TileShape, typename Frag,
+          typename Coords, typename HookOp = NoHook>
 KOKKOS_FUNCTION auto make_cute_fragment_node(Frag frag, Coords coords,
                                              HookOp hook = {}) {
-  return NodeHandle<FragmentTag, Frag, Coords, std::integral_constant<int, R>,
-                    ES, HookOp>{std::move(frag), std::move(coords),
-                                std::move(hook)};
+  return NodeHandle<FragmentTag, Frag, Coords, TileShape,
+                    std::integral_constant<int, R>, ES, HookOp>{
+      std::move(frag), std::move(coords), std::move(hook)};
 }
 
-template <typename ES, typename Frag, typename Coords, int R, typename HookOp>
+template <typename ES, typename Frag, typename Coords, typename TileShape,
+          int R, typename HookOp>
 class Evaluator<CutePolicyTag<ES>,
-                NodeHandle<FragmentTag, Frag, Coords,
+                NodeHandle<FragmentTag, Frag, Coords, TileShape,
                            std::integral_constant<int, R>, ES, HookOp>,
                 void> {
  public:
-  using node_type    = NodeHandle<FragmentTag, Frag, Coords,
+  using node_type    = NodeHandle<FragmentTag, Frag, Coords, TileShape,
                                   std::integral_constant<int, R>, ES, HookOp>;
   using policy_tag   = CutePolicyTag<ES>;
   using tiling_type  = void;
   using storage_type = Frag;
   using coords_type  = Coords;
-  using value_type   = typename node_type::value_type;
-  using exec_space   = ES;
+  using tile_shape_type     = TileShape;
+  using value_type          = typename node_type::value_type;
+  using exec_space          = ES;
   static constexpr int Rank = R;
 
   KOKKOS_FUNCTION explicit Evaluator(node_type n) : node_(n) {}
@@ -148,12 +156,13 @@ class Evaluator<CutePolicyTag<ES>,
 
 namespace Impl {
 
-template <typename ES, int R, typename Frag, typename Coords, typename HookOp>
+template <typename ES, int R, typename TileShape, typename Frag,
+          typename Coords, typename HookOp>
 KOKKOS_FUNCTION auto make_cute_fragment_value_evaluator(Frag   frag,
                                                         Coords coords,
                                                         HookOp hook) {
-  auto node = make_cute_fragment_node<ES, R>(std::move(frag), std::move(coords),
-                                             std::move(hook));
+  auto node = make_cute_fragment_node<ES, R, TileShape>(
+      std::move(frag), std::move(coords), std::move(hook));
   return Evaluator<CutePolicyTag<ES>, decltype(node), void>(node);
 }
 
@@ -481,8 +490,9 @@ class Evaluator<CutePolicyTag<ES>,
     cute::clear(frag);
     cute::gemm(tag_.mma, thr.partition_A(sA), thr.partition_B(sB), frag);
 
-    return Impl::make_cute_fragment_value_evaluator<ES, RankC>(frag, cC,
-                                                               node_.hook_op);
+    return Impl::make_cute_fragment_value_evaluator<
+        ES, RankC, decltype(cute::flatten(cute::shape(idC)))>(frag, cC,
+                                                              node_.hook_op);
   }
 
  private:
@@ -573,6 +583,10 @@ class CuteCombineEvaluator<ES,
       label_perm_seq_t<CModesSeq, typename std::tuple_element_t<
                                       K, std::tuple<Ops...>>::modes_seq>{})));
 
+  template <std::size_t K>
+  using flat_view_shape_t =
+      decltype(cute::flatten(std::declval<view_shape_t<K>>()));
+
   KOKKOS_FUNCTION CuteCombineEvaluator(node_type n, DeviceTuple<OpEvals...> ops,
                                        Kokkos::Array<int, Rank> origin)
       : fn_(n.fn), ops_(ops), origin_(origin) {}
@@ -592,7 +606,7 @@ class CuteCombineEvaluator<ES,
     return cute::make_tensor(s.data(), select_seq(s.layout(), op_perm_t<K>{}));
   }
 
-  template <typename Coords, typename Proto>
+  template <typename TileShape, typename Coords, typename Proto>
   KOKKOS_FUNCTION auto evaluate(const Coords& coords,
                                 const Proto&  proto) const {
     using frag_t = decltype(cute::make_tensor<S>(cute::shape(proto)));
@@ -604,7 +618,8 @@ class CuteCombineEvaluator<ES,
                         gather(v, oc, std::make_index_sequence<NumOps>{})));
       for (int m = 0; m < NumOut; ++m) outs[m](v) = r[m];
     }
-    return make_results(outs, coords, std::make_index_sequence<NumOut>{});
+    return make_results<TileShape>(outs, coords,
+                                   std::make_index_sequence<NumOut>{});
   }
 
   [[no_unique_address]] CombineFn fn_;
@@ -632,14 +647,16 @@ class CuteCombineEvaluator<ES,
     return {origin_[Ds] + static_cast<int>(cute::get<Ds>(oc))...};
   }
 
-  template <typename Frags, typename Coords, std::size_t... Ms>
+  template <typename TileShape, typename Frags, typename Coords,
+            std::size_t... Ms>
   KOKKOS_FUNCTION auto make_results(const Frags& outs, const Coords& coords,
                                     std::index_sequence<Ms...>) const {
-    using result_t = decltype(make_cute_fragment_value_evaluator<ES, Rank>(
-        outs[0], coords, NoHook{}));
+    using result_t =
+        decltype(make_cute_fragment_value_evaluator<ES, Rank, TileShape>(
+            outs[0], coords, NoHook{}));
     return Kokkos::Array<result_t, NumOut>{
-        make_cute_fragment_value_evaluator<ES, Rank>(outs[Ms], coords,
-                                                     NoHook{})...};
+        make_cute_fragment_value_evaluator<ES, Rank, TileShape>(
+            outs[Ms], coords, NoHook{})...};
   }
 };
 
@@ -660,6 +677,8 @@ struct fragments_share_driver<D, CModesSeq, std::tuple<OpEvals...>,
     else
       return std::is_same_v<typename Eval::coords_type,
                             typename driver_t::coords_type> &&
+             std::is_same_v<typename Eval::tile_shape_type,
+                            typename driver_t::tile_shape_type> &&
              std::is_same_v<
                  decltype(cute::shape(
                      std::declval<typename Eval::storage_type>())),
@@ -669,6 +688,25 @@ struct fragments_share_driver<D, CModesSeq, std::tuple<OpEvals...>,
   }
 
   static constexpr bool value = (one<OpEvals, Ops>() && ...);
+};
+
+template <typename Base, typename TileShape, typename OpEvals, typename Is>
+struct smem_operands_match_tile;
+
+template <typename Base, typename TileShape, typename... OpEvals,
+          std::size_t... Ks>
+struct smem_operands_match_tile<Base, TileShape, std::tuple<OpEvals...>,
+                                std::index_sequence<Ks...>> {
+  template <typename Eval, std::size_t K>
+  static constexpr bool one() {
+    if constexpr (is_cute_fragment_eval_v<Eval>)
+      return true;
+    else
+      return std::is_same_v<typename Base::template flat_view_shape_t<K>,
+                            TileShape>;
+  }
+
+  static constexpr bool value = (one<OpEvals, Ks>() && ...);
 };
 
 template <typename Base, typename Is>
@@ -713,6 +751,14 @@ class Evaluator<CutePolicyTag<ES>,
                                    std::index_sequence_for<OpEvals...>>::value,
       "CuTe combine: every fragment operand must share the driving "
       "fragment's partition and be labelled in the combine's output order");
+  static_assert(
+      Impl::smem_operands_match_tile<
+          base,
+          typename std::tuple_element_t<
+              D, std::tuple<OpEvals...>>::tile_shape_type,
+          std::tuple<OpEvals...>, std::index_sequence_for<OpEvals...>>::value,
+      "CuTe combine: every shared-memory operand must present the driving "
+      "fragment's tile extents in the output's mode order");
 
  public:
   using typename base::node_type;
@@ -723,7 +769,9 @@ class Evaluator<CutePolicyTag<ES>,
 
   KOKKOS_FUNCTION auto operator()() const {
     const auto& d = this->ops_.template get<D>().node();
-    return this->evaluate(d.coords_, d.frag_);
+    return this->template evaluate<
+        typename std::decay_t<decltype(d)>::tile_shape_type>(d.coords_,
+                                                             d.frag_);
   }
 };
 
@@ -772,7 +820,9 @@ class Evaluator<CutePolicyTag<ES>,
     const auto cC = cute::local_partition(
         cute::make_identity_tensor(cute::shape(this->template view<0>())),
         thr_layout_, thr_idx_);
-    return this->evaluate(cC, cC);
+    return this
+        ->template evaluate<typename base::template flat_view_shape_t<0>>(cC,
+                                                                          cC);
   }
 
  private:
