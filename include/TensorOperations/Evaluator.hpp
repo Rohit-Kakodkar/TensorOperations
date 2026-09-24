@@ -6,6 +6,7 @@
 #include <TensorOperations/ScratchTile.hpp>
 #include <TensorOperations/TimingInstrumentation.hpp>
 #include <array>
+#include <type_traits>
 #include <utility>
 
 #include <Kokkos_Core.hpp>
@@ -13,17 +14,27 @@
 namespace TensorOperations {
 
 // ---------------------------------------------------------------------------
-// Policy tag
+// Policy tags
 //
-// The memory tier an evaluator targets. One tier exists: team scratch, driven
-// by Kokkos::TeamPolicy. It stays a tag rather than becoming implicit so the
-// Evaluator specializations keep a slot to discriminate on if a second tier
-// (per-thread, or a device-wide range policy) is ever added.
+// The backend an evaluator targets. TeamPolicyTag is team scratch driven by
+// Kokkos::TeamPolicy. CutePolicyTag is the CuTe backend; it is declared ahead
+// of any Evaluator specialization so the driver can be threaded over the tag.
+// CuTe emits CUDA only, so the tag exists only in a CUDA-enabled build and
+// accepts no execution space but Kokkos::Cuda.
 // ---------------------------------------------------------------------------
 template <typename ES = Kokkos::DefaultExecutionSpace>
 struct TeamPolicyTag {
   using execution_space = ES;
 };
+
+#if defined(KOKKOS_ENABLE_CUDA)
+template <typename ES = Kokkos::Cuda>
+struct CutePolicyTag {
+  static_assert(std::is_same_v<ES, Kokkos::Cuda>,
+                "CutePolicyTag requires the Kokkos::Cuda execution space");
+  using execution_space = ES;
+};
+#endif
 
 // Tiling specs (StaticTile / DynamicTile) live in Tiling.hpp.
 
@@ -411,3 +422,7 @@ KOKKOS_FUNCTION auto make_evaluator(NodeType node, Tile tile,
 #include <TensorOperations/Evaluator/Level.hpp>
 
 }  // namespace TensorOperations
+
+#if defined(TENSOR_OPS_ENABLE_CUTE)
+#include <TensorOperations/Evaluator/Cute.hpp>
+#endif
