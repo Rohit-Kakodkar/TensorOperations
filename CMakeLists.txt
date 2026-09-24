@@ -164,6 +164,10 @@ if(TENSOR_OPS_CUTLASS_DIR AND Kokkos_ENABLE_CUDA)
   add_executable(test_cute_stage tests/test_cute_stage.cpp)
   target_link_libraries(test_cute_stage PRIVATE tensor GTest::gtest)
   gtest_discover_tests(test_cute_stage)
+
+  add_executable(test_cute_store tests/test_cute_store.cpp)
+  target_link_libraries(test_cute_store PRIVATE tensor GTest::gtest)
+  gtest_discover_tests(test_cute_store)
 endif()
 
 # ---------------------------------------------------------------------------
