@@ -139,10 +139,17 @@ add_executable(test_level_graph tests/test_level_graph.cpp)
 target_link_libraries(test_level_graph PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_level_graph)
 
-# test_einsum_node — labels decide the sum; delta-structured operands.
-add_executable(test_einsum_node tests/test_einsum_node.cpp)
-target_link_libraries(test_einsum_node PRIVATE tensor GTest::gtest)
-gtest_discover_tests(test_einsum_node)
+# test_general_contraction — n-ary contractions; delta-structured operands.
+add_executable(test_general_contraction tests/test_general_contraction.cpp)
+target_link_libraries(test_general_contraction PRIVATE tensor GTest::gtest)
+gtest_discover_tests(test_general_contraction)
+
+# test_structured_operands — Structured.hpp: delta/outer/stack used directly
+# as make_contraction_node operands, plus its ContractionTag vs
+# GeneralContractionTag dispatch. Custom main() wraps Kokkos init/finalize.
+add_executable(test_structured_operands tests/test_structured_operands.cpp)
+target_link_libraries(test_structured_operands PRIVATE tensor GTest::gtest)
+gtest_discover_tests(test_structured_operands)
 
 # test_functional_input — a leaf whose elements are computed, not addressed.
 # Custom main() wraps Kokkos init/finalize; every case launches a graph.

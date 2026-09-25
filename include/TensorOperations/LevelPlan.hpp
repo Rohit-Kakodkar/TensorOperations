@@ -201,6 +201,70 @@ constexpr void lg_note_all_reads(std::array<std::size_t, NS>& last,
    ...);
 }
 
+// --- streamed roots ----------------------------------------------------------
+//
+// A root is normally computed into its scratch tile and copied to its output
+// view by lg_store_roots after the last level. A GENERAL-CONTRACTION member
+// can instead store each value straight into the output view at its global
+// coordinate, and then the tile is dead weight -- the stiffness block's is
+// 62.5 KB. So a slot is STREAMED when
+//
+//   * it is a general-contraction member's output,
+//   * it is designated exactly once in outputs(...) (the RootsSeq), and
+//   * no member reads it (the same operand scan as liveness; a member cannot
+//     read its own level, so this means no later member).
+//
+// A streamed slot occupies no storage: it takes slot_pool_none, clashes with
+// nothing in the colouring, and lg_store_roots skips it.
+
+// Per flat member: is it a general contraction?
+template <typename LevelT, std::size_t... Ms>
+constexpr std::array<bool, sizeof...(Ms)> lg_member_general_impl(
+    std::index_sequence<Ms...>) {
+  return {
+      has_node_tag_v<GeneralContractionTag, tuple_element_t<Ms, LevelT>>...};
+}
+template <typename LevelT, std::size_t N>
+constexpr void lg_append_level_general(std::array<bool, N>& out,
+                                       std::size_t&         pos) {
+  for (bool g : lg_member_general_impl<LevelT>(
+           std::make_index_sequence<tuple_size_v<LevelT>>{}))
+    out[pos++] = g;
+}
+template <typename LevelsT, std::size_t N, std::size_t... Ls>
+constexpr void lg_fill_flat_general(std::array<bool, N>& out,
+                                    std::index_sequence<Ls...>) {
+  std::size_t pos = 0;
+  (lg_append_level_general<tuple_element_t<Ls, LevelsT>, N>(out, pos), ...);
+}
+
+template <typename LevelsT, std::size_t... Roots>
+constexpr std::array<bool, lg_num_slots<LevelsT>()> lg_streamed_slots() {
+  constexpr std::size_t NS = lg_num_slots<LevelsT>();
+  constexpr std::size_t NL = tuple_size_v<LevelsT>;
+
+  std::array<bool, lg_total_members<LevelsT>()> general{};
+  lg_fill_flat_general<LevelsT>(general, std::make_index_sequence<NL>{});
+
+  // NL + 1 is no level: a slot still holding it after the scan has no reader.
+  std::array<std::size_t, NS> last{};
+  for (std::size_t s = 0; s < NS; ++s) last[s] = NL + 1;
+  lg_note_all_reads<LevelsT, NS>(last, std::make_index_sequence<NL>{});
+
+  const std::size_t    roots[] = {Roots..., 0};
+  std::array<bool, NS> out{};
+  for (std::size_t s = 0; s < NS; ++s) {
+    std::size_t times = 0;
+    for (std::size_t i = 0; i < sizeof...(Roots); ++i)
+      times += roots[i] == s ? 1 : 0;
+    const std::size_t l = lg_slot_level<LevelsT>(s);
+    const std::size_t m = lg_slot_member<LevelsT>(s);
+    out[s]              = times == 1 && last[s] == NL + 1 && l < NL &&
+             general[lg_member_offset<LevelsT>(l) + m];
+  }
+  return out;
+}
+
 template <typename LevelsT, std::size_t... Roots>
 constexpr auto lg_pool_of_slot() {
   constexpr std::size_t NS = lg_num_slots<LevelsT>();
@@ -220,7 +284,9 @@ constexpr auto lg_pool_of_slot() {
   const std::array<std::size_t, sizeof...(Roots)> roots{Roots...};
   for (std::size_t i = 0; i < sizeof...(Roots); ++i) last[roots[i]] = NL;
 
-  return left_edge_colour<NS>(def, last);
+  // ... unless it is streamed, and then it has no storage at all.
+  return left_edge_colour<NS>(def, last, lg_streamed_slots<LevelsT, Roots...>(),
+                              slot_pool_none);
 }
 
 template <typename LevelsT, std::size_t... Roots>
@@ -228,7 +294,7 @@ constexpr std::size_t lg_pool_count() {
   const auto  p = lg_pool_of_slot<LevelsT, Roots...>();
   std::size_t n = 0;
   for (std::size_t s = 0; s < p.size(); ++s)
-    if (p[s] + 1 > n) n = p[s] + 1;
+    if (p[s] != slot_pool_none && p[s] + 1 > n) n = p[s] + 1;
   return n;
 }
 
@@ -245,6 +311,17 @@ struct lg_plan<LevelsT, std::index_sequence<Roots...>> {
   static constexpr std::size_t count() {
     return lg_pool_count<LevelsT, Roots...>();
   }
+  static constexpr auto streamed() {
+    return lg_streamed_slots<LevelsT, Roots...>();
+  }
+  // Where root slot S sits among the roots (the view it is stored to), or
+  // sizeof...(Roots) if it is not one.
+  static constexpr std::size_t position(std::size_t s) {
+    const std::size_t roots[] = {Roots..., 0};
+    for (std::size_t i = 0; i < sizeof...(Roots); ++i)
+      if (roots[i] == s) return i;
+    return sizeof...(Roots);
+  }
 };
 
 template <typename LevelsT, typename RootsSeq, std::size_t S>
@@ -253,6 +330,14 @@ inline constexpr std::size_t lg_slot_pool_v =
 template <typename LevelsT, typename RootsSeq>
 inline constexpr std::size_t lg_pool_count_v =
     lg_plan<LevelsT, RootsSeq>::count();
+/// Whether slot S is a streamed root (see lg_streamed_slots).
+template <typename LevelsT, typename RootsSeq, std::size_t S>
+inline constexpr bool lg_slot_streamed_v =
+    lg_plan<LevelsT, RootsSeq>::streamed()[S];
+/// The position of slot S in RootsSeq.
+template <typename LevelsT, typename RootsSeq, std::size_t S>
+inline constexpr std::size_t lg_root_position_v =
+    lg_plan<LevelsT, RootsSeq>::position(S);
 
 template <typename Node>
 using member_out_layout_t =
@@ -287,8 +372,9 @@ constexpr bool lg_all_staged_impl(std::index_sequence<Ms...>) {
   return (has_node_tag_v<StagedTag, tuple_element_t<Ms, LevelT>> && ...);
 }
 template <typename LevelT, std::size_t... Ms>
-constexpr bool lg_all_einsum_impl(std::index_sequence<Ms...>) {
-  return (has_node_tag_v<EinsumTag, tuple_element_t<Ms, LevelT>> && ...);
+constexpr bool lg_all_general_impl(std::index_sequence<Ms...>) {
+  return (has_node_tag_v<GeneralContractionTag, tuple_element_t<Ms, LevelT>> &&
+          ...);
 }
 template <typename LevelT>
 inline constexpr bool lg_all_contraction_v = lg_all_contraction_impl<LevelT>(
@@ -301,7 +387,7 @@ inline constexpr bool lg_all_staged_v = lg_all_staged_impl<LevelT>(
     std::make_index_sequence<tuple_size_v<LevelT>>{});
 
 template <typename LevelT>
-inline constexpr bool lg_all_einsum_v = lg_all_einsum_impl<LevelT>(
+inline constexpr bool lg_all_general_v = lg_all_general_impl<LevelT>(
     std::make_index_sequence<tuple_size_v<LevelT>>{});
 
 template <typename LevelT>
@@ -311,7 +397,7 @@ template <typename LevelT>
 inline constexpr bool lg_level_homogeneous_v =
     lg_level_nonempty_v<LevelT> &&
     (lg_all_contraction_v<LevelT> || lg_all_combine_v<LevelT> ||
-     lg_all_staged_v<LevelT> || lg_all_einsum_v<LevelT>);
+     lg_all_staged_v<LevelT> || lg_all_general_v<LevelT>);
 
 template <typename LevelT, std::size_t... Ms>
 constexpr bool lg_contraction_space_impl(std::index_sequence<Ms...>) {
@@ -364,7 +450,7 @@ constexpr int lg_max_operand_slot() {
     const int b = operand_slot<typename Node::node_b_type>();
     return a > b ? a : b;
   } else if constexpr (has_node_tag_v<CombineTag, Node> ||
-                       has_node_tag_v<EinsumTag, Node>) {
+                       has_node_tag_v<GeneralContractionTag, Node>) {
     return lg_max_combine_slot<Node>(
         std::make_index_sequence<static_cast<std::size_t>(Node::NumOps)>{});
   } else if constexpr (has_node_tag_v<StagedTag, Node>) {
@@ -425,8 +511,8 @@ struct LevelPlan {
   static_assert(Impl::lg_levels_homogeneous_v<LevelsT>,
                 "level graph: a level must be NON-EMPTY and HOMOGENEOUS -- "
                 "every member a contraction, every member a combine, every "
-                "member an einsum, or every member a stage. The decodes are different objects, so a mixed "
-                "level computes "
+                "member a general contraction, or every member a stage. The "
+                "decodes are different objects, so a mixed level computes "
                 "both and banks neither");
 
   static_assert(

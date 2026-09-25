@@ -73,7 +73,7 @@ constexpr void note_node_reads(std::array<std::size_t, NS>& last,
     note_read<NS>(last, operand_slot<typename Node::node_a_type>(), k);
     note_read<NS>(last, operand_slot<typename Node::node_b_type>(), k);
   } else if constexpr (has_node_tag_v<CombineTag, Node> ||
-                       has_node_tag_v<EinsumTag, Node>) {
+                       has_node_tag_v<GeneralContractionTag, Node>) {
     note_combine_reads<Node, NS>(
         last, k,
         std::make_index_sequence<static_cast<std::size_t>(Node::NumOps)>{});
@@ -102,17 +102,27 @@ constexpr void note_node_reads(std::array<std::size_t, NS>& last,
 // The coloring knows nothing about members, levels or tiles -- it is a function
 // of two integer arrays. Callers must supply CLOSED ranges; the overlap test
 // below relies on it.
+//
+// `skip` marks slots that occupy NO storage (a level graph's streamed roots):
+// they take the pool `none` and clash with nothing, so the others are coloured
+// exactly as if they were absent.
 template <std::size_t NS>
 constexpr std::array<std::size_t, NS> left_edge_colour(
     const std::array<std::size_t, NS>& def,
-    const std::array<std::size_t, NS>& last) {
+    const std::array<std::size_t, NS>& last, const std::array<bool, NS>& skip,
+    std::size_t none) {
   std::array<std::size_t, NS> pool{};
   for (std::size_t s = 0; s < NS; ++s) {
+    if (skip[s]) {
+      pool[s] = none;
+      continue;
+    }
     std::size_t p = 0;
     while (true) {
       bool clash = false;
       for (std::size_t t = 0; t < s; ++t)
-        if (pool[t] == p && def[s] <= last[t] && def[t] <= last[s]) {
+        if (!skip[t] && pool[t] == p && def[s] <= last[t] &&
+            def[t] <= last[s]) {
           clash = true;
           break;
         }
@@ -122,6 +132,12 @@ constexpr std::array<std::size_t, NS> left_edge_colour(
     pool[s] = p;
   }
   return pool;
+}
+template <std::size_t NS>
+constexpr std::array<std::size_t, NS> left_edge_colour(
+    const std::array<std::size_t, NS>& def,
+    const std::array<std::size_t, NS>& last) {
+  return left_edge_colour<NS>(def, last, std::array<bool, NS>{}, 0);
 }
 
 // --- tile-index gathering ---------------------------------------------------

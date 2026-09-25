@@ -18,7 +18,7 @@ struct FunctionalTag {};
 struct IntermTag {};
 struct ContractionTag {};
 struct CombineTag {};
-struct EinsumTag {};
+struct GeneralContractionTag {};
 struct SlotTag {};
 struct StagedTag {};
 
@@ -72,6 +72,28 @@ struct is_node_handle<NodeHandle<Tag, Args...>> : std::true_type {};
 template <typename T>
 inline constexpr bool is_node_handle_v =
     is_node_handle<std::remove_cv_t<std::remove_reference_t<T>>>::value;
+
+template <typename T, typename = void>
+struct has_modes_seq : std::false_type {};
+template <typename T>
+struct has_modes_seq<T, std::void_t<typename T::modes_seq>> : std::true_type {};
+
+// A STRUCTURED operand of make_contraction_node -- a delta, outer, stack, or a
+// relabel of one (Structured.hpp). Not a node, and it carries no data: the
+// general contraction lowers it to terms. Recognised by a nested
+// `structured_operand_tag`, so this header need not include Structured.hpp.
+template <typename T>
+inline constexpr bool is_structured_operand_v = requires {
+  typename std::remove_cv_t<std::remove_reference_t<T>>::structured_operand_tag;
+};
+
+// Anything make_contraction_node takes as an operand: a labelled node, or a
+// structured operand.
+template <typename T>
+inline constexpr bool is_contraction_operand_v =
+    (is_node_handle_v<T> &&
+     has_modes_seq<std::remove_cv_t<std::remove_reference_t<T>>>::value) ||
+    is_structured_operand_v<T>;
 
 // Safely extracts T::value_type when it exists; falls back to void.
 template <typename T, typename = void>
@@ -650,6 +672,11 @@ struct NodeHandle<ContractionTag, NodeA, NodeB, IntCRank, Scalar, ExecSpace,
 // canonical (freeA ++ freeB) order; the user's requested order is recorded as a
 // canonical->user permutation so the driver can write the result back
 // correctly.
+//
+// These overloads are taken only when the call IS such a binary contraction
+// (Impl::gemm_call_v); any other make_contraction_node call -- more operands,
+// a structured operand, a label shared with the output -- is the general
+// contraction in GeneralContraction.hpp.
 // ---------------------------------------------------------------------------
 
 namespace Impl {
@@ -714,12 +741,36 @@ auto make_contraction_node_impl(NodeA a, NodeB b, HookOp hook) {
                                                c_shape, std::move(hook)};
 }
 
+// Whether make_contraction_node<Out...>(a, b[, hook]) is this binary GEMM:
+// two node operands whose labels make a valid A x B -> C{Out} (each output
+// label on exactly one side, every other label on both), and a trailing
+// argument, if any, that is a hook rather than a third operand. Every other
+// call is a general contraction -- GeneralContraction.hpp, whose overloads of
+// make_contraction_node carry the complementary constraint (it cannot be
+// included here: it includes this header).
+template <typename OutSeq, typename A, typename B, typename Hook = NoHook>
+constexpr bool gemm_call() {
+  if constexpr (!is_node_handle_v<A> || !is_node_handle_v<B> ||
+                is_contraction_operand_v<Hook>)
+    return false;
+  else if constexpr (!has_modes_seq<A>::value || !has_modes_seq<B>::value)
+    return false;
+  else
+    return valid_contraction_v<static_cast<int>(OutSeq::size()),
+                               typename A::modes_seq, typename B::modes_seq,
+                               OutSeq>;
+}
+template <typename OutSeq, typename A, typename B, typename Hook = NoHook>
+inline constexpr bool gemm_call_v = gemm_call<OutSeq, A, B, Hook>();
+
 }  // namespace Impl
 
 // Primary form: infer the output scalar from NodeA, default execution space.
 //   make_contraction_node<'l','i'>(a, b)
 template <int32_t... OutModes, typename NodeA, typename NodeB,
           typename HookOp = NoHook>
+  requires(Impl::gemm_call_v<std::integer_sequence<int32_t, OutModes...>, NodeA,
+                             NodeB, HookOp>)
 auto make_contraction_node(NodeA a, NodeB b, HookOp hook = {}) {
   return Impl::make_contraction_node_impl<
       typename NodeA::value_type, Kokkos::DefaultExecutionSpace, OutModes...>(
@@ -731,6 +782,8 @@ auto make_contraction_node(NodeA a, NodeB b, HookOp hook = {}) {
 template <typename Scalar, typename ExecSpace = Kokkos::DefaultExecutionSpace,
           int32_t... OutModes, typename NodeA, typename NodeB,
           typename HookOp = NoHook>
+  requires(Impl::gemm_call_v<std::integer_sequence<int32_t, OutModes...>, NodeA,
+                             NodeB, HookOp>)
 auto make_contraction_node(NodeA a, NodeB b, HookOp hook = {}) {
   return Impl::make_contraction_node_impl<Scalar, ExecSpace, OutModes...>(
       std::move(a), std::move(b), std::move(hook));

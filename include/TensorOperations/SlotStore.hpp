@@ -145,6 +145,12 @@ struct SlotTiles {};
 template <std::size_t... Pools>
 struct SlotPools {};
 
+// The pool of a slot that occupies NO storage: a streamed root, whose producer
+// writes the designated output directly (LevelPlan.hpp). It contributes
+// nothing to the arena, and its view -- still typed by its tile, so nothing
+// else changes -- is placed at the arena base and never touched.
+inline constexpr std::size_t slot_pool_none = ~std::size_t{0};
+
 // The arena laid out by POOL rather than by slot: pool P is as big as its
 // largest occupant, pools sit end to end, and every slot assigned to P starts
 // at P's base. Slots sharing a pool therefore ALIAS, which is the point -- the
@@ -177,10 +183,12 @@ struct slot_pool_arena<ValueType, ExecSpace, SlotPools<Pools...>,
     std::size_t pelems[N > 0 ? N : 1] = {};
     std::size_t np                    = 0;
     for (std::size_t k = 0; k < N; ++k) {
+      if (pools[k] == slot_pool_none) continue;  // no storage
       if (steps[k] > pelems[pools[k]]) pelems[pools[k]] = steps[k];
       if (pools[k] + 1 > np) np = pools[k] + 1;
     }
 
+    if (i < N && pools[i] == slot_pool_none) return 0;
     const std::size_t upto = (i >= N) ? np : pools[i];
     std::size_t       off  = 0;
     for (std::size_t p = 0; p < upto; ++p) off += pelems[p];
