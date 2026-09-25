@@ -198,7 +198,7 @@ endif()
 # case is pinned to its OWN diagnostic: a duplicate label and a missing label
 # are independent defects and neither should trip the other's assert.
 # ---------------------------------------------------------------------------
-foreach(case 0 1 2)
+foreach(case 0 1 2 3)
   add_executable(labeltiles_guard_neg_${case} EXCLUDE_FROM_ALL
                  tests/negative/labeltiles_guard_negative.cpp)
   target_link_libraries(labeltiles_guard_neg_${case} PRIVATE tensor)
@@ -214,6 +214,9 @@ set_tests_properties(LabelTilesGuardNegative.Case1 PROPERTIES
 set_tests_properties(LabelTilesGuardNegative.Case2 PROPERTIES
                      PASS_REGULAR_EXPRESSION
                      "must appear in the graph's tile")
+set_tests_properties(LabelTilesGuardNegative.Case3 PROPERTIES
+                     PASS_REGULAR_EXPRESSION
+                     "a contracted label must be LabelWhole")
 
 # ---------------------------------------------------------------------------
 # Negative-compilation tests for the FUNCTIONAL-INPUT guard. Same rationale and

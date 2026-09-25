@@ -15,9 +15,12 @@
 // Selected by -DLABELTILES_NEG_CASE=<n>; exactly one case per target.
 //   1  a map naming the same label twice
 //   2  a node carrying a label the map does not mention
+//   3  a contraction whose contracted label is gridded (LabelTile)
 //   0  the control: a well-formed map, which must COMPILE.
 // ===========================================================================
 #include <TensorOperations/LabelTiles.hpp>
+#include <TensorOperations/LevelGraph.hpp>
+#include <TensorOperations/NodeHandle.hpp>
 
 #include <Kokkos_Core.hpp>
 
@@ -55,6 +58,21 @@ int main() {
   using Map  = LabelTiles<LabelTile<'e', kTE>, LabelTile<'i', kN>>;
   using Tile = tile_from_labels_t<Map, Modes<'e', 'j', 'i'>>;
   return static_cast<int>(Tile::rank == 3);
+
+#elif LABELTILES_NEG_CASE == 3
+  // 'a' is summed over but gridded: each block would own a partial sum.
+  using ES = Kokkos::DefaultExecutionSpace;
+  using Map =
+      LabelTiles<LabelWhole<'q', kN>, LabelTile<'a', 1>, LabelTile<'e', kTE>>;
+  using View = Kokkos::View<float**, Kokkos::LayoutRight, ES>;
+  View h("h", kN, kN), u("u", kTE, kN);
+  auto g0 = make_level_graph<float, ES>(Map{});
+  auto [g1, sh] =
+      g0.add(make_stage_node(make_input_node(make_handle<'q', 'a'>(h))));
+  auto [g2, su] =
+      g1.add(make_stage_node(make_input_node(make_handle<'e', 'a'>(u))));
+  auto g3 = g2.add(make_contraction_node<'q', 'e'>(sh, su));
+  return static_cast<int>(sizeof(g3) > 0);
 
 #else
 #error "unknown LABELTILES_NEG_CASE"
