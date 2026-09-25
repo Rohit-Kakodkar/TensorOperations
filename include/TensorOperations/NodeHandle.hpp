@@ -755,6 +755,18 @@ constexpr bool gemm_call() {
     return false;
   else if constexpr (!has_modes_seq<A>::value || !has_modes_seq<B>::value)
     return false;
+#if defined(TENSOR_OPS_CONTRACTION_BACKEND_GENERAL)
+  // Benchmarking switch: force every hook-less contraction through the
+  // general backend (GeneralContraction.hpp) instead of the GEMM backend
+  // (ContractionTag), so the two backends can be compared on identical call
+  // sites. A call WITH a hook still goes to GEMM -- the general backend has
+  // no hook support. The general overloads in GeneralContraction.hpp are
+  // constrained on the exact negation of this predicate, so returning false
+  // here is what routes the call there. Left undefined, this has no effect
+  // on behaviour.
+  else if constexpr (std::same_as<Hook, NoHook>)
+    return false;
+#endif
   else
     return valid_contraction_v<static_cast<int>(OutSeq::size()),
                                typename A::modes_seq, typename B::modes_seq,

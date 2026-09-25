@@ -291,6 +291,16 @@ if(TENSOR_OPS_BUILD_BENCHMARKS)
     benchmarks/sem_stiffness_3d/bench_sem3d_levelgraph.cpp)
   target_link_libraries(bench_sem3d_levelgraph_li PRIVATE tensor)
   target_compile_options(bench_sem3d_levelgraph_li PRIVATE -lineinfo)
+
+  # _general twin: same source, built against the GENERAL contraction backend
+  # instead of GEMM (see TENSOR_OPS_CONTRACTION_BACKEND_GENERAL in
+  # NodeHandle.hpp). Benchmarking-only, to compare the two backends head to
+  # head on identical call sites.
+  add_executable(bench_sem3d_levelgraph_general
+    benchmarks/sem_stiffness_3d/bench_sem3d_levelgraph.cpp)
+  target_link_libraries(bench_sem3d_levelgraph_general PRIVATE tensor)
+  target_compile_definitions(bench_sem3d_levelgraph_general PRIVATE
+    TENSOR_OPS_CONTRACTION_BACKEND_GENERAL)
 endif()
 
 # sfpp_min — a minimal, zero-dependency stand-in for SPECFEM++'s 3D elastic
@@ -348,6 +358,15 @@ add_executable(sfpp_min_bench_new_li sfpp_min/bench_new.cpp)
 target_link_libraries(sfpp_min_bench_new_li PRIVATE sfpp_min tensor)
 target_compile_options(sfpp_min_bench_new_li PRIVATE -lineinfo)
 
+# _general twin: same source, built against the GENERAL contraction backend
+# instead of GEMM (see TENSOR_OPS_CONTRACTION_BACKEND_GENERAL in
+# NodeHandle.hpp). Benchmarking-only, to compare the two backends head to head
+# on identical call sites.
+add_executable(sfpp_min_bench_new_general sfpp_min/bench_new.cpp)
+target_link_libraries(sfpp_min_bench_new_general PRIVATE sfpp_min tensor)
+target_compile_definitions(sfpp_min_bench_new_general PRIVATE
+  TENSOR_OPS_CONTRACTION_BACKEND_GENERAL)
+
 # The TE (tile-width) sweep. Its own binary because TE is a compile-time
 # parameter of the graph: folding it into bench_new would multiply that
 # harness's whole axis matrix by the number of TE values.
@@ -357,6 +376,15 @@ target_link_libraries(sfpp_min_bench_te PRIVATE sfpp_min tensor)
 add_executable(sfpp_min_bench_te_li sfpp_min/bench_te.cpp)
 target_link_libraries(sfpp_min_bench_te_li PRIVATE sfpp_min tensor)
 target_compile_options(sfpp_min_bench_te_li PRIVATE -lineinfo)
+
+# _general twin: same source, built against the GENERAL contraction backend
+# instead of GEMM (see TENSOR_OPS_CONTRACTION_BACKEND_GENERAL in
+# NodeHandle.hpp). Benchmarking-only, to compare the two backends head to head
+# on identical call sites.
+add_executable(sfpp_min_bench_te_general sfpp_min/bench_te.cpp)
+target_link_libraries(sfpp_min_bench_te_general PRIVATE sfpp_min tensor)
+target_compile_definitions(sfpp_min_bench_te_general PRIVATE
+  TENSOR_OPS_CONTRACTION_BACKEND_GENERAL)
 
 add_executable(sfpp_min_bench_mat sfpp_min/bench_mat.cpp)
 target_link_libraries(sfpp_min_bench_mat PRIVATE sfpp_min)
