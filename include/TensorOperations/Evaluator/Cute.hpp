@@ -6,6 +6,7 @@
 
 #include <cute/tensor.hpp>
 
+#include <array>
 #include <cstddef>
 #include <tuple>
 #include <type_traits>
@@ -211,10 +212,8 @@ struct CuteSmemLoadTag : CuteThreadTag<ThrLayout> {};
 template <typename ThrLayout>
 struct CuteStoreTag : CuteThreadTag<ThrLayout> {};
 
-template <typename Smem, typename ThrLayout>
-struct CuteStagedTag : CuteThreadTag<ThrLayout> {
-  Smem dst;
-};
+template <typename TileShape, typename ThrLayout>
+struct CuteStagedTag : CuteThreadTag<ThrLayout> {};
 
 template <typename AEval, typename BEval, typename TiledMma>
 struct CuteContractTag {
@@ -224,7 +223,140 @@ struct CuteContractTag {
   int      thr_idx;
 };
 
+template <typename TiledMma, int FreeA>
+struct CuteMmaPartitioner {
+  TiledMma mma;
+  int      thr_idx;
+
+  KOKKOS_FUNCTION bool active() const {
+    return thr_idx < static_cast<int>(cute::size(mma));
+  }
+
+  template <typename Tensor>
+  KOKKOS_FUNCTION auto operator()(const Tensor& t) const {
+    constexpr int R = decltype(cute::rank(t))::value;
+    static_assert(FreeA > 0 && FreeA < R,
+                  "CuTe MMA partitioner: C needs at least one free mode from "
+                  "each of A and B");
+    return mma.get_slice(thr_idx).partition_C(
+        cute::group_modes<1, 1 + R - FreeA>(cute::group_modes<0, FreeA>(t)));
+  }
+};
+
+template <typename ThrLayout>
+struct CuteThreadPartitioner {
+  ThrLayout thr_layout;
+  int       thr_idx;
+
+  KOKKOS_FUNCTION bool active() const {
+    return thr_idx < static_cast<int>(cute::size(thr_layout));
+  }
+
+  template <typename Tensor>
+  KOKKOS_FUNCTION auto operator()(const Tensor& t) const {
+    return cute::local_partition(t, thr_layout, thr_idx);
+  }
+};
+
+template <typename Partitioner>
+struct CuteFragmentStoreTag {
+  Partitioner part;
+};
+
 namespace Impl {
+
+template <typename Tile>
+struct cute_shape_of;
+
+template <int... Es>
+struct cute_shape_of<StaticTile<Es...>> {
+  using type = cute::Shape<cute::Int<Es>...>;
+};
+
+template <typename Tile>
+using cute_shape_of_t = typename cute_shape_of<Tile>::type;
+
+template <typename TileShape, std::size_t... Is>
+constexpr std::array<int, sizeof...(Is)> cute_static_extents(
+    std::index_sequence<Is...>) {
+  return {static_cast<int>(
+      decltype(cute::get<Is>(std::declval<TileShape>()))::value)...};
+}
+
+template <typename TileShape, int... Order>
+constexpr std::array<int, sizeof...(Order)> cute_thr_extents(
+    int num_threads, std::integer_sequence<int, Order...>) {
+  constexpr std::size_t R = sizeof...(Order);
+  const auto            ext =
+      cute_static_extents<TileShape>(std::make_index_sequence<R>{});
+  const int          order[] = {Order...};
+  std::array<int, R> thr{};
+  for (std::size_t d = 0; d < R; ++d) thr[d] = 1;
+  int budget = num_threads;
+  for (std::size_t k = 0; k < R; ++k) {
+    const int m = order[k];
+    int       d = ext[m] < budget ? ext[m] : budget;
+    while (ext[m] % d != 0) --d;
+    thr[m] = d;
+    budget /= d;
+  }
+  return thr;
+}
+
+template <int... Order, std::size_t R>
+constexpr std::array<int, R> cute_thr_strides(
+    const std::array<int, R>& thr, std::integer_sequence<int, Order...>) {
+  const int          order[] = {Order...};
+  std::array<int, R> st{};
+  int                s = 1;
+  for (std::size_t k = 0; k < R; ++k) {
+    st[order[k]] = s;
+    s *= thr[order[k]];
+  }
+  return st;
+}
+
+template <typename TileShape, typename Order, int NumThreads>
+inline constexpr auto cute_thr_ext_v =
+    cute_thr_extents<TileShape>(NumThreads, Order{});
+
+template <typename TileShape, typename Order, int NumThreads>
+inline constexpr auto cute_thr_stride_v =
+    cute_thr_strides(cute_thr_ext_v<TileShape, Order, NumThreads>, Order{});
+
+template <typename TileShape, typename Order, int NumThreads, typename Is>
+struct CuteThrLayout;
+
+template <typename TileShape, typename Order, int NumThreads, std::size_t... Is>
+struct CuteThrLayout<TileShape, Order, NumThreads, std::index_sequence<Is...>> {
+  using type = cute::Layout<
+      cute::Shape<
+          cute::Int<cute_thr_ext_v<TileShape, Order, NumThreads>[Is]>...>,
+      cute::Stride<
+          cute::Int<cute_thr_stride_v<TileShape, Order, NumThreads>[Is]>...>>;
+};
+
+template <typename TileShape, typename Order, int NumThreads>
+using cute_thr_layout_t = typename CuteThrLayout<
+    TileShape, Order, NumThreads,
+    std::make_index_sequence<cute::rank_v<TileShape>>>::type;
+
+template <int R, typename ArrayLayout>
+struct view_contiguity {
+  static_assert(std::is_same_v<ArrayLayout, Kokkos::LayoutLeft> ||
+                    std::is_same_v<ArrayLayout, Kokkos::LayoutRight>,
+                "CuTe backend: a staged View must be LayoutLeft or LayoutRight "
+                "so its contiguous mode is known at compile time");
+  template <std::size_t... Is>
+  static auto make(std::index_sequence<Is...>) -> std::conditional_t<
+      std::is_same_v<ArrayLayout, Kokkos::LayoutLeft>,
+      std::integer_sequence<int, static_cast<int>(Is)...>,
+      std::integer_sequence<int, static_cast<int>(R - 1 - Is)...>>;
+  using type = decltype(make(std::make_index_sequence<R>{}));
+};
+
+template <int R, typename ArrayLayout>
+using view_contiguity_t = typename view_contiguity<R, ArrayLayout>::type;
 
 template <typename ES, typename Storage, int R, typename HookOp,
           typename ThrLayout, typename Tag>
@@ -253,9 +385,13 @@ class CuteThreadTileEvaluator {
       : node_(n), tag_(tag) {}
 
  protected:
+  KOKKOS_FUNCTION CuteThreadPartitioner<ThrLayout> partitioner() const {
+    return {tag_.thr_layout, tag_.thr_idx};
+  }
+
   template <typename Tensor>
   KOKKOS_FUNCTION auto partition(const Tensor& t) const {
-    return cute::local_partition(t, tag_.thr_layout, tag_.thr_idx);
+    return partitioner()(t);
   }
 
   node_type   node_;
@@ -267,6 +403,43 @@ KOKKOS_FORCEINLINE_FUNCTION void apply_cute_hook(const Op& op, const Coord& c,
                                                  V& v,
                                                  std::index_sequence<Is...>) {
   op(static_cast<int>(cute::get<Is>(c))..., v);
+}
+
+template <typename Part, typename Tensor, typename Frag>
+inline constexpr bool partitions_like_v =
+    std::is_same_v<decltype(cute::shape(std::declval<const Part&>()(
+                       std::declval<const Tensor&>()))),
+                   decltype(cute::shape(std::declval<Frag>()))>;
+
+template <int R, typename Src, typename Part, typename Tiler, typename Coord,
+          typename T, typename ModesSeq, typename HookOp, int... Perm>
+KOKKOS_FUNCTION void cute_store_global(const Src& src, const Part& part,
+                                       const Tiler& tiler, const Coord& coord,
+                                       const TensorHandle<T, ModesSeq>& out,
+                                       std::integer_sequence<int, Perm...>,
+                                       const HookOp& hook) {
+  static_assert(sizeof...(Perm) == R,
+                "store permutation must have one entry per output mode");
+  static_assert(TensorHandle<T, ModesSeq>::Rank == R,
+                "CuTe store: output rank must equal the tile's rank");
+
+  const auto g = make_cute_handle(out).tensor;
+  const auto gc =
+      cute::make_tensor(g.data(), cute::select<Perm...>(g.layout()));
+  if (!part.active()) return;
+  auto gp = part(cute::local_tile(gc, tiler, coord));
+
+  if constexpr (std::is_same_v<HookOp, NoHook>) {
+    cute::copy(src, gp);
+  } else {
+    const auto cp = part(cute::local_tile(
+        cute::make_identity_tensor(cute::shape(gc)), tiler, coord));
+    for (int i = 0; i < static_cast<int>(cute::size(src)); ++i) {
+      auto v = src(i);
+      apply_cute_hook(hook, cp(i), v, std::make_index_sequence<R>{});
+      gp(i) = v;
+    }
+  }
 }
 
 }  // namespace Impl
@@ -291,49 +464,50 @@ class Evaluator<
                   "staged source and destination must have equal rank");
 
     const auto dst = this->node_.storage_;
-    cute::copy(this->partition(src.node().storage_), this->partition(dst));
+    if (this->partitioner().active())
+      cute::copy(this->partition(src.node().storage_), this->partition(dst));
 
     return Impl::make_cute_value_evaluator<ES>(dst, src.node().hook_op);
   }
 };
 
 template <typename ES, typename Operand, typename ModesSeq, typename NodeTile,
-          typename Smem, typename ThrLayout>
+          typename TileShape, typename ThrLayout>
 class Evaluator<CutePolicyTag<ES>,
                 NodeHandle<StagedTag, Operand, ModesSeq, NodeTile>,
-                CuteStagedTag<Smem, ThrLayout>> {
-  static_assert(cute::is_tensor<Smem>::value,
-                "CuTe staged: destination must be a cute::Tensor");
-  static_assert(cute::is_static<typename Smem::layout_type>::value,
-                "CuTe staged: destination layout must be static");
-
+                CuteStagedTag<TileShape, ThrLayout>> {
  public:
-  using node_type    = NodeHandle<StagedTag, Operand, ModesSeq, NodeTile>;
-  using policy_tag   = CutePolicyTag<ES>;
-  using tiling_type  = CuteStagedTag<Smem, ThrLayout>;
-  using value_type   = typename node_type::value_type;
-  using exec_space   = ES;
-  using modes_seq    = typename node_type::modes_seq;
-  using storage_type = Smem;
+  using node_type   = NodeHandle<StagedTag, Operand, ModesSeq, NodeTile>;
+  using policy_tag  = CutePolicyTag<ES>;
+  using tiling_type = CuteStagedTag<TileShape, ThrLayout>;
+  using value_type  = typename node_type::value_type;
+  using exec_space  = ES;
+  using modes_seq   = typename node_type::modes_seq;
   static constexpr int Rank = node_type::Rank;
 
-  static_assert(Smem::rank == Rank,
-                "CuTe staged: destination rank must equal the operand's rank");
+  static_assert(cute::is_static<TileShape>::value &&
+                    cute::rank_v<TileShape> == Rank,
+                "CuTe staged: the tile shape must be static with one mode per "
+                "operand mode");
+  static_assert(cute::is_static<ThrLayout>::value &&
+                    cute::rank_v<ThrLayout> == Rank,
+                "CuTe staged: the thread layout must be static with one mode "
+                "per operand mode");
 
   KOKKOS_FUNCTION Evaluator(node_type n, tiling_type tag)
       : node_(n), tag_(tag) {}
 
   template <typename Coord>
   KOKKOS_FUNCTION auto operator()(const Coord& coord) const {
-    auto src = make_evaluator<CutePolicyTag<ES>>(node_.operand_,
-                                                 cute::shape(tag_.dst))(coord);
-    auto stager = make_evaluator<CutePolicyTag<ES>>(
-        make_cute_interm_node<ES>(tag_.dst),
-        CuteSmemLoadTag<ThrLayout>{{tag_.thr_layout, tag_.thr_idx}});
-    return (stager = src);
+    const auto src =
+        make_evaluator<CutePolicyTag<ES>>(node_.operand_, TileShape{})(coord);
+    const CuteThreadPartitioner<ThrLayout> part{tag_.thr_layout, tag_.thr_idx};
+    const auto coords = part(cute::make_identity_tensor(TileShape{}));
+    auto       frag   = cute::make_tensor<value_type>(cute::shape(coords));
+    if (part.active()) cute::copy(part(src.node().storage_), frag);
+    return Impl::make_cute_fragment_value_evaluator<ES, Rank, TileShape>(
+        frag, coords, src.node().hook_op);
   }
-
-  KOKKOS_FUNCTION const storage_type& storage() const { return tag_.dst; }
 
  private:
   node_type   node_;
@@ -354,34 +528,14 @@ class Evaluator<
  public:
   using base::base;
 
-  template <typename Coord, typename T, typename ModesSeq, int... Perm>
+  template <typename Coord, typename T, typename ModesSeq, typename PermSeq>
   KOKKOS_FUNCTION void operator()(const Coord&                     coord,
                                   const TensorHandle<T, ModesSeq>& out,
-                                  std::integer_sequence<int, Perm...>) const {
-    static_assert(sizeof...(Perm) == R,
-                  "store permutation must have one entry per output mode");
-    static_assert(TensorHandle<T, ModesSeq>::Rank == R,
-                  "CuTe store: output rank must equal the tile's rank");
-
-    const auto g = Impl::make_cute_handle(out).tensor;
-    const auto gc =
-        cute::make_tensor(g.data(), cute::select<Perm...>(g.layout()));
-    const auto tiler = cute::shape(this->node_.storage_);
-    const auto sp    = this->partition(this->node_.storage_);
-    auto       gp    = this->partition(cute::local_tile(gc, tiler, coord));
-
-    if constexpr (std::is_same_v<HookOp, NoHook>) {
-      cute::copy(sp, gp);
-    } else {
-      const auto cp = this->partition(cute::local_tile(
-          cute::make_identity_tensor(cute::shape(gc)), tiler, coord));
-      for (int i = 0; i < static_cast<int>(cute::size(sp)); ++i) {
-        auto v = sp(i);
-        Impl::apply_cute_hook(this->node_.hook_op, cp(i), v,
-                              std::make_index_sequence<R>{});
-        gp(i) = v;
-      }
-    }
+                                  PermSeq                          perm) const {
+    const auto part = this->partitioner();
+    Impl::cute_store_global<R>(part(this->node_.storage_), part,
+                               cute::shape(this->node_.storage_), coord, out,
+                               perm, this->node_.hook_op);
   }
 };
 
@@ -828,6 +982,100 @@ class Evaluator<CutePolicyTag<ES>,
  private:
   ThrLayout thr_layout_;
   int       thr_idx_;
+};
+
+template <typename ES, typename Storage, int R, typename HookOp,
+          typename Partitioner>
+class Evaluator<
+    CutePolicyTag<ES>,
+    NodeHandle<IntermTag, Storage, std::integral_constant<int, R>, ES, HookOp>,
+    CuteFragmentStoreTag<Partitioner>> {
+  static_assert(cute::is_tensor<Storage>::value &&
+                    cute::is_smem<Storage>::value,
+                "CuTe fragment store: destination must be a shared-memory "
+                "cute::Tensor");
+  static_assert(cute::is_static<typename Storage::layout_type>::value,
+                "CuTe fragment store: destination layout must be static");
+
+ public:
+  using node_type   = NodeHandle<IntermTag, Storage,
+                                 std::integral_constant<int, R>, ES, HookOp>;
+  using policy_tag  = CutePolicyTag<ES>;
+  using tiling_type = CuteFragmentStoreTag<Partitioner>;
+  static constexpr int Rank = R;
+  using storage_type        = Storage;
+  using value_type          = typename node_type::value_type;
+  using exec_space          = ES;
+
+  KOKKOS_FUNCTION Evaluator(node_type n, tiling_type tag)
+      : node_(n), tag_(tag) {}
+
+  template <typename FragEval>
+  KOKKOS_FUNCTION auto operator=(const FragEval& src) const {
+    static_assert(Impl::is_cute_fragment_eval_v<FragEval>,
+                  "CuTe fragment store: the source must be a fragment "
+                  "evaluator");
+    static_assert(FragEval::Rank == R,
+                  "CuTe fragment store: fragment and destination must have "
+                  "equal rank");
+    static_assert(
+        std::is_same_v<decltype(cute::flatten(
+                           cute::shape(std::declval<Storage>()))),
+                       typename FragEval::tile_shape_type>,
+        "CuTe fragment store: the destination must have the fragment's tile "
+        "extents");
+    static_assert(
+        Impl::partitions_like_v<Partitioner, Storage,
+                                typename FragEval::storage_type>,
+        "CuTe fragment store: the partitioner must partition the destination "
+        "exactly as the fragment's producer partitioned it");
+
+    const auto dst = node_.storage_;
+    if (tag_.part.active()) cute::copy(src.node().frag_, tag_.part(dst));
+    return Impl::make_cute_value_evaluator<ES>(dst, src.node().hook_op);
+  }
+
+ private:
+  node_type   node_;
+  tiling_type tag_;
+};
+
+template <typename ES, typename Frag, typename Coords, typename TileShape,
+          int R, typename HookOp, typename Partitioner>
+class Evaluator<CutePolicyTag<ES>,
+                NodeHandle<FragmentTag, Frag, Coords, TileShape,
+                           std::integral_constant<int, R>, ES, HookOp>,
+                CuteFragmentStoreTag<Partitioner>> {
+  static_assert(
+      Impl::partitions_like_v<
+          Partitioner, decltype(cute::make_identity_tensor(TileShape{})), Frag>,
+      "CuTe fragment store: the partitioner must partition the tile exactly "
+      "as the fragment's producer partitioned it");
+
+ public:
+  using node_type    = NodeHandle<FragmentTag, Frag, Coords, TileShape,
+                                  std::integral_constant<int, R>, ES, HookOp>;
+  using policy_tag   = CutePolicyTag<ES>;
+  using tiling_type  = CuteFragmentStoreTag<Partitioner>;
+  using storage_type = Frag;
+  using value_type   = typename node_type::value_type;
+  using exec_space   = ES;
+  static constexpr int Rank = R;
+
+  KOKKOS_FUNCTION Evaluator(node_type n, tiling_type tag)
+      : node_(n), tag_(tag) {}
+
+  template <typename Coord, typename T, typename ModesSeq, typename PermSeq>
+  KOKKOS_FUNCTION void operator()(const Coord&                     coord,
+                                  const TensorHandle<T, ModesSeq>& out,
+                                  PermSeq                          perm) const {
+    Impl::cute_store_global<R>(node_.frag_, tag_.part, TileShape{}, coord, out,
+                               perm, node_.hook_op);
+  }
+
+ private:
+  node_type   node_;
+  tiling_type tag_;
 };
 
 }  // namespace TensorOperations

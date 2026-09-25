@@ -11,6 +11,23 @@
 
 namespace TensorOperations {
 
+namespace Impl {
+
+template <typename LT, typename Member>
+constexpr bool lg_contracted_labels_whole() {
+  if constexpr (!has_node_tag_v<ContractionTag, Member>) {
+    return true;
+  } else {
+    constexpr auto a = seq_to_array(typename Member::node_a_type::modes_seq{});
+    constexpr auto c = seq_to_array(typename Member::modes_seq{});
+    for (std::size_t i = 0; i < a.size(); ++i)
+      if (!arr_contains(c, a[i]) && label_gridded_of<LT>(a[i])) return false;
+    return true;
+  }
+}
+
+}  // namespace Impl
+
 template <typename Graph, std::size_t... Roots>
 struct LevelOutputs {
   Graph graph;
@@ -32,13 +49,13 @@ struct LevelOutputs {
 
   template <typename ES, TensorLike... Ts>
   int execute(const TeamPolicyTag<ES>& tag, const Ts&... views) const {
-    return graph.template launch<ES, Roots...>(tag, team, views...);
+    return graph.template launch<Roots...>(tag, team, views...);
   }
 
 #if defined(TENSOR_OPS_ENABLE_CUTE)
-  template <typename ES, TensorLike... Ts>
-  int execute(const CutePolicyTag<ES>& tag, const Ts&... views) const {
-    return graph.template launch<ES, Roots...>(tag, team, views...);
+  template <typename ES, int N, TensorLike... Ts>
+  int execute(const CutePolicyTag<ES, N>& tag, const Ts&... views) const {
+    return graph.template launch<Roots...>(tag, team, views...);
   }
 #endif
 };
@@ -57,6 +74,11 @@ struct LevelGraph {
   // passes through untouched.
   template <typename... Members>
   auto add(const Members&... members) const {
+    static_assert(
+        (Impl::lg_contracted_labels_whole<LabelTilesT, Members>() && ...),
+        "level graph: a contracted label must be LabelWhole -- gridding it "
+        "would split the sum across blocks, and nothing combines the partial "
+        "sums");
     auto level =
         DeviceTuple<Impl::lg_resolve_member_t<LabelTilesT, Members>...>{
             Impl::lg_resolve_member<LabelTilesT, Members>::get(members)...};
@@ -89,7 +111,7 @@ struct LevelGraph {
         std::make_index_sequence<Impl::lg_total_members_v<LevelsT>>{});
   }
 
-  template <typename ES, std::size_t... Roots, typename... ViewTs>
+  template <std::size_t... Roots, typename ES, typename... ViewTs>
   int launch(const TeamPolicyTag<ES>&, int team_size,
              const ViewTs&... views) const {
     check_launch<ES, sizeof...(Roots), sizeof...(ViewTs)>();
@@ -99,13 +121,16 @@ struct LevelGraph {
   }
 
 #if defined(TENSOR_OPS_ENABLE_CUTE)
-  template <typename ES, std::size_t... Roots, typename... ViewTs>
-  int launch(const CutePolicyTag<ES>&, int team_size,
+  template <std::size_t... Roots, typename ES, int N, typename... ViewTs>
+  int launch(const CutePolicyTag<ES, N>&, int team_size,
              const ViewTs&... views) const {
     check_launch<ES, sizeof...(Roots), sizeof...(ViewTs)>();
-    return Impl::lg_execute_cute<ValueType, ExecSpace, LabelTilesT, LevelsT>(
-        levels, scratch_bytes<std::index_sequence<Roots...>>(), team_size,
-        std::index_sequence<Roots...>{}, views...);
+    if (team_size > 0 && team_size != N)
+      Kokkos::abort(
+          "LevelGraph::execute: with the CuTe backend the block size is the "
+          "CutePolicyTag's NumThreads; team_size must match it or be unset");
+    return Impl::lg_execute_cute<ValueType, ExecSpace, LabelTilesT, LevelsT, N>(
+        levels, std::index_sequence<Roots...>{}, views...);
   }
 #endif
 
