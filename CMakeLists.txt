@@ -180,6 +180,10 @@ if(TENSOR_OPS_CUTLASS_DIR AND Kokkos_ENABLE_CUDA)
   add_executable(test_cute_combine tests/test_cute_combine.cpp)
   target_link_libraries(test_cute_combine PRIVATE tensor GTest::gtest)
   gtest_discover_tests(test_cute_combine)
+
+  add_executable(test_cute_level_graph tests/test_cute_level_graph.cpp)
+  target_link_libraries(test_cute_level_graph PRIVATE tensor GTest::gtest)
+  gtest_discover_tests(test_cute_level_graph)
 endif()
 
 # ---------------------------------------------------------------------------
