@@ -3,8 +3,10 @@
 #include <TensorOperations/TiledLayout.hpp>
 #include <TensorOperations/Tiling.hpp>
 #include <TensorOperations/Macros.hpp>
+#include <TensorOperations/ScratchTile.hpp>
 #include <TensorOperations/TimingInstrumentation.hpp>
 #include <array>
+#include <type_traits>
 #include <utility>
 
 #include <Kokkos_Core.hpp>
@@ -13,16 +15,26 @@ namespace TensorOperations {
 
 // ---------------------------------------------------------------------------
 // Policy tags
+//
+// The backend an evaluator targets. TeamPolicyTag is team scratch driven by
+// Kokkos::TeamPolicy. CutePolicyTag is the CuTe backend; it is declared ahead
+// of any Evaluator specialization so the driver can be threaded over the tag.
+// CuTe emits CUDA only, so the tag exists only in a CUDA-enabled build and
+// accepts no execution space but Kokkos::Cuda.
 // ---------------------------------------------------------------------------
 template <typename ES = Kokkos::DefaultExecutionSpace>
 struct TeamPolicyTag {
   using execution_space = ES;
 };
 
-template <typename ES = Kokkos::DefaultExecutionSpace>
-struct TeamPolicyTag2 {
+#if defined(KOKKOS_ENABLE_CUDA)
+template <typename ES = Kokkos::Cuda>
+struct CutePolicyTag {
+  static_assert(std::is_same_v<ES, Kokkos::Cuda>,
+                "CutePolicyTag requires the Kokkos::Cuda execution space");
   using execution_space = ES;
 };
+#endif
 
 // Tiling specs (StaticTile / DynamicTile) live in Tiling.hpp.
 
@@ -236,8 +248,8 @@ KOKKOS_FORCEINLINE_FUNCTION Kokkos::Array<T, M> as_result_array(
 //
 // This is where the phase-1 restriction on fused combine operands lives, and
 // the one place a phase-2 output selector would take an index instead of
-// asserting M == 1. Stated here rather than at the ScratchAllocator call site
-// so the restriction is one declaration, not a condition duplicated per
+// asserting M == 1. Stated here rather than at each consumer's call site so
+// the restriction is one declaration, not a condition duplicated per
 // consumer.
 //
 // Returns BY VALUE for the same reason as_result_array does: the argument is
@@ -337,14 +349,6 @@ inline constexpr bool produces_own_scratch_v =
 template <typename Node>
 inline constexpr bool reads_foreign_scratch_v = has_node_tag_v<SlotTag, Node>;
 
-// Every node kind an evaluator can consume as an operand: a leaf input, a fused
-// node that produces its own scratch, or a slot naming a buffer some other node
-// already filled.
-template <typename Node>
-inline constexpr bool fusable_operand_v =
-    has_node_tag_v<InputTag, Node> || produces_own_scratch_v<Node> ||
-    reads_foreign_scratch_v<Node>;
-
 // Can operand `Node`, tiled by `Tile`, be staged into the axis order `PermSeq`
 // gathers into?
 //
@@ -359,24 +363,24 @@ inline constexpr bool fusable_operand_v =
 // all: the buffer may have other consumers, and an in-place reorder would
 // permute it under them. So a slot admits ONLY the identity -- the true
 // zero-copy passthrough -- and a differently-ordered consumer must take the
-// relabel path (operand_relabelable_v, below) or name the buffer through a
-// second slot node carrying its own labels. This is why the branch leads: the
-// `!produces_own_scratch_v` test that follows would otherwise answer
-// "unconstrained" for a slot, on the reasoning that it is copied. It is not.
+// relabel path (the relabel evaluator, Evaluator/Team.hpp) or name the
+// buffer through a second slot node carrying its own labels. This is why the
+// branch leads: the `!produces_own_scratch_v` test that follows would
+// otherwise answer "unconstrained" for a slot, on the reasoning that it is
+// copied. It is not.
 //
-// Deliberately spelled with transpositions_equal_extent, the SAME predicate the
-// in-place reorder asserts on the scratch layout at its call site (see
-// Specialization 8 in Evaluator/Team.hpp): stating the rule once means an
-// evaluator's early, friendly rejection cannot drift from what the reorder
-// actually requires. Naming it also makes the rule testable -- a violation is a
-// hard error from inside an evaluator's class body, which no `requires` can
-// detect, so a test can only check it by asserting this predicate directly (see
-// the static_asserts above FusedPermutedOperandATeam in test_graph.cpp).
-// The branches are if constexpr rather than a `||` chain for the same reason
-// Specialization 8 guards its own static_assert that way: transpositions_equal_
-// extent reads extents statically off its argument, which only a StaticTile
-// offers, and a `||` would instantiate it even for the cases that never reach
-// the reorder.
+// Deliberately spelled with transpositions_equal_extent, the SAME predicate an
+// in-place reorder asserts on the scratch layout at its call site: stating the
+// rule once means an evaluator's early, friendly rejection cannot drift from
+// what the reorder actually requires. Naming it also makes the rule testable --
+// a violation is a hard error from inside an evaluator's class body, which no
+// `requires` can detect, so a test can only check it by asserting this
+// predicate directly.
+//
+// The branches are if constexpr rather than a `||` chain because
+// transpositions_equal_extent reads extents statically off its argument, which
+// only a StaticTile offers, and a `||` would instantiate it even for the cases
+// that never reach the reorder.
 template <typename Node, typename Tile, typename PermSeq>
 inline constexpr bool operand_stageable_v = [] {
   if constexpr (reads_foreign_scratch_v<Node>)
@@ -388,59 +392,6 @@ inline constexpr bool operand_stageable_v = [] {
   else
     return transpositions_equal_extent<operand_leaf_tile_t<Node, Tile>>(
         PermSeq{});
-}();
-
-// Should operand `Node` instead be RELABELED into the order `PermSeq` gathers
-// into -- consumed as a strided view over its own scratch, with no copy, no
-// reorder pass, and no constraint relating the permuted axes' extents?
-//
-// The complement of operand_stageable_v, and stated here beside it so the two
-// staging rules are read together and for the same testability reason: a
-// consumer's choice between them is otherwise buried in an evaluator class
-// body, where a test can only observe it by instantiating the whole evaluator.
-//
-// A fused operand (contraction or combine) qualifies, and so does a SLOT: what
-// they have in common is that their storage is per-team scratch, so relabeling
-// it aliases nothing observable -- unlike an input operand, whose storage is
-// the user's global tensor and whose reads would also lose their coalescing if
-// driven by the consumer's traversal order rather than the source's memory
-// order.
-//
-// For a slot this path is not merely permitted but REQUIRED: it is the only way
-// a differently-ordered consumer can read a shared buffer at all, since
-// operand_stageable_v forbids reordering one in place. It stays zero-copy and
-// read-only -- reorder_view retypes the layout and touches no data -- which is
-// exactly what sharing needs.
-//
-// Restricted further to the permuted, unhooked case:
-//   • an identity permutation already costs nothing on the staging path (true
-//     zero-copy passthrough), and relabeling would needlessly retype it;
-//   • a hook is applied by writing back into the operand's own C scratch, so
-//     hooked operands stay on the staging path rather than growing a second
-//     place that mutates a sub-contraction's buffer.
-// Whether the consumer CAN relabel at all is a separate question this predicate
-// does not answer: a contraction's GEMM needs a contiguous LayoutRight source
-// and must always stage. Only the combine evaluator consults this.
-//
-// hook_type is declared only on the ContractionTag node specialization, hence
-// the if constexpr chain rather than a `&&` one. A CombineTag node carries no
-// hook member at all (its fn already sees every coordinate and operand value,
-// so there is no separate store hook to apply), and a SlotTag node carries none
-// by deliberate design (NodeHandle.hpp: a hook writes back into the buffer it
-// rides on, which a shared buffer cannot allow). Both branches therefore drop
-// the hook half of the rule as vacuously satisfied rather than naming a
-// hook_type they do not have.
-template <typename Node, typename PermSeq>
-inline constexpr bool operand_relabelable_v = [] {
-  if constexpr (has_node_tag_v<ContractionTag, Node>)
-    return !is_identity_seq(PermSeq{}) &&
-           std::is_same_v<typename Node::hook_type, NoHook>;
-  else if constexpr (has_node_tag_v<CombineTag, Node>)
-    return !is_identity_seq(PermSeq{});
-  else if constexpr (has_node_tag_v<SlotTag, Node>)
-    return !is_identity_seq(PermSeq{});
-  else
-    return false;
 }();
 
 }  // namespace Impl
@@ -467,40 +418,11 @@ KOKKOS_FUNCTION auto make_evaluator(NodeType node, Tile tile,
   return Evaluator<PolicyTag, NodeType, Tile>(node, tile, team);
 }
 
-// Adopting overload: the evaluator writes its output into `adopted`, a buffer
-// the caller already carved, instead of taking one from the team cursor. A
-// contraction adopts a single scratch view; a multi-output combine adopts a
-// Kokkos::Array of them, one per output.
-//
-// The caller must then request the evaluator's operand_scratch_size_per_team()
-// -- NOT scratch_size_per_team() -- on top of whatever it allocated for
-// `adopted`, or the output is charged twice.
-template <typename PolicyTag, typename NodeType, typename Tile,
-          typename TeamMember, typename Adopted>
-KOKKOS_FUNCTION auto make_evaluator(NodeType node, Tile tile,
-                                    const TeamMember& team,
-                                    const Adopted&    adopted)
-    -> Evaluator<PolicyTag, NodeType, Tile> {
-  return Evaluator<PolicyTag, NodeType, Tile>(node, tile, team, adopted);
-}
-
-// Adopting overload with an OPERAND ARENA: the output is adopted as above, and
-// the operand staging comes from a driver-owned region instead of the team
-// cursor. A driver using this requests the arena ONCE, sized by its largest
-// node, rather than operand_scratch_size_per_team() summed over every node --
-// operand staging is dead at the node's own barrier, so no two nodes' buffers
-// are ever live together. See Impl::OperandArena.
-template <typename PolicyTag, typename NodeType, typename Tile,
-          typename TeamMember, typename Adopted, typename Arena>
-KOKKOS_FUNCTION auto make_evaluator(NodeType node, Tile tile,
-                                    const TeamMember& team,
-                                    const Adopted& adopted, Arena& arena)
-    -> Evaluator<PolicyTag, NodeType, Tile> {
-  return Evaluator<PolicyTag, NodeType, Tile>(node, tile, team, adopted, arena);
-}
-
 #include <TensorOperations/Evaluator/Team.hpp>
-#include <TensorOperations/Evaluator/Team2.hpp>
 #include <TensorOperations/Evaluator/Level.hpp>
 
 }  // namespace TensorOperations
+
+#if defined(TENSOR_OPS_ENABLE_CUTE)
+#include <TensorOperations/Evaluator/Cute.hpp>
+#endif

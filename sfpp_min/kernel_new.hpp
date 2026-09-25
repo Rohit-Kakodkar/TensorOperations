@@ -172,7 +172,7 @@ struct Integrand9 {
 //   ScatterAccel         r0, r1, r2            -> atomic_add    (no slot)
 //
 // WHY SPLIT SOMETHING THAT ALREADY WORKED. A sink level's iteration is driven
-// by its OPERAND 0 (LevelGraph.hpp, lg_run_combine_level: no output slot
+// by its OPERAND 0 (LevelGraph/Team.hpp, lg_run_combine_level: no output slot
 // exists, so the tile comes from evs.get<0>().iter_view()). When operand 0 was
 // tx0 -- a CONTRACTION result -- that view is stored in the contraction's
 // CANONICAL order, freeA ++ freeB = (i, e, k, j), so the memory-order decode
@@ -384,7 +384,7 @@ int new_stiffness(
   if (hw.extent(0) == 0) hw = make_hprimewgll(args.hprime, args.weights);
 
   auto g6 = build_new_graph<KeepRedundantLoads, TE>(args, hw);
-  return g6.outputs().team_size(team_size).execute(TeamPolicyTag2<ES>{});
+  return g6.outputs().team_size(team_size).execute(TeamPolicyTag<ES>{});
 }
 
 }  // namespace sfpp_min

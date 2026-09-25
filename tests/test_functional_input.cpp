@@ -117,7 +117,7 @@ void run_graph(ViewH Hd, ViewC Cd, MakeUNode make_u_node) {
       g0.add(make_stage_node(make_input_node(make_handle<'q', 'a'>(Hd))));
   auto [g2, u] = g1.add(make_stage_node(make_u_node()));
   auto [g3, c] = g2.add(make_contraction_node<'q', 'e', 'b'>(h, u));
-  g3.outputs(c).execute(TeamPolicyTag2<ES>{}, Cd);
+  g3.outputs(c).execute(TeamPolicyTag<ES>{}, Cd);
   Kokkos::fence();
 }
 

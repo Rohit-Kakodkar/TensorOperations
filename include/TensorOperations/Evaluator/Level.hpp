@@ -15,7 +15,7 @@ KOKKOS_FUNCTION auto reorder_operand(Eval e, const Team& team) {
   if constexpr (is_identity_v<PermSeq>) {
     return e;
   } else {
-    return (make_evaluator<TeamPolicyTag2<typename Eval::exec_space>>(
+    return (make_evaluator<TeamPolicyTag<typename Eval::exec_space>>(
                 e, PermSeq{}, team) = e);
   }
 }
@@ -129,7 +129,7 @@ KOKKOS_FUNCTION auto contract_into(NodeT node, AEval a, BEval b, CNode c,
                                    const Team& team) {
   using ES = typename NodeT::exec_space;
 
-  return make_evaluator<TeamPolicyTag2<ES>>(
+  return make_evaluator<TeamPolicyTag<ES>>(
       node,
       ContractOperands{
           Impl::reorder_operand<Impl::node_permA_t<NodeT>>(a, team),

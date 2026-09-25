@@ -79,7 +79,7 @@ void run_stage_node(V3 v, Buf1D out, Kokkos::View<int, ES> rank_out) {
       Kokkos::TeamPolicy<ES>(1, Kokkos::AUTO)
           .set_scratch_size(0, Kokkos::PerTeam(bytes)),
       KOKKOS_LAMBDA(const team_t& team) {
-        auto S = make_evaluator<TeamPolicyTag2<ES>>(
+        auto S = make_evaluator<TeamPolicyTag<ES>>(
             sn, TS{}, team)(Kokkos::Array<int, 3>{0, 0, 0});
         team.team_barrier();
         Kokkos::single(Kokkos::PerTeam(team), [=]() {
@@ -170,13 +170,13 @@ void run_level(V4 u, V2 h0, V2 h1, V2 h2, Buf1D o0, Buf1D o1, Buf1D o2) {
       Kokkos::TeamPolicy<ES>(1, Kokkos::AUTO)
           .set_scratch_size(0, Kokkos::PerTeam(bytes)),
       KOKKOS_LAMBDA(const team_t& team) {
-        auto U = make_evaluator<TeamPolicyTag2<ES>>(
+        auto U = make_evaluator<TeamPolicyTag<ES>>(
             un, TU{}, team)(Kokkos::Array<int, 4>{0, 0, 0, 0});
-        auto A0 = make_evaluator<TeamPolicyTag2<ES>>(
+        auto A0 = make_evaluator<TeamPolicyTag<ES>>(
             h0n, TH0{}, team)(Kokkos::Array<int, 2>{0, 0});
-        auto A1 = make_evaluator<TeamPolicyTag2<ES>>(
+        auto A1 = make_evaluator<TeamPolicyTag<ES>>(
             h1n, TH1{}, team)(Kokkos::Array<int, 2>{0, 0});
-        auto A2 = make_evaluator<TeamPolicyTag2<ES>>(
+        auto A2 = make_evaluator<TeamPolicyTag<ES>>(
             h2n, TH2{}, team)(Kokkos::Array<int, 2>{0, 0});
         team.team_barrier();
 
@@ -329,9 +329,9 @@ void run_sem(V4 u, V2 h, Buf1D o0, Buf1D o1, Buf1D o2) {
       Kokkos::TeamPolicy<ES>(1, Kokkos::AUTO)
           .set_scratch_size(0, Kokkos::PerTeam(bytes)),
       KOKKOS_LAMBDA(const team_t& team) {
-        auto U = make_evaluator<TeamPolicyTag2<ES>>(
+        auto U = make_evaluator<TeamPolicyTag<ES>>(
             un, TU{}, team)(Kokkos::Array<int, 4>{0, 0, 0, 0});
-        auto H = make_evaluator<TeamPolicyTag2<ES>>(
+        auto H = make_evaluator<TeamPolicyTag<ES>>(
             hn, TH{}, team)(Kokkos::Array<int, 2>{0, 0});
         team.team_barrier();
 

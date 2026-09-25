@@ -127,7 +127,7 @@ TEST(SinkCombine, PlainValueSinkIsBitwiseIdenticalToARootedGraph) {
         make_stage_node(make_input_node(make_handle<'e', 'a', 'b', 'c'>(Ud))));
     auto [g3, ca] = g2.add(make_contraction_node<'q', 'e', 'b', 'c'>(h, u));
     auto [g4, pa] = g3.add(make_combine_node<'q', 'e', 'b', 'c'>(ca, ScaleG{}));
-    g4.outputs(pa).execute(TeamPolicyTag2<ES>{}, Prooted);
+    g4.outputs(pa).execute(TeamPolicyTag<ES>{}, Prooted);
     Kokkos::fence();
   }
 
@@ -141,7 +141,7 @@ TEST(SinkCombine, PlainValueSinkIsBitwiseIdenticalToARootedGraph) {
     auto [g3, ca] = g2.add(make_contraction_node<'q', 'e', 'b', 'c'>(h, u));
     auto g4       = g3.add(
         make_combine_node<'q', 'e', 'b', 'c'>(ca, WritePlainSink{Psink}));
-    g4.outputs().execute(TeamPolicyTag2<ES>{});
+    g4.outputs().execute(TeamPolicyTag<ES>{});
     Kokkos::fence();
   }
 
@@ -187,7 +187,7 @@ TEST(SinkCombine, AtomicAccumulateThroughAnIndexMapMatchesReference) {
   auto [g3, ca] = g2.add(make_contraction_node<'q', 'e', 'b', 'c'>(h, u));
   auto g4 =
       g3.add(make_combine_node<'q', 'e', 'b', 'c'>(ca, AccumSink{Ad, Md}));
-  g4.outputs().execute(TeamPolicyTag2<ES>{});
+  g4.outputs().execute(TeamPolicyTag<ES>{});
   Kokkos::fence();
 
   auto Ah = Kokkos::create_mirror_view(Ad);
