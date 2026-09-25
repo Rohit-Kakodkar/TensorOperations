@@ -151,6 +151,37 @@ add_executable(test_sink_combine tests/test_sink_combine.cpp)
 target_link_libraries(test_sink_combine PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_sink_combine)
 
+set(TENSOR_OPS_CUTLASS_DIR "" CACHE PATH
+    "CUTLASS checkout for the CuTe backend (CUDA builds only)")
+if(TENSOR_OPS_CUTLASS_DIR AND Kokkos_ENABLE_CUDA)
+  target_include_directories(tensor INTERFACE ${TENSOR_OPS_CUTLASS_DIR}/include)
+  target_compile_definitions(tensor INTERFACE TENSOR_OPS_ENABLE_CUTE)
+
+  add_executable(test_cute_input tests/test_cute_input.cpp)
+  target_link_libraries(test_cute_input PRIVATE tensor GTest::gtest)
+  gtest_discover_tests(test_cute_input)
+
+  add_executable(test_cute_smem_load tests/test_cute_smem_load.cpp)
+  target_link_libraries(test_cute_smem_load PRIVATE tensor GTest::gtest)
+  gtest_discover_tests(test_cute_smem_load)
+
+  add_executable(test_cute_store tests/test_cute_store.cpp)
+  target_link_libraries(test_cute_store PRIVATE tensor GTest::gtest)
+  gtest_discover_tests(test_cute_store)
+
+  add_executable(test_cute_staged tests/test_cute_staged.cpp)
+  target_link_libraries(test_cute_staged PRIVATE tensor GTest::gtest)
+  gtest_discover_tests(test_cute_staged)
+
+  add_executable(test_cute_contract tests/test_cute_contract.cpp)
+  target_link_libraries(test_cute_contract PRIVATE tensor GTest::gtest)
+  gtest_discover_tests(test_cute_contract)
+
+  add_executable(test_cute_combine tests/test_cute_combine.cpp)
+  target_link_libraries(test_cute_combine PRIVATE tensor GTest::gtest)
+  gtest_discover_tests(test_cute_combine)
+endif()
+
 # ---------------------------------------------------------------------------
 # Negative-compilation tests for the LABEL-TILE MAP guards. Same rationale and
 # same caveats as the slot guards below.
