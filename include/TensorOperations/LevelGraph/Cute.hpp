@@ -128,69 +128,148 @@ __device__ const auto& lg_cute_slot_node(const LevelsT& levels) {
       .template get<lg_slot_member_v<LevelsT, S>>();
 }
 
+template <std::size_t NS>
+struct LgCuteReadRange {
+  std::array<std::size_t, NS> first{};
+  std::array<std::size_t, NS> last{};
+};
+
 template <typename Node, std::size_t NS>
-constexpr void lg_cute_note_reads(std::array<std::size_t, NS>& first,
-                                  std::size_t                  l) {
+constexpr void lg_cute_note_reads(LgCuteReadRange<NS>& r, std::size_t l) {
   if constexpr (has_node_tag_v<ContractionTag, Node>) {
     const std::size_t reads[] = {Node::node_a_type::SlotIdx,
                                  Node::node_b_type::SlotIdx};
-    for (const std::size_t s : reads)
-      if (l < first[s]) first[s] = l;
+    for (const std::size_t s : reads) {
+      if (l < r.first[s]) r.first[s] = l;
+      r.last[s] = l;
+    }
   }
 }
 
 template <typename LevelT, std::size_t NS, std::size_t... Ms>
-constexpr void lg_cute_note_level_reads(std::array<std::size_t, NS>& first,
-                                        std::size_t                  l,
+constexpr void lg_cute_note_level_reads(LgCuteReadRange<NS>& r, std::size_t l,
                                         std::index_sequence<Ms...>) {
-  (lg_cute_note_reads<tuple_element_t<Ms, LevelT>, NS>(first, l), ...);
+  (lg_cute_note_reads<tuple_element_t<Ms, LevelT>, NS>(r, l), ...);
 }
 
 template <typename LevelsT, std::size_t... Ls>
-constexpr auto lg_cute_first_readers(std::index_sequence<Ls...>) {
-  constexpr std::size_t       NS = lg_num_slots_v<LevelsT>;
-  std::array<std::size_t, NS> first{};
-  for (std::size_t s = 0; s < NS; ++s) first[s] = sizeof...(Ls);
+constexpr auto lg_cute_read_range(std::index_sequence<Ls...>) {
+  constexpr std::size_t NS = lg_num_slots_v<LevelsT>;
+  LgCuteReadRange<NS>   r{};
+  for (std::size_t s = 0; s < NS; ++s) r.first[s] = sizeof...(Ls);
   (lg_cute_note_level_reads<tuple_element_t<Ls, LevelsT>, NS>(
-       first, Ls,
+       r, Ls,
        std::make_index_sequence<tuple_size_v<tuple_element_t<Ls, LevelsT>>>{}),
    ...);
-  return first;
+  return r;
 }
+
+template <typename LevelsT>
+inline constexpr auto lg_cute_read_range_v = lg_cute_read_range<LevelsT>(
+    std::make_index_sequence<tuple_size_v<LevelsT>>{});
 
 template <typename LevelsT, std::size_t S>
 inline constexpr std::size_t lg_cute_first_reader_v =
-    lg_cute_first_readers<LevelsT>(
-        std::make_index_sequence<tuple_size_v<LevelsT>>{})[S];
+    lg_cute_read_range_v<LevelsT>.first[S];
+
+template <typename LevelsT, std::size_t S>
+inline constexpr std::size_t lg_cute_last_reader_v =
+    lg_cute_read_range_v<LevelsT>.last[S];
 
 template <typename LevelsT, std::size_t S>
 inline constexpr bool lg_cute_smem_slot_v =
     lg_cute_first_reader_v<LevelsT, S> < tuple_size_v<LevelsT>;
 
+template <typename LevelsT>
+constexpr auto lg_cute_pool_of_slot() {
+  constexpr std::size_t       NS = lg_num_slots_v<LevelsT>;
+  constexpr std::size_t       NL = tuple_size_v<LevelsT>;
+  constexpr auto              r  = lg_cute_read_range_v<LevelsT>;
+  std::array<std::size_t, NS> def{}, last{};
+  for (std::size_t s = 0; s < NS; ++s) {
+    const bool smem = r.first[s] < NL;
+    def[s]          = smem ? r.first[s] : NL + 1 + s;
+    last[s]         = smem ? r.last[s] : NL + 1 + s;
+  }
+  return left_edge_colour<NS>(def, last);
+}
+
+template <typename LevelsT, std::size_t S>
+inline constexpr std::size_t lg_cute_slot_pool_v =
+    lg_cute_pool_of_slot<LevelsT>()[S];
+
 template <typename V, typename ES, typename LevelsT, std::size_t... Ss>
-constexpr std::size_t lg_cute_smem_prefix(std::size_t n,
-                                          std::index_sequence<Ss...>) {
-  const std::size_t steps[] = {
-      (lg_cute_smem_slot_v<LevelsT, Ss>
-           ? slot_arena_step<V, ES>(
-                 slot_tile_elems<lg_slot_tile_t<LevelsT, Ss>>())
-           : std::size_t{0})...,
-      std::size_t{0}};
+constexpr std::array<std::size_t, sizeof...(Ss)> lg_cute_smem_steps(
+    std::index_sequence<Ss...>) {
+  return {(lg_cute_smem_slot_v<LevelsT, Ss>
+               ? slot_arena_step<V, ES>(
+                     slot_tile_elems<lg_slot_tile_t<LevelsT, Ss>>())
+               : std::size_t{0})...};
+}
+
+template <typename V, typename ES, typename LevelsT>
+constexpr std::size_t lg_cute_smem_prefix(std::size_t i) {
+  constexpr std::size_t NS = lg_num_slots_v<LevelsT>;
+  const auto            steps =
+      lg_cute_smem_steps<V, ES, LevelsT>(std::make_index_sequence<NS>{});
+  const auto pools = lg_cute_pool_of_slot<LevelsT>();
+
+  std::array<std::size_t, NS> pelems{};
+  std::size_t                 np = 0;
+  for (std::size_t k = 0; k < NS; ++k) {
+    if (steps[k] > pelems[pools[k]]) pelems[pools[k]] = steps[k];
+    if (steps[k] > 0 && pools[k] + 1 > np) np = pools[k] + 1;
+  }
+  const std::size_t upto = i >= NS ? np : pools[i];
+  std::size_t       off  = 0;
+  for (std::size_t p = 0; p < upto; ++p) off += pelems[p];
+  return off;
+}
+
+template <typename V, typename ES, typename LevelsT>
+constexpr std::size_t lg_cute_unpooled_smem_prefix(std::size_t n) {
+  constexpr std::size_t NS = lg_num_slots_v<LevelsT>;
+  const auto            steps =
+      lg_cute_smem_steps<V, ES, LevelsT>(std::make_index_sequence<NS>{});
   std::size_t o = 0;
-  for (std::size_t k = 0; k < n; ++k) o += steps[k];
+  for (std::size_t k = 0; k < n && k < NS; ++k) o += steps[k];
   return o;
 }
 
 template <typename V, typename ES, typename LevelsT, std::size_t S>
 inline constexpr std::size_t lg_cute_smem_offset_v =
-    lg_cute_smem_prefix<V, ES, LevelsT>(
-        S, std::make_index_sequence<lg_num_slots_v<LevelsT>>{});
+    lg_cute_smem_prefix<V, ES, LevelsT>(S);
 
 template <typename V, typename ES, typename LevelsT>
 inline constexpr std::size_t lg_cute_smem_elems_v =
-    lg_cute_smem_prefix<V, ES, LevelsT>(
-        lg_num_slots_v<LevelsT>,
-        std::make_index_sequence<lg_num_slots_v<LevelsT>>{});
+    lg_cute_smem_prefix<V, ES, LevelsT>(lg_num_slots_v<LevelsT>);
+
+template <typename V, typename ES, typename LevelsT>
+inline constexpr std::size_t lg_cute_unpooled_smem_elems_v =
+    lg_cute_unpooled_smem_prefix<V, ES, LevelsT>(lg_num_slots_v<LevelsT>);
+
+template <typename LevelsT, std::size_t L, std::size_t S>
+constexpr bool lg_cute_slot_reuses_at() {
+  if constexpr (lg_cute_first_reader_v<LevelsT, S> != L) {
+    return false;
+  } else {
+    constexpr std::size_t NS    = lg_num_slots_v<LevelsT>;
+    constexpr auto        r     = lg_cute_read_range_v<LevelsT>;
+    constexpr auto        pools = lg_cute_pool_of_slot<LevelsT>();
+    for (std::size_t t = 0; t < NS; ++t)
+      if (t != S && pools[t] == pools[S] && r.first[t] < L && r.last[t] < L)
+        return true;
+    return false;
+  }
+}
+
+template <typename LevelsT, std::size_t L, typename Ss>
+inline constexpr bool lg_cute_reuses_at_v = false;
+
+template <typename LevelsT, std::size_t L, std::size_t... Ss>
+inline constexpr bool
+    lg_cute_reuses_at_v<LevelsT, L, std::index_sequence<Ss...>> =
+        (lg_cute_slot_reuses_at<LevelsT, L, Ss>() || ...);
 
 template <typename V, typename ES, int NumThreads, typename LevelsT,
           std::size_t S>
@@ -294,6 +373,8 @@ __device__ auto lg_cute_run_level(const LevelsT&                   levels,
         lg_cute_stage_member<ES, NumThreads, LevelsT, GridModes, RootR, L, Ms>(
             levels, grid_idx)...};
   } else {
+    if constexpr (lg_cute_reuses_at_v<LevelsT, L, std::index_sequence<Ss...>>)
+      __syncthreads();
     (lg_cute_materialize<V, ES, NumThreads, LevelsT, L, Ss>(levels, acc, base),
      ...);
     if constexpr (lg_cute_copies_at_v<LevelsT, L, std::index_sequence<Ss...>>)
@@ -425,6 +506,11 @@ void lg_cute_check_wholes(const LevelsT& levels, std::index_sequence<Ls...>) {
 template <typename V, typename ES, typename LevelsT>
 std::size_t lg_cute_smem_bytes() {
   return lg_cute_smem_elems_v<V, ES, LevelsT> * sizeof(V);
+}
+
+template <typename V, typename ES, typename LevelsT>
+std::size_t lg_cute_unpooled_smem_bytes() {
+  return lg_cute_unpooled_smem_elems_v<V, ES, LevelsT> * sizeof(V);
 }
 
 template <typename V, typename ES, typename LT, typename LevelsT,

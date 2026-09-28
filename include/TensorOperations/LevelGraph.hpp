@@ -53,6 +53,11 @@ struct LevelOutputs {
   }
 
 #if defined(TENSOR_OPS_ENABLE_CUTE)
+  std::size_t cute_smem_bytes() const { return graph.cute_smem_bytes(); }
+  std::size_t cute_unpooled_smem_bytes() const {
+    return graph.cute_unpooled_smem_bytes();
+  }
+
   template <typename ES, int N, TensorLike... Ts>
   int execute(const CutePolicyTag<ES, N>& tag, const Ts&... views) const {
     return graph.template launch<Roots...>(tag, team, views...);
@@ -104,6 +109,16 @@ struct LevelGraph {
     return Impl::lg_unpooled_scratch_bytes<ValueType, ExecSpace, LevelsT>(
         std::make_index_sequence<Impl::lg_num_slots_v<LevelsT>>{});
   }
+
+#if defined(TENSOR_OPS_ENABLE_CUTE)
+  std::size_t cute_smem_bytes() const {
+    return Impl::lg_cute_smem_bytes<ValueType, ExecSpace, LevelsT>();
+  }
+
+  std::size_t cute_unpooled_smem_bytes() const {
+    return Impl::lg_cute_unpooled_smem_bytes<ValueType, ExecSpace, LevelsT>();
+  }
+#endif
 
   bool index_consistent() const {
     return index_consistent_impl(
