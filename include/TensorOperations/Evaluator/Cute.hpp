@@ -689,12 +689,14 @@ template <typename... OpEvals>
 struct CuteCombineTag {
   DeviceTuple<OpEvals...>                              ops;
   Kokkos::Array<int, Impl::combine_rank_v<OpEvals...>> origin{};
+  bool                                                 active = true;
 };
 
 template <typename ThrLayout, typename... OpEvals>
 struct CuteCombineThreadTag : CuteThreadTag<ThrLayout> {
   DeviceTuple<OpEvals...>                              ops;
   Kokkos::Array<int, Impl::combine_rank_v<OpEvals...>> origin{};
+  bool                                                 active = true;
 };
 
 namespace Impl {
@@ -743,8 +745,9 @@ class CuteCombineEvaluator<ES,
       decltype(cute::flatten(std::declval<view_shape_t<K>>()));
 
   KOKKOS_FUNCTION CuteCombineEvaluator(node_type n, DeviceTuple<OpEvals...> ops,
-                                       Kokkos::Array<int, Rank> origin)
-      : fn_(n.fn), ops_(ops), origin_(origin) {}
+                                       Kokkos::Array<int, Rank> origin,
+                                       bool                     active)
+      : fn_(n.fn), ops_(ops), origin_(origin), active_(active) {}
 
  protected:
   template <std::size_t K>
@@ -766,7 +769,8 @@ class CuteCombineEvaluator<ES,
                                 const Proto&  proto) const {
     using frag_t = decltype(cute::make_tensor<S>(cute::shape(proto)));
     Kokkos::Array<frag_t, NumOut> outs;
-    for (int v = 0; v < static_cast<int>(cute::size(coords)); ++v) {
+    const int nv = active_ ? static_cast<int>(cute::size(coords)) : 0;
+    for (int v = 0; v < nv; ++v) {
       const auto oc = cute::flatten(coords(v));
       const auto r  = as_output_array<S>(
           apply_combine(fn_, global_index(oc, std::make_index_sequence<Rank>{}),
@@ -780,6 +784,7 @@ class CuteCombineEvaluator<ES,
   [[no_unique_address]] CombineFn fn_;
   DeviceTuple<OpEvals...>         ops_;
   Kokkos::Array<int, Rank>        origin_;
+  bool                            active_;
 
  private:
   template <std::size_t K, typename Coord>
@@ -920,7 +925,7 @@ class Evaluator<CutePolicyTag<ES>,
   using tiling_type = CuteCombineTag<OpEvals...>;
 
   KOKKOS_FUNCTION Evaluator(node_type n, tiling_type t)
-      : base(n, t.ops, t.origin) {}
+      : base(n, t.ops, t.origin, t.active) {}
 
   KOKKOS_FUNCTION auto operator()() const {
     const auto& d = this->ops_.template get<D>().node();
@@ -967,7 +972,7 @@ class Evaluator<CutePolicyTag<ES>,
   using tiling_type = CuteCombineThreadTag<ThrLayout, OpEvals...>;
 
   KOKKOS_FUNCTION Evaluator(node_type n, tiling_type t)
-      : base(n, t.ops, t.origin),
+      : base(n, t.ops, t.origin, t.active),
         thr_layout_(t.thr_layout),
         thr_idx_(t.thr_idx) {}
 
