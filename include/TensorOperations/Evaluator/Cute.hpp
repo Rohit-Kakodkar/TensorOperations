@@ -563,15 +563,15 @@ KOKKOS_FUNCTION auto group_free_contracted(const Tensor& t) {
 }  // namespace Impl
 
 template <typename ES, typename NA, typename NB, typename IntCRank, typename S,
-          typename HookOp, typename CModesSeq, typename PermCSeq,
+          typename HookOp, typename CModesSeq, typename PermCSeq, typename Mma,
           typename AEval, typename BEval, typename TiledMma>
 class Evaluator<CutePolicyTag<ES>,
                 NodeHandle<ContractionTag, NA, NB, IntCRank, S, ES, HookOp,
-                           CModesSeq, PermCSeq>,
+                           CModesSeq, PermCSeq, Mma>,
                 CuteContractTag<AEval, BEval, TiledMma>> {
  public:
   using node_type  = NodeHandle<ContractionTag, NA, NB, IntCRank, S, ES, HookOp,
-                                CModesSeq, PermCSeq>;
+                                CModesSeq, PermCSeq, Mma>;
   using policy_tag = CutePolicyTag<ES>;
   using tiling_type = CuteContractTag<AEval, BEval, TiledMma>;
   using value_type  = S;
@@ -642,7 +642,8 @@ class Evaluator<CutePolicyTag<ES>,
     const auto cC   = thr.partition_C(idC);
     auto       frag = thr.partition_fragment_C(idC);
     cute::clear(frag);
-    cute::gemm(tag_.mma, thr.partition_A(sA), thr.partition_B(sB), frag);
+    if (tag_.thr_idx < static_cast<int>(cute::size(tag_.mma)))
+      cute::gemm(tag_.mma, thr.partition_A(sA), thr.partition_B(sB), frag);
 
     return Impl::make_cute_fragment_value_evaluator<
         ES, RankC, decltype(cute::flatten(cute::shape(idC)))>(frag, cC,
