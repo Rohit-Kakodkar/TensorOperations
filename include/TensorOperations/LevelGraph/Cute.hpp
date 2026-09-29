@@ -35,21 +35,26 @@ constexpr bool lg_cute_supported(std::index_sequence<Ls...>) {
   return (lg_cute_level_supported_v<tuple_element_t<Ls, LevelsT>> && ...);
 }
 
-template <typename Operand>
-struct lg_cute_array_layout {
-  static_assert(
-      has_node_tag_v<InputTag, Operand>,
-      "CuTe level graph: a staged operand must be a View-backed input node");
-  using type = typename std::decay_t<
-      decltype(std::declval<Operand>().handle)>::array_layout;
+template <typename Operand, int R, typename Tag = typename Operand::node_tag>
+struct lg_cute_stage_order {
+  static_assert(has_node_tag_v<InputTag, Operand>,
+                "CuTe level graph: a staged operand must be a View-backed or "
+                "functional input node");
+  using type = view_contiguity_t<
+      R, typename std::decay_t<
+             decltype(std::declval<Operand>().handle)>::array_layout>;
+};
+
+template <typename Operand, int R>
+struct lg_cute_stage_order<Operand, R, FunctionalTag> {
+  using type = order_contiguity_t<R, typename Operand::order_tag>;
 };
 
 template <typename Node, int NumThreads>
 struct lg_cute_stage {
   using tile_shape = cute_shape_of_t<member_out_tile_t<Node>>;
-  using order      = view_contiguity_t<
-      Node::Rank,
-      typename lg_cute_array_layout<typename Node::operand_type>::type>;
+  using order      = typename lg_cute_stage_order<typename Node::operand_type,
+                                                  Node::Rank>::type;
   using thr_layout = cute_thr_layout_t<tile_shape, order, NumThreads>;
   using part       = CuteThreadPartitioner<thr_layout>;
 };
