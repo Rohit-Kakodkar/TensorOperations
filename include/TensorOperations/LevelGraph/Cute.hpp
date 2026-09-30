@@ -498,11 +498,8 @@ __device__ auto lg_cute_combine_member(
     const LevelsT& levels, const Kokkos::Array<int, RootR>& grid_idx,
     const Acc& acc, V* base, std::index_sequence<Ks...>,
     std::index_sequence<Os...>) {
-  using Node = tuple_element_t<M, tuple_element_t<L, LevelsT>>;
-  using Plan = lg_cute_combine_plan<LevelsT, L, M, NumThreads>;
-  static_assert(Node::NumOut > 0,
-                "level graph (CuTe): sink combines (fn returning void) are not "
-                "supported by the CuTe backend yet");
+  using Node     = tuple_element_t<M, tuple_element_t<L, LevelsT>>;
+  using Plan     = lg_cute_combine_plan<LevelsT, L, M, NumThreads>;
   using Gather   = gather_seq_t<typename Node::modes_seq, GridModes>;
   using OutTile  = member_out_tile_t<Node>;
   const auto idx = node_index<Node::Rank, RootR>(grid_idx, Gather{});
@@ -517,7 +514,7 @@ __device__ auto lg_cute_combine_member(
   const auto& node   = levels.template get<L>().template get<M>();
   const bool  active = Plan::make(levels).active();
 
-  const auto outs = [&] {
+  const auto run = [&] {
     if constexpr (Plan::register_driven)
       return make_evaluator<CutePolicyTag<ES>>(
           node,
@@ -533,8 +530,14 @@ __device__ auto lg_cute_combine_member(
               ops,
               origin,
               active})();
-  }();
-  return DeviceTuple<std::decay_t<decltype(outs[Os])>...>{outs[Os]...};
+  };
+  if constexpr (Node::NumOut == 0) {
+    run();
+    return DeviceTuple<>{};
+  } else {
+    const auto outs = run();
+    return DeviceTuple<std::decay_t<decltype(outs[Os])>...>{outs[Os]...};
+  }
 }
 
 template <typename A, typename B, std::size_t... As, std::size_t... Bs>

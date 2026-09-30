@@ -831,9 +831,6 @@ class CuteCombineEvaluator<ES,
 
   static_assert(sizeof...(OpEvals) == NumOps,
                 "CuTe combine: one operand evaluator per node operand");
-  static_assert(NumOut >= 1,
-                "CuTe combine: a sink combine (fn returning void) is not "
-                "supported by the CuTe backend yet");
   static_assert(((OpEvals::Rank == Rank) && ...),
                 "CuTe combine: every operand must have the output's rank");
   static_assert((cute_combine_operand_ok<OpEvals>() && ...),
@@ -874,6 +871,27 @@ class CuteCombineEvaluator<ES,
   template <typename TileShape, typename Coords, typename Proto>
   KOKKOS_FUNCTION auto evaluate(const Coords& coords,
                                 const Proto&  proto) const {
+    if constexpr (NumOut == 0) {
+      const int nv = active_ ? static_cast<int>(cute::size(coords)) : 0;
+      for (int v = 0; v < nv; ++v) {
+        const auto oc = cute::flatten(coords(v));
+        apply_combine(fn_, global_index(oc, std::make_index_sequence<Rank>{}),
+                      gather(v, oc, std::make_index_sequence<NumOps>{}));
+      }
+    } else {
+      return evaluate_outputs<TileShape>(coords, proto);
+    }
+  }
+
+  [[no_unique_address]] CombineFn fn_;
+  DeviceTuple<OpEvals...>         ops_;
+  Kokkos::Array<int, Rank>        origin_;
+  bool                            active_;
+
+ private:
+  template <typename TileShape, typename Coords, typename Proto>
+  KOKKOS_FUNCTION auto evaluate_outputs(const Coords& coords,
+                                        const Proto&  proto) const {
     using frag_t = decltype(cute::make_tensor<S>(cute::shape(proto)));
     Kokkos::Array<frag_t, NumOut> outs;
     const int nv = active_ ? static_cast<int>(cute::size(coords)) : 0;
@@ -888,12 +906,6 @@ class CuteCombineEvaluator<ES,
                                    std::make_index_sequence<NumOut>{});
   }
 
-  [[no_unique_address]] CombineFn fn_;
-  DeviceTuple<OpEvals...>         ops_;
-  Kokkos::Array<int, Rank>        origin_;
-  bool                            active_;
-
- private:
   template <std::size_t K, typename Coord>
   KOKKOS_FUNCTION S read(int v, const Coord& oc) const {
     if constexpr (is_cute_fragment_eval_v<op_eval_t<K>>)
