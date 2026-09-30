@@ -78,8 +78,9 @@ struct has_modes_seq : std::false_type {};
 template <typename T>
 struct has_modes_seq<T, std::void_t<typename T::modes_seq>> : std::true_type {};
 
-// A STRUCTURED operand of make_contraction_node -- a delta, outer, stack, or a
-// relabel of one (Structured.hpp). Not a node, and it carries no data: the
+// A STRUCTURED operand of make_contraction_node -- the result of
+// make_delta_node, make_outer_product_node or make_stack_node, or a relabel of
+// one (Structured.hpp). Not a node, and it carries no data: the
 // general contraction lowers it to terms. Recognised by a nested
 // `structured_operand_tag`, so this header need not include Structured.hpp.
 template <typename T>

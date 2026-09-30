@@ -5,27 +5,34 @@
 // (GeneralContraction.hpp), as are dense nodes (slots, functional inputs), and
 // they nest:
 //
-//   delta<'a','b'>()               identity delta_ab, zero storage
-//   delta<'r'>(idx<t>)             unit vector e_t(r): 1 where r == t
-//   outer(x, y, ...)               outer product; the operands' label sets
-//                                  must be disjoint; labels = concatenation
-//   stack<'r'>(b_0, ..., b_{n-1})  lazy np.stack: the value is b_t where
-//                                  r == t; every b_t carries the same label
-//                                  SET (any order); labels = ('r', then b_0's
-//                                  labels in b_0's order)
-//   x.as<New...>()                 positional relabel over x's label order,
-//                                  zero-copy (like a slot's .as<>)
+//   make_delta_node<'a','b'>()        identity delta_ab, zero storage
+//   make_delta_node<'r'>(idx<t>)      unit vector e_t(r): 1 where r == t
+//   make_outer_product_node(x, y, ...)
+//                                     outer product; the operands' label sets
+//                                     must be disjoint; labels = concatenation
+//   make_stack_node<'r'>(b_0, ..., b_{n-1})
+//                                     lazy np.stack: the value is b_t where
+//                                     r == t; every b_t carries the same label
+//                                     SET (any order); labels = ('r', then
+//                                     b_0's labels in b_0's order)
+//   x.as<New...>()                    positional relabel over x's label order,
+//                                     zero-copy (like a slot's .as<>)
+//
+// None of them is a graph node on its own: the make_*_node names match the
+// rest of the builder API, and each result only enters a graph as an operand
+// of make_contraction_node.
 //
 // Lowering. Every operand lowers at compile time to a TERM SET, a sum of
 // terms, each a product of dense leaves, label equalities (a == b) and
 // constant bindings (l == t):
 //
-//   dense leaf     { leaf }
-//   delta<a,b>()   { a == b }
-//   delta<r>(t)    { r == t }
-//   outer          cartesian product of the operands' term sets
-//   stack<r>       union over t of b_t's terms, each with r == t added
-//   .as<>          the same terms, every label renamed
+//   dense leaf                    { leaf }
+//   make_delta_node<a,b>()        { a == b }
+//   make_delta_node<r>(idx<t>)    { r == t }
+//   make_outer_product_node       cartesian product of the operands' term sets
+//   make_stack_node<r>            union over t of b_t's terms, each with r == t
+//                                 added
+//   .as<>                         the same terms, every label renamed
 //
 // make_contraction_node multiplies its operands' term sets (first operand
 // outermost) and expands each term against the graph's label map: labels a
@@ -33,9 +40,13 @@
 //
 // The SEM gradient, and the label order it gets:
 //
-//   B = stack<'r'>(outer(hx, delta<'y','j'>(), delta<'z','k'>()),
-//                  outer(delta<'x','i'>(), hy, delta<'z','k'>()),
-//                  outer(delta<'x','i'>(), delta<'y','j'>(), hz));
+//   B = make_stack_node<'r'>(
+//       make_outer_product_node(hx, make_delta_node<'y','j'>(),
+//                               make_delta_node<'z','k'>()),
+//       make_outer_product_node(make_delta_node<'x','i'>(), hy,
+//                               make_delta_node<'z','k'>()),
+//       make_outer_product_node(make_delta_node<'x','i'>(),
+//                               make_delta_node<'y','j'>(), hz));
 //
 // with hx{x,i}, hy{y,j}, hz{z,k}: branch 0's labels are (x,i, y,j, z,k), so
 // B's are (r, x, i, y, j, z, k), and B.as<'s','x','l','y','m','z','n'>() is
@@ -59,7 +70,7 @@ namespace TensorOperations {
 
 // --- the operand types -----------------------------------------------------
 
-/// A constant index t, as a type: the argument of delta<'r'>(idx<t>).
+/// A constant index t, as a type: the argument of make_delta_node<'r'>(idx<t>).
 template <int T>
 struct ConstIndex {
   static_assert(T >= 0, "idx<t>: the index must be non-negative");
@@ -74,7 +85,7 @@ struct Relabeled;
 /// delta_ab: the identity between two labels. No storage.
 template <int32_t A, int32_t B>
 struct Delta {
-  static_assert(A != B, "delta<a, b>(): the two labels must differ");
+  static_assert(A != B, "make_delta_node<a, b>(): the two labels must differ");
   using structured_operand_tag = void;
   using modes_seq              = std::integer_sequence<int32_t, A, B>;
   static constexpr int Rank    = 2;
@@ -97,7 +108,8 @@ struct UnitVector {
 
   template <int32_t... New>
   constexpr auto as() const {
-    static_assert(sizeof...(New) == 1, "delta<r>(idx<t>) as(): one label");
+    static_assert(sizeof...(New) == 1,
+                  "make_delta_node<r>(idx<t>) as(): one label");
     constexpr int32_t l[] = {New...};
     return UnitVector<l[0], T>{};
   }
@@ -136,7 +148,8 @@ constexpr void check_relabel() {
 
 }  // namespace Impl
 
-/// outer(ops...): the product of operands with pairwise-disjoint label sets.
+/// make_outer_product_node(ops...): the product of operands with
+/// pairwise-disjoint label sets.
 template <typename... Ops>
 struct Outer {
   using structured_operand_tag = void;
@@ -154,7 +167,7 @@ struct Outer {
   }
 };
 
-/// stack<R>(branches...): the value is branch t where R == t.
+/// make_stack_node<R>(branches...): the value is branch t where R == t.
 template <int32_t R, typename... Branches>
 struct Stack {
   using structured_operand_tag = void;
@@ -196,51 +209,56 @@ struct Relabeled {
 
 // --- the factories ---------------------------------------------------------
 
-/// delta<'a','b'>(): the identity delta_ab.
+/// make_delta_node<'a','b'>(): the identity delta_ab.
 template <int32_t A, int32_t B>
-constexpr Delta<A, B> delta() {
+constexpr Delta<A, B> make_delta_node() {
   return {};
 }
 
-/// delta<'r'>(idx<t>): the unit vector e_t(r).
+/// make_delta_node<'r'>(idx<t>): the unit vector e_t(r).
 template <int32_t R, int T>
-constexpr UnitVector<R, T> delta(ConstIndex<T>) {
+constexpr UnitVector<R, T> make_delta_node(ConstIndex<T>) {
   return {};
 }
 
-/// outer(ops...): operands with pairwise-disjoint label sets, multiplied.
+/// make_outer_product_node(ops...): operands with pairwise-disjoint label
+/// sets, multiplied.
 template <typename... Ops>
-auto outer(Ops... ops) {
-  static_assert(sizeof...(Ops) >= 1, "outer(): needs at least one operand");
+auto make_outer_product_node(Ops... ops) {
+  static_assert(sizeof...(Ops) >= 1,
+                "make_outer_product_node(): needs at least one operand");
   static_assert((Impl::is_contraction_operand_v<Ops> && ...),
-                "outer(): every operand must be a slot, a functional input, "
-                "or a structured operand (delta, outer, stack, .as<>)");
+                "make_outer_product_node(): every operand must be a slot, a "
+                "functional input, or a structured operand (make_delta_node, "
+                "make_outer_product_node, make_stack_node, .as<>)");
   static_assert(
       Impl::labels_distinct_v<Impl::gc_cat_seq_t<std::integer_sequence<int32_t>,
                                                  typename Ops::modes_seq...>>,
-      "outer(): the operands' label sets must be pairwise disjoint -- a "
-      "shared label is a contraction or a Hadamard product, which is "
-      "make_contraction_node's job");
+      "make_outer_product_node(): the operands' label sets must be pairwise "
+      "disjoint -- a shared label is a contraction or a Hadamard product, "
+      "which is make_contraction_node's job");
   return Outer<Ops...>{std::tuple<Ops...>(std::move(ops)...)};
 }
 
-/// stack<'r'>(b_0, ..., b_{n-1}): the value is b_t where r == t.
+/// make_stack_node<'r'>(b_0, ..., b_{n-1}): the value is b_t where r == t.
 template <int32_t R, typename... Bs>
-auto stack(Bs... bs) {
-  static_assert(sizeof...(Bs) >= 1, "stack<r>(): needs at least one branch");
+auto make_stack_node(Bs... bs) {
+  static_assert(sizeof...(Bs) >= 1,
+                "make_stack_node<r>(): needs at least one branch");
   static_assert((Impl::is_contraction_operand_v<Bs> && ...),
-                "stack<r>(): every branch must be a slot, a functional "
-                "input, or a structured operand (delta, outer, stack, .as<>)");
+                "make_stack_node<r>(): every branch must be a slot, a "
+                "functional input, or a structured operand (make_delta_node, "
+                "make_outer_product_node, make_stack_node, .as<>)");
   using B0 = Impl::gc_first_t<Bs...>;
   static_assert(
       (Impl::same_label_set_v<typename Bs::modes_seq, typename B0::modes_seq> &&
        ...),
-      "stack<r>(): every branch must carry the same label set (in any "
-      "order)");
+      "make_stack_node<r>(): every branch must carry the same label set (in "
+      "any order)");
   static_assert(
       !Impl::arr_contains(Impl::seq_to_array(typename B0::modes_seq{}), R),
-      "stack<r>(): the stacking label must not be one of the branches' "
-      "labels");
+      "make_stack_node<r>(): the stacking label must not be one of the "
+      "branches' labels");
   return Stack<R, Bs...>{std::tuple<Bs...>(std::move(bs)...)};
 }
 

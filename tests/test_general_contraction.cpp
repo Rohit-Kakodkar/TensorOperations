@@ -9,13 +9,17 @@
 //
 //   1. matmul with a batch label carried by one operand -- a valid binary
 //      contraction, so it dispatches to the GEMM; the same product through
-//      outer(a) takes the general path, and both must agree with the host;
+//      make_outer_product_node(a) takes the general path, and both must agree
+//      with the host;
 //   2. a batch (Hadamard) label shared by operands and output;
 //   3. a four-operand contraction whose operands are ALL functional inputs,
 //      so the grid's extent comes from a general-contraction leaf, not a
 //      stage;
 //   4. structured operands: the 3D stiffness pattern K = B^T M B with the
-//      gradient B = stack<'r'>(outer(h, delta, delta), ...), i.e.
+//      gradient
+//        B = make_stack_node<'r'>(make_outer_product_node(h, delta, delta),
+//                                 ...),
+//      i.e.
 //        K = sum_{r,s,z,y,x} B_r(zyx, kji) M(e,a,b,r,s,zyx) B_s(zyx, nml)
 //      against the same expression with a DENSE B and against host loops,
 //      into a rank-9 StridedAlias on team scratch level 1, with the term
@@ -85,10 +89,11 @@ TEST(GeneralContraction, MatmulWithBatchLabel) {
   auto [g2, b] =
       g1.add(make_stage_node(make_input_node(make_handle<'j', 'k'>(B))));
   // Two node operands, each output label on exactly one: the binary GEMM.
-  // A one-operand outer(a) is the same tensor as a, but structured, so the
-  // same product through it is a general contraction.
+  // A one-operand make_outer_product_node(a) is the same tensor as a, but
+  // structured, so the same product through it is a general contraction.
   const auto gemm = make_contraction_node<'e', 'i', 'k'>(a, b);
-  const auto gen  = make_contraction_node<'e', 'i', 'k'>(outer(a), b);
+  const auto gen =
+      make_contraction_node<'e', 'i', 'k'>(make_outer_product_node(a), b);
   static_assert(Impl::has_node_tag_v<ContractionTag, decltype(gemm)>);
   static_assert(Impl::has_node_tag_v<GeneralContractionTag, decltype(gen)>);
 
@@ -355,9 +360,13 @@ TEST(GeneralContraction, StackedDeltasSumFactorTheStiffness) {
   // B_r(z, y, x; k, j, i): the derivative of the tensor-product basis
   // function (k, j, i) along reference direction r, at point (z, y, x) --
   // branch r is h along r times the identity along the other two.
-  const auto B = stack<'r'>(outer(hx, delta<'y', 'j'>(), delta<'z', 'k'>()),
-                            outer(delta<'x', 'i'>(), hy, delta<'z', 'k'>()),
-                            outer(delta<'x', 'i'>(), delta<'y', 'j'>(), hz));
+  const auto B = make_stack_node<'r'>(
+      make_outer_product_node(hx, make_delta_node<'y', 'j'>(),
+                              make_delta_node<'z', 'k'>()),
+      make_outer_product_node(make_delta_node<'x', 'i'>(), hy,
+                              make_delta_node<'z', 'k'>()),
+      make_outer_product_node(make_delta_node<'x', 'i'>(),
+                              make_delta_node<'y', 'j'>(), hz));
   // B's labels are 'r' then branch 0's: (r, x, i, y, j, z, k). The second
   // factor is B relabelled positionally r->s, i->l, j->m, k->n.
   using BModes = std::decay_t<decltype(B)>::modes_seq;
@@ -448,9 +457,13 @@ auto stiffness_graph(const StiffnessInputs& in) {
   auto [g1, hz] =
       g1b.add(make_stage_node(make_input_node(make_handle<'z', 'k'>(in.hz))));
   auto [g2, M]  = g1.add(stiffness_m_node());
-  const auto B  = stack<'r'>(outer(hx, delta<'y', 'j'>(), delta<'z', 'k'>()),
-                             outer(delta<'x', 'i'>(), hy, delta<'z', 'k'>()),
-                             outer(delta<'x', 'i'>(), delta<'y', 'j'>(), hz));
+  const auto B  = make_stack_node<'r'>(
+      make_outer_product_node(hx, make_delta_node<'y', 'j'>(),
+                              make_delta_node<'z', 'k'>()),
+      make_outer_product_node(make_delta_node<'x', 'i'>(), hy,
+                              make_delta_node<'z', 'k'>()),
+      make_outer_product_node(make_delta_node<'x', 'i'>(),
+                              make_delta_node<'y', 'j'>(), hz));
   const auto Bt = B.template as<'s', 'x', 'l', 'y', 'm', 'z', 'n'>();
   return g2.add(
       make_contraction_node<'e', 'a', 'k', 'j', 'i', 'b', 'n', 'm', 'l'>(B, M,
@@ -594,8 +607,9 @@ TEST(GeneralContraction, FunctionalValueLeafBetweenTwoLeaves) {
       }
 }
 
-// C(e,i) = sum_r w(e,r) stack<'r'>(a, b)(r,e,i) = w(e,0) a(e,i) + w(e,1)
-// b(e,i): two terms whose value leaf is a in one and b in the other.
+// C(e,i) = sum_r w(e,r) make_stack_node<'r'>(a, b)(r,e,i)
+//        = w(e,0) a(e,i) + w(e,1) b(e,i): two terms whose value leaf is a in
+// one and b in the other.
 template <typename Map, typename ExpectedValueLabels>
 Kokkos::View<float**, Kokkos::LayoutRight, ES> stacked_value_case(
     const Kokkos::View<float**, Kokkos::LayoutRight, ES>& A,
@@ -607,7 +621,8 @@ Kokkos::View<float**, Kokkos::LayoutRight, ES> stacked_value_case(
              make_stage_node(make_input_node(make_handle<'e', 'i'>(B))));
   auto [g2, w] =
       g1.add(make_stage_node(make_input_node(make_handle<'e', 'r'>(Wr))));
-  auto [g3, c] = g2.add(make_contraction_node<'e', 'i'>(stack<'r'>(a, b), w));
+  auto [g3, c] = g2.add(
+      make_contraction_node<'e', 'i'>(make_stack_node<'r'>(a, b), w));
   using Node =
       std::decay_t<decltype(g3.levels.template get<2>().template get<0>())>;
   static_assert(Node::NumTerms == 2);

@@ -107,8 +107,9 @@ template <typename LT, typename Member, typename... Leaves>
 struct lg_resolve_general<LT, Member, DeviceTuple<Leaves...>> {
   static_assert((gc_leaf_ok_v<Leaves> && ...),
                 "make_contraction_node: in a level graph every dense operand "
-                "(including those inside outer/stack) must be a graph slot "
-                "or a functional input -- stage an input node first");
+                "(including those inside make_outer_product_node / "
+                "make_stack_node) must be a graph slot or a functional "
+                "input -- stage an input node first");
   using S = typename Member::structure_type;
   static constexpr int err =
       gc_first_error<S, LT>(std::make_index_sequence<Member::NumTerms>{});
@@ -131,11 +132,12 @@ struct lg_resolve_general<LT, Member, DeviceTuple<Leaves...>> {
                 "an output label that no delta, idx or stack touches -- "
                 "anything else would index a partial tile");
   static_assert(err != gc_err_stack_extent,
-                "make_contraction_node: a stack<r> label's extent in the "
-                "label map must equal the stack's number of branches");
+                "make_contraction_node: a make_stack_node<r> label's extent "
+                "in the label map must equal the stack's number of branches");
   static_assert(err != gc_err_const_range,
-                "make_contraction_node: a constant index (delta<r>(idx<t>)) "
-                "lies outside its label's extent in the label map");
+                "make_contraction_node: a constant index "
+                "(make_delta_node<r>(idx<t>)) lies outside its label's "
+                "extent in the label map");
   static_assert(!lg_gc_uncarried_gridded<LT, typename Member::modes_seq,
                                          gc_leaf_labels_t<S>>::value,
                 "make_contraction_node: an output label that no dense "

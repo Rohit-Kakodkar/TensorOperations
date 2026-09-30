@@ -1,7 +1,8 @@
 // ===========================================================================
-// test_structured_operands.cpp -- Structured.hpp: delta, outer and stack
-// operands used directly as operands of make_contraction_node<Out...>, the
-// unified n-ary contraction entry point. make_contraction_node dispatches to
+// test_structured_operands.cpp -- Structured.hpp: make_delta_node,
+// make_outer_product_node and make_stack_node operands used directly as
+// operands of make_contraction_node<Out...>, the unified n-ary contraction
+// entry point. make_contraction_node dispatches to
 // ContractionTag for a plain two-operand GEMM shape (every output label in
 // exactly one input, no batch label) and to GeneralContractionTag for
 // everything else -- a shared batch label, or any structured operand.
@@ -11,17 +12,19 @@
 // transposed index cannot hide behind two equal extents), and the gridded
 // element label 'e' has more than one tile so a dropped tile origin shows up.
 //
-//   1. delta<> as a trace: C(e) = sum_{i,j} A(e,i,j) delta(i,j);
-//   2. delta<> as an identity embedding: C(e,i,k) = sum_j A(e,i,j) delta(j,k);
-//   3. delta<> as a diag(w) embedding: C(e,p,f) = w(e,p) delta(p,f);
-//   4. delta<> standing in for an un-formed Kronecker factor;
-//   5. delta<'r'>(idx<1>) as a slice: C(e,a) = sum_r M(e,a,r) e_1(r);
-//   6. stack<> mixing a dense branch and a delta branch;
-//   7. stack<> nested two deep;
-//   8. outer() grouping two operands with disjoint labels, one of them
-//      carrying a batch label straight into the output;
+//   1. make_delta_node<> as a trace: C(e) = sum_{i,j} A(e,i,j) delta(i,j);
+//   2. make_delta_node<> as an identity embedding:
+//      C(e,i,k) = sum_j A(e,i,j) delta(j,k);
+//   3. make_delta_node<> as a diag(w) embedding: C(e,p,f) = w(e,p) delta(p,f);
+//   4. make_delta_node<> standing in for an un-formed Kronecker factor;
+//   5. make_delta_node<'r'>(idx<1>) as a slice:
+//      C(e,a) = sum_r M(e,a,r) e_1(r);
+//   6. make_stack_node<> mixing a dense branch and a delta branch;
+//   7. make_stack_node<> nested two deep;
+//   8. make_outer_product_node() grouping two operands with disjoint labels,
+//      one of them carrying a batch label straight into the output;
 //   9. .as<>() relabelling a stack;
-//  10. delta<> reading a diagonal: C(e,i) = A(e,i,i);
+//  10. make_delta_node<> reading a diagonal: C(e,i) = A(e,i,i);
 //  11. dispatch: node_tag is ContractionTag only for a plain two-operand GEMM
 //      shape, and GeneralContractionTag for a shared batch label or any
 //      delta operand (compile-time only, nothing executes).
@@ -46,7 +49,8 @@ using ES = Kokkos::DefaultExecutionSpace;
 
 namespace {
 
-// --- 1. delta<> as a trace: C(e) = sum_{i,j} A(e,i,j) delta(i,j) -----------
+// --- 1. make_delta_node<> as a trace ---------------------------------------
+// C(e) = sum_{i,j} A(e,i,j) delta(i,j)
 
 float trace_aval(int e, int i, int j) {
   return 0.4f + 0.05f * e - 0.09f * i + 0.07f * j + 0.01f * e * i;
@@ -68,7 +72,8 @@ TEST(StructuredOperands, DeltaTrace) {
   auto g0 = make_level_graph<float, ES>(Map{});
   auto [g1, a] =
       g0.add(make_stage_node(make_input_node(make_handle<'e', 'i', 'j'>(A))));
-  auto [g2, c] = g1.add(make_contraction_node<'e'>(a, delta<'i', 'j'>()));
+  auto [g2, c] =
+      g1.add(make_contraction_node<'e'>(a, make_delta_node<'i', 'j'>()));
   g2.outputs(c).execute(TeamPolicyTag<ES>{}, C);
   Kokkos::fence();
 
@@ -80,15 +85,16 @@ TEST(StructuredOperands, DeltaTrace) {
   }
 }
 
-// --- 2. delta<> as an identity: C(e,i,k) = sum_j A(e,i,j) delta(j,k) -------
-// equals A(e,i,k).
+// --- 2. make_delta_node<> as an identity -----------------------------------
+// C(e,i,k) = sum_j A(e,i,j) delta(j,k) equals A(e,i,k).
 
 float ident_aval(int e, int i, int j) {
   return 0.3f + 0.07f * e - 0.11f * i + 0.05f * j + 0.01f * e * j;
 }
 
 TEST(StructuredOperands, DeltaIdentity) {
-  constexpr int fE = 6, fTE = 3, fI = 4, fJ = 5;  // delta<'j','k'>: j, k = fJ
+  // make_delta_node<'j','k'>: j, k = fJ
+  constexpr int fE = 6, fTE = 3, fI = 4, fJ = 5;
   using Map = LabelTiles<LabelTile<'e', fTE>, LabelWhole<'i', fI>,
                          LabelWhole<'j', fJ>, LabelWhole<'k', fJ>>;
 
@@ -103,8 +109,8 @@ TEST(StructuredOperands, DeltaIdentity) {
   auto g0 = make_level_graph<float, ES>(Map{});
   auto [g1, a] =
       g0.add(make_stage_node(make_input_node(make_handle<'e', 'i', 'j'>(A))));
-  auto [g2, c] =
-      g1.add(make_contraction_node<'e', 'i', 'k'>(a, delta<'j', 'k'>()));
+  auto [g2, c] = g1.add(
+      make_contraction_node<'e', 'i', 'k'>(a, make_delta_node<'j', 'k'>()));
   g2.outputs(c).execute(TeamPolicyTag<ES>{}, C);
   Kokkos::fence();
 
@@ -116,7 +122,8 @@ TEST(StructuredOperands, DeltaIdentity) {
             << e << " " << i << " " << k;
 }
 
-// --- 3. delta<> as a diag(w) embedding: C(e,p,f) = w(e,p) delta(p,f) ------
+// --- 3. make_delta_node<> as a diag(w) embedding ---------------------------
+// C(e,p,f) = w(e,p) delta(p,f)
 
 float diagw_val(int e, int p) {
   return 0.6f + 0.11f * e - 0.08f * p + 0.02f * e * p;
@@ -137,8 +144,8 @@ TEST(StructuredOperands, DeltaDiagEmbedding) {
   auto g0 = make_level_graph<float, ES>(Map{});
   auto [g1, w] =
       g0.add(make_stage_node(make_input_node(make_handle<'e', 'p'>(W))));
-  auto [g2, c] =
-      g1.add(make_contraction_node<'e', 'p', 'f'>(w, delta<'p', 'f'>()));
+  auto [g2, c] = g1.add(
+      make_contraction_node<'e', 'p', 'f'>(w, make_delta_node<'p', 'f'>()));
   g2.outputs(c).execute(TeamPolicyTag<ES>{}, C);
   Kokkos::fence();
 
@@ -151,7 +158,7 @@ TEST(StructuredOperands, DeltaDiagEmbedding) {
       }
 }
 
-// --- 4. delta<> standing in for an un-formed Kronecker factor -------------
+// --- 4. make_delta_node<> standing in for an un-formed Kronecker factor ----
 // C(e,i,j) = sum_{p,q} A(i,p) delta(j,q) U(e,p,q)  ==  (A tensor I) applied
 // to U, without ever forming the (fI*fJ) x (fP*fJ) Kronecker matrix.
 
@@ -187,7 +194,7 @@ TEST(StructuredOperands, DeltaAsKroneckerFactor) {
   auto [g2, u] =
       g1.add(make_stage_node(make_input_node(make_handle<'e', 'p', 'q'>(U))));
   auto [g3, c] = g2.add(
-      make_contraction_node<'e', 'i', 'j'>(a, delta<'j', 'q'>(), u));
+      make_contraction_node<'e', 'i', 'j'>(a, make_delta_node<'j', 'q'>(), u));
   g3.outputs(c).execute(TeamPolicyTag<ES>{}, C);
   Kokkos::fence();
 
@@ -202,8 +209,8 @@ TEST(StructuredOperands, DeltaAsKroneckerFactor) {
       }
 }
 
-// --- 5. delta<'r'>(idx<1>) as a slice: C(e,a) = sum_r M(e,a,r) e_1(r) -----
-// equals M(e,a,1).
+// --- 5. make_delta_node<'r'>(idx<1>) as a slice ----------------------------
+// C(e,a) = sum_r M(e,a,r) e_1(r) equals M(e,a,1).
 
 float slice_mval(int e, int a, int r) {
   return 0.35f + 0.08f * e - 0.06f * a + 0.04f * r + 0.01f * e * r;
@@ -226,7 +233,7 @@ TEST(StructuredOperands, DeltaUnitVectorSlices) {
   auto [g1, m] =
       g0.add(make_stage_node(make_input_node(make_handle<'e', 'a', 'r'>(M))));
   auto [g2, c] =
-      g1.add(make_contraction_node<'e', 'a'>(m, delta<'r'>(idx<1>)));
+      g1.add(make_contraction_node<'e', 'a'>(m, make_delta_node<'r'>(idx<1>)));
   g2.outputs(c).execute(TeamPolicyTag<ES>{}, C);
   Kokkos::fence();
 
@@ -236,8 +243,9 @@ TEST(StructuredOperands, DeltaUnitVectorSlices) {
       EXPECT_NEAR(Ch(e, a), slice_mval(e, a, 1), 1e-5f) << e << " " << a;
 }
 
-// --- 6. stack<> mixing a dense branch and a delta branch --------------------
-// S = stack<'r'>(H.as<'p','f'>(), delta<'p','f'>())     (r has extent 2)
+// --- 6. make_stack_node<> mixing a dense branch and a delta branch ---------
+// S = make_stack_node<'r'>(H.as<'p','f'>(), make_delta_node<'p','f'>())
+//     (r has extent 2)
 // C(e,r,f) = sum_p U(e,p) S(r,p,f)
 //   r=0: sum_p U(e,p) H(p,f)          r=1: U(e,f)
 
@@ -270,7 +278,7 @@ TEST(StructuredOperands, StackMixesDenseAndDelta) {
       g0.add(make_stage_node(make_input_node(make_handle<'p', 'f'>(H))));
   auto [g2, u] =
       g1.add(make_stage_node(make_input_node(make_handle<'e', 'p'>(U))));
-  auto s        = stack<'r'>(h.as<'p', 'f'>(), delta<'p', 'f'>());
+  auto s = make_stack_node<'r'>(h.as<'p', 'f'>(), make_delta_node<'p', 'f'>());
   auto [g3, c] = g2.add(make_contraction_node<'e', 'r', 'f'>(u, s));
   g3.outputs(c).execute(TeamPolicyTag<ES>{}, C);
   Kokkos::fence();
@@ -286,8 +294,10 @@ TEST(StructuredOperands, StackMixesDenseAndDelta) {
     }
 }
 
-// --- 7. stack<> nested two deep ---------------------------------------------
-// Outer = stack<'s'>(stack<'r'>(X, Y), stack<'r'>(Y, delta<'p','f'>()))
+// --- 7. make_stack_node<> nested two deep ----------------------------------
+// Outer = make_stack_node<'s'>(
+//     make_stack_node<'r'>(X, Y),
+//     make_stack_node<'r'>(Y, make_delta_node<'p','f'>()))
 // C(e,s,r,f) = sum_p U(e,p) Outer(s,r,p,f)
 //   (s,r) = (0,0): X   (0,1): Y   (1,0): Y   (1,1): delta
 
@@ -333,9 +343,10 @@ TEST(StructuredOperands, NestedStack) {
   auto [g3, u] =
       g2.add(make_stage_node(make_input_node(make_handle<'e', 'p'>(U))));
 
-  auto s0      = stack<'r'>(x.as<'p', 'f'>(), y.as<'p', 'f'>());
-  auto s1      = stack<'r'>(y.as<'p', 'f'>(), delta<'p', 'f'>());
-  auto outer_s = stack<'s'>(s0, s1);
+  auto s0      = make_stack_node<'r'>(x.as<'p', 'f'>(), y.as<'p', 'f'>());
+  auto s1 =
+      make_stack_node<'r'>(y.as<'p', 'f'>(), make_delta_node<'p', 'f'>());
+  auto outer_s = make_stack_node<'s'>(s0, s1);
 
   auto [g4, c] = g3.add(make_contraction_node<'e', 's', 'r', 'f'>(u, outer_s));
   g4.outputs(c).execute(TeamPolicyTag<ES>{}, C);
@@ -360,10 +371,10 @@ TEST(StructuredOperands, NestedStack) {
         }
 }
 
-// --- 8. outer() groups operands with disjoint labels into their product ---
-// C(e,i,j) = outer(A.as<'e','i'>(), B.as<'j'>())     (A(e,i); B declared as
-// B(m), renamed to 'j'.)  'e' rides straight through as a batch label --
-// nothing here sums it.
+// --- 8. make_outer_product_node() multiplies disjoint-label operands -------
+// C(e,i,j) = make_outer_product_node(A.as<'e','i'>(), B.as<'j'>())
+// (A(e,i); B declared as B(m), renamed to 'j'.)  'e' rides straight through
+// as a batch label -- nothing here sums it.
 
 float outer_aval(int e, int i) {
   return 0.4f + 0.06f * e - 0.1f * i + 0.02f * e * i;
@@ -392,7 +403,7 @@ TEST(StructuredOperands, OuterGroupsDisjointOperands) {
   auto [g2, b] =
       g1.add(make_stage_node(make_input_node(make_handle<'m'>(B))));
   auto [g3, c] = g2.add(make_contraction_node<'e', 'i', 'j'>(
-      outer(a.as<'e', 'i'>(), b.as<'j'>())));
+      make_outer_product_node(a.as<'e', 'i'>(), b.as<'j'>())));
   g3.outputs(c).execute(TeamPolicyTag<ES>{}, C);
   Kokkos::fence();
 
@@ -405,7 +416,7 @@ TEST(StructuredOperands, OuterGroupsDisjointOperands) {
 }
 
 // --- 9. .as<>() relabels a stack --------------------------------------------
-// S  = stack<'r'>(P.as<'e','x'>(), Q.as<'e','x'>())
+// S  = make_stack_node<'r'>(P.as<'e','x'>(), Q.as<'e','x'>())
 // S2 = S.as<'k','e','y'>()
 // C(e,k,y) = S2(e,k,y):   k=0 -> P(e,y)     k=1 -> Q(e,y)
 
@@ -444,7 +455,7 @@ TEST(StructuredOperands, StackRelabelledWithAs) {
       g0.add(make_stage_node(make_input_node(make_handle<'e', 'x'>(P))));
   auto [g2, q] =
       g1.add(make_stage_node(make_input_node(make_handle<'e', 'x'>(Q))));
-  auto s  = stack<'r'>(p.as<'e', 'x'>(), q.as<'e', 'x'>());
+  auto s  = make_stack_node<'r'>(p.as<'e', 'x'>(), q.as<'e', 'x'>());
   auto s2 = s.as<'k', 'e', 'y'>();
   auto [g3, c] = g2.add(make_contraction_node<'e', 'k', 'y'>(s2));
   g3.outputs(c).execute(TeamPolicyTag<ES>{}, C);
@@ -460,7 +471,7 @@ TEST(StructuredOperands, StackRelabelledWithAs) {
     }
 }
 
-// --- 10. delta<> reads a diagonal: C(e,i) = A(e,i,i) -----------------------
+// --- 10. make_delta_node<> reads a diagonal: C(e,i) = A(e,i,i) -------------
 
 float diagread_aval(int e, int i, int j) {
   return 0.55f + 0.04f * e - 0.07f * i + 0.09f * j - 0.015f * i * j;
@@ -483,7 +494,7 @@ TEST(StructuredOperands, DeltaReadsDiagonal) {
   auto [g1, a] =
       g0.add(make_stage_node(make_input_node(make_handle<'e', 'i', 'j'>(A))));
   auto [g2, c] =
-      g1.add(make_contraction_node<'e', 'i'>(a, delta<'i', 'j'>()));
+      g1.add(make_contraction_node<'e', 'i'>(a, make_delta_node<'i', 'j'>()));
   g2.outputs(c).execute(TeamPolicyTag<ES>{}, C);
   Kokkos::fence();
 
@@ -537,8 +548,8 @@ TEST(StructuredOperands, DispatchSharedBatchLabelIsGeneral) {
 TEST(StructuredOperands, DispatchDeltaOperandIsGeneral) {
   // Same shape as a matmul, but one operand is a delta: never ContractionTag.
   using A = decltype(make_input_node(make_handle<'i', 'j'>(Dispatch2D{})));
-  using Node = decltype(make_contraction_node<'i', 'k'>(std::declval<A>(),
-                                                        delta<'j', 'k'>()));
+  using Node = decltype(make_contraction_node<'i', 'k'>(
+      std::declval<A>(), make_delta_node<'j', 'k'>()));
   static_assert(std::is_same_v<typename Node::node_tag, GeneralContractionTag>);
 }
 

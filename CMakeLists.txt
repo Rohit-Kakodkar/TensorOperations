@@ -144,7 +144,8 @@ add_executable(test_general_contraction tests/test_general_contraction.cpp)
 target_link_libraries(test_general_contraction PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_general_contraction)
 
-# test_structured_operands — Structured.hpp: delta/outer/stack used directly
+# test_structured_operands — Structured.hpp: make_delta_node /
+# make_outer_product_node / make_stack_node used directly
 # as make_contraction_node operands, plus its ContractionTag vs
 # GeneralContractionTag dispatch. Custom main() wraps Kokkos init/finalize.
 add_executable(test_structured_operands tests/test_structured_operands.cpp)

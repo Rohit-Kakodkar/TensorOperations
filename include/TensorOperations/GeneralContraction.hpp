@@ -12,10 +12,11 @@
 // * Dense operands are slots (level outputs) or functional inputs, read at the
 //   coordinate the labels give; a functional input is evaluated on demand and
 //   never staged.
-// * Structured operands -- delta<'a','b'>(), delta<'r'>(idx<t>), outer(...),
-//   stack<'r'>(...), and .as<>() of those (Structured.hpp) -- carry no data.
-//   Each lowers to a set of terms; the node multiplies its operands' term
-//   sets, first operand outermost.
+// * Structured operands -- make_delta_node<'a','b'>(),
+//   make_delta_node<'r'>(idx<t>), make_outer_product_node(...),
+//   make_stack_node<'r'>(...), and .as<>() of those (Structured.hpp) -- carry
+//   no data. Each lowers to a set of terms; the node multiplies its
+//   operands' term sets, first operand outermost.
 //
 // Dispatch. make_contraction_node is the binary GEMM (ContractionTag,
 // NodeHandle.hpp) exactly when it is given two node operands whose labels make
@@ -715,8 +716,9 @@ constexpr bool gc_check_operands() {
                 "make_contraction_node: needs at least one operand");
   static_assert((is_contraction_operand_v<Ops> && ...),
                 "make_contraction_node: every argument must be an operand -- "
-                "a slot, a functional input, or a structured operand (delta, "
-                "outer, stack, .as<>). A trailing hook is accepted only by "
+                "a slot, a functional input, or a structured operand "
+                "(make_delta_node, make_outer_product_node, make_stack_node, "
+                ".as<>). A trailing hook is accepted only by "
                 "the binary GEMM form: two node operands, each output label "
                 "on exactly one of them");
   return sizeof...(Ops) >= 1 && (is_contraction_operand_v<Ops> && ...);
@@ -727,12 +729,12 @@ auto make_general_contraction_node_impl(const Ops&... ops) {
   using OutSeq = std::integer_sequence<int32_t, Out...>;
   static_assert(labels_distinct_v<OutSeq>,
                 "make_contraction_node: output labels must be pairwise "
-                "distinct (a diagonal is a delta<'a','b'>() operand, not a "
-                "repeated label)");
+                "distinct (a diagonal is a make_delta_node<'a','b'>() "
+                "operand, not a repeated label)");
   static_assert(((labels_distinct_v<typename Ops::modes_seq>) && ...),
                 "make_contraction_node: an operand's labels must be pairwise "
                 "distinct (read a diagonal by joining two distinct labels "
-                "with a delta<'a','b'>() operand)");
+                "with a make_delta_node<'a','b'>() operand)");
 
   using Lowered   = typename gc_product_all<gc_lower_t<Ops>...>::type;
   using Structure = GcStructure<OutSeq, Lowered>;
