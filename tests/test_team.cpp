@@ -369,7 +369,7 @@ using PartTile3 = StaticTile<2, 2, 4>;
 using TransTile = StaticTile<8, 4>;
 
 template <typename Node, typename Tile>
-using stage_src_t =
+using load_src_t =
     decltype(std::declval<const Evaluator<TeamPolicyTag<ES>, Node, Tile>&>()(
         std::declval<Kokkos::Array<int, Tile::rank>>()));
 
@@ -379,34 +379,34 @@ using scratch_view_for_t = decltype(Impl::alloc_scratch_tile<float, ES>(
 template <typename Tile>
 using scratch_layout_for_t = typename scratch_view_for_t<Tile>::layout_t;
 template <typename Tile>
-using Stager = Evaluator<TeamPolicyTag<ES>,
+using Loader = Evaluator<TeamPolicyTag<ES>,
                          decltype(make_interm_node(
                              std::declval<scratch_view_for_t<Tile>>())),
-                         StageTag>;
+                         ScratchLoadTag>;
 
 template <typename Node, typename Tile>
-using stage_result_t =
-    decltype(std::declval<const Stager<Tile>&>() =
-                 std::declval<const stage_src_t<Node, Tile>&>());
+using load_result_t =
+    decltype(std::declval<const Loader<Tile>&>() =
+                 std::declval<const load_src_t<Node, Tile>&>());
 static_assert(
     std::is_same_v<
-        stage_result_t<NodeNH, FullTile>,
+        load_result_t<NodeNH, FullTile>,
         Evaluator<TeamPolicyTag<ES>,
-                  typename stage_result_t<NodeNH, FullTile>::node_type, void>>,
-    "staging must return a value evaluator");
-static_assert(std::is_same_v<decltype(std::declval<typename stage_result_t<
+                  typename load_result_t<NodeNH, FullTile>::node_type, void>>,
+    "scratch load must return a value evaluator");
+static_assert(std::is_same_v<decltype(std::declval<typename load_result_t<
                                           NodeH, FullTile>::node_type>()
                                           .hook_op),
                              ScaleHook>,
-              "staging must carry the source hook forward unapplied");
+              "scratch load must carry the source hook forward unapplied");
 static_assert(
-    std::is_same_v<typename stage_result_t<NodeNH, FullTile>::storage_type,
+    std::is_same_v<typename load_result_t<NodeNH, FullTile>::storage_type,
                    scratch_view_for_t<FullTile>>);
 
-TEST(TeamStage, ResultTypesAreAsExpected) { SUCCEED(); }
+TEST(TeamScratchLoad, ResultTypesAreAsExpected) { SUCCEED(); }
 
 template <typename NodeT, typename Tile, std::size_t R>
-void run_stage(NodeT node, Kokkos::Array<int, R> tidx, Buf1D out) {
+void run_scratch_load(NodeT node, Kokkos::Array<int, R> tidx, Buf1D out) {
   using Eval              = Evaluator<TeamPolicyTag<ES>, NodeT, Tile>;
   const std::size_t bytes = Impl::scratch_tile_bytes<float, ES>(Tile{});
   Kokkos::parallel_for(
@@ -415,10 +415,10 @@ void run_stage(NodeT node, Kokkos::Array<int, R> tidx, Buf1D out) {
       KOKKOS_LAMBDA(const team_t& team) {
         Eval e(node, Tile{}, team);
         auto src    = e(tidx);
-        auto stager = make_evaluator<TeamPolicyTag<ES>>(
+        auto loader = make_evaluator<TeamPolicyTag<ES>>(
             make_interm_node(Impl::alloc_scratch_tile<float, ES>(team, Tile{})),
-            StageTag{}, team);
-        auto res = (stager = src);
+            ScratchLoadTag{}, team);
+        auto res = (loader = src);
         team.team_barrier();
 
         Kokkos::single(Kokkos::PerTeam(team), [=]() {
@@ -431,10 +431,10 @@ void run_stage(NodeT node, Kokkos::Array<int, R> tidx, Buf1D out) {
 }
 
 template <typename NodeT, typename Tile, std::size_t R>
-std::vector<float> stage(NodeT node, Kokkos::Array<int, R> tidx) {
+std::vector<float> scratch_load(NodeT node, Kokkos::Array<int, R> tidx) {
   constexpr int n = scratch_layout_for_t<Tile>::size();
   Buf1D         out("out", n);
-  run_stage<NodeT, Tile>(node, tidx, out);
+  run_scratch_load<NodeT, Tile>(node, tidx, out);
 
   auto h_out = Kokkos::create_mirror_view(out);
   Kokkos::deep_copy(h_out, out);
@@ -443,20 +443,20 @@ std::vector<float> stage(NodeT node, Kokkos::Array<int, R> tidx) {
   return vals;
 }
 
-TEST(TeamStage, FullTileCopiesEveryElement) {
-  const auto vals =
-      stage<NodeNH, FullTile>(make_input_node(make_handle<'i', 'j'>(T2{})),
-                              Kokkos::Array<int, 2>{0, 0});
+TEST(TeamScratchLoad, FullTileCopiesEveryElement) {
+  const auto vals = scratch_load<NodeNH, FullTile>(
+      make_input_node(make_handle<'i', 'j'>(T2{})),
+      Kokkos::Array<int, 2>{0, 0});
   for (int i = 0; i < 4; ++i)
     for (int j = 0; j < 8; ++j)
       EXPECT_FLOAT_EQ(vals[i * 8 + j], static_cast<float>(i * 8 + j))
           << "i=" << i << " j=" << j;
 }
 
-TEST(TeamStage, PartialTileCopiesItsWindow) {
-  const auto vals =
-      stage<NodeNH, PartTile>(make_input_node(make_handle<'i', 'j'>(T2{})),
-                              Kokkos::Array<int, 2>{1, 1});
+TEST(TeamScratchLoad, PartialTileCopiesItsWindow) {
+  const auto vals = scratch_load<NodeNH, PartTile>(
+      make_input_node(make_handle<'i', 'j'>(T2{})),
+      Kokkos::Array<int, 2>{1, 1});
   for (int a = 0; a < 2; ++a)
     for (int b = 0; b < 4; ++b)
       EXPECT_FLOAT_EQ(vals[a * 4 + b],
@@ -464,10 +464,10 @@ TEST(TeamStage, PartialTileCopiesItsWindow) {
           << "a=" << a << " b=" << b;
 }
 
-TEST(TeamStage, Rank3FullTileCopiesEveryElement) {
-  const auto vals =
-      stage<Node3, FullTile3>(make_input_node(make_handle<'i', 'j', 'k'>(T3{})),
-                              Kokkos::Array<int, 3>{1, 0, 0});
+TEST(TeamScratchLoad, Rank3FullTileCopiesEveryElement) {
+  const auto vals = scratch_load<Node3, FullTile3>(
+      make_input_node(make_handle<'i', 'j', 'k'>(T3{})),
+      Kokkos::Array<int, 3>{1, 0, 0});
   for (int a = 0; a < 2; ++a)
     for (int b = 0; b < 4; ++b)
       for (int c = 0; c < 8; ++c)
@@ -476,10 +476,10 @@ TEST(TeamStage, Rank3FullTileCopiesEveryElement) {
             << "a=" << a << " b=" << b << " c=" << c;
 }
 
-TEST(TeamStage, Rank3PartialTileCopiesItsWindow) {
-  const auto vals =
-      stage<Node3, PartTile3>(make_input_node(make_handle<'i', 'j', 'k'>(T3{})),
-                              Kokkos::Array<int, 3>{1, 1, 1});
+TEST(TeamScratchLoad, Rank3PartialTileCopiesItsWindow) {
+  const auto vals = scratch_load<Node3, PartTile3>(
+      make_input_node(make_handle<'i', 'j', 'k'>(T3{})),
+      Kokkos::Array<int, 3>{1, 1, 1});
   for (int a = 0; a < 2; ++a)
     for (int b = 0; b < 2; ++b)
       for (int c = 0; c < 4; ++c)
@@ -489,15 +489,15 @@ TEST(TeamStage, Rank3PartialTileCopiesItsWindow) {
             << "a=" << a << " b=" << b << " c=" << c;
 }
 
-TEST(TeamStage, HookedSourceStagesRawValues) {
-  const auto vals = stage<NodeH, FullTile>(
+TEST(TeamScratchLoad, HookedSourceLoadsRawValues) {
+  const auto vals = scratch_load<NodeH, FullTile>(
       make_input_node(make_handle<'i', 'j'>(T2{}), ScaleHook{}),
       Kokkos::Array<int, 2>{0, 0});
   for (int s = 0; s < 32; ++s)
     EXPECT_FLOAT_EQ(vals[s], static_cast<float>(s)) << "s=" << s;
 }
 
-void run_stage_relabeled(Buf1D out) {
+void run_scratch_load_relabeled(Buf1D out) {
   auto              node  = make_input_node(make_handle<'i', 'j'>(T2{}));
   const std::size_t bytes = Impl::scratch_tile_bytes<float, ES>(TransTile{});
   Kokkos::parallel_for(
@@ -510,11 +510,11 @@ void run_stage_relabeled(Buf1D out) {
         auto rel = make_evaluator<TeamPolicyTag<ES>>(src, Swap{}, team);
         auto tr  = (rel = src);
 
-        auto stager = make_evaluator<TeamPolicyTag<ES>>(
+        auto loader = make_evaluator<TeamPolicyTag<ES>>(
             make_interm_node(
                 Impl::alloc_scratch_tile<float, ES>(team, TransTile{})),
-            StageTag{}, team);
-        auto res = (stager = tr);
+            ScratchLoadTag{}, team);
+        auto res = (loader = tr);
         team.team_barrier();
 
         Kokkos::single(Kokkos::PerTeam(team), [=]() {
@@ -525,9 +525,9 @@ void run_stage_relabeled(Buf1D out) {
   Kokkos::fence();
 }
 
-TEST(TeamStage, RelabeledSourceTransposes) {
+TEST(TeamScratchLoad, RelabeledSourceTransposes) {
   Buf1D out("out", 32);
-  run_stage_relabeled(out);
+  run_scratch_load_relabeled(out);
   auto h_out = Kokkos::create_mirror_view(out);
   Kokkos::deep_copy(h_out, out);
 
@@ -555,7 +555,7 @@ KOKKOS_FUNCTION auto stage_full(Node node, Tile tile, const Team& team) {
       node, tile, team)(Kokkos::Array<int, Tile::rank>{});
   auto dst = make_evaluator<TeamPolicyTag<ES>>(
       make_interm_node(Impl::alloc_scratch_tile<float, ES>(team, tile)),
-      StageTag{}, team);
+      ScratchLoadTag{}, team);
   return (dst = src);
 }
 
@@ -1231,7 +1231,7 @@ KOKKOS_FUNCTION auto stage_at(Node node, Tile tile, Kokkos::Array<int, R> tidx,
   auto src = make_evaluator<TeamPolicyTag<ES>>(node, tile, team)(tidx);
   auto dst = make_evaluator<TeamPolicyTag<ES>>(
       make_interm_node(Impl::alloc_scratch_tile<float, ES>(team, tile)),
-      StageTag{}, team);
+      ScratchLoadTag{}, team);
   return (dst = src);
 }
 
@@ -1475,7 +1475,7 @@ void run_relabeled(V2 a, V2 bt, Buf1D out) {
         auto brel = make_evaluator<TeamPolicyTag<ES>>(bsrc, Swap{}, team);
         auto bdst = make_evaluator<TeamPolicyTag<ES>>(
             make_interm_node(Impl::alloc_scratch_tile<float, ES>(team, CT{})),
-            StageTag{}, team);
+            ScratchLoadTag{}, team);
         auto B = (bdst = (brel = bsrc));
 
         auto P =
