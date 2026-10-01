@@ -49,6 +49,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <type_traits>
 
 using namespace sfpp_min;
 
@@ -70,15 +71,62 @@ double best_ms(Fn&& fn, int warmup, int reps) {
   return best * 1e3;
 }
 
-template <bool Keep, int TE>
+// The backend is fixed per BINARY, not per run: sfpp_min_bench_te is the team
+// policy, sfpp_min_bench_te_cute (SFPP_MIN_BENCH_TE_CUTE) the CuTe policy.
+// Instantiating both launches of the same graph in one translation unit makes
+// nvcc stop inlining the team kernel's helpers (255 registers, ~15 KB stack,
+// ~40x slower), so the team number is only trustworthy from a team-only TU.
+struct TeamBackend {
+  static constexpr const char* name = "team";
+
+  template <bool Keep, int TE, class Args>
+  static NewFootprint footprint(const Args& args, const GlobalHPrime& hw) {
+    return new_footprint<Keep, TE>(
+        args, TensorOperations::TeamPolicyTag<KernelES>{}, hw);
+  }
+  template <bool Keep, int TE, class Args>
+  static int launch(const Args& args, int team_arg, const GlobalHPrime& hw) {
+    return new_stiffness<Keep, TE>(
+        args, TensorOperations::TeamPolicyTag<KernelES>{}, team_arg, hw);
+  }
+};
+
+#if defined(SFPP_MIN_BENCH_TE_CUTE)
+template <ContractionMma Mma>
+struct CuteBackend {
+  static constexpr const char* name = Mma == ContractionMma::Permuted
+                                          ? "cute (permuted MMA)"
+                                          : "cute (default MMA)";
+
+  template <bool Keep, int TE, class Args>
+  static NewFootprint footprint(const Args& args, const GlobalHPrime& hw) {
+    return new_footprint<Keep, TE, Mma>(
+        args, TensorOperations::CutePolicyTag<KernelES>{}, hw);
+  }
+  template <bool Keep, int TE, class Args>
+  static int launch(const Args& args, int, const GlobalHPrime& hw) {
+    return new_stiffness<Keep, TE, Mma>(
+        args, TensorOperations::CutePolicyTag<KernelES>{}, hw);
+  }
+};
+#endif
+
+template <class Backend, bool Keep, int TE>
 int run_impl(int argc, char** argv) {
   const int  reps     = (argc > 1) ? std::atoi(argv[1]) : 5;
   const int  warmup   = (argc > 2) ? std::atoi(argv[2]) : 2;
   const int  team_arg = (argc > 3) ? std::atoi(argv[3]) : -1;
   const bool profile  = (argc > 4) && std::strlen(argv[4]) > 0;
 
-  std::printf("kernel      : new (level graph), TE=%d, loads=%s\n", TE,
-              Keep ? "redundant" : "once");
+  if (!std::is_same_v<Backend, TeamBackend> && team_arg > 0) {
+    std::printf(
+        "the CuTe block size comes from the graph's MMAs; team size "
+        "(argv[3]) must be -1\n");
+    return 2;
+  }
+
+  std::printf("kernel      : new (level graph), backend=%s, TE=%d, loads=%s\n",
+              Backend::name, TE, Keep ? "redundant" : "once");
   std::printf("cell        : layout_right_dynamic soa iglob=ir num=xfast\n");
 
   const MeshDims d{60, 48, 9};
@@ -138,30 +186,35 @@ int run_impl(int argc, char** argv) {
   // The footprint is answerable on the host. Print it BEFORE the launch so a
   // TE that overruns shared memory is diagnosed by its request rather than by
   // an opaque launch failure.
-  const NewFootprint fp = new_footprint<Keep, TE>(args, hpwgll);
+  const NewFootprint fp = Backend::template footprint<Keep, TE>(args, hpwgll);
   std::printf(
       "scratch     : pooled %zu B  |  unpooled %zu B  |  %.0f B/element\n",
       fp.pooled, fp.unpooled, static_cast<double>(fp.pooled) / TE);
 
-  const int league = new_stiffness<Keep, TE>(args, team_arg, hpwgll);
+  const int league = Backend::template launch<Keep, TE>(args, team_arg, hpwgll);
   Kokkos::fence();
 
   std::printf("mesh        : interior nspec = %d, nglob = %d\n", nspec, nglob);
   std::printf("teams       : %d (league) x %d elements = %d work items/team\n",
               league, TE, TE * kPointsPerElement);
-  std::printf("team size   : %s\n",
-              team_arg > 0 ? std::to_string(team_arg).c_str() : "Kokkos::AUTO");
+  if (std::is_same_v<Backend, TeamBackend>)
+    std::printf("team size   : %s\n", team_arg > 0
+                                          ? std::to_string(team_arg).c_str()
+                                          : "Kokkos::AUTO");
+  else
+    std::printf("block size  : %d (from the graph's MMAs)\n", fp.threads);
 
   if (profile) {
     Kokkos::deep_copy(f.acceleration, static_cast<real_t>(0));
-    new_stiffness<Keep, TE>(args, team_arg, hpwgll);
+    Backend::template launch<Keep, TE>(args, team_arg, hpwgll);
     Kokkos::fence();
     std::printf("profile mode: one launch issued\n");
     return 0;
   }
 
   const double ms = best_ms(
-      [&]() { new_stiffness<Keep, TE>(args, team_arg, hpwgll); }, warmup, reps);
+      [&]() { Backend::template launch<Keep, TE>(args, team_arg, hpwgll); },
+      warmup, reps);
   const double ns_per_element = ms * 1e6 / nspec;
 
   std::printf("time        : %.4f ms  |  %.2f ns/element  |  %.4f ns/point\n",
@@ -169,33 +222,51 @@ int run_impl(int argc, char** argv) {
   return 0;
 }
 
-template <bool Keep>
+template <class Backend, bool Keep>
 int dispatch_te(int argc, char** argv, int te) {
   switch (te) {
     case 1:
-      return run_impl<Keep, 1>(argc, argv);
+      return run_impl<Backend, Keep, 1>(argc, argv);
     case 2:
-      return run_impl<Keep, 2>(argc, argv);
+      return run_impl<Backend, Keep, 2>(argc, argv);
     case 4:
-      return run_impl<Keep, 4>(argc, argv);
+      return run_impl<Backend, Keep, 4>(argc, argv);
     case 8:
-      return run_impl<Keep, 8>(argc, argv);
+      return run_impl<Backend, Keep, 8>(argc, argv);
     case 16:
-      return run_impl<Keep, 16>(argc, argv);
+      return run_impl<Backend, Keep, 16>(argc, argv);
     case 32:
-      return run_impl<Keep, 32>(argc, argv);
+      return run_impl<Backend, Keep, 32>(argc, argv);
     default:
       std::printf("unknown TE: %d (compiled for 1, 2, 4, 8, 16, 32)\n", te);
       return 2;
   }
 }
 
+template <class Backend>
+int dispatch_loads(int argc, char** argv, int te, const char* loads) {
+  return (std::strcmp(loads, "redundant") == 0)
+             ? dispatch_te<Backend, true>(argc, argv, te)
+             : dispatch_te<Backend, false>(argc, argv, te);
+}
+
+// argv[7] (CuTe binary only): the contraction MMA, default | permuted.
 int run(int argc, char** argv) {
   const int   te    = (argc > 5) ? std::atoi(argv[5]) : kExecChunk;
   const char* loads = (argc > 6) ? argv[6] : "once";
-  return (std::strcmp(loads, "redundant") == 0)
-             ? dispatch_te<true>(argc, argv, te)
-             : dispatch_te<false>(argc, argv, te);
+#if defined(SFPP_MIN_BENCH_TE_CUTE)
+  const char* mma = (argc > 7) ? argv[7] : "default";
+  if (std::strcmp(mma, "permuted") == 0)
+    return dispatch_loads<CuteBackend<ContractionMma::Permuted>>(argc, argv, te,
+                                                                 loads);
+  if (std::strcmp(mma, "default") == 0)
+    return dispatch_loads<CuteBackend<ContractionMma::Default>>(argc, argv, te,
+                                                                loads);
+  std::printf("unknown mma: %s (expected default | permuted)\n", mma);
+  return 2;
+#else
+  return dispatch_loads<TeamBackend>(argc, argv, te, loads);
+#endif
 }
 
 }  // namespace

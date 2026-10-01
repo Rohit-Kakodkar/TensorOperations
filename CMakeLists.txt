@@ -392,5 +392,15 @@ add_executable(sfpp_min_bench_te_li sfpp_min/bench_te.cpp)
 target_link_libraries(sfpp_min_bench_te_li PRIVATE sfpp_min tensor)
 target_compile_options(sfpp_min_bench_te_li PRIVATE -lineinfo)
 
+# The same TE sweep on the CuTe policy. A separate binary rather than a runtime
+# backend switch: instantiating the team and CuTe launches of one graph in the
+# same translation unit degrades the team kernel's codegen.
+if(TENSOR_OPS_CUTLASS_DIR AND Kokkos_ENABLE_CUDA)
+  add_executable(sfpp_min_bench_te_cute sfpp_min/bench_te.cpp)
+  target_link_libraries(sfpp_min_bench_te_cute PRIVATE sfpp_min tensor)
+  target_compile_definitions(sfpp_min_bench_te_cute
+                             PRIVATE SFPP_MIN_BENCH_TE_CUTE)
+endif()
+
 add_executable(sfpp_min_bench_mat sfpp_min/bench_mat.cpp)
 target_link_libraries(sfpp_min_bench_mat PRIVATE sfpp_min)
