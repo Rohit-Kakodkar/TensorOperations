@@ -270,6 +270,34 @@ set_tests_properties(LevelGuardNegative.Case4 PROPERTIES
                      PASS_REGULAR_EXPRESSION
                      "may not read a slot ITS OWN LEVEL")
 
+# ---------------------------------------------------------------------------
+# Structured-operand guards: make_stack_node<r, l...> and
+# make_outer_product_node<l...> declare every label positionally, and a label
+# kept from the operands may not move. Each case is pinned to its own guard's
+# wording; case 0 is the control and must compile.
+# ---------------------------------------------------------------------------
+foreach(case 0 1 2 3 4)
+  add_executable(structured_guard_neg_${case} EXCLUDE_FROM_ALL
+                 tests/negative/structured_guard_negative.cpp)
+  target_link_libraries(structured_guard_neg_${case} PRIVATE tensor)
+  target_compile_definitions(structured_guard_neg_${case}
+                             PRIVATE STRUCTURED_NEG_CASE=${case})
+  add_test(NAME StructuredGuardNegative.Case${case}
+           COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}
+                   --target structured_guard_neg_${case} --config $<CONFIG>)
+endforeach()
+set_tests_properties(StructuredGuardNegative.Case1 PROPERTIES
+                     PASS_REGULAR_EXPRESSION
+                     "a label kept from the branches must keep its position")
+set_tests_properties(StructuredGuardNegative.Case2 PROPERTIES
+                     PASS_REGULAR_EXPRESSION "declare one label per axis")
+set_tests_properties(StructuredGuardNegative.Case3 PROPERTIES
+                     PASS_REGULAR_EXPRESSION
+                     "a label kept from the operands must keep its position")
+set_tests_properties(StructuredGuardNegative.Case4 PROPERTIES
+                     PASS_REGULAR_EXPRESSION
+                     "declare the stacking label, then one label per branch")
+
 # Benchmarks (opt-in: -DTENSOR_OPS_BUILD_BENCHMARKS=ON). No gtest; own main().
 if(TENSOR_OPS_BUILD_BENCHMARKS)
   # --- 3D SEM stiffness on the LEVEL GRAPH (Sprint 5) -----------------------

@@ -132,8 +132,9 @@ struct lg_resolve_general<LT, Member, DeviceTuple<Leaves...>> {
                 "an output label that no delta, idx or stack touches -- "
                 "anything else would index a partial tile");
   static_assert(err != gc_err_stack_extent,
-                "make_contraction_node: a make_stack_node<r> label's extent "
-                "in the label map must equal the stack's number of branches");
+                "make_contraction_node: a make_stack_node<r, l...> stacking "
+                "label's extent in the label map must equal the stack's "
+                "number of branches");
   static_assert(err != gc_err_const_range,
                 "make_contraction_node: a constant index "
                 "(make_delta_node<r>(idx<t>)) lies outside its label's "

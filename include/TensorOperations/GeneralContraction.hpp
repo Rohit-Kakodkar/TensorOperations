@@ -13,9 +13,9 @@
 //   coordinate the labels give; a functional input is evaluated on demand and
 //   never staged.
 // * Structured operands -- make_delta_node<'a','b'>(),
-//   make_delta_node<'r'>(idx<t>), make_outer_product_node(...),
-//   make_stack_node<'r'>(...), and .as<>() of those (Structured.hpp) -- carry
-//   no data. Each lowers to a set of terms; the node multiplies its
+//   make_delta_node<'r'>(idx<t>), make_outer_product_node<l...>(...),
+//   make_stack_node<'r', l...>(...), and .as<>() of those (Structured.hpp) --
+//   carry no data. Each lowers to a set of terms; the node multiplies its
 //   operands' term sets, first operand outermost.
 //
 // Dispatch. make_contraction_node is the binary GEMM (ContractionTag,

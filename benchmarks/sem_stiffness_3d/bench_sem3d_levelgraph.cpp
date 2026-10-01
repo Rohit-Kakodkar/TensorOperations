@@ -426,14 +426,15 @@ std::size_t levelgraph_scratch(Fields d) {
 //
 // The reference gradient of SPECFEM++'s direct kernel,
 //
-//   B = make_stack_node<'r'>(make_outer_product_node(h, delta, delta), ...)
+//   B = make_stack_node<'r', ...>(make_outer_product_node<...>(h, delta,
+//                                                            delta), ...)
 //
 // replaces the nine hand-relabelled gradient contractions, and its divergence
 // twin D replaces the nine divergences AND the three weighted sums:
 //
 //   grad_r u_c = make_contraction_node(make_delta_node<'r'>(idx<r>), B, u_c)
-//   f_c        = make_contraction_node(D, make_stack_node<'r'>(F^0_c, F^1_c,
-//                                                              F^2_c))
+//   f_c        = make_contraction_node(D, make_stack_node<'r', ...>(
+//                                             F^0_c, F^1_c, F^2_c))
 //
 // The deltas are eliminated at compile time, so each gradient is one
 // length-N sum and each f_c three: the level graph's arithmetic. The stress
@@ -493,16 +494,16 @@ auto structured_outputs(Fields d) {
   // B(r; x,l, y,m, z,n): the derivative of basis function (n, m, l) along r
   // at point (z, y, x) -- H(point, function) along r, the identity along the
   // other two.
-  const auto B = make_stack_node<'r'>(
-      make_outer_product_node(h.template as<'x', 'l'>(),
-                              make_delta_node<'y', 'm'>(),
-                              make_delta_node<'z', 'n'>()),
-      make_outer_product_node(make_delta_node<'x', 'l'>(),
-                              h.template as<'y', 'm'>(),
-                              make_delta_node<'z', 'n'>()),
-      make_outer_product_node(make_delta_node<'x', 'l'>(),
-                              make_delta_node<'y', 'm'>(),
-                              h.template as<'z', 'n'>()));
+  const auto B = make_stack_node<'r', 'x', 'l', 'y', 'm', 'z', 'n'>(
+      make_outer_product_node<'x', 'l', 'y', 'm', 'z', 'n'>(
+          h.template as<'x', 'l'>(), make_delta_node<'y', 'm'>(),
+          make_delta_node<'z', 'n'>()),
+      make_outer_product_node<'x', 'l', 'y', 'm', 'z', 'n'>(
+          make_delta_node<'x', 'l'>(), h.template as<'y', 'm'>(),
+          make_delta_node<'z', 'n'>()),
+      make_outer_product_node<'x', 'l', 'y', 'm', 'z', 'n'>(
+          make_delta_node<'x', 'l'>(), make_delta_node<'y', 'm'>(),
+          h.template as<'z', 'n'>()));
   // Branch r of B against one component: the unit vector binds r, so the
   // other two branches vanish at compile time.
   auto grad = [&](auto r, auto uu) {
@@ -521,20 +522,20 @@ auto structured_outputs(Fields d) {
 
   // D(r; x,i, y,j, z,k): Hw(summed point, output) along r, the identity
   // along the other two.
-  const auto D = make_stack_node<'r'>(
-      make_outer_product_node(hw.template as<'x', 'i'>(),
-                              make_delta_node<'y', 'j'>(),
-                              make_delta_node<'z', 'k'>()),
-      make_outer_product_node(make_delta_node<'x', 'i'>(),
-                              hw.template as<'y', 'j'>(),
-                              make_delta_node<'z', 'k'>()),
-      make_outer_product_node(make_delta_node<'x', 'i'>(),
-                              make_delta_node<'y', 'j'>(),
-                              hw.template as<'z', 'k'>()));
+  const auto D = make_stack_node<'r', 'x', 'i', 'y', 'j', 'z', 'k'>(
+      make_outer_product_node<'x', 'i', 'y', 'j', 'z', 'k'>(
+          hw.template as<'x', 'i'>(), make_delta_node<'y', 'j'>(),
+          make_delta_node<'z', 'k'>()),
+      make_outer_product_node<'x', 'i', 'y', 'j', 'z', 'k'>(
+          make_delta_node<'x', 'i'>(), hw.template as<'y', 'j'>(),
+          make_delta_node<'z', 'k'>()),
+      make_outer_product_node<'x', 'i', 'y', 'j', 'z', 'k'>(
+          make_delta_node<'x', 'i'>(), make_delta_node<'y', 'j'>(),
+          hw.template as<'z', 'k'>()));
   // f_c = sum_r D_r F^r_c, the three directions stacked on r.
   auto div = [&](auto fx, auto fe, auto fg) {
     return make_contraction_node<'e', 'k', 'j', 'i'>(
-        D, make_stack_node<'r'>(fx, fe, fg));
+        D, make_stack_node<'r', 'e', 'z', 'y', 'x'>(fx, fe, fg));
   };
   auto [g5, r0, r1, r2] =
       g4.add(div(fx0, fe0, fg0), div(fx1, fe1, fg1), div(fx2, fe2, fg2));

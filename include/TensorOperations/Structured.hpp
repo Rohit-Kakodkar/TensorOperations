@@ -7,16 +7,24 @@
 //
 //   make_delta_node<'a','b'>()        identity delta_ab, zero storage
 //   make_delta_node<'r'>(idx<t>)      unit vector e_t(r): 1 where r == t
-//   make_outer_product_node(x, y, ...)
+//   make_outer_product_node<l...>(x, y, ...)
 //                                     outer product; the operands' label sets
-//                                     must be disjoint; labels = concatenation
-//   make_stack_node<'r'>(b_0, ..., b_{n-1})
+//                                     must be disjoint
+//   make_stack_node<'r', l...>(b_0, ..., b_{n-1})
 //                                     lazy np.stack: the value is b_t where
 //                                     r == t; every b_t carries the same label
-//                                     SET (any order); labels = ('r', then
-//                                     b_0's labels in b_0's order)
+//                                     SET (any order)
 //   x.as<New...>()                    positional relabel over x's label order,
 //                                     zero-copy (like a slot's .as<>)
+//
+// Every axis of an outer product or a stack is declared, so the order a later
+// .as<>() renames over is on the page. The labels are POSITIONAL over the
+// natural order -- the operands' labels concatenated for an outer product, and
+// for a stack its label 'r' followed by b_0's labels in b_0's order:
+//
+//   * repeating a natural label states it (it must keep its position; a
+//     swapped order is a compile error, never a silent transpose);
+//   * a new name relabels that axis at construction, as .as<>() would.
 //
 // None of them is a graph node on its own: the make_*_node names match the
 // rest of the builder API, and each result only enters a graph as an operand
@@ -30,27 +38,27 @@
 //   make_delta_node<a,b>()        { a == b }
 //   make_delta_node<r>(idx<t>)    { r == t }
 //   make_outer_product_node       cartesian product of the operands' term sets
-//   make_stack_node<r>            union over t of b_t's terms, each with r == t
+//   make_stack_node<r, l...>      union over t of b_t's terms, each with r == t
 //                                 added
-//   .as<>                         the same terms, every label renamed
+//   .as<>, or a renaming label    the same terms, every label renamed
 //
 // make_contraction_node multiplies its operands' term sets (first operand
 // outermost) and expands each term against the graph's label map: labels a
 // delta joins are merged, a constant binds its class, the rest is summed.
 //
-// The SEM gradient, and the label order it gets:
+// The SEM gradient, with hx{x,i}, hy{y,j}, hz{z,k}:
 //
-//   B = make_stack_node<'r'>(
-//       make_outer_product_node(hx, make_delta_node<'y','j'>(),
-//                               make_delta_node<'z','k'>()),
-//       make_outer_product_node(make_delta_node<'x','i'>(), hy,
-//                               make_delta_node<'z','k'>()),
-//       make_outer_product_node(make_delta_node<'x','i'>(),
-//                               make_delta_node<'y','j'>(), hz));
+//   B = make_stack_node<'r', 'x','i', 'y','j', 'z','k'>(
+//       make_outer_product_node<'x','i', 'y','j', 'z','k'>(
+//           hx, make_delta_node<'y','j'>(), make_delta_node<'z','k'>()),
+//       make_outer_product_node<'x','i', 'y','j', 'z','k'>(
+//           make_delta_node<'x','i'>(), hy, make_delta_node<'z','k'>()),
+//       make_outer_product_node<'x','i', 'y','j', 'z','k'>(
+//           make_delta_node<'x','i'>(), make_delta_node<'y','j'>(), hz));
 //
-// with hx{x,i}, hy{y,j}, hz{z,k}: branch 0's labels are (x,i, y,j, z,k), so
-// B's are (r, x, i, y, j, z, k), and B.as<'s','x','l','y','m','z','n'>() is
-// the same operator with r->s, i->l, j->m, k->n. Then
+// B.as<'s','x','l','y','m','z','n'>() is the same operator with r->s, i->l,
+// j->m, k->n -- as is the same make_stack_node call declared
+// <'s', 'x','l', 'y','m', 'z','n'>, relabelled at construction. Then
 //
 //   K = make_contraction_node<'e','a','k','j','i','b','n','m','l'>(
 //           B, M, B.as<'s','x','l','y','m','z','n'>());
@@ -146,9 +154,22 @@ constexpr void check_relabel() {
   static_assert(labels_distinct_v<New>, "as(): labels must be distinct");
 }
 
+// Declared labels read positionally over a natural order: a declared label
+// that also names a natural axis must sit at that axis's position, so a
+// swapped order cannot pass for a relabel.
+template <typename Natural, typename Declared>
+constexpr bool positional_relabel_ok() {
+  constexpr auto n = seq_to_array(Natural{});
+  constexpr auto d = seq_to_array(Declared{});
+  for (std::size_t p = 0; p < d.size(); ++p)
+    for (std::size_t q = 0; q < n.size(); ++q)
+      if (d[p] == n[q] && p != q) return false;
+  return true;
+}
+
 }  // namespace Impl
 
-/// make_outer_product_node(ops...): the product of operands with
+/// make_outer_product_node<l...>(ops...): the product of operands with
 /// pairwise-disjoint label sets.
 template <typename... Ops>
 struct Outer {
@@ -167,7 +188,7 @@ struct Outer {
   }
 };
 
-/// make_stack_node<R>(branches...): the value is branch t where R == t.
+/// make_stack_node<R, l...>(branches...): the value is branch t where R == t.
 template <int32_t R, typename... Branches>
 struct Stack {
   using structured_operand_tag = void;
@@ -221,45 +242,80 @@ constexpr UnitVector<R, T> make_delta_node(ConstIndex<T>) {
   return {};
 }
 
-/// make_outer_product_node(ops...): operands with pairwise-disjoint label
-/// sets, multiplied.
-template <typename... Ops>
+/// make_outer_product_node<l...>(ops...): operands with pairwise-disjoint
+/// label sets, multiplied. One label per axis, positional over the operands'
+/// labels concatenated: a repeated label states that axis, a new one renames
+/// it.
+template <int32_t... L, typename... Ops>
 auto make_outer_product_node(Ops... ops) {
   static_assert(sizeof...(Ops) >= 1,
-                "make_outer_product_node(): needs at least one operand");
+                "make_outer_product_node<l...>(): needs at least one operand");
   static_assert((Impl::is_contraction_operand_v<Ops> && ...),
-                "make_outer_product_node(): every operand must be a slot, a "
-                "functional input, or a structured operand (make_delta_node, "
-                "make_outer_product_node, make_stack_node, .as<>)");
+                "make_outer_product_node<l...>(): every operand must be a "
+                "slot, a functional input, or a structured operand "
+                "(make_delta_node, make_outer_product_node, make_stack_node, "
+                ".as<>)");
+  using Natural  = Impl::gc_cat_seq_t<std::integer_sequence<int32_t>,
+                                      typename Ops::modes_seq...>;
+  using Declared = std::integer_sequence<int32_t, L...>;
   static_assert(
-      Impl::labels_distinct_v<Impl::gc_cat_seq_t<std::integer_sequence<int32_t>,
-                                                 typename Ops::modes_seq...>>,
-      "make_outer_product_node(): the operands' label sets must be pairwise "
-      "disjoint -- a shared label is a contraction or a Hadamard product, "
-      "which is make_contraction_node's job");
-  return Outer<Ops...>{std::tuple<Ops...>(std::move(ops)...)};
+      Impl::labels_distinct_v<Natural>,
+      "make_outer_product_node<l...>(): the operands' label sets must be "
+      "pairwise disjoint -- a shared label is a contraction or a Hadamard "
+      "product, which is make_contraction_node's job");
+  static_assert(sizeof...(L) == Natural::size(),
+                "make_outer_product_node<l...>(): declare one label per axis "
+                "-- the operands' labels, concatenated");
+  static_assert(Impl::labels_distinct_v<Declared>,
+                "make_outer_product_node<l...>(): the labels must be distinct");
+  static_assert(Impl::positional_relabel_ok<Natural, Declared>(),
+                "make_outer_product_node<l...>(): a label kept from the "
+                "operands must keep its position -- the labels are "
+                "positional; to reorder, contract");
+  Outer<Ops...> o{std::tuple<Ops...>(std::move(ops)...)};
+  if constexpr (std::is_same_v<Natural, Declared>)
+    return o;
+  else
+    return Relabeled<Outer<Ops...>, Declared>{o};
 }
 
-/// make_stack_node<'r'>(b_0, ..., b_{n-1}): the value is b_t where r == t.
-template <int32_t R, typename... Bs>
+/// make_stack_node<'r', l...>(b_0, ..., b_{n-1}): the value is b_t where
+/// r == t. 'r' is the stacking label; l... are positional over b_0's labels:
+/// a repeated label states that axis, a new one renames it.
+template <int32_t R, int32_t... L, typename... Bs>
 auto make_stack_node(Bs... bs) {
   static_assert(sizeof...(Bs) >= 1,
-                "make_stack_node<r>(): needs at least one branch");
+                "make_stack_node<r, l...>(): needs at least one branch");
   static_assert((Impl::is_contraction_operand_v<Bs> && ...),
-                "make_stack_node<r>(): every branch must be a slot, a "
+                "make_stack_node<r, l...>(): every branch must be a slot, a "
                 "functional input, or a structured operand (make_delta_node, "
                 "make_outer_product_node, make_stack_node, .as<>)");
-  using B0 = Impl::gc_first_t<Bs...>;
+  using B0       = Impl::gc_first_t<Bs...>;
+  using Natural  = typename B0::modes_seq;
+  using Declared = std::integer_sequence<int32_t, L...>;
   static_assert(
-      (Impl::same_label_set_v<typename Bs::modes_seq, typename B0::modes_seq> &&
-       ...),
-      "make_stack_node<r>(): every branch must carry the same label set (in "
-      "any order)");
+      (Impl::same_label_set_v<typename Bs::modes_seq, Natural> && ...),
+      "make_stack_node<r, l...>(): every branch must carry the same label "
+      "set (in any order)");
+  static_assert(!Impl::arr_contains(Impl::seq_to_array(Natural{}), R),
+                "make_stack_node<r, l...>(): the stacking label must not be "
+                "one of the branches' labels");
+  static_assert(sizeof...(L) == Natural::size(),
+                "make_stack_node<r, l...>(): declare the stacking label, then "
+                "one label per branch axis -- branch 0's labels, in order");
   static_assert(
-      !Impl::arr_contains(Impl::seq_to_array(typename B0::modes_seq{}), R),
-      "make_stack_node<r>(): the stacking label must not be one of the "
-      "branches' labels");
-  return Stack<R, Bs...>{std::tuple<Bs...>(std::move(bs)...)};
+      Impl::labels_distinct_v<std::integer_sequence<int32_t, R, L...>>,
+      "make_stack_node<r, l...>(): the labels must be distinct");
+  static_assert(Impl::positional_relabel_ok<Natural, Declared>(),
+                "make_stack_node<r, l...>(): a label kept from the branches "
+                "must keep its position -- the labels are positional; to "
+                "reorder, contract");
+  Stack<R, Bs...> st{std::tuple<Bs...>(std::move(bs)...)};
+  if constexpr (std::is_same_v<Natural, Declared>)
+    return st;
+  else
+    return Relabeled<Stack<R, Bs...>,
+                     std::integer_sequence<int32_t, R, L...>>{st};
 }
 
 // --- lowering: every operand as a set of terms -----------------------------

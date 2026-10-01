@@ -24,6 +24,7 @@
 //   8. make_outer_product_node() grouping two operands with disjoint labels,
 //      one of them carrying a batch label straight into the output;
 //   9. .as<>() relabelling a stack;
+//  9b. the same relabel declared at construction, make_stack_node<'k','e','y'>;
 //  10. make_delta_node<> reading a diagonal: C(e,i) = A(e,i,i);
 //  11. dispatch: node_tag is ContractionTag only for a plain two-operand GEMM
 //      shape, and GeneralContractionTag for a shared batch label or any
@@ -244,7 +245,8 @@ TEST(StructuredOperands, DeltaUnitVectorSlices) {
 }
 
 // --- 6. make_stack_node<> mixing a dense branch and a delta branch ---------
-// S = make_stack_node<'r'>(H.as<'p','f'>(), make_delta_node<'p','f'>())
+// S = make_stack_node<'r', 'p', 'f'>(H.as<'p','f'>(),
+//                                    make_delta_node<'p','f'>())
 //     (r has extent 2)
 // C(e,r,f) = sum_p U(e,p) S(r,p,f)
 //   r=0: sum_p U(e,p) H(p,f)          r=1: U(e,f)
@@ -278,7 +280,8 @@ TEST(StructuredOperands, StackMixesDenseAndDelta) {
       g0.add(make_stage_node(make_input_node(make_handle<'p', 'f'>(H))));
   auto [g2, u] =
       g1.add(make_stage_node(make_input_node(make_handle<'e', 'p'>(U))));
-  auto s = make_stack_node<'r'>(h.as<'p', 'f'>(), make_delta_node<'p', 'f'>());
+  auto s = make_stack_node<'r', 'p', 'f'>(h.as<'p', 'f'>(),
+                                          make_delta_node<'p', 'f'>());
   auto [g3, c] = g2.add(make_contraction_node<'e', 'r', 'f'>(u, s));
   g3.outputs(c).execute(TeamPolicyTag<ES>{}, C);
   Kokkos::fence();
@@ -295,9 +298,9 @@ TEST(StructuredOperands, StackMixesDenseAndDelta) {
 }
 
 // --- 7. make_stack_node<> nested two deep ----------------------------------
-// Outer = make_stack_node<'s'>(
-//     make_stack_node<'r'>(X, Y),
-//     make_stack_node<'r'>(Y, make_delta_node<'p','f'>()))
+// Outer = make_stack_node<'s', 'r', 'p', 'f'>(
+//     make_stack_node<'r', 'p', 'f'>(X, Y),
+//     make_stack_node<'r', 'p', 'f'>(Y, make_delta_node<'p','f'>()))
 // C(e,s,r,f) = sum_p U(e,p) Outer(s,r,p,f)
 //   (s,r) = (0,0): X   (0,1): Y   (1,0): Y   (1,1): delta
 
@@ -343,10 +346,10 @@ TEST(StructuredOperands, NestedStack) {
   auto [g3, u] =
       g2.add(make_stage_node(make_input_node(make_handle<'e', 'p'>(U))));
 
-  auto s0      = make_stack_node<'r'>(x.as<'p', 'f'>(), y.as<'p', 'f'>());
-  auto s1 =
-      make_stack_node<'r'>(y.as<'p', 'f'>(), make_delta_node<'p', 'f'>());
-  auto outer_s = make_stack_node<'s'>(s0, s1);
+  auto s0 = make_stack_node<'r', 'p', 'f'>(x.as<'p', 'f'>(), y.as<'p', 'f'>());
+  auto s1 = make_stack_node<'r', 'p', 'f'>(y.as<'p', 'f'>(),
+                                           make_delta_node<'p', 'f'>());
+  auto outer_s = make_stack_node<'s', 'r', 'p', 'f'>(s0, s1);
 
   auto [g4, c] = g3.add(make_contraction_node<'e', 's', 'r', 'f'>(u, outer_s));
   g4.outputs(c).execute(TeamPolicyTag<ES>{}, C);
@@ -371,8 +374,9 @@ TEST(StructuredOperands, NestedStack) {
         }
 }
 
-// --- 8. make_outer_product_node() multiplies disjoint-label operands -------
-// C(e,i,j) = make_outer_product_node(A.as<'e','i'>(), B.as<'j'>())
+// --- 8. make_outer_product_node<> multiplies disjoint-label operands -------
+// C(e,i,j) = make_outer_product_node<'e','i','j'>(A.as<'e','i'>(),
+//                                                 B.as<'j'>())
 // (A(e,i); B declared as B(m), renamed to 'j'.)  'e' rides straight through
 // as a batch label -- nothing here sums it.
 
@@ -403,7 +407,7 @@ TEST(StructuredOperands, OuterGroupsDisjointOperands) {
   auto [g2, b] =
       g1.add(make_stage_node(make_input_node(make_handle<'m'>(B))));
   auto [g3, c] = g2.add(make_contraction_node<'e', 'i', 'j'>(
-      make_outer_product_node(a.as<'e', 'i'>(), b.as<'j'>())));
+      make_outer_product_node<'e', 'i', 'j'>(a.as<'e', 'i'>(), b.as<'j'>())));
   g3.outputs(c).execute(TeamPolicyTag<ES>{}, C);
   Kokkos::fence();
 
@@ -416,7 +420,7 @@ TEST(StructuredOperands, OuterGroupsDisjointOperands) {
 }
 
 // --- 9. .as<>() relabels a stack --------------------------------------------
-// S  = make_stack_node<'r'>(P.as<'e','x'>(), Q.as<'e','x'>())
+// S  = make_stack_node<'r', 'e', 'x'>(P.as<'e','x'>(), Q.as<'e','x'>())
 // S2 = S.as<'k','e','y'>()
 // C(e,k,y) = S2(e,k,y):   k=0 -> P(e,y)     k=1 -> Q(e,y)
 
@@ -455,8 +459,58 @@ TEST(StructuredOperands, StackRelabelledWithAs) {
       g0.add(make_stage_node(make_input_node(make_handle<'e', 'x'>(P))));
   auto [g2, q] =
       g1.add(make_stage_node(make_input_node(make_handle<'e', 'x'>(Q))));
-  auto s  = make_stack_node<'r'>(p.as<'e', 'x'>(), q.as<'e', 'x'>());
+  auto s  = make_stack_node<'r', 'e', 'x'>(p.as<'e', 'x'>(), q.as<'e', 'x'>());
   auto s2 = s.as<'k', 'e', 'y'>();
+  auto [g3, c] = g2.add(make_contraction_node<'e', 'k', 'y'>(s2));
+  g3.outputs(c).execute(TeamPolicyTag<ES>{}, C);
+  Kokkos::fence();
+
+  auto Ch = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, C);
+  for (int e = 0; e < fE; ++e)
+    for (int y = 0; y < fX; ++y) {
+      EXPECT_NEAR(Ch(e, 0, y), relabel_pval(e, y), 1e-5f)
+          << "k=0 " << e << " " << y;
+      EXPECT_NEAR(Ch(e, 1, y), relabel_qval(e, y), 1e-5f)
+          << "k=1 " << e << " " << y;
+    }
+}
+
+// --- 9b. the relabel of case 9, declared at construction -------------------
+// S2 = make_stack_node<'k','e','y'>(P.as<'e','x'>(), Q.as<'e','x'>()): the
+// labels are positional over ('k', then the branches' (e, x)), so 'x' is read
+// as 'y' from the start. It carries the labels of case 9's s.as<>() and lowers
+// to the same terms, so it must give the same values.
+
+TEST(StructuredOperands, StackRelabelledAtConstruction) {
+  constexpr int fE = 6, fTE = 3, fX = 5;
+  using Map = LabelTiles<LabelTile<'e', fTE>, LabelWhole<'k', 2>,
+                         LabelWhole<'x', fX>, LabelWhole<'y', fX>>;
+
+  Kokkos::View<float**, Kokkos::LayoutRight, ES>  P("P", fE, fX);
+  Kokkos::View<float**, Kokkos::LayoutRight, ES>  Q("Q", fE, fX);
+  Kokkos::View<float***, Kokkos::LayoutRight, ES> C("C", fE, 2, fX);
+  auto Ph = Kokkos::create_mirror_view(P);
+  auto Qh = Kokkos::create_mirror_view(Q);
+  for (int e = 0; e < fE; ++e)
+    for (int x = 0; x < fX; ++x) {
+      Ph(e, x) = relabel_pval(e, x);
+      Qh(e, x) = relabel_qval(e, x);
+    }
+  Kokkos::deep_copy(P, Ph);
+  Kokkos::deep_copy(Q, Qh);
+
+  auto g0 = make_level_graph<float, ES>(Map{});
+  auto [g1, p] =
+      g0.add(make_stage_node(make_input_node(make_handle<'e', 'x'>(P))));
+  auto [g2, q] =
+      g1.add(make_stage_node(make_input_node(make_handle<'e', 'x'>(Q))));
+  auto s2 = make_stack_node<'k', 'e', 'y'>(p.as<'e', 'x'>(), q.as<'e', 'x'>());
+  using ViaAs = decltype(make_stack_node<'r', 'e', 'x'>(p.as<'e', 'x'>(),
+                                                        q.as<'e', 'x'>())
+                             .as<'k', 'e', 'y'>());
+  static_assert(std::is_same_v<decltype(s2)::modes_seq, ViaAs::modes_seq>);
+  static_assert(std::is_same_v<Impl::gc_lower_t<decltype(s2)>,
+                               Impl::gc_lower_t<ViaAs>>);
   auto [g3, c] = g2.add(make_contraction_node<'e', 'k', 'y'>(s2));
   g3.outputs(c).execute(TeamPolicyTag<ES>{}, C);
   Kokkos::fence();
