@@ -145,6 +145,12 @@ struct SlotTiles {};
 template <std::size_t... Pools>
 struct SlotPools {};
 
+// The pool of a slot that occupies NO storage: a streamed root, whose producer
+// writes the designated output directly (LevelPlan.hpp). It contributes
+// nothing to the arena, and its view -- still typed by its tile, so nothing
+// else changes -- is placed at the arena base and never touched.
+inline constexpr std::size_t slot_pool_none = ~std::size_t{0};
+
 // The arena laid out by POOL rather than by slot: pool P is as big as its
 // largest occupant, pools sit end to end, and every slot assigned to P starts
 // at P's base. Slots sharing a pool therefore ALIAS, which is the point -- the
@@ -177,10 +183,12 @@ struct slot_pool_arena<ValueType, ExecSpace, SlotPools<Pools...>,
     std::size_t pelems[N > 0 ? N : 1] = {};
     std::size_t np                    = 0;
     for (std::size_t k = 0; k < N; ++k) {
+      if (pools[k] == slot_pool_none) continue;  // no storage
       if (steps[k] > pelems[pools[k]]) pelems[pools[k]] = steps[k];
       if (pools[k] + 1 > np) np = pools[k] + 1;
     }
 
+    if (i < N && pools[i] == slot_pool_none) return 0;
     const std::size_t upto = (i >= N) ? np : pools[i];
     std::size_t       off  = 0;
     for (std::size_t p = 0; p < upto; ++p) off += pelems[p];
@@ -246,8 +254,8 @@ KOKKOS_FUNCTION auto place_arena_slot_store(const Team& team,
     -> SlotStore<SlotView<ValueType, ExecSpace, Tiles>...> {
   constexpr std::size_t elems =
       Impl::slot_arena_prefix<ValueType, ExecSpace, Tiles...>(sizeof...(Tiles));
-  Impl::scratch_backing_t<ValueType, ExecSpace> arena(team.team_scratch(0),
-                                                      elems);
+  Impl::scratch_backing_t<ValueType, ExecSpace> arena(
+      team.team_scratch(0), elems);
   ValueType*                                    base = arena.data();
   return {DeviceTuple<SlotView<ValueType, ExecSpace, Tiles>...>{
       Impl::alloc_scratch_tile_at<ValueType, ExecSpace>(
@@ -288,14 +296,15 @@ std::size_t pooled_arena_slot_store_bytes(const Tiles&...) {
 template <typename ValueType, typename ExecSpace, typename PoolsList,
           typename Team, typename... Tiles, std::size_t... Is>
 KOKKOS_FUNCTION auto place_pooled_arena_slot_store(const Team& team,
+                                                   const int   scratch_level,
                                                    std::index_sequence<Is...>,
                                                    const Tiles&... tiles)
     -> SlotStore<SlotView<ValueType, ExecSpace, Tiles>...> {
   constexpr std::size_t elems =
       Impl::slot_pool_arena<ValueType, ExecSpace, PoolsList,
                             Impl::SlotTiles<Tiles...>>::total();
-  Impl::scratch_backing_t<ValueType, ExecSpace> arena(team.team_scratch(0),
-                                                      elems);
+  Impl::scratch_backing_t<ValueType, ExecSpace> arena(
+      team.team_scratch(scratch_level), elems);
   ValueType*                                    base = arena.data();
   return {DeviceTuple<SlotView<ValueType, ExecSpace, Tiles>...>{
       Impl::alloc_scratch_tile_at<ValueType, ExecSpace>(
@@ -304,13 +313,17 @@ KOKKOS_FUNCTION auto place_pooled_arena_slot_store(const Team& team,
           tiles)...}};
 }
 
+// `scratch_level` is the team scratch level the arena is carved from: 0 (the
+// default, on-chip on GPU) or 1 (host backends cap level 0 at 32 KB and allow
+// tens of MB at level 1; on GPU level 1 is global memory).
 template <typename ValueType, typename ExecSpace, typename PoolsList,
           typename Team, typename... Tiles>
 KOKKOS_FUNCTION auto carve_pooled_arena_slot_store(const Team& team,
+                                                   const int   scratch_level,
                                                    const Tiles&... tiles)
     -> SlotStore<SlotView<ValueType, ExecSpace, Tiles>...> {
   return place_pooled_arena_slot_store<ValueType, ExecSpace, PoolsList>(
-      team, std::index_sequence_for<Tiles...>{}, tiles...);
+      team, scratch_level, std::index_sequence_for<Tiles...>{}, tiles...);
 }
 
 }  // namespace TensorOperations

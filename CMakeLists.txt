@@ -139,6 +139,19 @@ add_executable(test_level_graph tests/test_level_graph.cpp)
 target_link_libraries(test_level_graph PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_level_graph)
 
+# test_general_contraction — n-ary contractions; delta-structured operands.
+add_executable(test_general_contraction tests/test_general_contraction.cpp)
+target_link_libraries(test_general_contraction PRIVATE tensor GTest::gtest)
+gtest_discover_tests(test_general_contraction)
+
+# test_structured_operands — Structured.hpp: make_delta_node /
+# make_outer_product_node / make_stack_node used directly
+# as make_contraction_node operands, plus its ContractionTag vs
+# GeneralContractionTag dispatch. Custom main() wraps Kokkos init/finalize.
+add_executable(test_structured_operands tests/test_structured_operands.cpp)
+target_link_libraries(test_structured_operands PRIVATE tensor GTest::gtest)
+gtest_discover_tests(test_structured_operands)
+
 # test_functional_input — a leaf whose elements are computed, not addressed.
 # Custom main() wraps Kokkos init/finalize; every case launches a graph.
 add_executable(test_functional_input tests/test_functional_input.cpp)
@@ -288,6 +301,34 @@ set_tests_properties(LevelGuardNegative.Case4 PROPERTIES
                      PASS_REGULAR_EXPRESSION
                      "may not read a slot ITS OWN LEVEL")
 
+# ---------------------------------------------------------------------------
+# Structured-operand guards: make_stack_node<r, l...> and
+# make_outer_product_node<l...> declare every label positionally, and a label
+# kept from the operands may not move. Each case is pinned to its own guard's
+# wording; case 0 is the control and must compile.
+# ---------------------------------------------------------------------------
+foreach(case 0 1 2 3 4)
+  add_executable(structured_guard_neg_${case} EXCLUDE_FROM_ALL
+                 tests/negative/structured_guard_negative.cpp)
+  target_link_libraries(structured_guard_neg_${case} PRIVATE tensor)
+  target_compile_definitions(structured_guard_neg_${case}
+                             PRIVATE STRUCTURED_NEG_CASE=${case})
+  add_test(NAME StructuredGuardNegative.Case${case}
+           COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}
+                   --target structured_guard_neg_${case} --config $<CONFIG>)
+endforeach()
+set_tests_properties(StructuredGuardNegative.Case1 PROPERTIES
+                     PASS_REGULAR_EXPRESSION
+                     "a label kept from the branches must keep its position")
+set_tests_properties(StructuredGuardNegative.Case2 PROPERTIES
+                     PASS_REGULAR_EXPRESSION "declare one label per axis")
+set_tests_properties(StructuredGuardNegative.Case3 PROPERTIES
+                     PASS_REGULAR_EXPRESSION
+                     "a label kept from the operands must keep its position")
+set_tests_properties(StructuredGuardNegative.Case4 PROPERTIES
+                     PASS_REGULAR_EXPRESSION
+                     "declare the stacking label, then one label per branch")
+
 # Benchmarks (opt-in: -DTENSOR_OPS_BUILD_BENCHMARKS=ON). No gtest; own main().
 if(TENSOR_OPS_BUILD_BENCHMARKS)
   # --- 3D SEM stiffness on the LEVEL GRAPH (Sprint 5) -----------------------
@@ -310,6 +351,16 @@ if(TENSOR_OPS_BUILD_BENCHMARKS)
     benchmarks/sem_stiffness_3d/bench_sem3d_levelgraph.cpp)
   target_link_libraries(bench_sem3d_levelgraph_li PRIVATE tensor)
   target_compile_options(bench_sem3d_levelgraph_li PRIVATE -lineinfo)
+
+  # _general twin: same source, built against the GENERAL contraction backend
+  # instead of GEMM (see TENSOR_OPS_CONTRACTION_BACKEND_GENERAL in
+  # NodeHandle.hpp). Benchmarking-only, to compare the two backends head to
+  # head on identical call sites.
+  add_executable(bench_sem3d_levelgraph_general
+    benchmarks/sem_stiffness_3d/bench_sem3d_levelgraph.cpp)
+  target_link_libraries(bench_sem3d_levelgraph_general PRIVATE tensor)
+  target_compile_definitions(bench_sem3d_levelgraph_general PRIVATE
+    TENSOR_OPS_CONTRACTION_BACKEND_GENERAL)
 endif()
 
 # sfpp_min — a minimal, zero-dependency stand-in for SPECFEM++'s 3D elastic
@@ -367,6 +418,15 @@ add_executable(sfpp_min_bench_new_li sfpp_min/bench_new.cpp)
 target_link_libraries(sfpp_min_bench_new_li PRIVATE sfpp_min tensor)
 target_compile_options(sfpp_min_bench_new_li PRIVATE -lineinfo)
 
+# _general twin: same source, built against the GENERAL contraction backend
+# instead of GEMM (see TENSOR_OPS_CONTRACTION_BACKEND_GENERAL in
+# NodeHandle.hpp). Benchmarking-only, to compare the two backends head to head
+# on identical call sites.
+add_executable(sfpp_min_bench_new_general sfpp_min/bench_new.cpp)
+target_link_libraries(sfpp_min_bench_new_general PRIVATE sfpp_min tensor)
+target_compile_definitions(sfpp_min_bench_new_general PRIVATE
+  TENSOR_OPS_CONTRACTION_BACKEND_GENERAL)
+
 # The TE (tile-width) sweep. Its own binary because TE is a compile-time
 # parameter of the graph: folding it into bench_new would multiply that
 # harness's whole axis matrix by the number of TE values.
@@ -376,6 +436,15 @@ target_link_libraries(sfpp_min_bench_te PRIVATE sfpp_min tensor)
 add_executable(sfpp_min_bench_te_li sfpp_min/bench_te.cpp)
 target_link_libraries(sfpp_min_bench_te_li PRIVATE sfpp_min tensor)
 target_compile_options(sfpp_min_bench_te_li PRIVATE -lineinfo)
+
+# _general twin: same source, built against the GENERAL contraction backend
+# instead of GEMM (see TENSOR_OPS_CONTRACTION_BACKEND_GENERAL in
+# NodeHandle.hpp). Benchmarking-only, to compare the two backends head to head
+# on identical call sites.
+add_executable(sfpp_min_bench_te_general sfpp_min/bench_te.cpp)
+target_link_libraries(sfpp_min_bench_te_general PRIVATE sfpp_min tensor)
+target_compile_definitions(sfpp_min_bench_te_general PRIVATE
+  TENSOR_OPS_CONTRACTION_BACKEND_GENERAL)
 
 add_executable(sfpp_min_bench_mat sfpp_min/bench_mat.cpp)
 target_link_libraries(sfpp_min_bench_mat PRIVATE sfpp_min)
