@@ -49,10 +49,14 @@ TEST(SfppMinGll, WeightsSumToTwo) {
 TEST(SfppMinGll, NodesAreSymmetricWithExactEndpoints) {
   EXPECT_DOUBLE_EQ(gll::node(0), -1.0);
   EXPECT_DOUBLE_EQ(gll::node(DEG), 1.0);
-  EXPECT_DOUBLE_EQ(gll::node(2), 0.0);
   for (int i = 0; i < NGLL; ++i)
     EXPECT_NEAR(gll::node(i), -gll::node(DEG - i), 1e-15) << "i=" << i;
-  EXPECT_NEAR(gll::node(3), std::sqrt(3.0 / 7.0), 1e-15);
+  for (int i = 1; i < NGLL; ++i)
+    EXPECT_LT(gll::node(i - 1), gll::node(i)) << "i=" << i;
+  if constexpr (NGLL == 5) {
+    EXPECT_DOUBLE_EQ(gll::node(2), 0.0);
+    EXPECT_NEAR(gll::node(3), std::sqrt(3.0 / 7.0), 1e-15);
+  }
 }
 
 TEST(SfppMinGll, RowSumsVanish) {
@@ -72,10 +76,10 @@ TEST(SfppMinGll, ColumnSumsDoNotVanish) {
   }
   EXPECT_GT(worst, 0.1) << "the rigid-body transpose check depends on this "
                            "asymmetry; a symmetric hprime would disarm it";
-  EXPECT_NEAR(worst, 5.625, 1e-10);
+  if constexpr (NGLL == 5) EXPECT_NEAR(worst, 5.625, 1e-10);
 }
 
-TEST(SfppMinGll, DifferentiationIsExactThroughDegreeFour) {
+TEST(SfppMinGll, DifferentiationIsExactThroughDegreeDeg) {
   for (int k = 0; k <= DEG; ++k) {
     for (int point = 0; point < NGLL; ++point) {
       double d = 0.0;
@@ -87,16 +91,17 @@ TEST(SfppMinGll, DifferentiationIsExactThroughDegreeFour) {
   }
 }
 
-TEST(SfppMinGll, QuadratureIsExactThroughDegreeSevenAndNotEight) {
-  for (int k = 0; k <= 7; ++k) {
+TEST(SfppMinGll, QuadratureIsExactThroughTwoDegMinusOneAndNotTwoDeg) {
+  for (int k = 0; k <= 2 * DEG - 1; ++k) {
     double q = 0.0;
     for (int i = 0; i < NGLL; ++i) q += gll::weight(i) * ipow(gll::node(i), k);
     const double exact = (k % 2) ? 0.0 : 2.0 / (k + 1);
     EXPECT_NEAR(q, exact, 1e-13) << "k=" << k;
   }
-  double q8 = 0.0;
-  for (int i = 0; i < NGLL; ++i) q8 += gll::weight(i) * ipow(gll::node(i), 8);
-  EXPECT_GT(std::abs(q8 - 2.0 / 9.0), 1e-3);
+  double q = 0.0;
+  for (int i = 0; i < NGLL; ++i)
+    q += gll::weight(i) * ipow(gll::node(i), 2 * DEG);
+  EXPECT_GT(std::abs(q - 2.0 / (2 * DEG + 1)), 1e-4);
 }
 
 TEST(SfppMinGll, FullFormulaMatchesSimpleFormulaAtGllNodes) {

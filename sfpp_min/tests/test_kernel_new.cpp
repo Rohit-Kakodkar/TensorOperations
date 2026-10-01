@@ -498,7 +498,11 @@ TYPED_TEST(SfppMinKernelNew, RigidBodyTranslationIsAtTheFloatRoundoffFloor) {
       "scale = %.3e, ratio = %.3e\n",
       residual, output_scale, ratio);
   EXPECT_GT(output_scale, 0.0) << "no output to compare against; test is void";
-  EXPECT_LT(ratio, 1e-5);
+  // Float roundoff in the derivative sums grows with the order (hprime's
+  // corner entries are DEG(DEG+1)/4: 5 at NGLL = 5, 14 at NGLL = 8 -- measured
+  // ratio 1.7e-5 there). A transposed operator puts the ratio near 1, so a
+  // 1e-4 bound at higher orders still separates the two by four decades.
+  EXPECT_LT(ratio, NGLL == 5 ? 1e-5 : 1e-4);
 }
 
 // The two variants are a performance choice, never a physics one: the redundant

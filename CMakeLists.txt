@@ -402,5 +402,38 @@ if(TENSOR_OPS_CUTLASS_DIR AND Kokkos_ENABLE_CUDA)
                              PRIVATE SFPP_MIN_BENCH_TE_CUTE)
 endif()
 
+# The same kernels at a higher polynomial order. NGLL is a compile-time
+# constant, so each order is its own set of binaries; the calibrated NGLL = 5
+# targets above are untouched.
+set(SFPP_MIN_EXTRA_NGLL 8 CACHE STRING "Extra NGLL values to build sfpp_min targets for")
+if(Kokkos_ENABLE_CUDA)
+foreach(n IN LISTS SFPP_MIN_EXTRA_NGLL)
+  add_executable(sfpp_min_gll_n${n} sfpp_min/tests/test_gll.cpp)
+  target_link_libraries(sfpp_min_gll_n${n} PRIVATE sfpp_min GTest::gtest)
+  target_compile_definitions(sfpp_min_gll_n${n} PRIVATE SFPP_MIN_NGLL=${n})
+  gtest_discover_tests(sfpp_min_gll_n${n} TEST_PREFIX sfpp_min.n${n}.)
+
+  add_executable(sfpp_min_kernel_new_n${n} sfpp_min/tests/test_kernel_new.cpp)
+  target_link_libraries(sfpp_min_kernel_new_n${n} PRIVATE sfpp_min tensor GTest::gtest)
+  target_compile_definitions(sfpp_min_kernel_new_n${n} PRIVATE SFPP_MIN_NGLL=${n})
+  gtest_discover_tests(sfpp_min_kernel_new_n${n} TEST_PREFIX sfpp_min.n${n}.)
+
+  add_executable(sfpp_min_bench_n${n} sfpp_min/bench.cpp)
+  target_link_libraries(sfpp_min_bench_n${n} PRIVATE sfpp_min)
+  target_compile_definitions(sfpp_min_bench_n${n} PRIVATE SFPP_MIN_NGLL=${n})
+
+  add_executable(sfpp_min_bench_te_n${n} sfpp_min/bench_te.cpp)
+  target_link_libraries(sfpp_min_bench_te_n${n} PRIVATE sfpp_min tensor)
+  target_compile_definitions(sfpp_min_bench_te_n${n} PRIVATE SFPP_MIN_NGLL=${n})
+
+  if(TENSOR_OPS_CUTLASS_DIR AND Kokkos_ENABLE_CUDA)
+    add_executable(sfpp_min_bench_te_cute_n${n} sfpp_min/bench_te.cpp)
+    target_link_libraries(sfpp_min_bench_te_cute_n${n} PRIVATE sfpp_min tensor)
+    target_compile_definitions(sfpp_min_bench_te_cute_n${n}
+                               PRIVATE SFPP_MIN_BENCH_TE_CUTE SFPP_MIN_NGLL=${n})
+  endif()
+endforeach()
+endif()
+
 add_executable(sfpp_min_bench_mat sfpp_min/bench_mat.cpp)
 target_link_libraries(sfpp_min_bench_mat PRIVATE sfpp_min)
