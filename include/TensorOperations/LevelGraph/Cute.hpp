@@ -2,6 +2,7 @@
 #include <TensorOperations/Evaluator.hpp>
 #include <TensorOperations/LevelGraph/Team.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <type_traits>
@@ -72,32 +73,65 @@ constexpr int lg_cute_mode_fit(int first, int last, int budget) {
   return best;
 }
 
-template <typename Node, int NumThreads>
+template <typename Node>
 struct lg_cute_default_mma {
-  using V                    = typename Node::value_type;
-  using Tile                 = member_out_tile_t<Node>;
-  static constexpr int FreeA = Node::node_a_type::Rank - Node::NumContracted;
-  static constexpr int TM    = lg_cute_mode_fit<Tile>(0, FreeA, NumThreads);
+  using V                     = typename Node::value_type;
+  using Tile                  = member_out_tile_t<Node>;
+  static constexpr int Budget = Node::mma_type::budget;
+  static constexpr int FreeA  = Node::node_a_type::Rank - Node::NumContracted;
+  static constexpr int TM     = lg_cute_mode_fit<Tile>(0, FreeA, Budget);
   static constexpr int TN =
-      lg_cute_mode_fit<Tile>(FreeA, Node::Rank, NumThreads / TM);
+      lg_cute_mode_fit<Tile>(FreeA, Node::Rank, Budget / TM);
   using type = decltype(cute::make_tiled_mma(
       cute::UniversalFMA<V, V, V>{},
       cute::Layout<cute::Shape<cute::Int<TM>, cute::Int<TN>, cute::_1>>{}));
 };
 
-template <typename Node, int NumThreads>
+template <typename Node>
 using lg_cute_mma_t = typename std::conditional_t<
-    std::is_same_v<typename Node::mma_type, DefaultMma>,
-    lg_cute_default_mma<Node, NumThreads>,
+    is_default_mma_v<typename Node::mma_type>, lg_cute_default_mma<Node>,
     std::type_identity<typename Node::mma_type>>::type;
 
-template <int NumThreads, typename Node>
-__device__ lg_cute_mma_t<Node, NumThreads> lg_cute_mma(const Node& n) {
-  if constexpr (std::is_same_v<typename Node::mma_type, DefaultMma>)
+template <typename Node>
+__device__ lg_cute_mma_t<Node> lg_cute_mma(const Node& n) {
+  if constexpr (is_default_mma_v<typename Node::mma_type>)
     return {};
   else
     return n.mma;
 }
+
+inline constexpr int lg_cute_no_mma_threads = 128;
+
+template <typename Node>
+constexpr int lg_cute_member_threads() {
+  if constexpr (has_node_tag_v<ContractionTag, Node>)
+    return static_cast<int>(
+        decltype(cute::size(std::declval<lg_cute_mma_t<Node>>()))::value);
+  else
+    return 0;
+}
+
+template <typename LevelT, std::size_t... Ms>
+constexpr int lg_cute_level_threads(std::index_sequence<Ms...>) {
+  int n = 0;
+  ((n = std::max(n, lg_cute_member_threads<tuple_element_t<Ms, LevelT>>())),
+   ...);
+  return n;
+}
+
+template <typename LevelsT, std::size_t... Ls>
+constexpr int lg_cute_graph_threads(std::index_sequence<Ls...>) {
+  int n = 0;
+  ((n = std::max(n, lg_cute_level_threads<tuple_element_t<Ls, LevelsT>>(
+                        std::make_index_sequence<
+                            tuple_size_v<tuple_element_t<Ls, LevelsT>>>{}))),
+   ...);
+  return n > 0 ? n : lg_cute_no_mma_threads;
+}
+
+template <typename LevelsT>
+inline constexpr int lg_cute_num_threads_v = lg_cute_graph_threads<LevelsT>(
+    std::make_index_sequence<tuple_size_v<LevelsT>>{});
 
 template <typename Node, int NumThreads, typename Tag = typename Node::node_tag>
 struct lg_cute_producer;
@@ -115,13 +149,13 @@ struct lg_cute_producer<Node, NumThreads, StagedTag> {
 
 template <typename Node, int NumThreads>
 struct lg_cute_producer<Node, NumThreads, ContractionTag> {
-  using mma                  = lg_cute_mma_t<Node, NumThreads>;
+  using mma                  = lg_cute_mma_t<Node>;
   static constexpr int FreeA = Node::node_a_type::Rank - Node::NumContracted;
   using tile_shape           = cute_shape_of_t<member_out_tile_t<Node>>;
   using part                 = CuteMmaPartitioner<mma, FreeA>;
 
   __device__ static part make(const Node& n) {
-    return {lg_cute_mma<NumThreads>(n), static_cast<int>(threadIdx.x)};
+    return {lg_cute_mma(n), static_cast<int>(threadIdx.x)};
   }
 };
 
@@ -460,7 +494,7 @@ template <typename V, typename ES, int NumThreads, typename LevelsT,
           std::size_t L, std::size_t M>
 __device__ auto lg_cute_contract_member(const LevelsT& levels, V* base) {
   using Node       = tuple_element_t<M, tuple_element_t<L, LevelsT>>;
-  using Mma        = lg_cute_mma_t<Node, NumThreads>;
+  using Mma        = lg_cute_mma_t<Node>;
   const auto& node = levels.template get<L>().template get<M>();
   const auto  a =
       lg_cute_operand<V, ES, NumThreads, LevelsT, typename Node::node_a_type>(
@@ -468,15 +502,9 @@ __device__ auto lg_cute_contract_member(const LevelsT& levels, V* base) {
   const auto b =
       lg_cute_operand<V, ES, NumThreads, LevelsT, typename Node::node_b_type>(
           base);
-  static_assert(
-      static_cast<int>(decltype(cute::size(std::declval<Mma>()))::value) <=
-          NumThreads,
-      "CuTe level graph: a contraction's TiledMMA needs more threads than "
-      "the CutePolicyTag's NumThreads");
   const auto c = make_evaluator<CutePolicyTag<ES>>(
       node, CuteContractTag<decltype(a), decltype(b), Mma>{
-                a, b, lg_cute_mma<NumThreads>(node),
-                static_cast<int>(threadIdx.x)})();
+                a, b, lg_cute_mma(node), static_cast<int>(threadIdx.x)})();
   return DeviceTuple<decltype(c)>{c};
 }
 
@@ -704,23 +732,30 @@ void lg_cute_check_wholes(const LevelsT& levels, std::index_sequence<Ls...>) {
       ...);
 }
 
-template <typename V, typename ES, typename LevelsT, int N>
+template <typename V, typename ES, typename LevelsT>
 std::size_t lg_cute_smem_bytes() {
-  return lg_cute_smem_elems_v<V, ES, LevelsT, N> * sizeof(V);
+  return lg_cute_smem_elems_v<V, ES, LevelsT, lg_cute_num_threads_v<LevelsT>> *
+         sizeof(V);
 }
 
-template <typename V, typename ES, typename LevelsT, int N>
+template <typename V, typename ES, typename LevelsT>
 std::size_t lg_cute_unpooled_smem_bytes() {
-  return lg_cute_unpooled_smem_elems_v<V, ES, LevelsT, N> * sizeof(V);
+  return lg_cute_unpooled_smem_elems_v<V, ES, LevelsT,
+                                       lg_cute_num_threads_v<LevelsT>> *
+         sizeof(V);
 }
 
 template <typename V, typename ES, typename LT, typename LevelsT,
-          int NumThreads, typename RootsSeq, typename... ViewTs>
+          typename RootsSeq, typename... ViewTs>
 int lg_execute_cute(const LevelsT& levels, RootsSeq, const ViewTs&... views) {
   static_assert(lg_cute_supported<LevelsT>(
                     std::make_index_sequence<tuple_size_v<LevelsT>>{}),
                 "level graph (CuTe): every level must be all stage, all "
                 "contraction or all combine members");
+  constexpr int NumThreads = lg_cute_num_threads_v<LevelsT>;
+  static_assert(NumThreads <= 1024,
+                "level graph (CuTe): the largest contraction TiledMMA needs "
+                "more than 1024 threads");
   using GridModes      = lg_grid_modes_t<LT, LevelsT>;
   using GridTile       = lg_grid_tile_t<LT, LevelsT>;
   using Scheduler      = LinearTileScheduler;
@@ -733,7 +768,7 @@ int lg_execute_cute(const LevelsT& levels, RootsSeq, const ViewTs&... views) {
                            std::make_index_sequence<tuple_size_v<LevelsT>>{});
   const int         wk    = lg_league_size<GridTile>(grid_shape);
   const auto        varr  = lg_view_array(views...);
-  const std::size_t bytes = lg_cute_smem_bytes<V, ES, LevelsT, NumThreads>();
+  const std::size_t bytes = lg_cute_smem_bytes<V, ES, LevelsT>();
 
   const auto kernel =
       lg_cute_kernel<V, ES, NumThreads, LevelsT, GridModes, GridTile, Scheduler,

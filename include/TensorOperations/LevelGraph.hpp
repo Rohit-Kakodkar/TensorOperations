@@ -53,17 +53,15 @@ struct LevelOutputs {
   }
 
 #if defined(TENSOR_OPS_ENABLE_CUTE)
-  template <int N = 128>
-  std::size_t cute_smem_bytes() const {
-    return graph.template cute_smem_bytes<N>();
-  }
-  template <int N = 128>
+  static constexpr int cute_num_threads() { return Graph::cute_num_threads(); }
+
+  std::size_t cute_smem_bytes() const { return graph.cute_smem_bytes(); }
   std::size_t cute_unpooled_smem_bytes() const {
-    return graph.template cute_unpooled_smem_bytes<N>();
+    return graph.cute_unpooled_smem_bytes();
   }
 
-  template <typename ES, int N, TensorLike... Ts>
-  int execute(const CutePolicyTag<ES, N>& tag, const Ts&... views) const {
+  template <typename ES, TensorLike... Ts>
+  int execute(const CutePolicyTag<ES>& tag, const Ts&... views) const {
     return graph.template launch<Roots...>(tag, team, views...);
   }
 #endif
@@ -115,15 +113,16 @@ struct LevelGraph {
   }
 
 #if defined(TENSOR_OPS_ENABLE_CUTE)
-  template <int N = 128>
-  std::size_t cute_smem_bytes() const {
-    return Impl::lg_cute_smem_bytes<ValueType, ExecSpace, LevelsT, N>();
+  static constexpr int cute_num_threads() {
+    return Impl::lg_cute_num_threads_v<LevelsT>;
   }
 
-  template <int N = 128>
+  std::size_t cute_smem_bytes() const {
+    return Impl::lg_cute_smem_bytes<ValueType, ExecSpace, LevelsT>();
+  }
+
   std::size_t cute_unpooled_smem_bytes() const {
-    return Impl::lg_cute_unpooled_smem_bytes<ValueType, ExecSpace, LevelsT,
-                                             N>();
+    return Impl::lg_cute_unpooled_smem_bytes<ValueType, ExecSpace, LevelsT>();
   }
 #endif
 
@@ -143,15 +142,15 @@ struct LevelGraph {
   }
 
 #if defined(TENSOR_OPS_ENABLE_CUTE)
-  template <std::size_t... Roots, typename ES, int N, typename... ViewTs>
-  int launch(const CutePolicyTag<ES, N>&, int team_size,
+  template <std::size_t... Roots, typename ES, typename... ViewTs>
+  int launch(const CutePolicyTag<ES>&, int team_size,
              const ViewTs&... views) const {
     check_launch<ES, sizeof...(Roots), sizeof...(ViewTs)>();
-    if (team_size > 0 && team_size != N)
+    if (team_size > 0)
       Kokkos::abort(
-          "LevelGraph::execute: with the CuTe backend the block size is the "
-          "CutePolicyTag's NumThreads; team_size must match it or be unset");
-    return Impl::lg_execute_cute<ValueType, ExecSpace, LabelTilesT, LevelsT, N>(
+          "LevelGraph::execute: with the CuTe backend the block size comes "
+          "from the graph's contraction MMAs; team_size must be unset");
+    return Impl::lg_execute_cute<ValueType, ExecSpace, LabelTilesT, LevelsT>(
         levels, std::index_sequence<Roots...>{}, views...);
   }
 #endif

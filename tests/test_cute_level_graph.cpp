@@ -154,11 +154,6 @@ TEST(CuteLevelGraph, IdleThreadsWithDefaultBlock) {
   single_stage_root<1, CutePolicyTag<>, ViewR>(6, CutePolicyTag<>{}, 6);
 }
 
-TEST(CuteLevelGraph, SmallerBlockStillCoversTheTile) {
-  single_stage_root<1, CutePolicyTag<ES, 32>, ViewR>(6, CutePolicyTag<ES, 32>{},
-                                                     6);
-}
-
 TEST(CuteLevelGraph, TwoMemberStageLevelBothRoots) {
   constexpr int E = 8;
   ViewR         u("u", E, N, N, N), w("w", E, N, N, N);
@@ -200,7 +195,8 @@ TEST(CuteLevelGraph, TwoStageLevelsWithDifferentTiles) {
       g1.add(make_stage_node(make_input_node(make_handle<'e', 'c'>(b))));
   const auto out = g2.outputs(sa, sb);
 
-  EXPECT_EQ(out.execute(CutePolicyTag<ES, 16>{}, ca, cb), E / 4);
+  static_assert(decltype(out)::cute_num_threads() == 128);
+  EXPECT_EQ(out.execute(CutePolicyTag<>{}, ca, cb), E / 4);
   ASSERT_TRUE(synced());
   out.execute(TeamPolicyTag<ES>{}, ta, tb);
   ASSERT_TRUE(synced());
@@ -221,8 +217,8 @@ using MapQ =
 template <int NG>
 using OpView = Kokkos::View<float**, Kokkos::LayoutRight, ES>;
 
-template <int NG, int TE, typename Policy>
-void one_member_gradient(int E, Policy policy) {
+template <int NG, int TE, int Threads, typename Mma = DefaultMma<>>
+void one_member_gradient(int E, Mma mma = {}) {
   OpView<NG> h("h", NG, NG);
   ViewR      u("u", E, NG, NG, NG);
   ViewR      cute_out("cute_out", NG, E, NG, NG),
@@ -236,10 +232,12 @@ void one_member_gradient(int E, Policy policy) {
       g0.add(make_stage_node(make_input_node(make_handle<'q', 'a'>(h))));
   auto [g2, su] = g1.add(
       make_stage_node(make_input_node(make_handle<'e', 'a', 'b', 'c'>(u))));
-  auto [g3, c]   = g2.add(make_contraction_node<'q', 'e', 'b', 'c'>(sh, su));
+  auto [g3, c] =
+      g2.add(make_contraction_node<'q', 'e', 'b', 'c'>(sh, su, NoHook{}, mma));
   const auto out = g3.outputs(c);
+  static_assert(decltype(out)::cute_num_threads() == Threads);
 
-  EXPECT_EQ(out.execute(policy, cute_out), E / TE);
+  EXPECT_EQ(out.execute(CutePolicyTag<>{}, cute_out), E / TE);
   ASSERT_TRUE(synced());
   out.execute(TeamPolicyTag<ES>{}, team_out);
   ASSERT_TRUE(synced());
@@ -251,15 +249,26 @@ void one_member_gradient(int E, Policy policy) {
 }  // namespace
 
 TEST(CuteLevelGraph, ContractionDefaultMma) {
-  one_member_gradient<8, 2>(8, CutePolicyTag<>{});
+  one_member_gradient<8, 2, 128>(8);
 }
 
 TEST(CuteLevelGraph, ContractionDefaultMmaOddExtents) {
-  one_member_gradient<5, 2>(8, CutePolicyTag<>{});
+  one_member_gradient<5, 2, 50>(8);
 }
 
-TEST(CuteLevelGraph, ContractionSmallBlock) {
-  one_member_gradient<5, 1>(6, CutePolicyTag<ES, 32>{});
+TEST(CuteLevelGraph, SmallMmaBlockStillCoversTheStagedTiles) {
+  one_member_gradient<5, 1, 25>(6, DefaultMma<32>{});
+}
+
+TEST(CuteLevelGraph, DefaultMmaBudgetRaisesTheBlock) {
+  one_member_gradient<8, 2, 256>(8, DefaultMma<256>{});
+}
+
+TEST(CuteLevelGraph, UserMmaSetsTheBlock) {
+  one_member_gradient<8, 2, 32>(
+      8, cute::make_tiled_mma(
+             cute::UniversalFMA<float, float, float>{},
+             cute::Layout<cute::Shape<cute::_4, cute::_8, cute::_1>>{}));
 }
 
 TEST(CuteLevelGraph, ThreeMembersShareTheOperator) {
@@ -323,6 +332,7 @@ TEST(CuteLevelGraph, UserMmaWithIdleThreadsBesideDefault) {
              make_contraction_node<'q', 'e', 'a', 'c'>(
                  sh.template as<'q', 'b'>(), su));
   const auto out = g3.outputs(xa, xb);
+  static_assert(decltype(out)::cute_num_threads() == 128);
 
   out.execute(CutePolicyTag<>{}, ca, cb);
   ASSERT_TRUE(synced());

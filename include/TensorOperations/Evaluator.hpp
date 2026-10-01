@@ -28,14 +28,11 @@ struct TeamPolicyTag {
 };
 
 #if defined(KOKKOS_ENABLE_CUDA)
-template <typename ES = Kokkos::Cuda, int NumThreads = 128>
+template <typename ES = Kokkos::Cuda>
 struct CutePolicyTag {
   static_assert(std::is_same_v<ES, Kokkos::Cuda>,
                 "CutePolicyTag requires the Kokkos::Cuda execution space");
-  static_assert(NumThreads > 0 && NumThreads <= 1024,
-                "CutePolicyTag: a block has between 1 and 1024 threads");
-  using execution_space            = ES;
-  static constexpr int num_threads = NumThreads;
+  using execution_space = ES;
 };
 #endif
 
