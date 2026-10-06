@@ -233,7 +233,7 @@ set_tests_properties(LabelTilesGuardNegative.Case3 PROPERTIES
 # are pinned separately because they are independent factories: one guard
 # present and the other missing must not read as both working.
 # ---------------------------------------------------------------------------
-foreach(case 0 1 2)
+foreach(case 0 1 2 3 4)
   add_executable(functional_guard_neg_${case} EXCLUDE_FROM_ALL
                  tests/negative/functional_guard_negative.cpp)
   target_link_libraries(functional_guard_neg_${case} PRIVATE tensor)
@@ -247,6 +247,12 @@ set_tests_properties(FunctionalGuardNegative.Case1
                      FunctionalGuardNegative.Case2
                      PROPERTIES PASS_REGULAR_EXPRESSION
                      "a functional input has no address")
+set_tests_properties(FunctionalGuardNegative.Case3
+                     PROPERTIES PASS_REGULAR_EXPRESSION
+                     "a multi-output functional input takes no hook")
+set_tests_properties(FunctionalGuardNegative.Case4
+                     PROPERTIES PASS_REGULAR_EXPRESSION
+                     "a void fn produces nothing")
 
 # ---------------------------------------------------------------------------
 # Negative-compilation tests for the ARENA guard. Same rationale and same

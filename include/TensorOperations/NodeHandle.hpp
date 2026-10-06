@@ -211,6 +211,25 @@ struct is_functional_layout<
 template <typename T>
 inline constexpr bool is_functional_layout_v = is_functional_layout<T>::value;
 
+// --- combine fn return-type introspection ----------------------------------
+// Classify combine_ret_t (Concept.hpp: the type fn returns for the combine call
+// shape) as a scalar (NumOut == 1) or a Kokkos::Array<U, M> (NumOut == M).
+template <typename Ret>
+struct combine_out {  // scalar result
+  static constexpr int num = 1;
+  using elem               = Ret;
+};
+template <typename U, std::size_t M>
+struct combine_out<Kokkos::Array<U, M>> {  // Kokkos::Array<U, M> result
+  static constexpr int num = static_cast<int>(M);
+  using elem               = U;
+};
+template <>
+struct combine_out<void> {  // sink: fn returns nothing and scatters itself, so
+  static constexpr int num = 0;  // it contributes no output slot to the graph
+  using elem               = void;
+};
+
 // Number of output tensors a node emits: 1 for every node except a multi-output
 // combine, which exposes `NumOut`.
 template <typename Node, typename = void>
@@ -283,14 +302,16 @@ struct NodeHandle<FunctionalTag, Fn, ModesSeq, ValueType, ExecSpace, Layout,
   Layout                       layout_;
   [[no_unique_address]] HookOp hook_op;
 
-  using node_tag            = FunctionalTag;
-  static constexpr int Rank = static_cast<int>(ModesSeq::size());
-  using value_type          = ValueType;
-  using exec_space          = ExecSpace;
-  using modes_seq           = ModesSeq;
-  using functor_type        = Fn;
-  using layout_type         = Layout;
-  using order_tag           = Impl::layout_order_t<Layout>;
+  using node_tag              = FunctionalTag;
+  static constexpr int Rank   = static_cast<int>(ModesSeq::size());
+  using value_type            = ValueType;
+  using exec_space            = ExecSpace;
+  using modes_seq             = ModesSeq;
+  using functor_type          = Fn;
+  using layout_type           = Layout;
+  using order_tag             = Impl::layout_order_t<Layout>;
+  using result_type           = functional_value_t<Fn, Rank>;
+  static constexpr int NumOut = Impl::combine_out<result_type>::num;
 
   static_assert(Impl::labels_distinct_v<ModesSeq>,
                 "functional input node: labels must be distinct");
@@ -339,13 +360,14 @@ template <typename Operand, typename ModesSeq, typename Tile>
 struct NodeHandle<StagedTag, Operand, ModesSeq, Tile> {
   Operand operand_;
 
-  using node_tag            = StagedTag;
-  using operand_type        = Operand;
-  using tile_type           = Tile;
-  static constexpr int Rank = Operand::Rank;
-  using value_type          = typename Operand::value_type;
-  using exec_space          = typename Operand::exec_space;
-  using modes_seq           = ModesSeq;
+  using node_tag              = StagedTag;
+  using operand_type          = Operand;
+  using tile_type             = Tile;
+  static constexpr int Rank   = Operand::Rank;
+  static constexpr int NumOut = Impl::output_arity<Operand>::value;
+  using value_type            = typename Operand::value_type;
+  using exec_space            = typename Operand::exec_space;
+  using modes_seq             = ModesSeq;
 
   static_assert(static_cast<int>(ModesSeq::size()) == Rank,
                 "staged node: one label per axis");
@@ -480,7 +502,13 @@ KOKKOS_FUNCTION auto make_functional_input_node_impl(Layout layout, Fn fn,
                 "DynamicTileLayout{Right,Left}, StaticTileLayout{Right,Left}, "
                 "or StaticTileLayoutStride -- these are the layouts whose "
                 "traversal order a tile can inherit");
-  using ValueType = functional_value_t<Fn, Rank>;
+  using OutInfo   = combine_out<functional_value_t<Fn, Rank>>;
+  using ValueType = typename OutInfo::elem;
+  static_assert(OutInfo::num >= 1,
+                "functional input source must return a value or a "
+                "Kokkos::Array<V, M> of M values; a void fn produces nothing");
+  static_assert(OutInfo::num == 1 || std::same_as<HookOp, NoHook>,
+                "a multi-output functional input takes no hook");
   static_assert(
       std::same_as<HookOp, NoHook> || HookLike<HookOp, Rank, ValueType>,
       "functional input hook must be callable as op(i_0, ..., i_{Rank-1}, "
@@ -798,25 +826,6 @@ struct NodeHandle<CombineTag, CombineFn, IntRank, Scalar, ExecSpace, ModesSeq,
 //   make_combine_node<'i','j'>(a, b, ..., fn)
 // ---------------------------------------------------------------------------
 namespace Impl {
-
-// --- combine fn return-type introspection ----------------------------------
-// Classify combine_ret_t (Concept.hpp: the type fn returns for the combine call
-// shape) as a scalar (NumOut == 1) or a Kokkos::Array<U, M> (NumOut == M).
-template <typename Ret>
-struct combine_out {  // scalar result
-  static constexpr int num = 1;
-  using elem               = Ret;
-};
-template <typename U, std::size_t M>
-struct combine_out<Kokkos::Array<U, M>> {  // Kokkos::Array<U, M> result
-  static constexpr int num = static_cast<int>(M);
-  using elem               = U;
-};
-template <>
-struct combine_out<void> {  // sink: fn returns nothing and scatters itself, so
-  static constexpr int num = 0;  // it contributes no output slot to the graph
-  using elem               = void;
-};
 
 // An operand's shape() gathered into the TargetSeq (output) axis order, so
 // operand extents can be compared mode-for-mode whatever each operand's own
