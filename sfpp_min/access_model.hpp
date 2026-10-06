@@ -11,7 +11,7 @@ inline constexpr int kWorkItemsPerTeam = kExecChunk * kPointsPerElement;
 inline constexpr int kTeamSize         = 256;
 inline constexpr int kWarpSize         = 32;
 
-static_assert(kWorkItemsPerTeam == 500,
+static_assert(NGLL != 5 || kWorkItemsPerTeam == 500,
               "the ground truth was measured at 4 elements x 125 points");
 
 struct WorkItem {

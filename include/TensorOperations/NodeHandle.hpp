@@ -24,6 +24,20 @@ struct StagedTag {};
 // Sentinel for "no hook"
 struct NoHook {};
 
+template <int Budget = 128>
+struct DefaultMma {
+  static_assert(Budget > 0 && Budget <= 1024,
+                "DefaultMma: a block has between 1 and 1024 threads");
+  static constexpr int budget = Budget;
+};
+
+namespace Impl {
+template <typename M>
+inline constexpr bool is_default_mma_v = false;
+template <int B>
+inline constexpr bool is_default_mma_v<DefaultMma<B>> = true;
+}  // namespace Impl
+
 // Forward declaration — TiledLayout.hpp defines it; exec_space_of below has to
 // look through it, and including it here would be a cycle.
 template <typename ViewType, typename Layout>
@@ -618,9 +632,9 @@ KOKKOS_FUNCTION auto make_slot_node(
 // present the user's output view/tile canonically.
 template <typename NodeA, typename NodeB, typename IntCRank, typename Scalar,
           typename ExecSpace, typename HookOp, typename ModesSeq,
-          typename PermCSeq>
+          typename PermCSeq, typename Mma>
 struct NodeHandle<ContractionTag, NodeA, NodeB, IntCRank, Scalar, ExecSpace,
-                  HookOp, ModesSeq, PermCSeq> {
+                  HookOp, ModesSeq, PermCSeq, Mma> {
   using node_tag                     = ContractionTag;
   static constexpr int Rank          = IntCRank::value;
   static constexpr int NumContracted = (NodeA::Rank + NodeB::Rank - Rank) / 2;
@@ -631,11 +645,13 @@ struct NodeHandle<ContractionTag, NodeA, NodeB, IntCRank, Scalar, ExecSpace,
   using node_b_type                  = NodeB;
   using modes_seq                    = ModesSeq;  // canonical output labels
   using permC_seq                    = PermCSeq;  // canonical -> user output
+  using mma_type                     = Mma;
 
   NodeA                        node_a;
   NodeB                        node_b;
   Kokkos::Array<int, Rank>     shape_;  // canonical output extents
   [[no_unique_address]] HookOp hook_op;
+  [[no_unique_address]] Mma    mma;
 
   KOKKOS_FUNCTION Kokkos::Array<int, Rank> shape() const { return shape_; }
 };
@@ -654,8 +670,8 @@ struct NodeHandle<ContractionTag, NodeA, NodeB, IntCRank, Scalar, ExecSpace,
 namespace Impl {
 
 template <typename ActualScalar, typename ExecSpace, int32_t... OutModes,
-          typename NodeA, typename NodeB, typename HookOp>
-auto make_contraction_node_impl(NodeA a, NodeB b, HookOp hook) {
+          typename NodeA, typename NodeB, typename HookOp, typename Mma>
+auto make_contraction_node_impl(NodeA a, NodeB b, HookOp hook, Mma mma) {
   static_assert(Impl::is_node_handle_v<NodeA> && Impl::is_node_handle_v<NodeB>,
                 "contraction operands must be node handles; a multi-output "
                 "slice (CombineOutputHandle) is a terminal output, not an "
@@ -709,8 +725,8 @@ auto make_contraction_node_impl(NodeA a, NodeB b, HookOp hook) {
 
   return NodeHandle<ContractionTag, NodeA, NodeB,
                     std::integral_constant<int, Rank>, ActualScalar, ExecSpace,
-                    HookOp, CanonModes, PermC>{std::move(a), std::move(b),
-                                               c_shape, std::move(hook)};
+                    HookOp, CanonModes, PermC, Mma>{
+      std::move(a), std::move(b), c_shape, std::move(hook), std::move(mma)};
 }
 
 }  // namespace Impl
@@ -718,21 +734,21 @@ auto make_contraction_node_impl(NodeA a, NodeB b, HookOp hook) {
 // Primary form: infer the output scalar from NodeA, default execution space.
 //   make_contraction_node<'l','i'>(a, b)
 template <int32_t... OutModes, typename NodeA, typename NodeB,
-          typename HookOp = NoHook>
-auto make_contraction_node(NodeA a, NodeB b, HookOp hook = {}) {
+          typename HookOp = NoHook, typename Mma = DefaultMma<>>
+auto make_contraction_node(NodeA a, NodeB b, HookOp hook = {}, Mma mma = {}) {
   return Impl::make_contraction_node_impl<
       typename NodeA::value_type, Kokkos::DefaultExecutionSpace, OutModes...>(
-      std::move(a), std::move(b), std::move(hook));
+      std::move(a), std::move(b), std::move(hook), std::move(mma));
 }
 
 // Explicit scalar (and execution-space) override:
 //   make_contraction_node<double, Kokkos::DefaultExecutionSpace, 'i','k'>(a, b)
 template <typename Scalar, typename ExecSpace = Kokkos::DefaultExecutionSpace,
           int32_t... OutModes, typename NodeA, typename NodeB,
-          typename HookOp = NoHook>
-auto make_contraction_node(NodeA a, NodeB b, HookOp hook = {}) {
+          typename HookOp = NoHook, typename Mma = DefaultMma<>>
+auto make_contraction_node(NodeA a, NodeB b, HookOp hook = {}, Mma mma = {}) {
   return Impl::make_contraction_node_impl<Scalar, ExecSpace, OutModes...>(
-      std::move(a), std::move(b), std::move(hook));
+      std::move(a), std::move(b), std::move(hook), std::move(mma));
 }
 
 // ---------------------------------------------------------------------------

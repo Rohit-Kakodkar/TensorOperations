@@ -61,9 +61,11 @@ __device__ auto smem_tile(float* ptr) {
 template <typename Shape, typename Thr, typename StageNode, typename Coord>
 __device__ auto stage(StageNode sn, float* ptr, int thr, Coord coord) {
   auto dst = smem_tile<Shape>(ptr);
-  auto ev  = make_evaluator<CutePolicyTag<>>(
-      sn, CuteStagedTag<decltype(dst), Thr>{{Thr{}, thr}, dst});
-  return ev(coord);
+  auto src = make_evaluator<CutePolicyTag<>>(sn.operand_, Shape{})(coord);
+  auto ld =
+      make_evaluator<CutePolicyTag<>>(make_cute_interm_node<Kokkos::Cuda>(dst),
+                                      CuteSmemLoadTag<Thr>{Thr{}, thr});
+  return (ld = src);
 }
 
 template <typename Shape>

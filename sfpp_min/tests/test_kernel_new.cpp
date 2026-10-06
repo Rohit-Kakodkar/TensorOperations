@@ -32,6 +32,8 @@
 
 #include <cmath>
 #include <cstdio>
+#include <string>
+#include <type_traits>
 #include <vector>
 
 using namespace sfpp_min;
@@ -48,6 +50,13 @@ namespace {
 constexpr int kTestTE =
     std::is_same_v<KernelES, Kokkos::DefaultHostExecutionSpace> ? 2
                                                                 : kExecChunk;
+
+// Every test runs once per backend the build has: the team policy always, and
+// the CuTe policy when the build is configured with TENSOR_OPS_CUTLASS_DIR.
+using TeamPolicy = TensorOperations::TeamPolicyTag<KernelES>;
+#if defined(TENSOR_OPS_ENABLE_CUTE)
+using CutePolicy = TensorOperations::CutePolicyTag<KernelES>;
+#endif
 
 constexpr MeshDims kD{4, 3, 2};
 
@@ -160,11 +169,12 @@ struct ErrorReport {
   }
 };
 
-template <bool KeepRedundantLoads = false, int TE = kTestTE, typename Off>
+template <typename Policy, bool KeepRedundantLoads = false, int TE = kTestTE,
+          typename Off>
 ErrorReport run_and_compare(Case<Off>& k) {
   const GllViews q    = make_gll_views();
   auto           args = make_args(k, q);
-  new_stiffness<KeepRedundantLoads, TE>(args);
+  new_stiffness<KeepRedundantLoads, TE>(args, Policy{});
   Kokkos::fence();
   k.f.to_host();
 
@@ -187,7 +197,7 @@ ErrorReport run_and_compare(Case<Off>& k) {
 // on the serial oracle exactly as the LayoutLeft run does. A transposed
 // subscript would still produce a plausible-looking field, which is why the
 // oracle rather than a self-comparison is the judge.
-template <bool KeepRedundantLoads = false, typename Off>
+template <typename Policy, bool KeepRedundantLoads = false, typename Off>
 ErrorReport run_and_compare_iglob_right(Case<Off>& k) {
   IglobMapRight gr(k.set.nspec());
   for (int ispec = 0; ispec < k.set.nspec(); ++ispec)
@@ -205,7 +215,7 @@ ErrorReport run_and_compare_iglob_right(Case<Off>& k) {
   DummyKernelArgs args{make_accessor(k.m), make_accessor(k.p), gr.map,
                        k.f.displacement,   k.f.velocity,       k.f.acceleration,
                        q.hprime,           q.weights,          k.set.nspec()};
-  new_stiffness<KeepRedundantLoads, kTestTE>(args);
+  new_stiffness<KeepRedundantLoads, kTestTE>(args, Policy{});
   Kokkos::fence();
   k.f.to_host();
 
@@ -223,7 +233,7 @@ ErrorReport run_and_compare_iglob_right(Case<Off>& k) {
   return e;
 }
 
-template <bool KeepRedundantLoads = false, typename Off>
+template <typename Policy, bool KeepRedundantLoads = false, typename Off>
 ErrorReport run_and_compare_aos(Case<Off>& k) {
   MetricsAoS<Off>    m(k.set.nspec());
   PropertiesAoS<Off> p(k.set.nspec());
@@ -256,7 +266,7 @@ ErrorReport run_and_compare_aos(Case<Off>& k) {
   DummyKernelArgs args{make_accessor(m), make_accessor(p), k.g.map,
                        k.f.displacement, k.f.velocity,     k.f.acceleration,
                        q.hprime,         q.weights,        k.set.nspec()};
-  new_stiffness<KeepRedundantLoads, kTestTE>(args);
+  new_stiffness<KeepRedundantLoads, kTestTE>(args, Policy{});
   Kokkos::fence();
   k.f.to_host();
 
@@ -275,12 +285,12 @@ ErrorReport run_and_compare_aos(Case<Off>& k) {
 }
 
 // Every oracle test runs both KeepRedundantLoads values through one body.
-template <bool Keep, typename Off>
+template <typename Policy, bool Keep, typename Off>
 void expect_oracle(const char* name) {
   auto k = make_case<Off>();
   set_linear_field(k);
   set_velocity(k);
-  const ErrorReport e = run_and_compare<Keep>(k);
+  const ErrorReport e = run_and_compare<Policy, Keep>(k);
   std::printf(
       "[ INFO     ] %s (keep=%d): max|diff| = %.3e, scale = %.3e, "
       "relative = %.3e\n",
@@ -289,45 +299,65 @@ void expect_oracle(const char* name) {
   EXPECT_LT(e.relative(), 1e-4) << name << " keep=" << Keep;
 }
 
-template <typename Off>
+template <typename Policy, typename Off>
 void expect_layout_invariant(const char* name) {
-  expect_oracle<false, Off>(name);
-  expect_oracle<true, Off>(name);
+  expect_oracle<Policy, false, Off>(name);
+  expect_oracle<Policy, true, Off>(name);
 }
+
+template <typename Policy>
+class SfppMinKernelNew : public ::testing::Test {};
+
+struct PolicyName {
+  template <typename Policy>
+  static std::string GetName(int) {
+    return std::is_same_v<Policy, TeamPolicy> ? "Team" : "Cute";
+  }
+};
+
+#if defined(TENSOR_OPS_ENABLE_CUTE)
+using Policies = ::testing::Types<TeamPolicy, CutePolicy>;
+#else
+using Policies = ::testing::Types<TeamPolicy>;
+#endif
+TYPED_TEST_SUITE(SfppMinKernelNew, Policies, PolicyName);
 
 }  // namespace
 
-TEST(SfppMinKernelNew, MatchesSerialOracleStaticExtents) {
-  expect_layout_invariant<ChunkTiledOffset>("static extents");
+TYPED_TEST(SfppMinKernelNew, MatchesSerialOracleStaticExtents) {
+  expect_layout_invariant<TypeParam, ChunkTiledOffset>("static extents");
 }
 
-TEST(SfppMinKernelNew, MatchesSerialOracleDynamicExtents) {
-  expect_layout_invariant<ChunkTiledDynamicOffset>("dynamic extents");
+TYPED_TEST(SfppMinKernelNew, MatchesSerialOracleDynamicExtents) {
+  expect_layout_invariant<TypeParam, ChunkTiledDynamicOffset>(
+      "dynamic extents");
 }
 
-TEST(SfppMinKernelNew, MatchesSerialOracleLayoutRight) {
-  expect_layout_invariant<PlainOffset>("LayoutRight (PlainOffset)");
+TYPED_TEST(SfppMinKernelNew, MatchesSerialOracleLayoutRight) {
+  expect_layout_invariant<TypeParam, PlainOffset>("LayoutRight (PlainOffset)");
 }
 
-TEST(SfppMinKernelNew, MatchesSerialOracleLayoutRightDynamic) {
-  expect_layout_invariant<LayoutRightDynamicOffset>("LayoutRight dynamic");
+TYPED_TEST(SfppMinKernelNew, MatchesSerialOracleLayoutRightDynamic) {
+  expect_layout_invariant<TypeParam, LayoutRightDynamicOffset>(
+      "LayoutRight dynamic");
 }
 
-TEST(SfppMinKernelNew, MatchesSerialOracleLayoutLeft) {
-  expect_layout_invariant<LayoutLeftOffset>("LayoutLeft");
+TYPED_TEST(SfppMinKernelNew, MatchesSerialOracleLayoutLeft) {
+  expect_layout_invariant<TypeParam, LayoutLeftOffset>("LayoutLeft");
 }
 
-TEST(SfppMinKernelNew, MatchesSerialOracleLayoutLeftDynamic) {
-  expect_layout_invariant<LayoutLeftDynamicOffset>("LayoutLeft dynamic");
+TYPED_TEST(SfppMinKernelNew, MatchesSerialOracleLayoutLeftDynamic) {
+  expect_layout_invariant<TypeParam, LayoutLeftDynamicOffset>(
+      "LayoutLeft dynamic");
 }
 
-template <typename Off>
+template <typename Policy, typename Off>
 void expect_aos_invariant(const char* name) {
   {
     auto k = make_case<Off>();
     set_linear_field(k);
     set_velocity(k);
-    const ErrorReport e = run_and_compare_aos<false>(k);
+    const ErrorReport e = run_and_compare_aos<Policy, false>(k);
     std::printf(
         "[ INFO     ] %s (keep=0): max|diff| = %.3e, scale = %.3e, "
         "relative = %.3e\n",
@@ -339,7 +369,7 @@ void expect_aos_invariant(const char* name) {
     auto k = make_case<Off>();
     set_linear_field(k);
     set_velocity(k);
-    const ErrorReport e = run_and_compare_aos<true>(k);
+    const ErrorReport e = run_and_compare_aos<Policy, true>(k);
     std::printf(
         "[ INFO     ] %s (keep=1): max|diff| = %.3e, scale = %.3e, "
         "relative = %.3e\n",
@@ -349,12 +379,13 @@ void expect_aos_invariant(const char* name) {
   }
 }
 
-TEST(SfppMinKernelNew, MatchesSerialOracleAoSStaticExtents) {
-  expect_aos_invariant<ChunkTiledOffset>("AoS static extents");
+TYPED_TEST(SfppMinKernelNew, MatchesSerialOracleAoSStaticExtents) {
+  expect_aos_invariant<TypeParam, ChunkTiledOffset>("AoS static extents");
 }
 
-TEST(SfppMinKernelNew, MatchesSerialOracleAoSDynamicExtents) {
-  expect_aos_invariant<ChunkTiledDynamicOffset>("AoS dynamic extents");
+TYPED_TEST(SfppMinKernelNew, MatchesSerialOracleAoSDynamicExtents) {
+  expect_aos_invariant<TypeParam, ChunkTiledDynamicOffset>(
+      "AoS dynamic extents");
 }
 
 // A rigid-body translation is in the operator's null space exactly, because
@@ -362,13 +393,14 @@ TEST(SfppMinKernelNew, MatchesSerialOracleAoSDynamicExtents) {
 // double floor. A transposed hprime -- or a transposed hprimewgll, which the
 // graph builds itself -- puts the residual at the order of the output, ratio
 // near 1. This is the one test that catches either transpose.
-TEST(SfppMinKernelNew, MatchesSerialOracleWithLayoutRightIglob) {
+TYPED_TEST(SfppMinKernelNew, MatchesSerialOracleWithLayoutRightIglob) {
   for (int keep = 0; keep < 2; ++keep) {
     auto k = make_case<ChunkTiledDynamicOffset>();
     set_linear_field(k);
     set_velocity(k);
-    const ErrorReport e = keep ? run_and_compare_iglob_right<true>(k)
-                               : run_and_compare_iglob_right<false>(k);
+    const ErrorReport e =
+        keep ? run_and_compare_iglob_right<TypeParam, true>(k)
+             : run_and_compare_iglob_right<TypeParam, false>(k);
     std::printf(
         "[ INFO     ] LayoutRight iglob (keep=%d): max|diff| = %.3e, "
         "scale = %.3e, relative = %.3e\n",
@@ -378,13 +410,13 @@ TEST(SfppMinKernelNew, MatchesSerialOracleWithLayoutRightIglob) {
   }
 }
 
-TEST(SfppMinKernelNew, MatchesSerialOracleWithIxFastestNumbering) {
+TYPED_TEST(SfppMinKernelNew, MatchesSerialOracleWithIxFastestNumbering) {
   for (int keep = 0; keep < 2; ++keep) {
     auto k = make_case<ChunkTiledDynamicOffset>(/*ix_fastest=*/true);
     set_linear_field(k);
     set_velocity(k);
-    const ErrorReport e =
-        keep ? run_and_compare<true>(k) : run_and_compare<false>(k);
+    const ErrorReport e = keep ? run_and_compare<TypeParam, true>(k)
+                               : run_and_compare<TypeParam, false>(k);
     std::printf(
         "[ INFO     ] ix-fastest numbering (keep=%d): max|diff| = %.3e, "
         "scale = %.3e, relative = %.3e\n",
@@ -395,11 +427,11 @@ TEST(SfppMinKernelNew, MatchesSerialOracleWithIxFastestNumbering) {
 }
 
 // The two axes together: the graph's numbering AND a LayoutRight index map.
-TEST(SfppMinKernelNew, MatchesSerialOracleIxFastestWithLayoutRightIglob) {
+TYPED_TEST(SfppMinKernelNew, MatchesSerialOracleIxFastestWithLayoutRightIglob) {
   auto k = make_case<ChunkTiledDynamicOffset>(/*ix_fastest=*/true);
   set_linear_field(k);
   set_velocity(k);
-  const ErrorReport e = run_and_compare_iglob_right<false>(k);
+  const ErrorReport e = run_and_compare_iglob_right<TypeParam, false>(k);
   std::printf(
       "[ INFO     ] ix-fastest + LayoutRight iglob: max|diff| = %.3e, "
       "scale = %.3e, relative = %.3e\n",
@@ -413,12 +445,12 @@ TEST(SfppMinKernelNew, MatchesSerialOracleIxFastestWithLayoutRightIglob) {
 // same field at any tile width" is a claim about code that differs, not a
 // tautology. The TE sweep picked TE=1 as the winner, and until this test
 // existed nothing had checked TE=1 against the oracle at all.
-template <int TE>
+template <typename Policy, int TE>
 void expect_te_invariant() {
   auto k = make_case<ChunkTiledDynamicOffset>(/*ix_fastest=*/true);
   set_linear_field(k);
   set_velocity(k);
-  const ErrorReport e = run_and_compare<false, TE>(k);
+  const ErrorReport e = run_and_compare<Policy, false, TE>(k);
   std::printf(
       "[ INFO     ] TE=%d: max|diff| = %.3e, scale = %.3e, relative = %.3e\n",
       TE, e.worst_abs, e.scale, e.relative());
@@ -427,15 +459,15 @@ void expect_te_invariant() {
   EXPECT_LT(e.relative(), 1e-4) << "TE=" << TE;
 }
 
-TEST(SfppMinKernelNew, MatchesSerialOracleAtTileWidthOne) {
-  expect_te_invariant<1>();
+TYPED_TEST(SfppMinKernelNew, MatchesSerialOracleAtTileWidthOne) {
+  expect_te_invariant<TypeParam, 1>();
 }
 
-TEST(SfppMinKernelNew, MatchesSerialOracleAtTileWidthTwo) {
-  expect_te_invariant<2>();
+TYPED_TEST(SfppMinKernelNew, MatchesSerialOracleAtTileWidthTwo) {
+  expect_te_invariant<TypeParam, 2>();
 }
 
-TEST(SfppMinKernelNew, RigidBodyTranslationIsAtTheFloatRoundoffFloor) {
+TYPED_TEST(SfppMinKernelNew, RigidBodyTranslationIsAtTheFloatRoundoffFloor) {
   auto         k    = make_case<ChunkTiledOffset>();
   const double c[3] = {1.3e-3, -0.7e-3, 2.1e-3};
   set_constant_field(k, c);
@@ -443,7 +475,7 @@ TEST(SfppMinKernelNew, RigidBodyTranslationIsAtTheFloatRoundoffFloor) {
 
   const GllViews q    = make_gll_views();
   auto           args = make_args(k, q);
-  new_stiffness<false, kTestTE>(args);
+  new_stiffness<false, kTestTE>(args, TypeParam{});
   Kokkos::fence();
   k.f.to_host();
 
@@ -457,7 +489,7 @@ TEST(SfppMinKernelNew, RigidBodyTranslationIsAtTheFloatRoundoffFloor) {
   auto k2 = make_case<ChunkTiledOffset>();
   set_linear_field(k2);
   set_velocity(k2);
-  const ErrorReport ref          = run_and_compare(k2);
+  const ErrorReport ref          = run_and_compare<TypeParam>(k2);
   const double      output_scale = ref.scale;
 
   const double ratio = residual / output_scale;
@@ -466,7 +498,11 @@ TEST(SfppMinKernelNew, RigidBodyTranslationIsAtTheFloatRoundoffFloor) {
       "scale = %.3e, ratio = %.3e\n",
       residual, output_scale, ratio);
   EXPECT_GT(output_scale, 0.0) << "no output to compare against; test is void";
-  EXPECT_LT(ratio, 1e-5);
+  // Float roundoff in the derivative sums grows with the order (hprime's
+  // corner entries are DEG(DEG+1)/4: 5 at NGLL = 5, 14 at NGLL = 8 -- measured
+  // ratio 1.7e-5 there). A transposed operator puts the ratio near 1, so a
+  // 1e-4 bound at higher orders still separates the two by four decades.
+  EXPECT_LT(ratio, NGLL == 5 ? 1e-5 : 1e-4);
 }
 
 // The two variants are a performance choice, never a physics one: the redundant
@@ -478,13 +514,13 @@ TEST(SfppMinKernelNew, RigidBodyTranslationIsAtTheFloatRoundoffFloor) {
 // relative O(1); the atomic-reorder floor is ~1e-6, so a 1e-4 bound separates
 // them cleanly -- the same bound and the same discriminating power as bitwise,
 // without a false failure on the GPU's nondeterministic reduction order.
-TEST(SfppMinKernelNew, RedundantLoadsDoNotChangeTheField) {
+TYPED_TEST(SfppMinKernelNew, RedundantLoadsDoNotChangeTheField) {
   auto k0 = make_case<ChunkTiledDynamicOffset>();
   set_linear_field(k0);
   set_velocity(k0);
   const GllViews q0    = make_gll_views();
   auto           args0 = make_args(k0, q0);
-  new_stiffness<false, kTestTE>(args0);
+  new_stiffness<false, kTestTE>(args0, TypeParam{});
   Kokkos::fence();
   k0.f.to_host();
 
@@ -493,7 +529,7 @@ TEST(SfppMinKernelNew, RedundantLoadsDoNotChangeTheField) {
   set_velocity(k1);
   const GllViews q1    = make_gll_views();
   auto           args1 = make_args(k1, q1);
-  new_stiffness<true, kTestTE>(args1);
+  new_stiffness<true, kTestTE>(args1, TypeParam{});
   Kokkos::fence();
   k1.f.to_host();
 
@@ -516,6 +552,117 @@ TEST(SfppMinKernelNew, RedundantLoadsDoNotChangeTheField) {
       << "the redundant loads feed no-ops; they must not move the field beyond "
          "the atomic-reorder roundoff floor";
 }
+
+#if defined(TENSOR_OPS_ENABLE_CUTE)
+// The two backends run the same graph, so they must agree far tighter than
+// either agrees with the double-precision oracle. Only the atomic scatter's
+// accumulation order differs, which puts the floor at float roundoff.
+TEST(SfppMinKernelNewCute, MatchesTheTeamBackend) {
+  auto kt = make_case<ChunkTiledDynamicOffset>(/*ix_fastest=*/true);
+  set_linear_field(kt);
+  set_velocity(kt);
+  const GllViews qt = make_gll_views();
+  new_stiffness<false, kTestTE>(make_args(kt, qt), TeamPolicy{});
+  Kokkos::fence();
+  kt.f.to_host();
+
+  auto kc = make_case<ChunkTiledDynamicOffset>(/*ix_fastest=*/true);
+  set_linear_field(kc);
+  set_velocity(kc);
+  const GllViews qc = make_gll_views();
+  new_stiffness<false, kTestTE>(make_args(kc, qc), CutePolicy{});
+  Kokkos::fence();
+  kc.f.to_host();
+
+  double worst = 0.0, scale = 0.0;
+  for (int ig = 0; ig < kt.nglob; ++ig)
+    for (int c = 0; c < 3; ++c) {
+      const double t = kt.f.h_acceleration(ig, c);
+      scale          = std::max(scale, std::abs(t));
+      worst = std::max(worst, std::abs(t - kc.f.h_acceleration(ig, c)));
+    }
+  const double relative = scale > 0.0 ? worst / scale : worst;
+  std::printf(
+      "[ INFO     ] cute vs team: max|diff| = %.3e, scale = %.3e, "
+      "relative = %.3e\n",
+      worst, scale, relative);
+  EXPECT_GT(scale, 0.0) << "void test: the team backend produced a zero field";
+  EXPECT_LT(relative, 1e-5);
+}
+
+// The permuted MMA hands threads (point, point) and loops over the elements,
+// so it partitions every contraction and every register-driven combine
+// differently from the default. The field must not move.
+template <int TE, ContractionMma Mma, typename Off>
+void expect_cute_mma_oracle(const char* name) {
+  auto k = make_case<Off>(/*ix_fastest=*/true);
+  set_linear_field(k);
+  set_velocity(k);
+  const GllViews q = make_gll_views();
+  new_stiffness<false, TE, Mma>(make_args(k, q), CutePolicy{});
+  Kokkos::fence();
+  k.f.to_host();
+
+  const ReferenceOutput want =
+      reference_stiffness(k.set, k.m, k.p, k.g, k.f, k.nglob);
+  ErrorReport e;
+  for (int ig = 0; ig < k.nglob; ++ig)
+    for (int c = 0; c < 3; ++c) {
+      const double got = k.f.h_acceleration(ig, c);
+      const double ref = want.a(c, ig);
+      e.worst_abs      = std::max(e.worst_abs, std::abs(got - ref));
+      e.scale          = std::max(e.scale, std::abs(ref));
+    }
+  std::printf("[ INFO     ] %s TE=%d: relative = %.3e\n", name, TE,
+              e.relative());
+  EXPECT_GT(e.scale, 0.0) << name << ": oracle produced an all-zero field";
+  EXPECT_LT(e.relative(), 1e-4) << name << " TE=" << TE;
+}
+
+TEST(SfppMinKernelNewCute, PermutedMmaMatchesTheOracle) {
+  constexpr auto P = ContractionMma::Permuted;
+  expect_cute_mma_oracle<1, P, LayoutRightDynamicOffset>("permuted LR");
+  expect_cute_mma_oracle<2, P, LayoutRightDynamicOffset>("permuted LR");
+  expect_cute_mma_oracle<4, P, LayoutRightDynamicOffset>("permuted LR");
+  expect_cute_mma_oracle<8, P, LayoutRightDynamicOffset>("permuted LR");
+  expect_cute_mma_oracle<4, P, ChunkTiledDynamicOffset>("permuted chunk");
+  expect_cute_mma_oracle<4, P, LayoutLeftDynamicOffset>("permuted LL");
+}
+
+TEST(SfppMinKernelNewCute, PermutedMmaUsesOneThreadPerPoint) {
+  auto           k    = make_case<LayoutRightDynamicOffset>();
+  const GllViews q    = make_gll_views();
+  const auto     args = make_args(k, q);
+  const auto     hw   = make_hprimewgll(args.hprime, args.weights);
+  EXPECT_EQ(
+      (new_footprint<false, 4, ContractionMma::Permuted>(args, CutePolicy{}, hw)
+           .threads),
+      NGLL * NGLL * NGLL);
+  if constexpr (NGLL == 5)
+    EXPECT_EQ((new_footprint<false, 4, ContractionMma::Default>(
+                   args, CutePolicy{}, hw)
+                   .threads),
+              NGLL * 4 * NGLL);
+}
+
+// The CuTe launch fits the default dynamic shared memory without an opt-in,
+// pooling buys something, and the default MMA budget sets the block size.
+TEST(SfppMinKernelNewCute, FootprintIsPooledAndFitsTheDefaultSharedMemory) {
+  auto               k    = make_case<ChunkTiledDynamicOffset>();
+  const GllViews     q    = make_gll_views();
+  const auto         args = make_args(k, q);
+  const auto         hw   = make_hprimewgll(args.hprime, args.weights);
+  const NewFootprint fp = new_footprint<false, kTestTE>(args, CutePolicy{}, hw);
+  std::printf(
+      "[ INFO     ] cute TE=%d: pooled %zu B, unpooled %zu B, block %d\n",
+      kTestTE, fp.pooled, fp.unpooled, fp.threads);
+  EXPECT_GT(fp.pooled, 0u);
+  EXPECT_LE(fp.pooled, fp.unpooled);
+  if constexpr (NGLL == 5) EXPECT_LE(fp.pooled, std::size_t{48 * 1024});
+  EXPECT_GT(fp.threads, 0);
+  EXPECT_LE(fp.threads, TensorOperations::DefaultMma<>::budget);
+}
+#endif
 
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);

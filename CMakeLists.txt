@@ -173,6 +173,10 @@ if(TENSOR_OPS_CUTLASS_DIR AND Kokkos_ENABLE_CUDA)
   target_link_libraries(test_cute_staged PRIVATE tensor GTest::gtest)
   gtest_discover_tests(test_cute_staged)
 
+  add_executable(test_cute_functional_input tests/test_cute_functional_input.cpp)
+  target_link_libraries(test_cute_functional_input PRIVATE tensor GTest::gtest)
+  gtest_discover_tests(test_cute_functional_input)
+
   add_executable(test_cute_contract tests/test_cute_contract.cpp)
   target_link_libraries(test_cute_contract PRIVATE tensor GTest::gtest)
   gtest_discover_tests(test_cute_contract)
@@ -180,6 +184,10 @@ if(TENSOR_OPS_CUTLASS_DIR AND Kokkos_ENABLE_CUDA)
   add_executable(test_cute_combine tests/test_cute_combine.cpp)
   target_link_libraries(test_cute_combine PRIVATE tensor GTest::gtest)
   gtest_discover_tests(test_cute_combine)
+
+  add_executable(test_cute_level_graph tests/test_cute_level_graph.cpp)
+  target_link_libraries(test_cute_level_graph PRIVATE tensor GTest::gtest)
+  gtest_discover_tests(test_cute_level_graph)
 
   add_executable(test_cute_fragment_store tests/test_cute_fragment_store.cpp)
   target_link_libraries(test_cute_fragment_store PRIVATE tensor GTest::gtest)
@@ -194,7 +202,7 @@ endif()
 # case is pinned to its OWN diagnostic: a duplicate label and a missing label
 # are independent defects and neither should trip the other's assert.
 # ---------------------------------------------------------------------------
-foreach(case 0 1 2)
+foreach(case 0 1 2 3)
   add_executable(labeltiles_guard_neg_${case} EXCLUDE_FROM_ALL
                  tests/negative/labeltiles_guard_negative.cpp)
   target_link_libraries(labeltiles_guard_neg_${case} PRIVATE tensor)
@@ -210,6 +218,9 @@ set_tests_properties(LabelTilesGuardNegative.Case1 PROPERTIES
 set_tests_properties(LabelTilesGuardNegative.Case2 PROPERTIES
                      PASS_REGULAR_EXPRESSION
                      "must appear in the graph's tile")
+set_tests_properties(LabelTilesGuardNegative.Case3 PROPERTIES
+                     PASS_REGULAR_EXPRESSION
+                     "a contracted label must be LabelWhole")
 
 # ---------------------------------------------------------------------------
 # Negative-compilation tests for the FUNCTIONAL-INPUT guard. Same rationale and
@@ -380,6 +391,49 @@ target_link_libraries(sfpp_min_bench_te PRIVATE sfpp_min tensor)
 add_executable(sfpp_min_bench_te_li sfpp_min/bench_te.cpp)
 target_link_libraries(sfpp_min_bench_te_li PRIVATE sfpp_min tensor)
 target_compile_options(sfpp_min_bench_te_li PRIVATE -lineinfo)
+
+# The same TE sweep on the CuTe policy. A separate binary rather than a runtime
+# backend switch: instantiating the team and CuTe launches of one graph in the
+# same translation unit degrades the team kernel's codegen.
+if(TENSOR_OPS_CUTLASS_DIR AND Kokkos_ENABLE_CUDA)
+  add_executable(sfpp_min_bench_te_cute sfpp_min/bench_te.cpp)
+  target_link_libraries(sfpp_min_bench_te_cute PRIVATE sfpp_min tensor)
+  target_compile_definitions(sfpp_min_bench_te_cute
+                             PRIVATE SFPP_MIN_BENCH_TE_CUTE)
+endif()
+
+# The same kernels at a higher polynomial order. NGLL is a compile-time
+# constant, so each order is its own set of binaries; the calibrated NGLL = 5
+# targets above are untouched.
+set(SFPP_MIN_EXTRA_NGLL 8 CACHE STRING "Extra NGLL values to build sfpp_min targets for")
+if(Kokkos_ENABLE_CUDA)
+foreach(n IN LISTS SFPP_MIN_EXTRA_NGLL)
+  add_executable(sfpp_min_gll_n${n} sfpp_min/tests/test_gll.cpp)
+  target_link_libraries(sfpp_min_gll_n${n} PRIVATE sfpp_min GTest::gtest)
+  target_compile_definitions(sfpp_min_gll_n${n} PRIVATE SFPP_MIN_NGLL=${n})
+  gtest_discover_tests(sfpp_min_gll_n${n} TEST_PREFIX sfpp_min.n${n}.)
+
+  add_executable(sfpp_min_kernel_new_n${n} sfpp_min/tests/test_kernel_new.cpp)
+  target_link_libraries(sfpp_min_kernel_new_n${n} PRIVATE sfpp_min tensor GTest::gtest)
+  target_compile_definitions(sfpp_min_kernel_new_n${n} PRIVATE SFPP_MIN_NGLL=${n})
+  gtest_discover_tests(sfpp_min_kernel_new_n${n} TEST_PREFIX sfpp_min.n${n}.)
+
+  add_executable(sfpp_min_bench_n${n} sfpp_min/bench.cpp)
+  target_link_libraries(sfpp_min_bench_n${n} PRIVATE sfpp_min)
+  target_compile_definitions(sfpp_min_bench_n${n} PRIVATE SFPP_MIN_NGLL=${n})
+
+  add_executable(sfpp_min_bench_te_n${n} sfpp_min/bench_te.cpp)
+  target_link_libraries(sfpp_min_bench_te_n${n} PRIVATE sfpp_min tensor)
+  target_compile_definitions(sfpp_min_bench_te_n${n} PRIVATE SFPP_MIN_NGLL=${n})
+
+  if(TENSOR_OPS_CUTLASS_DIR AND Kokkos_ENABLE_CUDA)
+    add_executable(sfpp_min_bench_te_cute_n${n} sfpp_min/bench_te.cpp)
+    target_link_libraries(sfpp_min_bench_te_cute_n${n} PRIVATE sfpp_min tensor)
+    target_compile_definitions(sfpp_min_bench_te_cute_n${n}
+                               PRIVATE SFPP_MIN_BENCH_TE_CUTE SFPP_MIN_NGLL=${n})
+  endif()
+endforeach()
+endif()
 
 add_executable(sfpp_min_bench_mat sfpp_min/bench_mat.cpp)
 target_link_libraries(sfpp_min_bench_mat PRIVATE sfpp_min)

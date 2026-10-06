@@ -2,8 +2,14 @@
 
 namespace sfpp_min {
 
-inline constexpr int NGLL = 5;
-inline constexpr int DEG  = NGLL - 1;
+// GLL points per axis. The calibrated ground truth is NGLL = 5; other orders
+// are built as separate targets with -DSFPP_MIN_NGLL=<n>.
+#ifndef SFPP_MIN_NGLL
+#define SFPP_MIN_NGLL 5
+#endif
+inline constexpr int NGLL = SFPP_MIN_NGLL;
+static_assert(NGLL >= 2, "a GLL rule needs at least the two endpoints");
+inline constexpr int DEG = NGLL - 1;
 
 inline constexpr int kStorageChunk = 32;
 inline constexpr int kExecChunk    = 4;

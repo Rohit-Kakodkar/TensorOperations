@@ -379,15 +379,15 @@ KOKKOS_FUNCTION constexpr bool extents_agree() noexcept {
 }  // namespace Impl
 
 template <typename ES, typename NA, typename NB, typename IntCRank, typename S,
-          typename HookOp, typename CModesSeq, typename PermCSeq,
+          typename HookOp, typename CModesSeq, typename PermCSeq, typename Mma,
           typename AEval, typename BEval, typename CNode>
 class Evaluator<TeamPolicyTag<ES>,
                 NodeHandle<ContractionTag, NA, NB, IntCRank, S, ES, HookOp,
-                           CModesSeq, PermCSeq>,
+                           CModesSeq, PermCSeq, Mma>,
                 ContractOperands<AEval, BEval, CNode>> {
  public:
   using node_type  = NodeHandle<ContractionTag, NA, NB, IntCRank, S, ES, HookOp,
-                                CModesSeq, PermCSeq>;
+                                CModesSeq, PermCSeq, Mma>;
   using policy_tag = TeamPolicyTag<ES>;
   using tiling_type   = ContractOperands<AEval, BEval, CNode>;
   using value_type    = S;

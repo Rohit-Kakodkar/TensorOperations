@@ -263,11 +263,47 @@ inline GlobalHPrime make_hprimewgll(GlobalHPrime  hprime,
   return hw;
 }
 
+// The TiledMMA every contraction carries (the team backend ignores it). Each
+// contraction's canonical output is (free A | free B) = (5 | TE, 5, 5), with
+// the element axis first on the N side. The default MMA may only give threads
+// a PREFIX of N, so it stops at TE*5 = 20 and loops over the last axis: 5 x 20
+// = 100 threads. The permuted MMA instead visits N as (5, 5, TE) -- the two
+// point axes first, the element axis last -- so 5 x 25 = 125 threads each own
+// one point of every element and loop over the TE elements. Which one wins
+// depends on the data layout: the combine levels inherit the MMA's thread map,
+// and with it which global addresses a warp loads together.
+enum class ContractionMma { Default, Permuted };
+
+#if defined(TENSOR_OPS_ENABLE_CUTE)
+template <int TE, ContractionMma Mma>
+auto new_contraction_mma() {
+  if constexpr (Mma == ContractionMma::Permuted) {
+    using namespace cute;
+    return make_tiled_mma(UniversalFMA<real_t, real_t, real_t>{},
+                          Layout<Shape<Int<NGLL>, Int<NGLL * NGLL>, _1>>{},
+                          Tile<Int<NGLL>,
+                               Layout<Shape<Int<NGLL>, Int<NGLL>, Int<TE>>,
+                                      Stride<Int<TE>, Int<TE * NGLL>, _1>>,
+                               _1>{});
+  } else {
+    return TensorOperations::DefaultMma<>{};
+  }
+}
+#else
+template <int TE, ContractionMma Mma>
+auto new_contraction_mma() {
+  static_assert(Mma == ContractionMma::Default,
+                "a permuted MMA needs the CuTe backend");
+  return TensorOperations::DefaultMma<>{};
+}
+#endif
+
 // The one place the graph is built. new_stiffness launches it; new_footprint
 // queries its scratch without launching -- both go through here, so the
 // footprint reported at GATE C is the SAME graph the launch requests, never a
 // hand-copied upper bound that can drift from it.
-template <bool KeepRedundantLoads, int TE, typename MetricsAcc,
+template <bool KeepRedundantLoads, int TE,
+          ContractionMma Mma = ContractionMma::Default, typename MetricsAcc,
           typename PropertiesAcc, typename IglobView>
 auto build_new_graph(
     const DummyKernelArgs<MetricsAcc, PropertiesAcc, IglobView>& args,
@@ -287,6 +323,8 @@ auto build_new_graph(
       sink{args.acceleration, args.iglob,   args.weights,
            args.velocity,     args.metrics, args.properties};
 
+  const auto mma = new_contraction_mma<TE, Mma>();
+
   auto g0           = make_level_graph<real_t, ES>(GMap{});
   auto [g1, h, hwn] = g0.add(
       make_stage_node(make_input_node(make_handle<'r', 'p'>(args.hprime))),
@@ -304,15 +342,18 @@ auto build_new_graph(
 
   auto gx = [&](auto uu) {
     return make_contraction_node<'e', 'k', 'j', 'i'>(
-        h.template as<'i', 'p'>(), uu.template as<'e', 'k', 'j', 'p'>());
+        h.template as<'i', 'p'>(), uu.template as<'e', 'k', 'j', 'p'>(),
+        NoHook{}, mma);
   };
   auto ge = [&](auto uu) {
     return make_contraction_node<'e', 'k', 'j', 'i'>(
-        h.template as<'j', 'p'>(), uu.template as<'e', 'k', 'p', 'i'>());
+        h.template as<'j', 'p'>(), uu.template as<'e', 'k', 'p', 'i'>(),
+        NoHook{}, mma);
   };
   auto gg = [&](auto uu) {
     return make_contraction_node<'e', 'k', 'j', 'i'>(
-        h.template as<'k', 'p'>(), uu.template as<'e', 'p', 'j', 'i'>());
+        h.template as<'k', 'p'>(), uu.template as<'e', 'p', 'j', 'i'>(),
+        NoHook{}, mma);
   };
   auto [g3, gx0, gx1, gx2, ge0, ge1, ge2, gg0, gg1, gg2] = g2.add(
       gx(u0), gx(u1), gx(u2), ge(u0), ge(u1), ge(u2), gg(u0), gg(u1), gg(u2));
@@ -323,15 +364,18 @@ auto build_new_graph(
 
   auto dvx = [&](auto f) {
     return make_contraction_node<'e', 'k', 'j', 'i'>(
-        hwn.template as<'p', 'i'>(), f.template as<'e', 'k', 'j', 'p'>());
+        hwn.template as<'p', 'i'>(), f.template as<'e', 'k', 'j', 'p'>(),
+        NoHook{}, mma);
   };
   auto dve = [&](auto f) {
     return make_contraction_node<'e', 'k', 'j', 'i'>(
-        hwn.template as<'p', 'j'>(), f.template as<'e', 'k', 'p', 'i'>());
+        hwn.template as<'p', 'j'>(), f.template as<'e', 'k', 'p', 'i'>(),
+        NoHook{}, mma);
   };
   auto dvg = [&](auto f) {
     return make_contraction_node<'e', 'k', 'j', 'i'>(
-        hwn.template as<'p', 'k'>(), f.template as<'e', 'p', 'j', 'i'>());
+        hwn.template as<'p', 'k'>(), f.template as<'e', 'p', 'j', 'i'>(),
+        NoHook{}, mma);
   };
   auto [g5, tx0, tx1, tx2, te0, te1, te2, tg0, tg1, tg2] =
       g4.add(dvx(fx0), dvx(fx1), dvx(fx2), dve(fe0), dve(fe1), dve(fe2),
@@ -352,39 +396,78 @@ auto build_new_graph(
   return g7;
 }
 
-// The scratch the launch requests. `pooled` is what set_scratch_size gets
-// (after liveness pooling); `unpooled` is one buffer per slot. The launch shmem
-// ncu reports is `pooled` plus Kokkos's per-team overhead. No launch here.
+// The scratch the launch requests. `pooled` is what the launch asks for (after
+// liveness pooling); `unpooled` is one buffer per slot. On the team backend the
+// launch shmem ncu reports is `pooled` plus Kokkos's per-team overhead. On CuTe
+// `pooled` is the whole dynamic shared memory and `threads` the block size the
+// graph's MMAs derive; the team backend reports threads = -1 (AUTO or argv).
+// No launch here.
 struct NewFootprint {
   std::size_t pooled   = 0;
   std::size_t unpooled = 0;
+  int         threads  = -1;
 };
 
 template <bool KeepRedundantLoads = false, int TE = kExecChunk,
           typename MetricsAcc, typename PropertiesAcc, typename IglobView>
 NewFootprint new_footprint(
     const DummyKernelArgs<MetricsAcc, PropertiesAcc, IglobView>& args,
-    GlobalHPrime                                                 hw) {
-  auto g6 = build_new_graph<KeepRedundantLoads, TE>(args, hw);
-  return {g6.outputs().scratch_bytes(), g6.outputs().slot_bytes()};
+    TensorOperations::TeamPolicyTag<KernelES>, GlobalHPrime hw) {
+  const auto out = build_new_graph<KeepRedundantLoads, TE>(args, hw).outputs();
+  return {out.scratch_bytes(), out.slot_bytes(), -1};
+}
+
+inline GlobalHPrime hprimewgll_or_build(const GlobalHPrime&  given,
+                                        const GlobalHPrime&  hprime,
+                                        const GlobalWeights& weights) {
+  return given.extent(0) == 0 ? make_hprimewgll(hprime, weights) : given;
 }
 
 // Signature shape matches dummy_stiffness so make_args and every offset policy
-// work unchanged. hprimewgll is optional: the benchmark precomputes it once and
-// passes it so it stays out of the timed region; tests let it build here.
+// work unchanged; the policy tag picks the backend. hprimewgll is optional: the
+// benchmark precomputes it once and passes it so it stays out of the timed
+// region; tests let it build here. team_size exists only on the team backend --
+// CuTe's block size comes from the graph's contraction MMAs.
 template <bool KeepRedundantLoads = false, int TE = kExecChunk,
           typename MetricsAcc, typename PropertiesAcc, typename IglobView>
 int new_stiffness(
     const DummyKernelArgs<MetricsAcc, PropertiesAcc, IglobView>& args,
-    int team_size = -1, GlobalHPrime hprimewgll = GlobalHPrime{}) {
-  using namespace TensorOperations;
-  using ES = KernelES;
-
-  GlobalHPrime hw = hprimewgll;
-  if (hw.extent(0) == 0) hw = make_hprimewgll(args.hprime, args.weights);
-
-  auto g6 = build_new_graph<KeepRedundantLoads, TE>(args, hw);
-  return g6.outputs().team_size(team_size).execute(TeamPolicyTag<ES>{});
+    TensorOperations::TeamPolicyTag<KernelES> policy, int team_size = -1,
+    GlobalHPrime hprimewgll = GlobalHPrime{}) {
+  const GlobalHPrime hw =
+      hprimewgll_or_build(hprimewgll, args.hprime, args.weights);
+  return build_new_graph<KeepRedundantLoads, TE>(args, hw)
+      .outputs()
+      .team_size(team_size)
+      .execute(policy);
 }
+
+#if defined(TENSOR_OPS_ENABLE_CUTE)
+template <bool KeepRedundantLoads = false, int TE = kExecChunk,
+          ContractionMma Mma = ContractionMma::Default, typename MetricsAcc,
+          typename PropertiesAcc, typename IglobView>
+NewFootprint new_footprint(
+    const DummyKernelArgs<MetricsAcc, PropertiesAcc, IglobView>& args,
+    TensorOperations::CutePolicyTag<KernelES>, GlobalHPrime hw) {
+  const auto out =
+      build_new_graph<KeepRedundantLoads, TE, Mma>(args, hw).outputs();
+  return {out.cute_smem_bytes(), out.cute_unpooled_smem_bytes(),
+          out.cute_num_threads()};
+}
+
+template <bool KeepRedundantLoads = false, int TE = kExecChunk,
+          ContractionMma Mma = ContractionMma::Default, typename MetricsAcc,
+          typename PropertiesAcc, typename IglobView>
+int new_stiffness(
+    const DummyKernelArgs<MetricsAcc, PropertiesAcc, IglobView>& args,
+    TensorOperations::CutePolicyTag<KernelES>                    policy,
+    GlobalHPrime hprimewgll = GlobalHPrime{}) {
+  const GlobalHPrime hw =
+      hprimewgll_or_build(hprimewgll, args.hprime, args.weights);
+  return build_new_graph<KeepRedundantLoads, TE, Mma>(args, hw)
+      .outputs()
+      .execute(policy);
+}
+#endif
 
 }  // namespace sfpp_min
