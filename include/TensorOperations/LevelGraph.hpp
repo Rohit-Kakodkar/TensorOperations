@@ -53,9 +53,13 @@ struct LevelOutputs {
   }
 
 #if defined(TENSOR_OPS_ENABLE_CUTE)
-  std::size_t cute_smem_bytes() const { return graph.cute_smem_bytes(); }
+  template <int N = 128>
+  std::size_t cute_smem_bytes() const {
+    return graph.template cute_smem_bytes<N>();
+  }
+  template <int N = 128>
   std::size_t cute_unpooled_smem_bytes() const {
-    return graph.cute_unpooled_smem_bytes();
+    return graph.template cute_unpooled_smem_bytes<N>();
   }
 
   template <typename ES, int N, TensorLike... Ts>
@@ -111,12 +115,15 @@ struct LevelGraph {
   }
 
 #if defined(TENSOR_OPS_ENABLE_CUTE)
+  template <int N = 128>
   std::size_t cute_smem_bytes() const {
-    return Impl::lg_cute_smem_bytes<ValueType, ExecSpace, LevelsT>();
+    return Impl::lg_cute_smem_bytes<ValueType, ExecSpace, LevelsT, N>();
   }
 
+  template <int N = 128>
   std::size_t cute_unpooled_smem_bytes() const {
-    return Impl::lg_cute_unpooled_smem_bytes<ValueType, ExecSpace, LevelsT>();
+    return Impl::lg_cute_unpooled_smem_bytes<ValueType, ExecSpace, LevelsT,
+                                             N>();
   }
 #endif
 

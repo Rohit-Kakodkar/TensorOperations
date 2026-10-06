@@ -410,31 +410,31 @@ auto pooled_chain(OpView<kPN> h, ViewR u) {
 using PooledLevels = std::decay_t<decltype(std::get<0>(pooled_chain(
     std::declval<OpView<kPN>>(), std::declval<ViewR>())))>::levels_type;
 
-static_assert(Impl::lg_cute_first_reader_v<PooledLevels, 0> == 2 &&
-              Impl::lg_cute_last_reader_v<PooledLevels, 0> == 4);
-static_assert(Impl::lg_cute_first_reader_v<PooledLevels, 1> == 2 &&
-              Impl::lg_cute_last_reader_v<PooledLevels, 1> == 2);
-static_assert(Impl::lg_cute_first_reader_v<PooledLevels, 2> == 3 &&
-              Impl::lg_cute_last_reader_v<PooledLevels, 2> == 3);
-static_assert(Impl::lg_cute_first_reader_v<PooledLevels, 3> == 4 &&
-              Impl::lg_cute_last_reader_v<PooledLevels, 3> == 4);
-static_assert(!Impl::lg_cute_smem_slot_v<PooledLevels, 4>,
+static_assert(Impl::lg_cute_first_reader_v<PooledLevels, 128, 0> == 2 &&
+              Impl::lg_cute_last_reader_v<PooledLevels, 128, 0> == 4);
+static_assert(Impl::lg_cute_first_reader_v<PooledLevels, 128, 1> == 2 &&
+              Impl::lg_cute_last_reader_v<PooledLevels, 128, 1> == 2);
+static_assert(Impl::lg_cute_first_reader_v<PooledLevels, 128, 2> == 3 &&
+              Impl::lg_cute_last_reader_v<PooledLevels, 128, 2> == 3);
+static_assert(Impl::lg_cute_first_reader_v<PooledLevels, 128, 3> == 4 &&
+              Impl::lg_cute_last_reader_v<PooledLevels, 128, 3> == 4);
+static_assert(!Impl::lg_cute_smem_slot_v<PooledLevels, 128, 4>,
               "the root is only ever in registers");
-static_assert(Impl::lg_cute_slot_pool_v<PooledLevels, 1> !=
-                  Impl::lg_cute_slot_pool_v<PooledLevels, 0>,
+static_assert(Impl::lg_cute_slot_pool_v<PooledLevels, 128, 1> !=
+                  Impl::lg_cute_slot_pool_v<PooledLevels, 128, 0>,
               "h and u are copied at the same level");
-static_assert(Impl::lg_cute_slot_pool_v<PooledLevels, 2> ==
-                  Impl::lg_cute_slot_pool_v<PooledLevels, 1>,
+static_assert(Impl::lg_cute_slot_pool_v<PooledLevels, 128, 2> ==
+                  Impl::lg_cute_slot_pool_v<PooledLevels, 128, 1>,
               "x reclaims u's buffer");
-static_assert(Impl::lg_cute_slot_pool_v<PooledLevels, 3> ==
-                  Impl::lg_cute_slot_pool_v<PooledLevels, 1>,
+static_assert(Impl::lg_cute_slot_pool_v<PooledLevels, 128, 3> ==
+                  Impl::lg_cute_slot_pool_v<PooledLevels, 128, 1>,
               "y reclaims x's buffer");
-static_assert(
-    !Impl::lg_cute_reuses_at_v<PooledLevels, 2, std::make_index_sequence<2>>);
-static_assert(
-    Impl::lg_cute_reuses_at_v<PooledLevels, 3, std::make_index_sequence<3>>);
-static_assert(
-    Impl::lg_cute_reuses_at_v<PooledLevels, 4, std::make_index_sequence<4>>);
+static_assert(!Impl::lg_cute_reuses_at_v<PooledLevels, 128, 2,
+                                         std::make_index_sequence<2>>);
+static_assert(Impl::lg_cute_reuses_at_v<PooledLevels, 128, 3,
+                                        std::make_index_sequence<3>>);
+static_assert(Impl::lg_cute_reuses_at_v<PooledLevels, 128, 4,
+                                        std::make_index_sequence<4>>);
 
 }  // namespace
 
@@ -484,6 +484,297 @@ TEST(CuteLevelGraph, PooledChainReusesBuffers) {
 
   EXPECT_LT(max_rel_err(cz, rz), 1e-5f);
   EXPECT_LT(max_rel_err(cz, tz), 1e-5f);
+}
+
+struct ScaleAt {
+  KOKKOS_FUNCTION float operator()(int i, int j, int k, int l, float g) const {
+    return 2.0f * g + 0.5f + 0.01f * static_cast<float>(i) -
+           0.002f * static_cast<float>(l) + 0.003f * static_cast<float>(j * k);
+  }
+};
+
+struct DupAt {
+  KOKKOS_FUNCTION Kokkos::Array<float, 2> operator()(int i, int j, int k, int l,
+                                                     float g) const {
+    return {ScaleAt{}(i, j, k, l, g), -3.0f * g + 0.1f * static_cast<float>(j)};
+  }
+};
+
+struct MixAt {
+  KOKKOS_FUNCTION float operator()(int i, int j, int k, int l, float x,
+                                   float y) const {
+    return x - 0.5f * y + 0.01f * static_cast<float>(i + 3 * j) -
+           0.002f * static_cast<float>(k * l);
+  }
+};
+
+namespace {
+
+using HostV4 = Kokkos::View<float****, Kokkos::LayoutRight, Kokkos::HostSpace>;
+
+template <typename F>
+HostV4 host_map(const HostV4& g, F f) {
+  HostV4 r("r", g.extent(0), g.extent(1), g.extent(2), g.extent(3));
+  for (int i = 0; i < static_cast<int>(g.extent(0)); ++i)
+    for (int j = 0; j < static_cast<int>(g.extent(1)); ++j)
+      for (int k = 0; k < static_cast<int>(g.extent(2)); ++k)
+        for (int l = 0; l < static_cast<int>(g.extent(3)); ++l)
+          r(i, j, k, l) = f(i, j, k, l, g(i, j, k, l));
+  return r;
+}
+
+template <typename G>
+using LevelsOf = typename std::decay_t<G>::levels_type;
+
+template <int NG, int TE>
+struct GradFixture {
+  static constexpr int E = 6;
+  OpView<NG>           h{"h", NG, NG};
+  ViewR                u{"u", E, NG, NG, NG};
+
+  GradFixture() {
+    fill(h, 0.5f);
+    fill(u, -2.0f);
+  }
+
+  auto graph() const {
+    auto g0 = make_level_graph<float, ES>(MapQ<NG, TE>{});
+    auto [g1, sh] =
+        g0.add(make_stage_node(make_input_node(make_handle<'q', 'a'>(h))));
+    auto [g2, su] = g1.add(
+        make_stage_node(make_input_node(make_handle<'e', 'a', 'b', 'c'>(u))));
+    auto [g3, ca] = g2.add(make_contraction_node<'q', 'e', 'b', 'c'>(sh, su));
+    return std::make_tuple(g3, sh, ca);
+  }
+
+  HostV4 grad() const { return gradient_ref(h, u, 0); }
+};
+
+}  // namespace
+
+TEST(CuteLevelGraph, CombineRegisterDrivenAfterContraction) {
+  GradFixture<5, 2> fx;
+  auto [g3, sh, ca] = fx.graph();
+  auto [g4, pv] = g3.add(make_combine_node<'q', 'e', 'b', 'c'>(ca, ScaleAt{}));
+  using Plan    = Impl::lg_cute_combine_plan<LevelsOf<decltype(g4)>, 3, 0, 128>;
+  static_assert(Plan::register_driven && Plan::D == 0);
+
+  ViewR cp("cp", 5, fx.E, 5, 5), tp("tp", 5, fx.E, 5, 5);
+  Kokkos::deep_copy(cp, -999.0f);
+  const auto out = g4.outputs(pv);
+  EXPECT_EQ(out.cute_smem_bytes(), g3.outputs(ca).cute_smem_bytes());
+
+  out.execute(CutePolicyTag<>{}, cp);
+  ASSERT_TRUE(synced());
+  out.execute(TeamPolicyTag<ES>{}, tp);
+  ASSERT_TRUE(synced());
+
+  EXPECT_LT(max_rel_err(cp, host_map(fx.grad(), ScaleAt{})), 1e-5f);
+  EXPECT_LT(max_rel_err(cp, tp), 1e-5f);
+}
+
+TEST(CuteLevelGraph, CombineMultiOutputBothRoots) {
+  GradFixture<8, 2> fx;
+  auto [g3, sh, ca] = fx.graph();
+  auto [g4, p0, p1] =
+      g3.add(make_combine_node<'q', 'e', 'b', 'c'>(ca, DupAt{}));
+  ViewR      c0("c0", 8, fx.E, 8, 8), c1("c1", 8, fx.E, 8, 8);
+  ViewR      t0("t0", 8, fx.E, 8, 8), t1("t1", 8, fx.E, 8, 8);
+  const auto out = g4.outputs(p0, p1);
+
+  out.execute(CutePolicyTag<>{}, c0, c1);
+  ASSERT_TRUE(synced());
+  out.execute(TeamPolicyTag<ES>{}, t0, t1);
+  ASSERT_TRUE(synced());
+
+  const auto g = fx.grad();
+  EXPECT_LT(max_rel_err(c0, host_map(g, ScaleAt{})), 1e-5f);
+  EXPECT_LT(max_rel_err(c1, host_map(g,
+                                     [](int, int j, int, int, float v) {
+                                       return -3.0f * v +
+                                              0.1f * static_cast<float>(j);
+                                     })),
+            1e-5f);
+  EXPECT_LT(max_rel_err(c0, t0), 1e-5f);
+  EXPECT_LT(max_rel_err(c1, t1), 1e-5f);
+}
+
+TEST(CuteLevelGraph, CombinePermutedReadIsThreadDriven) {
+  GradFixture<5, 2> fx;
+  auto [g3, sh, ca] = fx.graph();
+  auto [g4, pv] = g3.add(make_combine_node<'q', 'c', 'e', 'b'>(ca, ScaleAt{}));
+  using Plan    = Impl::lg_cute_combine_plan<LevelsOf<decltype(g4)>, 3, 0, 128>;
+  static_assert(!Plan::register_driven);
+  static_assert(decltype(cute::size(typename Plan::thr_layout{}))::value < 128,
+                "exercises idle threads on the thread-driven path");
+
+  ViewR cp("cp", 5, 5, fx.E, 5), tp("tp", 5, 5, fx.E, 5);
+  Kokkos::deep_copy(cp, -999.0f);
+  const auto out = g4.outputs(pv);
+  EXPECT_GT(out.cute_smem_bytes(), g3.outputs(ca).cute_smem_bytes());
+
+  out.execute(CutePolicyTag<>{}, cp);
+  ASSERT_TRUE(synced());
+  out.execute(TeamPolicyTag<ES>{}, tp);
+  ASSERT_TRUE(synced());
+
+  const auto g = fx.grad();
+  HostV4     r("r", 5, 5, fx.E, 5);
+  for (int q = 0; q < 5; ++q)
+    for (int c = 0; c < 5; ++c)
+      for (int e = 0; e < fx.E; ++e)
+        for (int b = 0; b < 5; ++b)
+          r(q, c, e, b) = ScaleAt{}(q, c, e, b, g(q, e, b, c));
+  EXPECT_LT(max_rel_err(cp, r), 1e-5f);
+  EXPECT_LT(max_rel_err(cp, tp), 1e-5f);
+}
+
+TEST(CuteLevelGraph, CombineMixedPartitionsGoThroughSmem) {
+  GradFixture<5, 2> fx;
+  ViewR             w("w", 5, fx.E, 5, 5);
+  fill(w, 4.0f);
+  auto [g3, sh, ca] = fx.graph();
+  auto [g4, sw]     = g3.add(
+      make_stage_node(make_input_node(make_handle<'q', 'e', 'b', 'c'>(w))));
+  auto [g5, pv] =
+      g4.add(make_combine_node<'q', 'e', 'b', 'c'>(ca, sw, MixAt{}));
+  using Plan = Impl::lg_cute_combine_plan<LevelsOf<decltype(g5)>, 4, 0, 128>;
+  static_assert(Plan::register_driven && Plan::D == 0);
+  static_assert(Plan::template in_register<0>() &&
+                !Plan::template in_register<1>());
+
+  ViewR      cp("cp", 5, fx.E, 5, 5), tp("tp", 5, fx.E, 5, 5);
+  const auto out = g5.outputs(pv);
+  out.execute(CutePolicyTag<>{}, cp);
+  ASSERT_TRUE(synced());
+  out.execute(TeamPolicyTag<ES>{}, tp);
+  ASSERT_TRUE(synced());
+
+  const auto g  = fx.grad();
+  auto       hw = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, w);
+  HostV4     r("r", 5, fx.E, 5, 5);
+  for (int q = 0; q < 5; ++q)
+    for (int e = 0; e < fx.E; ++e)
+      for (int b = 0; b < 5; ++b)
+        for (int c = 0; c < 5; ++c)
+          r(q, e, b, c) = MixAt{}(q, e, b, c, g(q, e, b, c), hw(q, e, b, c));
+  EXPECT_LT(max_rel_err(cp, r), 1e-5f);
+  EXPECT_LT(max_rel_err(cp, tp), 1e-5f);
+}
+
+TEST(CuteLevelGraph, CombineOfStagesStaysInRegisters) {
+  constexpr int NG = 5, TE = 2, E = 6;
+  ViewR         a("a", E, NG, NG, NG), b("b", E, NG, NG, NG);
+  ViewR         cp("cp", E, NG, NG, NG), tp("tp", E, NG, NG, NG);
+  fill(a, 1.0f);
+  fill(b, -6.0f);
+
+  auto g0           = make_level_graph<float, ES>(MapQ<NG, TE>{});
+  auto [g1, sa, sb] = g0.add(
+      make_stage_node(make_input_node(make_handle<'e', 'a', 'b', 'c'>(a))),
+      make_stage_node(make_input_node(make_handle<'e', 'a', 'b', 'c'>(b))));
+  auto [g2, pv] =
+      g1.add(make_combine_node<'e', 'a', 'b', 'c'>(sa, sb, MixAt{}));
+  using Plan = Impl::lg_cute_combine_plan<LevelsOf<decltype(g2)>, 1, 0, 128>;
+  static_assert(Plan::register_driven && Plan::template in_register<0>() &&
+                Plan::template in_register<1>());
+
+  const auto out = g2.outputs(pv);
+  EXPECT_EQ(out.cute_smem_bytes(), 0u);
+  out.execute(CutePolicyTag<>{}, cp);
+  ASSERT_TRUE(synced());
+  out.execute(TeamPolicyTag<ES>{}, tp);
+  ASSERT_TRUE(synced());
+
+  auto   ha = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, a);
+  auto   hb = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, b);
+  HostV4 r("r", E, NG, NG, NG);
+  for (int e = 0; e < E; ++e)
+    for (int i = 0; i < NG; ++i)
+      for (int j = 0; j < NG; ++j)
+        for (int k = 0; k < NG; ++k)
+          r(e, i, j, k) = MixAt{}(e, i, j, k, ha(e, i, j, k), hb(e, i, j, k));
+  EXPECT_LT(max_rel_err(cp, r), 1e-5f);
+  EXPECT_LT(max_rel_err(cp, tp), 1e-5f);
+}
+
+TEST(CuteLevelGraph, CombineChainsIntoCombineAndContraction) {
+  GradFixture<5, 2> fx;
+  auto [g3, sh, ca] = fx.graph();
+  auto [g4, p] = g3.add(make_combine_node<'q', 'e', 'b', 'c'>(ca, ScaleAt{}));
+  auto [g5, r] = g4.add(make_combine_node<'q', 'e', 'b', 'c'>(p, ScaleAt{}));
+  auto [g6, d] = g5.add(
+      make_contraction_node<'p', 'e', 'b', 'c'>(sh.template as<'p', 'q'>(), r));
+  using Levels = LevelsOf<decltype(g6)>;
+  using PlanR  = Impl::lg_cute_combine_plan<Levels, 4, 0, 128>;
+  static_assert(PlanR::register_driven && PlanR::template in_register<0>(),
+                "combine -> combine stays in registers");
+  static_assert(!Impl::lg_cute_smem_slot_v<Levels, 128, 3> &&
+                    Impl::lg_cute_smem_slot_v<Levels, 128, 4>,
+                "only the combine read by the contraction goes to smem");
+
+  ViewR      cr("cr", 5, fx.E, 5, 5), tr("tr", 5, fx.E, 5, 5);
+  ViewR      cd("cd", 5, fx.E, 5, 5), td("td", 5, fx.E, 5, 5);
+  const auto out = g6.outputs(r, d);
+  out.execute(CutePolicyTag<>{}, cr, cd);
+  ASSERT_TRUE(synced());
+  out.execute(TeamPolicyTag<ES>{}, tr, td);
+  ASSERT_TRUE(synced());
+
+  const auto rr = host_map(host_map(fx.grad(), ScaleAt{}), ScaleAt{});
+  auto   hh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, fx.h);
+  HostV4 rd("rd", 5, fx.E, 5, 5);
+  for (int p = 0; p < 5; ++p)
+    for (int e = 0; e < fx.E; ++e)
+      for (int b = 0; b < 5; ++b)
+        for (int c = 0; c < 5; ++c) {
+          float acc = 0.0f;
+          for (int q = 0; q < 5; ++q) acc += hh(p, q) * rr(q, e, b, c);
+          rd(p, e, b, c) = acc;
+        }
+  EXPECT_LT(max_rel_err(cr, rr), 1e-5f);
+  EXPECT_LT(max_rel_err(cd, rd), 1e-4f);
+  EXPECT_LT(max_rel_err(td, rd), 1e-4f);
+  EXPECT_LT(max_rel_err(cr, tr), 1e-5f);
+  EXPECT_LT(max_rel_err(cd, td), 1e-5f);
+}
+
+TEST(CuteLevelGraph, CombineOfPermutedContractionOutput) {
+  constexpr int NG = 5, TE = 5, E = 10;
+  OpView<NG>    h("h", NG, NG);
+  ViewR         u("u", E, NG, NG, NG);
+  ViewR         cp("cp", E, NG, NG, NG), tp("tp", E, NG, NG, NG);
+  fill(h, 0.5f);
+  fill(u, -2.0f);
+
+  auto g0 = make_level_graph<float, ES>(MapQ<NG, TE>{});
+  auto [g1, sh] =
+      g0.add(make_stage_node(make_input_node(make_handle<'q', 'a'>(h))));
+  auto [g2, su] = g1.add(
+      make_stage_node(make_input_node(make_handle<'e', 'a', 'b', 'c'>(u))));
+  auto [g3, x]  = g2.add(make_contraction_node<'e', 'b', 'c', 'q'>(sh, su));
+  auto [g4, pv] = g3.add(make_combine_node<'e', 'b', 'c', 'q'>(x, ScaleAt{}));
+  using Plan    = Impl::lg_cute_combine_plan<LevelsOf<decltype(g4)>, 3, 0, 128>;
+  static_assert(
+      !Plan::register_driven,
+      "x is stored in canonical (q,e,b,c) order: a fragment cannot be "
+      "read as (e,b,c,q) even though the tile extents agree");
+
+  const auto out = g4.outputs(pv);
+  out.execute(CutePolicyTag<>{}, cp);
+  ASSERT_TRUE(synced());
+  out.execute(TeamPolicyTag<ES>{}, tp);
+  ASSERT_TRUE(synced());
+
+  const auto g = gradient_ref(h, u, 0);
+  HostV4     r("r", E, NG, NG, NG);
+  for (int e = 0; e < E; ++e)
+    for (int b = 0; b < NG; ++b)
+      for (int c = 0; c < NG; ++c)
+        for (int q = 0; q < NG; ++q)
+          r(e, b, c, q) = ScaleAt{}(e, b, c, q, g(q, e, b, c));
+  EXPECT_LT(max_rel_err(cp, r), 1e-5f);
+  EXPECT_LT(max_rel_err(cp, tp), 1e-5f);
 }
 
 int main(int argc, char* argv[]) {
