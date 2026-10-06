@@ -590,16 +590,16 @@ TEST(SfppMinKernelNewCute, MatchesTheTeamBackend) {
   EXPECT_LT(relative, 1e-5);
 }
 
-// The permuted MMA hands threads (point, point) and loops over the elements,
-// so it partitions every contraction and every register-driven combine
-// differently from the default. The field must not move.
-template <int TE, ContractionMma Mma, typename Off>
-void expect_cute_mma_oracle(const char* name) {
+// Each TE is a different RowOfI thread map (NGLL*NGLL*TE threads, element
+// slowest), so every contraction and register-driven combine partitions
+// differently. The field must not move.
+template <int TE, typename Off>
+void expect_cute_oracle(const char* name) {
   auto k = make_case<Off>(/*ix_fastest=*/true);
   set_linear_field(k);
   set_velocity(k);
   const GllViews q = make_gll_views();
-  new_stiffness<false, TE, Mma>(make_args(k, q), CutePolicy{});
+  new_stiffness<false, TE>(make_args(k, q), CutePolicy{});
   Kokkos::fence();
   k.f.to_host();
 
@@ -619,34 +619,18 @@ void expect_cute_mma_oracle(const char* name) {
   EXPECT_LT(e.relative(), 1e-4) << name << " TE=" << TE;
 }
 
-TEST(SfppMinKernelNewCute, PermutedMmaMatchesTheOracle) {
-  constexpr auto P = ContractionMma::Permuted;
-  expect_cute_mma_oracle<1, P, LayoutRightDynamicOffset>("permuted LR");
-  expect_cute_mma_oracle<2, P, LayoutRightDynamicOffset>("permuted LR");
-  expect_cute_mma_oracle<4, P, LayoutRightDynamicOffset>("permuted LR");
-  expect_cute_mma_oracle<8, P, LayoutRightDynamicOffset>("permuted LR");
-  expect_cute_mma_oracle<4, P, ChunkTiledDynamicOffset>("permuted chunk");
-  expect_cute_mma_oracle<4, P, LayoutLeftDynamicOffset>("permuted LL");
-}
-
-TEST(SfppMinKernelNewCute, PermutedMmaUsesOneThreadPerPoint) {
-  auto           k    = make_case<LayoutRightDynamicOffset>();
-  const GllViews q    = make_gll_views();
-  const auto     args = make_args(k, q);
-  const auto     hw   = make_hprimewgll(args.hprime, args.weights);
-  EXPECT_EQ(
-      (new_footprint<false, 4, ContractionMma::Permuted>(args, CutePolicy{}, hw)
-           .threads),
-      NGLL * NGLL * NGLL);
+TEST(SfppMinKernelNewCute, MatchesTheOracleAtEveryTE) {
+  expect_cute_oracle<1, LayoutRightDynamicOffset>("LR");
+  expect_cute_oracle<2, LayoutRightDynamicOffset>("LR");
+  expect_cute_oracle<4, LayoutRightDynamicOffset>("LR");
   if constexpr (NGLL == 5)
-    EXPECT_EQ((new_footprint<false, 4, ContractionMma::Default>(
-                   args, CutePolicy{}, hw)
-                   .threads),
-              NGLL * 4 * NGLL);
+    expect_cute_oracle<8, LayoutRightDynamicOffset>("LR");
+  expect_cute_oracle<4, ChunkTiledDynamicOffset>("chunk");
+  expect_cute_oracle<4, LayoutLeftDynamicOffset>("LL");
 }
 
 // The CuTe launch fits the default dynamic shared memory without an opt-in,
-// pooling buys something, and the default MMA budget sets the block size.
+// pooling buys something, and the RowOfI MMA gives one thread per row.
 TEST(SfppMinKernelNewCute, FootprintIsPooledAndFitsTheDefaultSharedMemory) {
   auto               k    = make_case<ChunkTiledDynamicOffset>();
   const GllViews     q    = make_gll_views();
@@ -659,8 +643,7 @@ TEST(SfppMinKernelNewCute, FootprintIsPooledAndFitsTheDefaultSharedMemory) {
   EXPECT_GT(fp.pooled, 0u);
   EXPECT_LE(fp.pooled, fp.unpooled);
   if constexpr (NGLL == 5) EXPECT_LE(fp.pooled, std::size_t{48 * 1024});
-  EXPECT_GT(fp.threads, 0);
-  EXPECT_LE(fp.threads, TensorOperations::DefaultMma<>::budget);
+  EXPECT_EQ(fp.threads, NGLL * NGLL * kTestTE);
 }
 #endif
 

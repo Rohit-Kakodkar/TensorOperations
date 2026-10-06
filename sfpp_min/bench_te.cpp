@@ -92,20 +92,17 @@ struct TeamBackend {
 };
 
 #if defined(SFPP_MIN_BENCH_TE_CUTE)
-template <ContractionMma Mma>
 struct CuteBackend {
-  static constexpr const char* name = Mma == ContractionMma::Permuted
-                                          ? "cute (permuted MMA)"
-                                          : "cute (default MMA)";
+  static constexpr const char* name = "cute";
 
   template <bool Keep, int TE, class Args>
   static NewFootprint footprint(const Args& args, const GlobalHPrime& hw) {
-    return new_footprint<Keep, TE, Mma>(
+    return new_footprint<Keep, TE>(
         args, TensorOperations::CutePolicyTag<KernelES>{}, hw);
   }
   template <bool Keep, int TE, class Args>
   static int launch(const Args& args, int, const GlobalHPrime& hw) {
-    return new_stiffness<Keep, TE, Mma>(
+    return new_stiffness<Keep, TE>(
         args, TensorOperations::CutePolicyTag<KernelES>{}, hw);
   }
 };
@@ -130,18 +127,16 @@ int run_impl(int argc, char** argv) {
   std::printf("cell        : layout_right_dynamic soa iglob=ir num=xfast\n");
 
   const MeshDims d{60, 48, 9};
-  const auto     set   = interior_elements(d);
-  const int      nspec = set.nspec();
-  if (nspec % TE != 0) {
-    std::printf(
-        "TE=%d does not divide nspec=%d; the team tier has no "
-        "remainder path\n",
-        TE, nspec);
-    return 2;
-  }
+  const auto     set        = interior_elements(d);
+  const int      nspec_real = set.nspec();
+  const int      nspec      = (nspec_real + TE - 1) / TE * TE;
 
   IglobMapRight g(nspec);
   const int     nglob = renumber_ix_fastest(d, set, g);
+  for (int e = nspec_real; e < nspec; ++e)
+    for (int k = 0; k < NGLL; ++k)
+      for (int j = 0; j < NGLL; ++j)
+        for (int i = 0; i < NGLL; ++i) g.h_map(e, k, j, i) = nglob;
   g.to_device();
 
   Metrics<Off>    m(nspec);
@@ -151,7 +146,7 @@ int run_impl(int argc, char** argv) {
   m.to_device();
   p.to_device();
 
-  Fields f(nglob);
+  Fields f(nglob + 1);
   for (int ig = 0; ig < nglob; ++ig)
     for (int c = 0; c < 3; ++c) {
       f.h_displacement(ig, c) =
@@ -194,7 +189,19 @@ int run_impl(int argc, char** argv) {
   const int league = Backend::template launch<Keep, TE>(args, team_arg, hpwgll);
   Kokkos::fence();
 
-  std::printf("mesh        : interior nspec = %d, nglob = %d\n", nspec, nglob);
+  std::printf("mesh        : interior nspec = %d (padded to %d), nglob = %d\n",
+              nspec_real, nspec, nglob);
+  {
+    auto   h   = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{},
+                                                     f.acceleration);
+    double sum = 0.0, sum2 = 0.0;
+    for (int ig = 0; ig < nglob; ++ig)
+      for (int c = 0; c < 3; ++c) {
+        sum += h(ig, c) * (1.0 + 0.001 * ((ig * 7 + c) % 13));
+        sum2 += static_cast<double>(h(ig, c)) * h(ig, c);
+      }
+    std::printf("checksum    : weighted %.9e  |  l2^2 %.9e\n", sum, sum2);
+  }
   std::printf("teams       : %d (league) x %d elements = %d work items/team\n",
               league, TE, TE * kPointsPerElement);
   if (std::is_same_v<Backend, TeamBackend>)
@@ -215,30 +222,46 @@ int run_impl(int argc, char** argv) {
   const double ms = best_ms(
       [&]() { Backend::template launch<Keep, TE>(args, team_arg, hpwgll); },
       warmup, reps);
-  const double ns_per_element = ms * 1e6 / nspec;
+  const double ns_per_element = ms * 1e6 / nspec_real;
 
   std::printf("time        : %.4f ms  |  %.2f ns/element  |  %.4f ns/point\n",
               ms, ns_per_element, ns_per_element / kPointsPerElement);
   return 0;
 }
 
+template <class Backend, bool Keep, int TE>
+int run_te(int argc, char** argv) {
+  constexpr int threads = NGLL * NGLL * TE;
+  if constexpr (!std::is_same_v<Backend, TeamBackend> && threads > 1024) {
+    std::printf(
+        "TE=%d needs %d threads per block at NGLL=%d; a CuTe block has at "
+        "most 1024\n",
+        TE, threads, NGLL);
+    return 2;
+  } else {
+    return run_impl<Backend, Keep, TE>(argc, argv);
+  }
+}
+
 template <class Backend, bool Keep>
 int dispatch_te(int argc, char** argv, int te) {
   switch (te) {
     case 1:
-      return run_impl<Backend, Keep, 1>(argc, argv);
+      return run_te<Backend, Keep, 1>(argc, argv);
     case 2:
-      return run_impl<Backend, Keep, 2>(argc, argv);
+      return run_te<Backend, Keep, 2>(argc, argv);
     case 4:
-      return run_impl<Backend, Keep, 4>(argc, argv);
+      return run_te<Backend, Keep, 4>(argc, argv);
+    case 5:
+      return run_te<Backend, Keep, 5>(argc, argv);
     case 8:
-      return run_impl<Backend, Keep, 8>(argc, argv);
+      return run_te<Backend, Keep, 8>(argc, argv);
     case 16:
-      return run_impl<Backend, Keep, 16>(argc, argv);
+      return run_te<Backend, Keep, 16>(argc, argv);
     case 32:
-      return run_impl<Backend, Keep, 32>(argc, argv);
+      return run_te<Backend, Keep, 32>(argc, argv);
     default:
-      std::printf("unknown TE: %d (compiled for 1, 2, 4, 8, 16, 32)\n", te);
+      std::printf("unknown TE: %d (compiled for 1, 2, 4, 5, 8, 16, 32)\n", te);
       return 2;
   }
 }
@@ -250,20 +273,11 @@ int dispatch_loads(int argc, char** argv, int te, const char* loads) {
              : dispatch_te<Backend, false>(argc, argv, te);
 }
 
-// argv[7] (CuTe binary only): the contraction MMA, default | permuted.
 int run(int argc, char** argv) {
   const int   te    = (argc > 5) ? std::atoi(argv[5]) : kExecChunk;
   const char* loads = (argc > 6) ? argv[6] : "once";
 #if defined(SFPP_MIN_BENCH_TE_CUTE)
-  const char* mma = (argc > 7) ? argv[7] : "default";
-  if (std::strcmp(mma, "permuted") == 0)
-    return dispatch_loads<CuteBackend<ContractionMma::Permuted>>(argc, argv, te,
-                                                                 loads);
-  if (std::strcmp(mma, "default") == 0)
-    return dispatch_loads<CuteBackend<ContractionMma::Default>>(argc, argv, te,
-                                                                loads);
-  std::printf("unknown mma: %s (expected default | permuted)\n", mma);
-  return 2;
+  return dispatch_loads<CuteBackend>(argc, argv, te, loads);
 #else
   return dispatch_loads<TeamBackend>(argc, argv, te, loads);
 #endif
