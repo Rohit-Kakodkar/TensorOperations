@@ -23,7 +23,20 @@ struct StagedTag {};
 
 // Sentinel for "no hook"
 struct NoHook {};
-struct DefaultMma {};
+
+template <int Budget = 128>
+struct DefaultMma {
+  static_assert(Budget > 0 && Budget <= 1024,
+                "DefaultMma: a block has between 1 and 1024 threads");
+  static constexpr int budget = Budget;
+};
+
+namespace Impl {
+template <typename M>
+inline constexpr bool is_default_mma_v = false;
+template <int B>
+inline constexpr bool is_default_mma_v<DefaultMma<B>> = true;
+}  // namespace Impl
 
 // Forward declaration — TiledLayout.hpp defines it; exec_space_of below has to
 // look through it, and including it here would be a cycle.
@@ -721,7 +734,7 @@ auto make_contraction_node_impl(NodeA a, NodeB b, HookOp hook, Mma mma) {
 // Primary form: infer the output scalar from NodeA, default execution space.
 //   make_contraction_node<'l','i'>(a, b)
 template <int32_t... OutModes, typename NodeA, typename NodeB,
-          typename HookOp = NoHook, typename Mma = DefaultMma>
+          typename HookOp = NoHook, typename Mma = DefaultMma<>>
 auto make_contraction_node(NodeA a, NodeB b, HookOp hook = {}, Mma mma = {}) {
   return Impl::make_contraction_node_impl<
       typename NodeA::value_type, Kokkos::DefaultExecutionSpace, OutModes...>(
@@ -732,7 +745,7 @@ auto make_contraction_node(NodeA a, NodeB b, HookOp hook = {}, Mma mma = {}) {
 //   make_contraction_node<double, Kokkos::DefaultExecutionSpace, 'i','k'>(a, b)
 template <typename Scalar, typename ExecSpace = Kokkos::DefaultExecutionSpace,
           int32_t... OutModes, typename NodeA, typename NodeB,
-          typename HookOp = NoHook, typename Mma = DefaultMma>
+          typename HookOp = NoHook, typename Mma = DefaultMma<>>
 auto make_contraction_node(NodeA a, NodeB b, HookOp hook = {}, Mma mma = {}) {
   return Impl::make_contraction_node_impl<Scalar, ExecSpace, OutModes...>(
       std::move(a), std::move(b), std::move(hook), std::move(mma));
