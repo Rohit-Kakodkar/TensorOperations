@@ -400,6 +400,12 @@ if(TENSOR_OPS_CUTLASS_DIR AND Kokkos_ENABLE_CUDA)
   target_link_libraries(sfpp_min_bench_te_cute PRIVATE sfpp_min tensor)
   target_compile_definitions(sfpp_min_bench_te_cute
                              PRIVATE SFPP_MIN_BENCH_TE_CUTE)
+
+  add_executable(sfpp_min_bench_te_cute_li sfpp_min/bench_te.cpp)
+  target_link_libraries(sfpp_min_bench_te_cute_li PRIVATE sfpp_min tensor)
+  target_compile_definitions(sfpp_min_bench_te_cute_li
+                             PRIVATE SFPP_MIN_BENCH_TE_CUTE)
+  target_compile_options(sfpp_min_bench_te_cute_li PRIVATE -lineinfo)
 endif()
 
 # The same kernels at a higher polynomial order. NGLL is a compile-time
