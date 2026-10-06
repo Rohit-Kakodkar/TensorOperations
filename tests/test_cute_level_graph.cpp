@@ -777,6 +777,179 @@ TEST(CuteLevelGraph, CombineOfPermutedContractionOutput) {
   EXPECT_LT(max_rel_err(cp, tp), 1e-5f);
 }
 
+namespace {
+
+constexpr int kFE = 8, kFN = 5, kFTE = 2, kNglob = 97;
+
+using ViewGlob = Kokkos::View<float**, Kokkos::LayoutLeft, ES>;
+using ViewMap  = Kokkos::View<int****, Kokkos::LayoutRight, ES>;
+
+struct ReadU {
+  ViewR                 u;
+  KOKKOS_FUNCTION float operator()(int e, int a, int b, int c) const {
+    return u(e, a, b, c);
+  }
+};
+
+struct GatherU {
+  ViewGlob              glob;
+  ViewMap               iglob;
+  int                   comp;
+  KOKKOS_FUNCTION float operator()(int e, int a, int b, int c) const {
+    return glob(iglob(e, a, b, c), comp);
+  }
+};
+
+int gid(int e, int a, int b, int c) {
+  return (e * 37 + a * 11 + b * 5 + c * 3) % kNglob;
+}
+
+const Kokkos::Array<int, 4> kFExt{kFE, kFN, kFN, kFN};
+
+template <typename MakeU>
+auto functional_gradient(OpView<kFN> h, MakeU make_u, ViewR cute_out,
+                         ViewR team_out) {
+  Kokkos::deep_copy(cute_out, -999.0f);
+  auto g0 = make_level_graph<float, ES>(MapQ<kFN, kFTE>{});
+  auto [g1, sh] =
+      g0.add(make_stage_node(make_input_node(make_handle<'q', 'a'>(h))));
+  auto [g2, su]  = g1.add(make_stage_node(make_u()));
+  auto [g3, c]   = g2.add(make_contraction_node<'q', 'e', 'b', 'c'>(sh, su));
+  const auto out = g3.outputs(c);
+  EXPECT_EQ(out.execute(CutePolicyTag<>{}, cute_out), kFE / kFTE);
+  EXPECT_TRUE(synced());
+  out.execute(TeamPolicyTag<ES>{}, team_out);
+  EXPECT_TRUE(synced());
+}
+
+ViewR gathered_u(ViewGlob glob, int comp) {
+  auto  hg = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, glob);
+  ViewR u("u_ref", kFE, kFN, kFN, kFN);
+  auto  hu = Kokkos::create_mirror_view(u);
+  for (int e = 0; e < kFE; ++e)
+    for (int a = 0; a < kFN; ++a)
+      for (int b = 0; b < kFN; ++b)
+        for (int c = 0; c < kFN; ++c)
+          hu(e, a, b, c) = hg(gid(e, a, b, c), comp);
+  Kokkos::deep_copy(u, hu);
+  return u;
+}
+
+struct GatherFixture {
+  OpView<kFN> h{"h", kFN, kFN};
+  ViewGlob    glob{"glob", kNglob, 3};
+  ViewMap     iglob{"iglob", kFE, kFN, kFN, kFN};
+
+  GatherFixture() {
+    fill(h, 0.5f);
+    fill(glob, -3.0f);
+    auto hm = Kokkos::create_mirror_view(iglob);
+    for (int e = 0; e < kFE; ++e)
+      for (int a = 0; a < kFN; ++a)
+        for (int b = 0; b < kFN; ++b)
+          for (int c = 0; c < kFN; ++c) hm(e, a, b, c) = gid(e, a, b, c);
+    Kokkos::deep_copy(iglob, hm);
+  }
+
+  GatherU fn() const { return {glob, iglob, 1}; }
+};
+
+template <typename Operand>
+using stage_order_t = typename Impl::lg_cute_stage_order<Operand, 4>::type;
+
+template <typename Layout>
+using functional_stage_t =
+    decltype(make_functional_input_node<ES, 'e', 'a', 'b', 'c'>(
+        std::declval<Layout>(), std::declval<GatherU>()));
+
+static_assert(
+    std::is_same_v<stage_order_t<functional_stage_t<DynamicTileLayoutRight<4>>>,
+                   std::integer_sequence<int, 3, 2, 1, 0>>);
+static_assert(
+    std::is_same_v<stage_order_t<functional_stage_t<DynamicTileLayoutLeft<4>>>,
+                   std::integer_sequence<int, 0, 1, 2, 3>>);
+static_assert(
+    std::is_same_v<stage_order_t<functional_stage_t<StaticTileLayoutStride<
+                       StaticTile<kFE, kFN, kFN, kFN>, 2, 3, 1, 0>>>,
+                   std::integer_sequence<int, 2, 3, 1, 0>>);
+
+}  // namespace
+
+TEST(CuteLevelGraph, FunctionalStageIsBitwiseTheInputStage) {
+  OpView<kFN> h("h", kFN, kFN);
+  ViewR       u("u", kFE, kFN, kFN, kFN);
+  fill(h, 0.5f);
+  fill(u, -2.0f);
+  ViewR plain("plain", kFN, kFE, kFN, kFN), fn_out("fn", kFN, kFE, kFN, kFN),
+      team("team", kFN, kFE, kFN, kFN);
+
+  functional_gradient(
+      h, [&] { return make_input_node(make_handle<'e', 'a', 'b', 'c'>(u)); },
+      plain, team);
+  functional_gradient(
+      h,
+      [&] {
+        return make_functional_input_node<ES, 'e', 'a', 'b', 'c'>(kFExt,
+                                                                  ReadU{u});
+      },
+      fn_out, team);
+
+  EXPECT_EQ(mismatches(fn_out, plain), 0);
+  EXPECT_LT(max_rel_err(fn_out, team), 1e-5f);
+}
+
+TEST(CuteLevelGraph, FunctionalStageGathersThroughAnIndexMap) {
+  const GatherFixture f;
+  ViewR cute_out("cute", kFN, kFE, kFN, kFN), team("team", kFN, kFE, kFN, kFN);
+
+  functional_gradient(
+      f.h,
+      [&] {
+        return make_functional_input_node<ES, 'e', 'a', 'b', 'c'>(kFExt,
+                                                                  f.fn());
+      },
+      cute_out, team);
+
+  EXPECT_LT(max_rel_err(cute_out, gradient_ref(f.h, gathered_u(f.glob, 1), 0)),
+            1e-5f);
+  EXPECT_LT(max_rel_err(cute_out, team), 1e-5f);
+}
+
+TEST(CuteLevelGraph, FunctionalStageOrderDoesNotChangeTheResult) {
+  const GatherFixture f;
+  ViewR right("right", kFN, kFE, kFN, kFN), left("left", kFN, kFE, kFN, kFN),
+      perm("perm", kFN, kFE, kFN, kFN), team("team", kFN, kFE, kFN, kFN);
+
+  functional_gradient(
+      f.h,
+      [&] {
+        return make_functional_input_node<ES, 'e', 'a', 'b', 'c'>(
+            DynamicTileLayoutRight<4>{kFExt}, f.fn());
+      },
+      right, team);
+  functional_gradient(
+      f.h,
+      [&] {
+        return make_functional_input_node<ES, 'e', 'a', 'b', 'c'>(
+            DynamicTileLayoutLeft<4>{kFExt}, f.fn());
+      },
+      left, team);
+  functional_gradient(
+      f.h,
+      [&] {
+        return make_functional_input_node<ES, 'e', 'a', 'b', 'c'>(
+            StaticTileLayoutStride<StaticTile<kFE, kFN, kFN, kFN>, 2, 3, 1,
+                                   0>{},
+            f.fn());
+      },
+      perm, team);
+
+  EXPECT_LT(max_rel_err(right, gradient_ref(f.h, gathered_u(f.glob, 1), 0)),
+            1e-5f);
+  EXPECT_EQ(mismatches(left, right), 0);
+  EXPECT_EQ(mismatches(perm, right), 0);
+}
+
 int main(int argc, char* argv[]) {
   ::testing::InitGoogleTest(&argc, argv);
   Kokkos::initialize(argc, argv);

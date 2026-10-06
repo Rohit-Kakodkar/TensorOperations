@@ -43,6 +43,54 @@ KOKKOS_FUNCTION CuteHandle<T, ModesSeq> make_cute_handle(
       h, std::make_index_sequence<TensorHandle<T, ModesSeq>::Rank>{})};
 }
 
+template <typename Fn, typename CoordIter, typename V>
+struct CuteFunctionalIterator {
+  using value_type   = V;
+  using element_type = V;
+  using reference    = V;
+
+  Fn        fn;
+  CoordIter coord;
+
+  KOKKOS_FUNCTION V operator*() const {
+    const auto c = *coord;
+    return call(c, std::make_index_sequence<decltype(cute::rank(c))::value>{});
+  }
+
+  template <typename C>
+  KOKKOS_FUNCTION auto operator+(const C& c) const {
+    auto next = coord + c;
+    return CuteFunctionalIterator<Fn, decltype(next), V>{fn, next};
+  }
+
+  template <typename C>
+  KOKKOS_FUNCTION V operator[](const C& c) const {
+    return *(*this + c);
+  }
+
+ private:
+  template <typename Coord, std::size_t... Is>
+  KOKKOS_FUNCTION V call(const Coord& c, std::index_sequence<Is...>) const {
+    return fn(static_cast<int>(cute::get<Is>(c))...);
+  }
+};
+
+template <typename V, typename Fn, std::size_t R, std::size_t... Is>
+KOKKOS_FUNCTION auto make_cute_functional_tensor(
+    const Fn& fn, const Kokkos::Array<int, R>& shape,
+    std::index_sequence<Is...>) {
+  const auto id = cute::make_identity_tensor(cute::make_shape(shape[Is]...));
+  return cute::make_tensor(
+      CuteFunctionalIterator<Fn, decltype(id.data()), V>{fn, id.data()},
+      id.layout());
+}
+
+template <typename V, typename Fn, int R>
+using cute_functional_tensor_t = decltype(make_cute_functional_tensor<V>(
+    std::declval<const Fn&>(),
+    std::declval<const Kokkos::Array<int, static_cast<std::size_t>(R)>&>(),
+    std::make_index_sequence<static_cast<std::size_t>(R)>{}));
+
 }  // namespace Impl
 
 template <typename ES, typename Storage, int R, typename HookOp>
@@ -198,6 +246,44 @@ class Evaluator<CutePolicyTag<ES>, NodeHandle<InputTag, T, ModesSeq, HookOp>,
   Impl::CuteHandle<T, ModesSeq> handle_;
   Tiler                         tiler_;
   [[no_unique_address]] HookOp  hook_;
+};
+
+template <typename ES, typename Fn, typename ModesSeq, typename ValueType,
+          typename NodeES, typename Layout, typename HookOp, typename Tiler>
+class Evaluator<
+    CutePolicyTag<ES>,
+    NodeHandle<FunctionalTag, Fn, ModesSeq, ValueType, NodeES, Layout, HookOp>,
+    Tiler> {
+ public:
+  using node_type   = NodeHandle<FunctionalTag, Fn, ModesSeq, ValueType, NodeES,
+                                 Layout, HookOp>;
+  using policy_tag  = CutePolicyTag<ES>;
+  using tiling_type = Tiler;
+  using exec_space  = ES;
+  static constexpr int Rank = node_type::Rank;
+
+  static_assert(std::is_same_v<NodeES, ES>,
+                "CuTe functional input: the node's execution space must be the "
+                "policy's");
+  static_assert(cute::rank_v<Tiler> == Rank,
+                "CuTe functional input: tiler rank must equal the node's rank");
+
+  KOKKOS_FUNCTION Evaluator(node_type n, Tiler t)
+      : tensor_(Impl::make_cute_functional_tensor<ValueType>(
+            n.fn_, n.shape(), std::make_index_sequence<Rank>{})),
+        tiler_(t),
+        hook_(n.hook_op) {}
+
+  template <typename Coord>
+  KOKKOS_FUNCTION auto operator()(const Coord& coord) const {
+    return Impl::make_cute_value_evaluator<ES>(
+        cute::local_tile(tensor_, tiler_, coord), hook_);
+  }
+
+ private:
+  Impl::cute_functional_tensor_t<ValueType, Fn, Rank> tensor_;
+  Tiler                                               tiler_;
+  [[no_unique_address]] HookOp                        hook_;
 };
 
 template <typename ThrLayout>
@@ -357,6 +443,27 @@ struct view_contiguity {
 
 template <int R, typename ArrayLayout>
 using view_contiguity_t = typename view_contiguity<R, ArrayLayout>::type;
+
+template <int R, typename OrderTag>
+struct order_contiguity {
+  static_assert(std::is_same_v<OrderTag, LayoutLeft> ||
+                    std::is_same_v<OrderTag, LayoutRight>,
+                "CuTe backend: a functional input's order must be LayoutLeft, "
+                "LayoutRight or an explicit fastest-first permutation");
+  using type = view_contiguity_t<
+      R, std::conditional_t<std::is_same_v<OrderTag, LayoutLeft>,
+                            Kokkos::LayoutLeft, Kokkos::LayoutRight>>;
+};
+
+template <int R, int... Ord>
+struct order_contiguity<R, std::integer_sequence<int, Ord...>> {
+  static_assert(sizeof...(Ord) == R,
+                "CuTe backend: order must name every mode once");
+  using type = std::integer_sequence<int, Ord...>;
+};
+
+template <int R, typename OrderTag>
+using order_contiguity_t = typename order_contiguity<R, OrderTag>::type;
 
 template <typename ES, typename Storage, int R, typename HookOp,
           typename ThrLayout, typename Tag>

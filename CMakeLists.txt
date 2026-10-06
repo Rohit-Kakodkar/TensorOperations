@@ -173,6 +173,10 @@ if(TENSOR_OPS_CUTLASS_DIR AND Kokkos_ENABLE_CUDA)
   target_link_libraries(test_cute_staged PRIVATE tensor GTest::gtest)
   gtest_discover_tests(test_cute_staged)
 
+  add_executable(test_cute_functional_input tests/test_cute_functional_input.cpp)
+  target_link_libraries(test_cute_functional_input PRIVATE tensor GTest::gtest)
+  gtest_discover_tests(test_cute_functional_input)
+
   add_executable(test_cute_contract tests/test_cute_contract.cpp)
   target_link_libraries(test_cute_contract PRIVATE tensor GTest::gtest)
   gtest_discover_tests(test_cute_contract)
