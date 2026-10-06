@@ -293,7 +293,21 @@ struct DummyKernelArgs {
 // Upstream reaches 48 WITHOUT launch bounds; we reach it by pinning the budget.
 // Same destination, different route, so occupancy and stalls must be
 // re-measured rather than assumed. See plans/minimal-sfpp-library-sprints.md.
-using DummyLaunchBounds = Kokkos::LaunchBounds<kTeamSize, 5>;
+//
+// At other orders there is no ground truth. The 5 blocks/SM target cannot hold:
+// at NGLL = 8 the scratch is ~99 KB, so Kokkos finds no legal team size. The
+// bound is then the number of blocks the scratch alone allows on an SM (228 KB
+// on H100/A100 opt-in, less 1 KB per block for the runtime), clamped to [1, 5].
+inline constexpr std::size_t kDummyScratchEstimate =
+    sizeof(real_t) *
+    (static_cast<std::size_t>(kExecChunk) * kPointsPerElement * (3 + 9) +
+     NGLL * NGLL);
+inline constexpr unsigned kDummyMinBlocks = [] {
+  if (NGLL == 5) return 5u;
+  const std::size_t fit = (228u * 1024u) / (kDummyScratchEstimate + 1024u);
+  return static_cast<unsigned>(fit < 1 ? 1 : (fit > 5 ? 5 : fit));
+}();
+using DummyLaunchBounds = Kokkos::LaunchBounds<kTeamSize, kDummyMinBlocks>;
 
 template <typename ScratchLayout = Kokkos::LayoutLeft, typename MetricsAcc,
           typename PropertiesAcc, typename IglobView>

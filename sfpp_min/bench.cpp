@@ -120,21 +120,26 @@ int run_impl(int argc, char** argv, const char* layout_name) {
   // The three ways to silently break fidelity -- tidied-away redundant loads,
   // the wrong scratch layout, an unpinned team size -- all make this kernel
   // FASTER. Review does not catch that, so assert it here.
+  // The calibration only exists at NGLL = 5; other orders extrapolate the same
+  // kernel and have no ground truth to check against.
   bool ok = true;
-  if (scratch != 24124u) {
+  if (NGLL == 5 && scratch != 24124u) {
     std::printf("FIDELITY FAIL: scratch request %zu != 24124 B\n", scratch);
     ok = false;
   }
-  if (resolved != 256) {
+  if (NGLL == 5 && resolved != 256) {
     std::printf(
         "FIDELITY WARN: team size %d != 256 (ground truth); the "
         "register/scratch footprint has drifted\n",
         resolved);
   }
-  if (launch_shmem != 26188u) {
+  if (NGLL == 5 && launch_shmem != 26188u) {
     std::printf("FIDELITY WARN: predicted launch shmem %zu != 26188 B\n",
                 launch_shmem);
   }
+  if (NGLL != 5)
+    std::printf(
+        "fidelity    : not checked (calibrated at NGLL=5, this is %d)\n", NGLL);
 
   if (profile) {
     Kokkos::deep_copy(f.acceleration, static_cast<real_t>(0));
