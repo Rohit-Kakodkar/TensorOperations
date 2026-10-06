@@ -749,8 +749,19 @@ class Evaluator<CutePolicyTag<ES>,
     const auto cC   = thr.partition_C(idC);
     auto       frag = thr.partition_fragment_C(idC);
     cute::clear(frag);
-    if (tag_.thr_idx < static_cast<int>(cute::size(tag_.mma)))
-      cute::gemm(tag_.mma, thr.partition_A(sA), thr.partition_B(sB), frag);
+    if (tag_.thr_idx < static_cast<int>(cute::size(tag_.mma))) {
+      const auto tA = thr.partition_A(sA);
+      const auto tB = thr.partition_B(sB);
+      auto       rA = thr.partition_fragment_A(sA);
+      auto       rB = thr.partition_fragment_B(sB);
+      cute::copy(tA, rA);
+      CUTE_UNROLL
+      for (int k = 0; k < static_cast<int>(cute::size<2>(rA)); ++k) {
+        cute::copy(tB(cute::_, cute::_, k), rB(cute::_, cute::_, k));
+        cute::gemm(tag_.mma, frag, rA(cute::_, cute::_, k),
+                   rB(cute::_, cute::_, k), frag);
+      }
+    }
 
     return Impl::make_cute_fragment_value_evaluator<
         ES, RankC, decltype(cute::flatten(cute::shape(idC)))>(frag, cC,
