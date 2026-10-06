@@ -8,6 +8,7 @@
 #include <cmath>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 using namespace TensorOperations;
 
@@ -948,6 +949,250 @@ TEST(CuteLevelGraph, FunctionalStageOrderDoesNotChangeTheResult) {
             1e-5f);
   EXPECT_EQ(mismatches(left, right), 0);
   EXPECT_EQ(mismatches(perm, right), 0);
+}
+
+namespace {
+
+constexpr int kSN = 5, kSTE = 2, kSE = 8, kSNglob = 37;
+
+using ViewA   = Kokkos::View<float*, ES>;
+using ViewM4  = Kokkos::View<int****, Kokkos::LayoutRight, ES>;
+using SinkMap = MapQ<kSN, kSTE>;
+
+struct ScaleG {
+  KOKKOS_FUNCTION float operator()(int, int, int, int, float v) const {
+    return 2.0f * v + 0.5f;
+  }
+};
+
+struct WriteSink {
+  ViewR                out;
+  KOKKOS_FUNCTION void operator()(int q, int e, int b, int c, float v) const {
+    out(q, e, b, c) = 2.0f * v + 0.5f;
+  }
+};
+
+struct AccumSink {
+  ViewA                a;
+  ViewM4               map;
+  KOKKOS_FUNCTION void operator()(int q, int e, int b, int c, float v) const {
+    Kokkos::atomic_add(&a(map(q, e, b, c)), 2.0f * v + 0.5f);
+  }
+};
+
+struct Split3 {
+  KOKKOS_FUNCTION Kokkos::Array<float, 3> operator()(int q, int, int, int c,
+                                                     float v) const {
+    return {v, 2.0f * v - static_cast<float>(q),
+            0.5f * v + static_cast<float>(c)};
+  }
+};
+
+struct Write3Sink {
+  ViewR                o0, o1, o2;
+  KOKKOS_FUNCTION void operator()(int q, int e, int b, int c, float x, float y,
+                                  float z) const {
+    o0(q, e, b, c) = x;
+    o1(q, e, b, c) = y;
+    o2(q, e, b, c) = z;
+  }
+};
+
+int sink_gid(int q, int e, int b, int c) {
+  return (((q * kSE + e) * kSN + b) * kSN + c) % kSNglob;
+}
+
+struct SinkInputs {
+  OpView<kSN> h{"h", kSN, kSN};
+  ViewR       u{"u", kSE, kSN, kSN, kSN};
+  SinkInputs() {
+    fill(h, 0.5f);
+    fill(u, -2.0f);
+  }
+};
+
+template <typename Finish>
+auto after_contraction(const SinkInputs& in, Finish finish) {
+  auto g0 = make_level_graph<float, ES>(SinkMap{});
+  auto [g1, sh] =
+      g0.add(make_stage_node(make_input_node(make_handle<'q', 'a'>(in.h))));
+  auto [g2, su] = g1.add(
+      make_stage_node(make_input_node(make_handle<'e', 'a', 'b', 'c'>(in.u))));
+  auto [g3, c] = g2.add(make_contraction_node<'q', 'e', 'b', 'c'>(sh, su));
+  return finish(g3, c);
+}
+
+ViewR sink_view(const char* name) {
+  ViewR v(name, kSN, kSE, kSN, kSN);
+  Kokkos::deep_copy(v, -999.0f);
+  return v;
+}
+
+}  // namespace
+
+TEST(CuteLevelGraph, PlainSinkIsBitwiseTheRootedGraph) {
+  const SinkInputs in;
+  ViewR            rooted = sink_view("rooted"), sunk = sink_view("sunk"),
+                   team = sink_view("team");
+
+  after_contraction(in, [&](auto g, auto c) {
+    auto [g4, p] = g.add(make_combine_node<'q', 'e', 'b', 'c'>(c, ScaleG{}));
+    EXPECT_EQ(g4.outputs(p).execute(CutePolicyTag<>{}, rooted), kSE / kSTE);
+    return 0;
+  });
+  ASSERT_TRUE(synced());
+  after_contraction(in, [&](auto g, auto c) {
+    auto g4 = g.add(make_combine_node<'q', 'e', 'b', 'c'>(c, WriteSink{sunk}));
+    EXPECT_EQ(g4.outputs().execute(CutePolicyTag<>{}), kSE / kSTE);
+    return 0;
+  });
+  ASSERT_TRUE(synced());
+  after_contraction(in, [&](auto g, auto c) {
+    auto g4 = g.add(make_combine_node<'q', 'e', 'b', 'c'>(c, WriteSink{team}));
+    g4.outputs().execute(TeamPolicyTag<ES>{});
+    return 0;
+  });
+  ASSERT_TRUE(synced());
+
+  EXPECT_EQ(mismatches(sunk, rooted), 0);
+  EXPECT_LT(max_rel_err(sunk, team), 1e-5f);
+}
+
+TEST(CuteLevelGraph, AtomicSinkThroughAnIndexMap) {
+  const SinkInputs in;
+  ViewM4           map("map", kSN, kSE, kSN, kSN);
+  ViewA            cute_a("cute_a", kSNglob), team_a("team_a", kSNglob);
+  auto             hm = Kokkos::create_mirror_view(map);
+  std::vector<int> hits(kSNglob, 0);
+  for (int q = 0; q < kSN; ++q)
+    for (int e = 0; e < kSE; ++e)
+      for (int b = 0; b < kSN; ++b)
+        for (int c = 0; c < kSN; ++c)
+          ++hits[hm(q, e, b, c) = sink_gid(q, e, b, c)];
+  Kokkos::deep_copy(map, hm);
+  EXPECT_GT(*std::max_element(hits.begin(), hits.end()), 1);
+
+  after_contraction(in, [&](auto g, auto c) {
+    auto g4 =
+        g.add(make_combine_node<'q', 'e', 'b', 'c'>(c, AccumSink{cute_a, map}));
+    g4.outputs().execute(CutePolicyTag<>{});
+    return 0;
+  });
+  after_contraction(in, [&](auto g, auto c) {
+    auto g4 =
+        g.add(make_combine_node<'q', 'e', 'b', 'c'>(c, AccumSink{team_a, map}));
+    g4.outputs().execute(TeamPolicyTag<ES>{});
+    return 0;
+  });
+  ASSERT_TRUE(synced());
+
+  const auto          grad = gradient_ref(in.h, in.u, 0);
+  std::vector<double> ref(kSNglob, 0.0);
+  for (int q = 0; q < kSN; ++q)
+    for (int e = 0; e < kSE; ++e)
+      for (int b = 0; b < kSN; ++b)
+        for (int c = 0; c < kSN; ++c)
+          ref[sink_gid(q, e, b, c)] += 2.0 * grad(q, e, b, c) + 0.5;
+
+  auto   hc = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, cute_a);
+  auto   ht = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, team_a);
+  double scale = 0.0, err_ref = 0.0, err_team = 0.0;
+  for (int n = 0; n < kSNglob; ++n) {
+    scale    = std::max(scale, std::abs(ref[n]));
+    err_ref  = std::max(err_ref, std::abs(ref[n] - hc(n)));
+    err_team = std::max(err_team, std::abs(static_cast<double>(ht(n)) - hc(n)));
+  }
+  EXPECT_GT(scale, 0.0);
+  EXPECT_LT(err_ref / scale, 1e-5);
+  EXPECT_LT(err_team / scale, 1e-5);
+}
+
+TEST(CuteLevelGraph, RegisterDrivenSinkAfterMultiOutputCombine) {
+  const SinkInputs in;
+  ViewR c0 = sink_view("c0"), c1 = sink_view("c1"), c2 = sink_view("c2");
+  ViewR t0 = sink_view("t0"), t1 = sink_view("t1"), t2 = sink_view("t2");
+
+  const auto run = [&](auto policy, ViewR o0, ViewR o1, ViewR o2) {
+    after_contraction(in, [&](auto g, auto c) {
+      auto [g4, x, y, z] =
+          g.add(make_combine_node<'q', 'e', 'b', 'c'>(c, Split3{}));
+      auto g5    = g4.add(make_combine_node<'q', 'e', 'b', 'c'>(
+          x, y, z, Write3Sink{o0, o1, o2}));
+      using Plan = Impl::lg_cute_combine_plan<std::decay_t<decltype(g5.levels)>,
+                                              4, 0, 128>;
+      static_assert(Plan::register_driven && Plan::template in_register_v<0> &&
+                    Plan::template in_register_v<1> &&
+                    Plan::template in_register_v<2>);
+      g5.outputs().execute(policy);
+      return 0;
+    });
+  };
+  run(CutePolicyTag<>{}, c0, c1, c2);
+  ASSERT_TRUE(synced());
+  run(TeamPolicyTag<ES>{}, t0, t1, t2);
+  ASSERT_TRUE(synced());
+
+  const auto grad = gradient_ref(in.h, in.u, 0);
+  HostV4     r0("r0", kSN, kSE, kSN, kSN), r1("r1", kSN, kSE, kSN, kSN),
+      r2("r2", kSN, kSE, kSN, kSN);
+  for (int q = 0; q < kSN; ++q)
+    for (int e = 0; e < kSE; ++e)
+      for (int b = 0; b < kSN; ++b)
+        for (int c = 0; c < kSN; ++c) {
+          const auto s   = Split3{}(q, e, b, c, grad(q, e, b, c));
+          r0(q, e, b, c) = s[0];
+          r1(q, e, b, c) = s[1];
+          r2(q, e, b, c) = s[2];
+        }
+  EXPECT_LT(max_rel_err(c0, r0), 1e-5f);
+  EXPECT_LT(max_rel_err(c1, r1), 1e-5f);
+  EXPECT_LT(max_rel_err(c2, r2), 1e-5f);
+  EXPECT_LT(max_rel_err(c0, t0), 1e-5f);
+  EXPECT_LT(max_rel_err(c1, t1), 1e-5f);
+  EXPECT_LT(max_rel_err(c2, t2), 1e-5f);
+}
+
+TEST(CuteLevelGraph, MixedSinkAndRootedCombineLevel) {
+  const SinkInputs in;
+  ViewR cute_root = sink_view("cute_root"), cute_sink = sink_view("cute_sink");
+  ViewR team_root = sink_view("team_root"), team_sink = sink_view("team_sink");
+
+  const auto run = [&](auto policy, ViewR root, ViewR sunk) {
+    after_contraction(in, [&](auto g, auto c) {
+      auto [g4, p] =
+          g.add(make_combine_node<'q', 'e', 'b', 'c'>(c, WriteSink{sunk}),
+                make_combine_node<'q', 'e', 'b', 'c'>(c, ScaleG{}));
+      g4.outputs(p).execute(policy, root);
+      return 0;
+    });
+  };
+  run(CutePolicyTag<>{}, cute_root, cute_sink);
+  ASSERT_TRUE(synced());
+  run(TeamPolicyTag<ES>{}, team_root, team_sink);
+  ASSERT_TRUE(synced());
+
+  EXPECT_EQ(mismatches(cute_sink, cute_root), 0);
+  EXPECT_LT(max_rel_err(cute_root, team_root), 1e-5f);
+  EXPECT_LT(max_rel_err(cute_sink, team_sink), 1e-5f);
+}
+
+TEST(CuteLevelGraph, SinkDoesNotRaiseSharedMemory) {
+  const SinkInputs in;
+  ViewR            p0 = sink_view("p0"), p1 = sink_view("p1");
+  const auto       rooted = after_contraction(in, [&](auto g, auto c) {
+    const auto t    = c.template as<'q', 'e', 'c', 'b'>();
+    auto [g4, a, b] = g.add(make_combine_node<'q', 'e', 'b', 'c'>(t, ScaleG{}),
+                            make_combine_node<'q', 'e', 'b', 'c'>(t, ScaleG{}));
+    return g4.cute_smem_bytes();
+  });
+  const auto       sunk   = after_contraction(in, [&](auto g, auto c) {
+    const auto t = c.template as<'q', 'e', 'c', 'b'>();
+    auto g4 = g.add(make_combine_node<'q', 'e', 'b', 'c'>(t, WriteSink{p0}),
+                    make_combine_node<'q', 'e', 'b', 'c'>(t, WriteSink{p1}));
+    return g4.cute_smem_bytes();
+  });
+  EXPECT_GT(sunk, 0u);
+  EXPECT_EQ(sunk, rooted);
 }
 
 int main(int argc, char* argv[]) {

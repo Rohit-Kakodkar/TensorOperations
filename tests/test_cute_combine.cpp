@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <type_traits>
 
 using namespace TensorOperations;
 
@@ -28,6 +29,26 @@ namespace {
 using V2    = Kokkos::View<float**, Kokkos::LayoutLeft, Kokkos::Cuda>;
 using V3    = Kokkos::View<float***, Kokkos::LayoutLeft, Kokkos::Cuda>;
 using Count = Kokkos::View<int, Kokkos::Cuda>;
+
+struct EpilogueSink {
+  V3                   out0, out1;
+  int*                 writes;
+  KOKKOS_FUNCTION void operator()(int i, int b, int c, float x, float w) const {
+    const auto r                 = EpilogueFn{}(i, b, c, x, w);
+    out0(i - 10, b - 20, c - 30) = r[0];
+    out1(i - 10, b - 20, c - 30) = r[1];
+    Kokkos::atomic_add(writes, 1);
+  }
+};
+
+struct PointwiseSink {
+  V3                   out;
+  int*                 writes;
+  KOKKOS_FUNCTION void operator()(int p, int q, int r, float x, float y) const {
+    out(p, q, r) = PointwiseFn{}(p, q, r, x, y);
+    Kokkos::atomic_add(writes, 1);
+  }
+};
 
 float h_val(int n) { return 0.25f * n - 3.0f + static_cast<float>(n % 7); }
 float u_val(int n) { return 0.5f - 0.125f * n + static_cast<float>(n % 5); }
@@ -90,6 +111,32 @@ __global__ void epilogue_kernel(SH sh, SU su, SW sw, CN cn, GN gn, Mma mma,
   }
 }
 
+template <typename SH, typename SU, typename SW, typename CN, typename GN,
+          typename Mma>
+__global__ void epilogue_sink_kernel(SH sh, SU su, SW sw, CN cn, GN gn, Mma mma,
+                                     Kokkos::Array<int, 3> origin) {
+  using ThrH = cute::Layout<cute::Shape<S5, S5>>;
+  using ThrU = cute::Layout<cute::Shape<cute::_1, S5, S5>>;
+  __shared__ float bh[25];
+  __shared__ float bu[125];
+  __shared__ float bw[125];
+  const int        thr = static_cast<int>(threadIdx.x);
+
+  auto eh = stage<HSh, ThrH>(sh, bh, thr, zeros<HSh>());
+  auto eu = stage<USh, ThrU>(su, bu, thr, zeros<USh>());
+  auto ew = stage<USh, ThrU>(sw, bw, thr, zeros<USh>());
+  __syncthreads();
+
+  auto x = make_evaluator<CutePolicyTag<>>(
+      cn, CuteContractTag<decltype(eh), decltype(eu), Mma>{eh, eu, mma, thr})();
+  auto ev = make_evaluator<CutePolicyTag<>>(
+      gn, CuteCombineTag<decltype(x), decltype(ew)>{
+              DeviceTuple<decltype(x), decltype(ew)>(x, ew), origin});
+  static_assert(std::is_void_v<decltype(ev())>,
+                "a sink combine evaluates to nothing");
+  ev();
+}
+
 constexpr int P = 4, Q = 6, R = 8, TP = 2, TQ = 3, TR = 4;
 
 template <typename SA, typename SB, typename GN>
@@ -122,6 +169,31 @@ __global__ void pointwise_kernel(SA sa, SB sb, GN gn, V3 out, int* writes) {
         origin[2] + cute::get<2>(oc)) = outs[0].node().frag_(v);
     atomicAdd(writes, 1);
   }
+}
+
+template <typename SA, typename SB, typename GN>
+__global__ void pointwise_sink_kernel(SA sa, SB sb, GN gn) {
+  using ATile = cute::Shape<cute::_2, cute::_3, cute::_4>;
+  using BTile = cute::Shape<cute::_4, cute::_2, cute::_3>;
+  using ThrA  = cute::Layout<cute::Shape<cute::_2, cute::_3, cute::_2>>;
+  using ThrB  = cute::Layout<cute::Shape<cute::_2, cute::_2, cute::_3>>;
+  using ThrC  = cute::Layout<cute::Shape<cute::_2, cute::_3, cute::_2>>;
+  __shared__ float ba[TP * TQ * TR];
+  __shared__ float bb[TP * TQ * TR];
+  const int        thr = static_cast<int>(threadIdx.x);
+  const int        tp = blockIdx.x, tq = blockIdx.y, tr = blockIdx.z;
+
+  auto ea = stage<ATile, ThrA>(sa, ba, thr, cute::make_coord(tp, tq, tr));
+  auto eb = stage<BTile, ThrB>(sb, bb, thr, cute::make_coord(tr, tp, tq));
+  __syncthreads();
+
+  const Kokkos::Array<int, 3> origin{TP * tp, TQ * tq, TR * tr};
+  make_evaluator<CutePolicyTag<>>(
+      gn, CuteCombineThreadTag<ThrC, decltype(ea), decltype(eb)>{
+              {ThrC{}, thr},
+              DeviceTuple<decltype(ea), decltype(eb)>(ea, eb),
+              origin,
+              thr < static_cast<int>(cute::size(ThrC{}))})();
 }
 
 template <typename V>
@@ -198,6 +270,82 @@ TEST(CuteCombine, SmemOnlyTilesWithPermutedOperand) {
   auto gn = make_combine_node<'p', 'q', 'r'>(an, bn, PointwiseFn{});
   pointwise_kernel<<<dim3(P / TP, Q / TQ, R / TR), 12>>>(
       make_stage_node(an), make_stage_node(bn), gn, out, writes.data());
+  ASSERT_TRUE(launched());
+
+  auto ha = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, a);
+  auto hb = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, b);
+  auto ho = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, out);
+  auto nw = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, writes);
+  EXPECT_EQ(nw(), P * Q * R);
+
+  int bad = 0;
+  for (int p = 0; p < P; ++p)
+    for (int q = 0; q < Q; ++q)
+      for (int r = 0; r < R; ++r) {
+        const float want =
+            ha(p, q, r) - 3.0f * hb(r, p, q) + static_cast<float>(p * q - r);
+        if (!close(ho(p, q, r), want)) ++bad;
+      }
+  EXPECT_EQ(bad, 0);
+}
+
+TEST(CuteCombine, FragmentDrivenSinkWritesTheEpilogue) {
+  V2    h("h", 5, 5);
+  V3    u("u", 5, 5, 5), w("w", 5, 5, 5);
+  V3    r0("r0", 5, 5, 5), r1("r1", 5, 5, 5);
+  V3    s0("s0", 5, 5, 5), s1("s1", 5, 5, 5);
+  Count rw("rw"), sw("sw");
+  fill(h, h_val);
+  fill(u, u_val);
+  fill(w, w_val);
+
+  auto hn = make_input_node(make_handle<'i', 'a'>(h));
+  auto un = make_input_node(make_handle<'b', 'a', 'c'>(u));
+  auto wn = make_input_node(make_handle<'c', 'i', 'b'>(w));
+  auto cn = make_contraction_node<'i', 'b', 'c'>(hn, un);
+  auto mma =
+      cute::make_tiled_mma(cute::UniversalFMA<float, float, float>{},
+                           cute::Layout<cute::Shape<S5, S5, cute::_1>>{});
+  const Kokkos::Array<int, 3> origin{10, 20, 30};
+
+  auto rooted = make_combine_node<'i', 'b', 'c'>(cn, wn, EpilogueFn{});
+  epilogue_kernel<<<1, 25>>>(make_stage_node(hn), make_stage_node(un),
+                             make_stage_node(wn), cn, rooted, mma, origin, r0,
+                             r1, rw.data());
+  ASSERT_TRUE(launched());
+
+  auto sink =
+      make_combine_node<'i', 'b', 'c'>(cn, wn, EpilogueSink{s0, s1, sw.data()});
+  static_assert(decltype(sink)::NumOut == 0);
+  epilogue_sink_kernel<<<1, 25>>>(make_stage_node(hn), make_stage_node(un),
+                                  make_stage_node(wn), cn, sink, mma, origin);
+  ASSERT_TRUE(launched());
+
+  auto nw = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, sw);
+  EXPECT_EQ(nw(), 5 * 5 * 5);
+  auto a0  = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, r0);
+  auto a1  = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, r1);
+  auto b0  = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, s0);
+  auto b1  = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, s1);
+  int  bad = 0;
+  for (std::size_t n = 0; n < a0.size(); ++n)
+    if (a0.data()[n] != b0.data()[n] || a1.data()[n] != b1.data()[n]) ++bad;
+  EXPECT_EQ(bad, 0);
+}
+
+TEST(CuteCombine, ThreadDrivenSinkWritesEveryElementOnce) {
+  V3    a("a", P, Q, R), b("b", R, P, Q), out("out", P, Q, R);
+  Count writes("writes");
+  fill(a, u_val);
+  fill(b, w_val);
+  Kokkos::deep_copy(out, -999.0f);
+
+  auto an = make_input_node(make_handle<'p', 'q', 'r'>(a));
+  auto bn = make_input_node(make_handle<'r', 'p', 'q'>(b));
+  auto gn = make_combine_node<'p', 'q', 'r'>(an, bn,
+                                             PointwiseSink{out, writes.data()});
+  pointwise_sink_kernel<<<dim3(P / TP, Q / TQ, R / TR), 16>>>(
+      make_stage_node(an), make_stage_node(bn), gn);
   ASSERT_TRUE(launched());
 
   auto ha = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, a);
