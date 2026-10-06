@@ -4,6 +4,8 @@
 #include <Kokkos_Core.hpp>
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cmath>
 #include <type_traits>
 #include <utility>
 
@@ -73,6 +75,41 @@ int mismatches2(const A& got, const B& want) {
     for (int j = 0; j < static_cast<int>(hw.extent(1)); ++j)
       if (hg(i, j) != hw(i, j)) ++bad;
   return bad;
+}
+
+template <typename A, typename B>
+float max_rel_err(const A& got, const B& want) {
+  auto  hg = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, got);
+  auto  hw = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, want);
+  float m  = 0.0f;
+  for (std::size_t n = 0; n < hw.size(); ++n)
+    m = std::max(m, std::abs(hg.data()[n] - hw.data()[n]) /
+                        (1.0f + std::abs(hw.data()[n])));
+  return m;
+}
+
+template <typename HV, typename UV>
+auto gradient_ref(const HV& h, const UV& u, int axis) {
+  auto      hh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, h);
+  auto      hu = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, u);
+  const int E  = static_cast<int>(hu.extent(0));
+  const int Q  = static_cast<int>(hh.extent(0));
+  const int K  = static_cast<int>(hh.extent(1));
+  const int M  = static_cast<int>(hu.extent(2));
+  Kokkos::View<float****, Kokkos::LayoutRight, Kokkos::HostSpace> r("ref", Q, E,
+                                                                    M, M);
+  for (int q = 0; q < Q; ++q)
+    for (int e = 0; e < E; ++e)
+      for (int m = 0; m < M; ++m)
+        for (int n = 0; n < M; ++n) {
+          float acc = 0.0f;
+          for (int k = 0; k < K; ++k)
+            acc += hh(q, k) * (axis == 0   ? hu(e, k, m, n)
+                               : axis == 1 ? hu(e, m, k, n)
+                                           : hu(e, m, n, k));
+          r(q, e, m, n) = acc;
+        }
+  return r;
 }
 
 bool synced() {
@@ -171,6 +208,179 @@ TEST(CuteLevelGraph, TwoStageLevelsWithDifferentTiles) {
   EXPECT_EQ(mismatches2(cb, b), 0);
   EXPECT_EQ(mismatches2(ca, ta), 0);
   EXPECT_EQ(mismatches2(cb, tb), 0);
+}
+
+namespace {
+
+template <int NG, int TE>
+using MapQ =
+    LabelTiles<LabelTile<'e', TE>, LabelWhole<'q', NG>, LabelWhole<'p', NG>,
+               LabelWhole<'a', NG>, LabelWhole<'b', NG>, LabelWhole<'c', NG>>;
+
+template <int NG>
+using OpView = Kokkos::View<float**, Kokkos::LayoutRight, ES>;
+
+template <int NG, int TE, typename Policy>
+void one_member_gradient(int E, Policy policy) {
+  OpView<NG> h("h", NG, NG);
+  ViewR      u("u", E, NG, NG, NG);
+  ViewR      cute_out("cute_out", NG, E, NG, NG),
+      team_out("team_out", NG, E, NG, NG);
+  fill(h, 0.5f);
+  fill(u, -2.0f);
+  Kokkos::deep_copy(cute_out, -999.0f);
+
+  auto g0 = make_level_graph<float, ES>(MapQ<NG, TE>{});
+  auto [g1, sh] =
+      g0.add(make_stage_node(make_input_node(make_handle<'q', 'a'>(h))));
+  auto [g2, su] = g1.add(
+      make_stage_node(make_input_node(make_handle<'e', 'a', 'b', 'c'>(u))));
+  auto [g3, c]   = g2.add(make_contraction_node<'q', 'e', 'b', 'c'>(sh, su));
+  const auto out = g3.outputs(c);
+
+  EXPECT_EQ(out.execute(policy, cute_out), E / TE);
+  ASSERT_TRUE(synced());
+  out.execute(TeamPolicyTag<ES>{}, team_out);
+  ASSERT_TRUE(synced());
+
+  EXPECT_LT(max_rel_err(cute_out, gradient_ref(h, u, 0)), 1e-5f);
+  EXPECT_LT(max_rel_err(cute_out, team_out), 1e-5f);
+}
+
+}  // namespace
+
+TEST(CuteLevelGraph, ContractionDefaultMma) {
+  one_member_gradient<8, 2>(8, CutePolicyTag<>{});
+}
+
+TEST(CuteLevelGraph, ContractionDefaultMmaOddExtents) {
+  one_member_gradient<5, 2>(8, CutePolicyTag<>{});
+}
+
+TEST(CuteLevelGraph, ContractionSmallBlock) {
+  one_member_gradient<5, 1>(6, CutePolicyTag<ES, 32>{});
+}
+
+TEST(CuteLevelGraph, ThreeMembersShareTheOperator) {
+  constexpr int NG = 5, TE = 2, E = 6;
+  OpView<NG>    h("h", NG, NG);
+  ViewR         u("u", E, NG, NG, NG);
+  ViewR         ca("ca", NG, E, NG, NG), cb("cb", NG, E, NG, NG),
+      cc("cc", NG, E, NG, NG);
+  ViewR ta("ta", NG, E, NG, NG), tb("tb", NG, E, NG, NG),
+      tc("tc", NG, E, NG, NG);
+  fill(h, 1.5f);
+  fill(u, -0.5f);
+
+  auto g0 = make_level_graph<float, ES>(MapQ<NG, TE>{});
+  auto [g1, sh] =
+      g0.add(make_stage_node(make_input_node(make_handle<'q', 'a'>(h))));
+  auto [g2, su] = g1.add(
+      make_stage_node(make_input_node(make_handle<'e', 'a', 'b', 'c'>(u))));
+  auto [g3, xa, xb, xc] = g2.add(
+      make_contraction_node<'q', 'e', 'b', 'c'>(sh, su),
+      make_contraction_node<'q', 'e', 'a', 'c'>(sh.template as<'q', 'b'>(), su),
+      make_contraction_node<'q', 'e', 'a', 'b'>(sh.template as<'q', 'c'>(),
+                                                su));
+  const auto out = g3.outputs(xa, xb, xc);
+
+  out.execute(CutePolicyTag<>{}, ca, cb, cc);
+  ASSERT_TRUE(synced());
+  out.execute(TeamPolicyTag<ES>{}, ta, tb, tc);
+  ASSERT_TRUE(synced());
+
+  EXPECT_LT(max_rel_err(ca, gradient_ref(h, u, 0)), 1e-5f);
+  EXPECT_LT(max_rel_err(cb, gradient_ref(h, u, 1)), 1e-5f);
+  EXPECT_LT(max_rel_err(cc, gradient_ref(h, u, 2)), 1e-5f);
+  EXPECT_LT(max_rel_err(ca, ta), 1e-5f);
+  EXPECT_LT(max_rel_err(cb, tb), 1e-5f);
+  EXPECT_LT(max_rel_err(cc, tc), 1e-5f);
+}
+
+TEST(CuteLevelGraph, UserMmaWithIdleThreadsBesideDefault) {
+  constexpr int NG = 8, TE = 2, E = 8;
+  OpView<NG>    h("h", NG, NG);
+  ViewR         u("u", E, NG, NG, NG);
+  ViewR         ca("ca", NG, E, NG, NG), cb("cb", NG, E, NG, NG);
+  ViewR         ta("ta", NG, E, NG, NG), tb("tb", NG, E, NG, NG);
+  fill(h, 0.75f);
+  fill(u, 3.0f);
+
+  const auto mma = cute::make_tiled_mma(
+      cute::UniversalFMA<float, float, float>{},
+      cute::Layout<cute::Shape<cute::_4, cute::_8, cute::_1>>{});
+  static_assert(decltype(cute::size(mma))::value == 32);
+
+  auto g0 = make_level_graph<float, ES>(MapQ<NG, TE>{});
+  auto [g1, sh] =
+      g0.add(make_stage_node(make_input_node(make_handle<'q', 'a'>(h))));
+  auto [g2, su] = g1.add(
+      make_stage_node(make_input_node(make_handle<'e', 'a', 'b', 'c'>(u))));
+  auto [g3, xa, xb] =
+      g2.add(make_contraction_node<'q', 'e', 'b', 'c'>(sh, su, NoHook{}, mma),
+             make_contraction_node<'q', 'e', 'a', 'c'>(
+                 sh.template as<'q', 'b'>(), su));
+  const auto out = g3.outputs(xa, xb);
+
+  out.execute(CutePolicyTag<>{}, ca, cb);
+  ASSERT_TRUE(synced());
+  out.execute(TeamPolicyTag<ES>{}, ta, tb);
+  ASSERT_TRUE(synced());
+
+  EXPECT_LT(max_rel_err(ca, gradient_ref(h, u, 0)), 1e-5f);
+  EXPECT_LT(max_rel_err(cb, gradient_ref(h, u, 1)), 1e-5f);
+  EXPECT_LT(max_rel_err(ca, ta), 1e-5f);
+  EXPECT_LT(max_rel_err(cb, tb), 1e-5f);
+}
+
+TEST(CuteLevelGraph, ChainedContractionReadsPermutedRoot) {
+  constexpr int NG = 5, TE = 2, E = 6;
+  OpView<NG>    h("h", NG, NG);
+  ViewR         u("u", E, NG, NG, NG);
+  ViewR         cx("cx", E, NG, NG, NG), tx("tx", E, NG, NG, NG);
+  ViewR         cd("cd", NG, E, NG, NG), td("td", NG, E, NG, NG);
+  fill(h, 1.25f);
+  fill(u, 0.5f);
+  Kokkos::deep_copy(cx, -999.0f);
+  Kokkos::deep_copy(cd, -999.0f);
+
+  auto g0 = make_level_graph<float, ES>(MapQ<NG, TE>{});
+  auto [g1, sh] =
+      g0.add(make_stage_node(make_input_node(make_handle<'q', 'a'>(h))));
+  auto [g2, su] = g1.add(
+      make_stage_node(make_input_node(make_handle<'e', 'a', 'b', 'c'>(u))));
+  auto [g3, x] = g2.add(make_contraction_node<'e', 'b', 'c', 'q'>(sh, su));
+  auto [g4, d] = g3.add(
+      make_contraction_node<'p', 'e', 'b', 'c'>(sh.template as<'p', 'q'>(), x));
+  const auto out = g4.outputs(x, d);
+
+  out.execute(CutePolicyTag<>{}, cx, cd);
+  ASSERT_TRUE(synced());
+  out.execute(TeamPolicyTag<ES>{}, tx, td);
+  ASSERT_TRUE(synced());
+
+  const auto g  = gradient_ref(h, u, 0);
+  auto       hh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, h);
+  Kokkos::View<float****, Kokkos::LayoutRight, Kokkos::HostSpace> rx(
+      "rx", E, NG, NG, NG),
+      rd("rd", NG, E, NG, NG);
+  for (int q = 0; q < NG; ++q)
+    for (int e = 0; e < E; ++e)
+      for (int b = 0; b < NG; ++b)
+        for (int c = 0; c < NG; ++c) rx(e, b, c, q) = g(q, e, b, c);
+  for (int p = 0; p < NG; ++p)
+    for (int e = 0; e < E; ++e)
+      for (int b = 0; b < NG; ++b)
+        for (int c = 0; c < NG; ++c) {
+          float acc = 0.0f;
+          for (int q = 0; q < NG; ++q) acc += hh(p, q) * g(q, e, b, c);
+          rd(p, e, b, c) = acc;
+        }
+
+  EXPECT_LT(max_rel_err(cx, rx), 1e-5f);
+  EXPECT_LT(max_rel_err(cd, rd), 1e-5f);
+  EXPECT_LT(max_rel_err(cx, tx), 1e-5f);
+  EXPECT_LT(max_rel_err(cd, td), 1e-5f);
 }
 
 int main(int argc, char* argv[]) {
