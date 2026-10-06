@@ -28,9 +28,12 @@ template <typename Shape, typename Thr, typename StageNode>
 __device__ auto stage(StageNode sn, float* ptr, int thr) {
   auto dst = cute::make_tensor(cute::make_smem_ptr(ptr),
                                cute::make_layout(Shape{}, cute::LayoutRight{}));
-  auto ev  = make_evaluator<CutePolicyTag<>>(
-      sn, CuteStagedTag<decltype(dst), Thr>{{Thr{}, thr}, dst});
-  return ev(cute::repeat<cute::rank_v<Shape>>(0));
+  auto src = make_evaluator<CutePolicyTag<>>(
+      sn.operand_, Shape{})(cute::repeat<cute::rank_v<Shape>>(0));
+  auto ld =
+      make_evaluator<CutePolicyTag<>>(make_cute_interm_node<Kokkos::Cuda>(dst),
+                                      CuteSmemLoadTag<Thr>{Thr{}, thr});
+  return (ld = src);
 }
 
 template <typename X>
