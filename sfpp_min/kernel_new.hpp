@@ -263,39 +263,26 @@ inline GlobalHPrime make_hprimewgll(GlobalHPrime  hprime,
   return hw;
 }
 
-// The TiledMMA every contraction carries (the team backend ignores it). Each
-// contraction's canonical output is (free A | free B) = (5 | TE, 5, 5), with
-// the element axis first on the N side. The default MMA may only give threads
-// a PREFIX of N, so it stops at TE*5 = 20 and loops over the last axis: 5 x 20
-// = 100 threads. The permuted MMA instead visits N as (5, 5, TE) -- the two
-// point axes first, the element axis last -- so 5 x 25 = 125 threads each own
-// one point of every element and loop over the TE elements. Which one wins
-// depends on the data layout: the combine levels inherit the MMA's thread map,
-// and with it which global addresses a warp loads together.
-enum class ContractionMma { Default, Permuted };
-
+// The TiledMMA the CuTe launch's contractions carry; the team backend ignores
+// the MMA, so its graph keeps DefaultMma. Each contraction's canonical output
+// is (free A | free B) = (NGLL | TE, NGLL, NGLL). One thread per N point,
+// numbered with the last free-B axis fastest and the element axis slowest, so
+// NGLL*NGLL*TE threads each own a whole row of the free-A axis (i for the
+// x-contractions) and walk it in registers.
 #if defined(TENSOR_OPS_ENABLE_CUTE)
-template <int TE, ContractionMma Mma>
-auto new_contraction_mma() {
-  if constexpr (Mma == ContractionMma::Permuted) {
-    using namespace cute;
-    return make_tiled_mma(UniversalFMA<real_t, real_t, real_t>{},
-                          Layout<Shape<Int<NGLL>, Int<NGLL * NGLL>, _1>>{},
-                          Tile<Int<NGLL>,
-                               Layout<Shape<Int<NGLL>, Int<NGLL>, Int<TE>>,
-                                      Stride<Int<TE>, Int<TE * NGLL>, _1>>,
-                               _1>{});
-  } else {
-    return TensorOperations::DefaultMma<>{};
-  }
+template <int TE>
+auto row_of_i_mma() {
+  using namespace cute;
+  return make_tiled_mma(UniversalFMA<real_t, real_t, real_t>{},
+                        Layout<Shape<_1, Int<NGLL * NGLL * TE>, _1>>{},
+                        Tile<Int<NGLL>,
+                             Layout<Shape<Int<NGLL>, Int<NGLL>, Int<TE>>,
+                                    Stride<Int<NGLL * TE>, Int<TE>, _1>>,
+                             _1>{});
 }
-#else
-template <int TE, ContractionMma Mma>
-auto new_contraction_mma() {
-  static_assert(Mma == ContractionMma::Default,
-                "a permuted MMA needs the CuTe backend");
-  return TensorOperations::DefaultMma<>{};
-}
+
+template <int TE>
+using RowOfIMma = decltype(row_of_i_mma<TE>());
 #endif
 
 // The one place the graph is built. new_stiffness launches it; new_footprint
@@ -303,7 +290,7 @@ auto new_contraction_mma() {
 // footprint reported at GATE C is the SAME graph the launch requests, never a
 // hand-copied upper bound that can drift from it.
 template <bool KeepRedundantLoads, int TE,
-          ContractionMma Mma = ContractionMma::Default, typename MetricsAcc,
+          typename Mma = TensorOperations::DefaultMma<>, typename MetricsAcc,
           typename PropertiesAcc, typename IglobView>
 auto build_new_graph(
     const DummyKernelArgs<MetricsAcc, PropertiesAcc, IglobView>& args,
@@ -323,7 +310,7 @@ auto build_new_graph(
       sink{args.acceleration, args.iglob,   args.weights,
            args.velocity,     args.metrics, args.properties};
 
-  const auto mma = new_contraction_mma<TE, Mma>();
+  const Mma mma{};
 
   auto g0           = make_level_graph<real_t, ES>(GMap{});
   auto [g1, h, hwn] = g0.add(
@@ -444,27 +431,26 @@ int new_stiffness(
 
 #if defined(TENSOR_OPS_ENABLE_CUTE)
 template <bool KeepRedundantLoads = false, int TE = kExecChunk,
-          ContractionMma Mma = ContractionMma::Default, typename MetricsAcc,
-          typename PropertiesAcc, typename IglobView>
+          typename MetricsAcc, typename PropertiesAcc, typename IglobView>
 NewFootprint new_footprint(
     const DummyKernelArgs<MetricsAcc, PropertiesAcc, IglobView>& args,
     TensorOperations::CutePolicyTag<KernelES>, GlobalHPrime hw) {
   const auto out =
-      build_new_graph<KeepRedundantLoads, TE, Mma>(args, hw).outputs();
+      build_new_graph<KeepRedundantLoads, TE, RowOfIMma<TE>>(args, hw)
+          .outputs();
   return {out.cute_smem_bytes(), out.cute_unpooled_smem_bytes(),
           out.cute_num_threads()};
 }
 
 template <bool KeepRedundantLoads = false, int TE = kExecChunk,
-          ContractionMma Mma = ContractionMma::Default, typename MetricsAcc,
-          typename PropertiesAcc, typename IglobView>
+          typename MetricsAcc, typename PropertiesAcc, typename IglobView>
 int new_stiffness(
     const DummyKernelArgs<MetricsAcc, PropertiesAcc, IglobView>& args,
     TensorOperations::CutePolicyTag<KernelES>                    policy,
     GlobalHPrime hprimewgll = GlobalHPrime{}) {
   const GlobalHPrime hw =
       hprimewgll_or_build(hprimewgll, args.hprime, args.weights);
-  return build_new_graph<KeepRedundantLoads, TE, Mma>(args, hw)
+  return build_new_graph<KeepRedundantLoads, TE, RowOfIMma<TE>>(args, hw)
       .outputs()
       .execute(policy);
 }
