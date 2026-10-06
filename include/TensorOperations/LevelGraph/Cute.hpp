@@ -188,11 +188,6 @@ struct lg_cute_slot_producer<LevelsT, S, N, CombineTag>
     : lg_cute_combine_plan<LevelsT, lg_slot_level_v<LevelsT, S>,
                            lg_slot_member_v<LevelsT, S>, N> {};
 
-template <typename ThrLayout>
-struct lg_cute_thread_part {
-  using part = CuteThreadPartitioner<ThrLayout>;
-};
-
 template <int R, std::size_t... Is>
 auto lg_cute_right_order(std::index_sequence<Is...>)
     -> std::integer_sequence<int, (R - 1 - static_cast<int>(Is))...>;
@@ -218,48 +213,47 @@ struct lg_cute_combine_plan {
       typename lg_slot_canon_modes<LevelsT, slot<K>,
                                    typename op_t<K>::modes_seq>::type;
   template <std::size_t K>
-  using op_part_t = typename lg_cute_slot_producer<LevelsT, slot<K>, N>::part;
+  using producer_t = lg_cute_slot_producer<LevelsT, slot<K>, N>;
 
   template <std::size_t K>
   static constexpr bool eligible() {
     return std::is_same_v<canon_t<K>, CModes> &&
            std::is_same_v<typename op_t<K>::modes_seq, CModes> &&
-           std::is_same_v<
-               typename lg_cute_slot_producer<LevelsT, slot<K>, N>::tile_shape,
-               tile_shape>;
+           std::is_same_v<typename producer_t<K>::tile_shape, tile_shape>;
   }
 
   template <std::size_t... Ks>
   static constexpr std::size_t first_eligible(std::index_sequence<Ks...>) {
-    const bool e[] = {eligible<Ks>()..., false};
-    for (std::size_t k = 0; k < sizeof...(Ks); ++k)
-      if (e[k]) return k;
-    return sizeof...(Ks);
+    const bool  e[] = {eligible<Ks>()..., false};
+    std::size_t k   = 0;
+    while (k < sizeof...(Ks) && !e[k]) ++k;
+    return k;
   }
 
   static constexpr std::size_t D =
       first_eligible(std::make_index_sequence<NumOps>{});
   static constexpr bool register_driven = D < NumOps;
 
+  using part =
+      std::conditional_t<register_driven,
+                         typename producer_t<register_driven ? D : 0>::part,
+                         CuteThreadPartitioner<thr_layout>>;
+
   template <std::size_t K>
   static constexpr bool in_register() {
-    if constexpr (!register_driven)
-      return false;
+    if constexpr (register_driven)
+      return eligible<K>() &&
+             std::is_same_v<typename producer_t<K>::part, part>;
     else
-      return eligible<K>() && std::is_same_v<op_part_t<K>, op_part_t<D>>;
+      return false;
   }
 
   template <std::size_t K>
   static constexpr bool in_register_v = in_register<K>();
 
-  using part = typename std::conditional_t<
-      register_driven,
-      lg_cute_slot_producer<LevelsT, slot<(register_driven ? D : 0)>, N>,
-      lg_cute_thread_part<thr_layout>>::part;
-
   __device__ static part make(const LevelsT& levels) {
     if constexpr (register_driven)
-      return lg_cute_slot_producer<LevelsT, slot<D>, N>::make(levels);
+      return producer_t<D>::make(levels);
     else
       return {thr_layout{}, static_cast<int>(threadIdx.x)};
   }
@@ -539,31 +533,15 @@ __device__ auto lg_cute_combine_member(
                                                    L, M, Ks>(acc, base))...>;
   const Ops   ops{lg_cute_combine_operand<V, ES, NumThreads, LevelsT, L, M, Ks>(
       acc, base)...};
-  const auto& node   = levels.template get<L>().template get<M>();
-  const bool  active = Plan::make(levels).active();
-
-  const auto run = [&] {
-    if constexpr (Plan::register_driven)
-      return make_evaluator<CutePolicyTag<ES>>(
-          node,
-          CuteCombineTag<std::decay_t<decltype(ops.template get<Ks>())>...>{
-              ops, origin, active})();
-    else
-      return make_evaluator<CutePolicyTag<ES>>(
-          node,
-          CuteCombineThreadTag<
-              typename Plan::thr_layout,
-              std::decay_t<decltype(ops.template get<Ks>())>...>{
-              {typename Plan::thr_layout{}, static_cast<int>(threadIdx.x)},
-              ops,
-              origin,
-              active})();
-  };
+  const auto& node = levels.template get<L>().template get<M>();
+  const auto  ev   = make_evaluator<CutePolicyTag<ES>>(
+      node, make_cute_combine_tag<typename Plan::tile_shape>(
+                Plan::make(levels), origin, ops.template get<Ks>()...));
   if constexpr (Node::NumOut == 0) {
-    run();
+    ev();
     return DeviceTuple<>{};
   } else {
-    const auto outs = run();
+    const auto outs = ev();
     return DeviceTuple<std::decay_t<decltype(outs[Os])>...>{outs[Os]...};
   }
 }
