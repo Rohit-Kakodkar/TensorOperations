@@ -283,6 +283,7 @@ TEST(CuteLevelGraph, ThreeMembersShareTheOperator) {
       make_contraction_node<'q', 'e', 'a', 'b'>(sh.template as<'q', 'c'>(),
                                                 su));
   const auto out = g3.outputs(xa, xb, xc);
+  EXPECT_EQ(out.cute_smem_bytes(), out.cute_unpooled_smem_bytes());
 
   out.execute(CutePolicyTag<>{}, ca, cb, cc);
   ASSERT_TRUE(synced());
@@ -381,6 +382,108 @@ TEST(CuteLevelGraph, ChainedContractionReadsPermutedRoot) {
   EXPECT_LT(max_rel_err(cd, rd), 1e-5f);
   EXPECT_LT(max_rel_err(cx, tx), 1e-5f);
   EXPECT_LT(max_rel_err(cd, td), 1e-5f);
+}
+
+namespace {
+
+constexpr int kPN = 5, kPTE = 2, kPE = 6;
+
+using MapP =
+    LabelTiles<LabelTile<'e', kPTE>, LabelWhole<'q', kPN>, LabelWhole<'p', kPN>,
+               LabelWhole<'r', kPN>, LabelWhole<'a', kPN>, LabelWhole<'b', kPN>,
+               LabelWhole<'c', kPN>>;
+
+auto pooled_chain(OpView<kPN> h, ViewR u) {
+  auto g0 = make_level_graph<float, ES>(MapP{});
+  auto [g1, sh] =
+      g0.add(make_stage_node(make_input_node(make_handle<'q', 'a'>(h))));
+  auto [g2, su] = g1.add(
+      make_stage_node(make_input_node(make_handle<'e', 'a', 'b', 'c'>(u))));
+  auto [g3, x] = g2.add(make_contraction_node<'q', 'e', 'b', 'c'>(sh, su));
+  auto [g4, y] = g3.add(
+      make_contraction_node<'p', 'e', 'b', 'c'>(sh.template as<'p', 'q'>(), x));
+  auto [g5, z] = g4.add(
+      make_contraction_node<'r', 'e', 'b', 'c'>(sh.template as<'r', 'p'>(), y));
+  return std::make_tuple(g5, z);
+}
+
+using PooledLevels = std::decay_t<decltype(std::get<0>(pooled_chain(
+    std::declval<OpView<kPN>>(), std::declval<ViewR>())))>::levels_type;
+
+static_assert(Impl::lg_cute_first_reader_v<PooledLevels, 0> == 2 &&
+              Impl::lg_cute_last_reader_v<PooledLevels, 0> == 4);
+static_assert(Impl::lg_cute_first_reader_v<PooledLevels, 1> == 2 &&
+              Impl::lg_cute_last_reader_v<PooledLevels, 1> == 2);
+static_assert(Impl::lg_cute_first_reader_v<PooledLevels, 2> == 3 &&
+              Impl::lg_cute_last_reader_v<PooledLevels, 2> == 3);
+static_assert(Impl::lg_cute_first_reader_v<PooledLevels, 3> == 4 &&
+              Impl::lg_cute_last_reader_v<PooledLevels, 3> == 4);
+static_assert(!Impl::lg_cute_smem_slot_v<PooledLevels, 4>,
+              "the root is only ever in registers");
+static_assert(Impl::lg_cute_slot_pool_v<PooledLevels, 1> !=
+                  Impl::lg_cute_slot_pool_v<PooledLevels, 0>,
+              "h and u are copied at the same level");
+static_assert(Impl::lg_cute_slot_pool_v<PooledLevels, 2> ==
+                  Impl::lg_cute_slot_pool_v<PooledLevels, 1>,
+              "x reclaims u's buffer");
+static_assert(Impl::lg_cute_slot_pool_v<PooledLevels, 3> ==
+                  Impl::lg_cute_slot_pool_v<PooledLevels, 1>,
+              "y reclaims x's buffer");
+static_assert(
+    !Impl::lg_cute_reuses_at_v<PooledLevels, 2, std::make_index_sequence<2>>);
+static_assert(
+    Impl::lg_cute_reuses_at_v<PooledLevels, 3, std::make_index_sequence<3>>);
+static_assert(
+    Impl::lg_cute_reuses_at_v<PooledLevels, 4, std::make_index_sequence<4>>);
+
+}  // namespace
+
+TEST(CuteLevelGraph, PooledChainReusesBuffers) {
+  OpView<kPN> h("h", kPN, kPN);
+  ViewR       u("u", kPE, kPN, kPN, kPN);
+  ViewR       cz("cz", kPN, kPE, kPN, kPN), tz("tz", kPN, kPE, kPN, kPN);
+  fill(h, 0.25f);
+  fill(u, -1.5f);
+  Kokkos::deep_copy(cz, -999.0f);
+
+  auto [g, z]    = pooled_chain(h, u);
+  const auto out = g.outputs(z);
+
+  constexpr std::size_t tile =
+      Impl::slot_arena_step<float, ES>(kPN * kPTE * kPN * kPN);
+  constexpr std::size_t hstep = Impl::slot_arena_step<float, ES>(kPN * kPN);
+  EXPECT_EQ(out.cute_unpooled_smem_bytes(), (hstep + 3 * tile) * sizeof(float));
+  EXPECT_EQ(out.cute_smem_bytes(), (hstep + tile) * sizeof(float));
+
+  EXPECT_EQ(out.execute(CutePolicyTag<>{}, cz), kPE / kPTE);
+  ASSERT_TRUE(synced());
+  out.execute(TeamPolicyTag<ES>{}, tz);
+  ASSERT_TRUE(synced());
+
+  const auto g1 = gradient_ref(h, u, 0);
+  auto       hh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, h);
+  Kokkos::View<float****, Kokkos::LayoutRight, Kokkos::HostSpace> y(
+      "y", kPN, kPE, kPN, kPN),
+      rz("rz", kPN, kPE, kPN, kPN);
+  for (int p = 0; p < kPN; ++p)
+    for (int e = 0; e < kPE; ++e)
+      for (int b = 0; b < kPN; ++b)
+        for (int c = 0; c < kPN; ++c) {
+          float acc = 0.0f;
+          for (int q = 0; q < kPN; ++q) acc += hh(p, q) * g1(q, e, b, c);
+          y(p, e, b, c) = acc;
+        }
+  for (int r = 0; r < kPN; ++r)
+    for (int e = 0; e < kPE; ++e)
+      for (int b = 0; b < kPN; ++b)
+        for (int c = 0; c < kPN; ++c) {
+          float acc = 0.0f;
+          for (int p = 0; p < kPN; ++p) acc += hh(r, p) * y(p, e, b, c);
+          rz(r, e, b, c) = acc;
+        }
+
+  EXPECT_LT(max_rel_err(cz, rz), 1e-5f);
+  EXPECT_LT(max_rel_err(cz, tz), 1e-5f);
 }
 
 int main(int argc, char* argv[]) {
