@@ -593,13 +593,13 @@ TEST(SfppMinKernelNewCute, MatchesTheTeamBackend) {
 // Each TE is a different RowOfI thread map (NGLL*NGLL*TE threads, element
 // slowest), so every contraction and register-driven combine partitions
 // differently. The field must not move.
-template <int TE, typename Off>
+template <int TE, typename Off, typename Mmas = RowOfIMmas<TE>>
 void expect_cute_oracle(const char* name) {
   auto k = make_case<Off>(/*ix_fastest=*/true);
   set_linear_field(k);
   set_velocity(k);
   const GllViews q = make_gll_views();
-  new_stiffness<false, TE>(make_args(k, q), CutePolicy{});
+  new_stiffness<false, TE, Mmas>(make_args(k, q), CutePolicy{});
   Kokkos::fence();
   k.f.to_host();
 
@@ -627,6 +627,51 @@ TEST(SfppMinKernelNewCute, MatchesTheOracleAtEveryTE) {
     expect_cute_oracle<8, LayoutRightDynamicOffset>("LR");
   expect_cute_oracle<4, ChunkTiledDynamicOffset>("chunk");
   expect_cute_oracle<4, LayoutLeftDynamicOffset>("LL");
+}
+
+TEST(SfppMinKernelNewCute, RowOfEMatchesTheOracleAtEveryTE) {
+  expect_cute_oracle<1, LayoutRightDynamicOffset, RowOfEMmas<1>>("row-of-e LR");
+  expect_cute_oracle<2, LayoutRightDynamicOffset, RowOfEMmas<2>>("row-of-e LR");
+  expect_cute_oracle<3, LayoutRightDynamicOffset, RowOfEMmas<3>>("row-of-e LR");
+  expect_cute_oracle<4, LayoutRightDynamicOffset, RowOfEMmas<4>>("row-of-e LR");
+  if constexpr (NGLL == 5)
+    expect_cute_oracle<8, LayoutRightDynamicOffset, RowOfEMmas<8>>(
+        "row-of-e LR");
+  expect_cute_oracle<4, ChunkTiledDynamicOffset, RowOfEMmas<4>>(
+      "row-of-e chunk");
+  expect_cute_oracle<4, LayoutLeftDynamicOffset, RowOfEMmas<4>>("row-of-e LL");
+}
+
+template <typename Plan, std::size_t... Ks>
+constexpr bool all_in_register(std::index_sequence<Ks...>) {
+  return (Plan::template in_register<Ks>() && ...);
+}
+
+TEST(SfppMinKernelNewCute, RowOfECombinesReadEveryContractionInRegisters) {
+  auto           k    = make_case<LayoutRightDynamicOffset>();
+  const GllViews q    = make_gll_views();
+  const auto     args = make_args(k, q);
+  const auto     hw   = make_hprimewgll(args.hprime, args.weights);
+  using G =
+      decltype(build_new_graph<false, kTestTE, RowOfEMmas<kTestTE>>(args, hw));
+  using Levels    = typename G::levels_type;
+  constexpr int N = TensorOperations::Impl::lg_cute_num_threads_v<Levels>;
+  using Integrand =
+      TensorOperations::Impl::lg_cute_combine_plan<Levels, 3, 0, N>;
+  using ToAccel = TensorOperations::Impl::lg_cute_combine_plan<Levels, 5, 0, N>;
+  static_assert(N == NGLL * NGLL * NGLL);
+  static_assert(Integrand::aligned_driven &&
+                all_in_register<Integrand>(std::make_index_sequence<9>{}));
+  static_assert(ToAccel::aligned_driven &&
+                all_in_register<ToAccel>(std::make_index_sequence<9>{}));
+  const NewFootprint row_e = new_footprint<false, kTestTE, RowOfEMmas<kTestTE>>(
+      args, CutePolicy{}, hw);
+  const NewFootprint row_i =
+      new_footprint<false, kTestTE>(args, CutePolicy{}, hw);
+  std::printf("[ INFO     ] smem pooled: row-of-e %zu B, row-of-i %zu B\n",
+              row_e.pooled, row_i.pooled);
+  EXPECT_LT(row_e.pooled, row_i.pooled);
+  EXPECT_EQ(row_e.threads, NGLL * NGLL * NGLL);
 }
 
 // The CuTe launch fits the default dynamic shared memory without an opt-in,

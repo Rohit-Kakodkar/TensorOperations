@@ -1,4 +1,5 @@
 #pragma once
+#include <TensorOperations/CutePointMap.hpp>
 #include <TensorOperations/Evaluator.hpp>
 #include <TensorOperations/LevelGraph/Team.hpp>
 
@@ -222,6 +223,40 @@ struct lg_cute_combine_plan {
            std::is_same_v<typename producer_t<K>::tile_shape, tile_shape>;
   }
 
+  template <std::size_t K>
+  using producer_node_t = lg_cute_slot_node_t<LevelsT, slot<K>>;
+
+  template <std::size_t K>
+  static constexpr bool contraction_fragment() {
+    if constexpr (!has_node_tag_v<ContractionTag, producer_node_t<K>>)
+      return false;
+    else
+      return same_label_set_v<canon_t<K>, CModes> &&
+             std::is_same_v<typename op_t<K>::modes_seq, CModes>;
+  }
+
+  template <std::size_t K, bool = contraction_fragment<K>()>
+  struct point_tv {
+    using type = void;
+  };
+  template <std::size_t K>
+  struct point_tv<K, true> {
+    using type =
+        cute_point_tv_t<typename lg_cute_producer<producer_node_t<K>, N>::mma,
+                        CModes, canon_t<K>, tile_shape>;
+  };
+  template <std::size_t K>
+  using point_tv_t = typename point_tv<K>::type;
+
+  template <std::size_t K>
+  static constexpr bool aligned_candidate() {
+    if constexpr (!contraction_fragment<K>())
+      return false;
+    else
+      return decltype(cute::size(point_tv_t<K>{}))::value ==
+             decltype(cute::size(tile_shape{}))::value;
+  }
+
   template <std::size_t... Ks>
   static constexpr std::size_t first_eligible(std::index_sequence<Ks...>) {
     const bool  e[] = {eligible<Ks>()..., false};
@@ -230,18 +265,75 @@ struct lg_cute_combine_plan {
     return k;
   }
 
-  static constexpr std::size_t D =
-      first_eligible(std::make_index_sequence<NumOps>{});
-  static constexpr bool register_driven = D < NumOps;
+  template <std::size_t... Ks>
+  static constexpr std::size_t first_aligned(std::index_sequence<Ks...>) {
+    const bool  e[] = {aligned_candidate<Ks>()..., false};
+    std::size_t k   = 0;
+    while (k < sizeof...(Ks) && !e[k]) ++k;
+    return k;
+  }
 
-  using part =
-      std::conditional_t<register_driven,
-                         typename producer_t<register_driven ? D : 0>::part,
-                         CuteThreadPartitioner<thr_layout>>;
+  static constexpr std::size_t DS =
+      first_eligible(std::make_index_sequence<NumOps>{});
+  static constexpr std::size_t DA =
+      first_aligned(std::make_index_sequence<NumOps>{});
+  template <std::size_t K>
+  static constexpr bool aligned_with_first() {
+    if constexpr (!aligned_candidate<K>())
+      return !contraction_fragment<K>();
+    else
+      return cute_points_aligned_v<point_tv_t<K>, point_tv_t<DA>>;
+  }
+
+  template <std::size_t... Ks>
+  static constexpr bool all_aligned(std::index_sequence<Ks...>) {
+    return (aligned_with_first<Ks>() && ...);
+  }
+
+  static constexpr bool aligned_driven =
+      DS == NumOps && DA < NumOps &&
+      all_aligned(std::make_index_sequence<NumOps>{});
+  static constexpr std::size_t D               = aligned_driven ? DA : DS;
+  static constexpr bool        register_driven = D < NumOps;
+
+  template <bool Strict, bool Aligned, int Dummy = 0>
+  struct pick {
+    using part = CuteThreadPartitioner<thr_layout>;
+    __device__ static part make(const LevelsT&) {
+      return {thr_layout{}, static_cast<int>(threadIdx.x)};
+    }
+  };
+  template <int Dummy>
+  struct pick<true, false, Dummy> {
+    using part = typename producer_t<D>::part;
+    __device__ static part make(const LevelsT& levels) {
+      return producer_t<D>::make(levels);
+    }
+  };
+  template <int Dummy>
+  struct pick<false, true, Dummy> {
+    using part = CutePermutedPartitioner<typename producer_t<D>::part,
+                                         label_perm_seq_t<canon_t<D>, CModes>>;
+    __device__ static part make(const LevelsT& levels) {
+      return {producer_t<D>::make(levels)};
+    }
+  };
+  using picked = pick<register_driven && !aligned_driven, aligned_driven>;
+  using part   = typename picked::part;
+
+  template <std::size_t K, std::size_t Driver = D>
+  static constexpr bool aligned_in_register() {
+    if constexpr (!aligned_driven || !aligned_candidate<K>())
+      return false;
+    else
+      return cute_points_aligned_v<point_tv_t<K>, point_tv_t<Driver>>;
+  }
 
   template <std::size_t K>
   static constexpr bool in_register() {
-    if constexpr (register_driven)
+    if constexpr (aligned_driven)
+      return aligned_in_register<K>();
+    else if constexpr (register_driven)
       return eligible<K>() &&
              std::is_same_v<typename producer_t<K>::part, part>;
     else
@@ -251,11 +343,11 @@ struct lg_cute_combine_plan {
   template <std::size_t K>
   static constexpr bool in_register_v = in_register<K>();
 
+  template <std::size_t K, std::size_t Driver = D>
+  using remap_t = cute_value_remap_t<point_tv_t<K>, point_tv_t<Driver>>;
+
   __device__ static part make(const LevelsT& levels) {
-    if constexpr (register_driven)
-      return producer_t<D>::make(levels);
-    else
-      return {thr_layout{}, static_cast<int>(threadIdx.x)};
+    return picked::make(levels);
   }
 };
 
@@ -504,9 +596,24 @@ __device__ auto lg_cute_contract_member(const LevelsT& levels, V* base) {
 
 template <typename V, typename ES, int NumThreads, typename LevelsT,
           std::size_t L, std::size_t M, std::size_t K, typename Acc>
-__device__ auto lg_cute_combine_operand(const Acc& acc, V* base) {
+__device__ auto lg_cute_combine_operand(const LevelsT& levels, const Acc& acc,
+                                        V* base) {
   using Plan = lg_cute_combine_plan<LevelsT, L, M, NumThreads>;
-  if constexpr (Plan::template in_register_v<K>)
+  if constexpr (Plan::template in_register_v<K> && Plan::aligned_driven) {
+    using TileShape = typename Plan::tile_shape;
+    const auto& f   = acc.template get<Plan::template slot<K>>().node();
+    const auto  coords =
+        Plan::make(levels)(cute::make_identity_tensor(TileShape{}));
+    using Remap = typename Plan::template remap_t<K>;
+    auto frag =
+        cute::make_tensor<typename std::decay_t<decltype(f.frag_)>::value_type>(
+            cute::shape(coords));
+    CUTE_UNROLL
+    for (int v = 0; v < static_cast<int>(cute::size(frag)); ++v)
+      frag(v) = f.frag_(Remap{}(v));
+    return make_cute_fragment_value_evaluator<ES, Plan::Node::Rank, TileShape>(
+        frag, coords, f.hook_op);
+  } else if constexpr (Plan::template in_register_v<K>)
     return acc.template get<Plan::template slot<K>>();
   else
     return lg_cute_operand<V, ES, NumThreads, LevelsT,
@@ -528,11 +635,11 @@ __device__ auto lg_cute_combine_member(
   Kokkos::Array<int, Node::Rank> origin{};
   for (int d = 0; d < Node::Rank; ++d) origin[d] = idx[d] * OutTile::extent(d);
 
-  using Ops =
-      DeviceTuple<decltype(lg_cute_combine_operand<V, ES, NumThreads, LevelsT,
-                                                   L, M, Ks>(acc, base))...>;
+  using Ops = DeviceTuple<
+      decltype(lg_cute_combine_operand<V, ES, NumThreads, LevelsT, L, M, Ks>(
+          levels, acc, base))...>;
   const Ops   ops{lg_cute_combine_operand<V, ES, NumThreads, LevelsT, L, M, Ks>(
-      acc, base)...};
+      levels, acc, base)...};
   const auto& node = levels.template get<L>().template get<M>();
   const auto  ev   = make_evaluator<CutePolicyTag<ES>>(
       node, make_cute_combine_tag<typename Plan::tile_shape>(

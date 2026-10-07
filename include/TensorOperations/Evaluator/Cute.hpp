@@ -669,6 +669,19 @@ KOKKOS_FUNCTION auto group_free_contracted(const Tensor& t) {
 
 }  // namespace Impl
 
+template <typename Part, typename PermSeq>
+struct CutePermutedPartitioner {
+  Part part;
+
+  KOKKOS_FUNCTION bool active() const { return part.active(); }
+
+  template <typename Tensor>
+  KOKKOS_FUNCTION auto operator()(const Tensor& t) const {
+    return part(
+        cute::make_tensor(t.data(), Impl::select_seq(t.layout(), PermSeq{})));
+  }
+};
+
 template <typename ES, typename NA, typename NB, typename IntCRank, typename S,
           typename HookOp, typename CModesSeq, typename PermCSeq, typename Mma,
           typename AEval, typename BEval, typename TiledMma>

@@ -283,6 +283,57 @@ auto row_of_i_mma() {
 
 template <int TE>
 using RowOfIMma = decltype(row_of_i_mma<TE>());
+
+template <int TE, typename ThrLayout>
+auto row_of_e_mma() {
+  using namespace cute;
+  return make_tiled_mma(UniversalFMA<real_t, real_t, real_t>{}, ThrLayout{},
+                        Tile<Int<NGLL>,
+                             Layout<Shape<Int<NGLL>, Int<NGLL>, Int<TE>>,
+                                    Stride<Int<NGLL * TE>, Int<TE>, _1>>,
+                             _1>{});
+}
+#endif
+
+template <typename X, typename Eta = X, typename Gamma = X>
+struct ContractionMmas {
+  using x     = X;
+  using eta   = Eta;
+  using gamma = Gamma;
+};
+
+#if defined(TENSOR_OPS_ENABLE_CUTE)
+template <int TE>
+using RowOfEMmas = ContractionMmas<
+    decltype(row_of_e_mma<
+             TE, cute::Layout<
+                     cute::Shape<cute::Int<NGLL>,
+                                 cute::Shape<cute::Int<NGLL>, cute::Int<NGLL>>,
+                                 cute::_1>,
+                     cute::Stride<
+                         cute::_1,
+                         cute::Stride<cute::Int<NGLL>, cute::Int<NGLL * NGLL>>,
+                         cute::_0>>>()),
+    decltype(row_of_e_mma<
+             TE,
+             cute::Layout<
+                 cute::Shape<cute::Int<NGLL>,
+                             cute::Shape<cute::Int<NGLL>, cute::Int<NGLL>>,
+                             cute::_1>,
+                 cute::Stride<cute::Int<NGLL>,
+                              cute::Stride<cute::_1, cute::Int<NGLL * NGLL>>,
+                              cute::_0>>>()),
+    decltype(row_of_e_mma<
+             TE, cute::Layout<
+                     cute::Shape<cute::Int<NGLL>,
+                                 cute::Shape<cute::Int<NGLL>, cute::Int<NGLL>>,
+                                 cute::_1>,
+                     cute::Stride<cute::Int<NGLL * NGLL>,
+                                  cute::Stride<cute::_1, cute::Int<NGLL>>,
+                                  cute::_0>>>())>;
+
+template <int TE>
+using RowOfIMmas = ContractionMmas<RowOfIMma<TE>>;
 #endif
 
 // The one place the graph is built. new_stiffness launches it; new_footprint
@@ -290,8 +341,8 @@ using RowOfIMma = decltype(row_of_i_mma<TE>());
 // footprint reported at GATE C is the SAME graph the launch requests, never a
 // hand-copied upper bound that can drift from it.
 template <bool KeepRedundantLoads, int TE,
-          typename Mma = TensorOperations::DefaultMma<>, typename MetricsAcc,
-          typename PropertiesAcc, typename IglobView>
+          typename Mmas = ContractionMmas<TensorOperations::DefaultMma<>>,
+          typename MetricsAcc, typename PropertiesAcc, typename IglobView>
 auto build_new_graph(
     const DummyKernelArgs<MetricsAcc, PropertiesAcc, IglobView>& args,
     GlobalHPrime                                                 hw) {
@@ -310,7 +361,9 @@ auto build_new_graph(
       sink{args.acceleration, args.iglob,   args.weights,
            args.velocity,     args.metrics, args.properties};
 
-  const Mma mma{};
+  const typename Mmas::x     mx{};
+  const typename Mmas::eta   me{};
+  const typename Mmas::gamma mg{};
 
   auto g0           = make_level_graph<real_t, ES>(GMap{});
   auto [g1, h, hwn] = g0.add(
@@ -330,17 +383,17 @@ auto build_new_graph(
   auto gx = [&](auto uu) {
     return make_contraction_node<'e', 'k', 'j', 'i'>(
         h.template as<'i', 'p'>(), uu.template as<'e', 'k', 'j', 'p'>(),
-        NoHook{}, mma);
+        NoHook{}, mx);
   };
   auto ge = [&](auto uu) {
     return make_contraction_node<'e', 'k', 'j', 'i'>(
         h.template as<'j', 'p'>(), uu.template as<'e', 'k', 'p', 'i'>(),
-        NoHook{}, mma);
+        NoHook{}, me);
   };
   auto gg = [&](auto uu) {
     return make_contraction_node<'e', 'k', 'j', 'i'>(
         h.template as<'k', 'p'>(), uu.template as<'e', 'p', 'j', 'i'>(),
-        NoHook{}, mma);
+        NoHook{}, mg);
   };
   auto [g3, gx0, gx1, gx2, ge0, ge1, ge2, gg0, gg1, gg2] = g2.add(
       gx(u0), gx(u1), gx(u2), ge(u0), ge(u1), ge(u2), gg(u0), gg(u1), gg(u2));
@@ -352,17 +405,17 @@ auto build_new_graph(
   auto dvx = [&](auto f) {
     return make_contraction_node<'e', 'k', 'j', 'i'>(
         hwn.template as<'p', 'i'>(), f.template as<'e', 'k', 'j', 'p'>(),
-        NoHook{}, mma);
+        NoHook{}, mx);
   };
   auto dve = [&](auto f) {
     return make_contraction_node<'e', 'k', 'j', 'i'>(
         hwn.template as<'p', 'j'>(), f.template as<'e', 'k', 'p', 'i'>(),
-        NoHook{}, mma);
+        NoHook{}, me);
   };
   auto dvg = [&](auto f) {
     return make_contraction_node<'e', 'k', 'j', 'i'>(
         hwn.template as<'p', 'k'>(), f.template as<'e', 'p', 'j', 'i'>(),
-        NoHook{}, mma);
+        NoHook{}, mg);
   };
   auto [g5, tx0, tx1, tx2, te0, te1, te2, tg0, tg1, tg2] =
       g4.add(dvx(fx0), dvx(fx1), dvx(fx2), dve(fe0), dve(fe1), dve(fe2),
@@ -431,26 +484,27 @@ int new_stiffness(
 
 #if defined(TENSOR_OPS_ENABLE_CUTE)
 template <bool KeepRedundantLoads = false, int TE = kExecChunk,
-          typename MetricsAcc, typename PropertiesAcc, typename IglobView>
+          typename Mmas = RowOfIMmas<TE>, typename MetricsAcc,
+          typename PropertiesAcc, typename IglobView>
 NewFootprint new_footprint(
     const DummyKernelArgs<MetricsAcc, PropertiesAcc, IglobView>& args,
     TensorOperations::CutePolicyTag<KernelES>, GlobalHPrime hw) {
   const auto out =
-      build_new_graph<KeepRedundantLoads, TE, RowOfIMma<TE>>(args, hw)
-          .outputs();
+      build_new_graph<KeepRedundantLoads, TE, Mmas>(args, hw).outputs();
   return {out.cute_smem_bytes(), out.cute_unpooled_smem_bytes(),
           out.cute_num_threads()};
 }
 
 template <bool KeepRedundantLoads = false, int TE = kExecChunk,
-          typename MetricsAcc, typename PropertiesAcc, typename IglobView>
+          typename Mmas = RowOfIMmas<TE>, typename MetricsAcc,
+          typename PropertiesAcc, typename IglobView>
 int new_stiffness(
     const DummyKernelArgs<MetricsAcc, PropertiesAcc, IglobView>& args,
     TensorOperations::CutePolicyTag<KernelES>                    policy,
     GlobalHPrime hprimewgll = GlobalHPrime{}) {
   const GlobalHPrime hw =
       hprimewgll_or_build(hprimewgll, args.hprime, args.weights);
-  return build_new_graph<KeepRedundantLoads, TE, RowOfIMma<TE>>(args, hw)
+  return build_new_graph<KeepRedundantLoads, TE, Mmas>(args, hw)
       .outputs()
       .execute(policy);
 }
