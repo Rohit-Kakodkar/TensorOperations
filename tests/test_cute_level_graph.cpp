@@ -1205,6 +1205,130 @@ TEST(CuteLevelGraph, SinkDoesNotRaiseSharedMemory) {
   EXPECT_EQ(sunk, rooted);
 }
 
+namespace {
+
+template <int TE>
+using RowOfENTile =
+    cute::Layout<cute::Shape<cute::_5, cute::_5, cute::Int<TE>>,
+                 cute::Stride<cute::Int<5 * TE>, cute::Int<TE>, cute::_1>>;
+template <int TE>
+using RowOfENTileSwappedE = cute::Layout<
+    cute::Shape<cute::_5, cute::_5, cute::Shape<cute::_2, cute::Int<TE / 2>>>,
+    cute::Stride<cute::Int<5 * TE>, cute::Int<TE>,
+                 cute::Stride<cute::Int<TE / 2>, cute::_1>>>;
+
+template <int TE, typename Thr, typename NTile>
+using RowOfEMma = decltype(cute::make_tiled_mma(
+    cute::UniversalFMA<float, float, float>{}, Thr{},
+    cute::Tile<cute::_5, NTile, cute::_1>{}));
+
+using ThrX = cute::Layout<
+    cute::Shape<cute::_5, cute::Shape<cute::_5, cute::_5>, cute::_1>,
+    cute::Stride<cute::_1, cute::Stride<cute::_5, cute::Int<25>>, cute::_0>>;
+using ThrEta = cute::Layout<
+    cute::Shape<cute::_5, cute::Shape<cute::_5, cute::_5>, cute::_1>,
+    cute::Stride<cute::_5, cute::Stride<cute::_1, cute::Int<25>>, cute::_0>>;
+using ThrGamma = cute::Layout<
+    cute::Shape<cute::_5, cute::Shape<cute::_5, cute::_5>, cute::_1>,
+    cute::Stride<cute::Int<25>, cute::Stride<cute::_1, cute::_5>, cute::_0>>;
+
+template <int TE>
+using MapET =
+    LabelTiles<LabelTile<'e', TE>, LabelWhole<'k', 5>, LabelWhole<'j', 5>,
+               LabelWhole<'i', 5>, LabelWhole<'p', 5>, LabelWhole<'r', 5>>;
+
+struct GradMix {
+  KOKKOS_FUNCTION float operator()(int e, int, int, int i, float x, float y,
+                                   float z) const {
+    return x - 2.0f * y + 4.0f * z + 0.5f * static_cast<float>(e) -
+           0.25f * static_cast<float>(i);
+  }
+};
+
+template <int TE, typename MX, typename ME, typename MG>
+void expect_aligned_gradient_combine() {
+  constexpr int E = 2 * TE;
+  OpView<5>     h("h", 5, 5);
+  ViewR         u("u", E, 5, 5, 5);
+  fill(h, 0.5f);
+  fill(u, -2.0f);
+  ViewR cp("cp", E, 5, 5, 5), tp("tp", E, 5, 5, 5);
+  Kokkos::deep_copy(cp, -999.0f);
+
+  auto g0 = make_level_graph<float, ES>(MapET<TE>{});
+  auto [g1, sh] =
+      g0.add(make_stage_node(make_input_node(make_handle<'r', 'p'>(h))));
+  auto [g2, su] = g1.add(
+      make_stage_node(make_input_node(make_handle<'e', 'k', 'j', 'i'>(u))));
+  auto [g3, gx, ge, gg] =
+      g2.add(make_contraction_node<'e', 'k', 'j', 'i'>(
+                 sh.template as<'i', 'p'>(),
+                 su.template as<'e', 'k', 'j', 'p'>(), NoHook{}, MX{}),
+             make_contraction_node<'e', 'k', 'j', 'i'>(
+                 sh.template as<'j', 'p'>(),
+                 su.template as<'e', 'k', 'p', 'i'>(), NoHook{}, ME{}),
+             make_contraction_node<'e', 'k', 'j', 'i'>(
+                 sh.template as<'k', 'p'>(),
+                 su.template as<'e', 'p', 'j', 'i'>(), NoHook{}, MG{}));
+  auto [g4, pv] =
+      g3.add(make_combine_node<'e', 'k', 'j', 'i'>(gx, ge, gg, GradMix{}));
+
+  using Levels    = LevelsOf<decltype(g4)>;
+  constexpr int N = Impl::lg_cute_num_threads_v<Levels>;
+  using Plan      = Impl::lg_cute_combine_plan<Levels, 3, 0, N>;
+  static_assert(N == 125);
+  static_assert(Plan::aligned_driven && Plan::template in_register<0>() &&
+                    Plan::template in_register<1>() &&
+                    Plan::template in_register<2>(),
+                "aligned row-of-e gradients must reach the combine in "
+                "registers");
+  static_assert(!Impl::lg_cute_smem_slot_v<Levels, N, 2> &&
+                    !Impl::lg_cute_smem_slot_v<Levels, N, 3> &&
+                    !Impl::lg_cute_smem_slot_v<Levels, N, 4>,
+                "gradients read in registers need no shared-memory slot");
+
+  const auto out = g4.outputs(pv);
+  out.execute(CutePolicyTag<>{}, cp);
+  ASSERT_TRUE(synced());
+  out.execute(TeamPolicyTag<ES>{}, tp);
+  ASSERT_TRUE(synced());
+
+  auto   hh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, h);
+  auto   hu = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, u);
+  HostV4 r("r", E, 5, 5, 5);
+  for (int e = 0; e < E; ++e)
+    for (int k = 0; k < 5; ++k)
+      for (int j = 0; j < 5; ++j)
+        for (int i = 0; i < 5; ++i) {
+          float x = 0.0f, y = 0.0f, z = 0.0f;
+          for (int p = 0; p < 5; ++p) {
+            x += hh(i, p) * hu(e, k, j, p);
+            y += hh(j, p) * hu(e, k, p, i);
+            z += hh(k, p) * hu(e, p, j, i);
+          }
+          r(e, k, j, i) = GradMix{}(e, k, j, i, x, y, z);
+        }
+  EXPECT_LT(max_rel_err(cp, r), 1e-5f);
+  EXPECT_LT(max_rel_err(cp, tp), 1e-5f);
+}
+
+}  // namespace
+
+TEST(CuteLevelGraph, AlignedRowOfEGradientsCombineInRegisters) {
+  using NT = RowOfENTile<2>;
+  expect_aligned_gradient_combine<2, RowOfEMma<2, ThrX, NT>,
+                                  RowOfEMma<2, ThrEta, NT>,
+                                  RowOfEMma<2, ThrGamma, NT>>();
+}
+
+TEST(CuteLevelGraph, AlignedGradientsInADifferentValueOrderStillCombine) {
+  using NT  = RowOfENTile<4>;
+  using NTs = RowOfENTileSwappedE<4>;
+  expect_aligned_gradient_combine<4, RowOfEMma<4, ThrX, NT>,
+                                  RowOfEMma<4, ThrEta, NTs>,
+                                  RowOfEMma<4, ThrGamma, NT>>();
+}
+
 int main(int argc, char* argv[]) {
   ::testing::InitGoogleTest(&argc, argv);
   Kokkos::initialize(argc, argv);

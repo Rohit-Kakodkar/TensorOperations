@@ -92,17 +92,29 @@ struct TeamBackend {
 };
 
 #if defined(SFPP_MIN_BENCH_TE_CUTE)
+#if defined(SFPP_MIN_BENCH_ROW_OF_E)
+template <int TE>
+using BenchMmas = RowOfEMmas<TE>;
+#else
+template <int TE>
+using BenchMmas = RowOfIMmas<TE>;
+#endif
+
 struct CuteBackend {
-  static constexpr const char* name = "cute";
+#if defined(SFPP_MIN_BENCH_ROW_OF_E)
+  static constexpr const char* name = "cute (row of e)";
+#else
+  static constexpr const char* name = "cute (row of i)";
+#endif
 
   template <bool Keep, int TE, class Args>
   static NewFootprint footprint(const Args& args, const GlobalHPrime& hw) {
-    return new_footprint<Keep, TE>(
+    return new_footprint<Keep, TE, BenchMmas<TE>>(
         args, TensorOperations::CutePolicyTag<KernelES>{}, hw);
   }
   template <bool Keep, int TE, class Args>
   static int launch(const Args& args, int, const GlobalHPrime& hw) {
-    return new_stiffness<Keep, TE>(
+    return new_stiffness<Keep, TE, BenchMmas<TE>>(
         args, TensorOperations::CutePolicyTag<KernelES>{}, hw);
   }
 };
@@ -250,6 +262,10 @@ int dispatch_te(int argc, char** argv, int te) {
       return run_te<Backend, Keep, 1>(argc, argv);
     case 2:
       return run_te<Backend, Keep, 2>(argc, argv);
+#if defined(SFPP_MIN_BENCH_ROW_OF_E)
+    case 3:
+      return run_te<Backend, Keep, 3>(argc, argv);
+#endif
     case 4:
       return run_te<Backend, Keep, 4>(argc, argv);
     case 5:
