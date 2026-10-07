@@ -303,6 +303,12 @@ struct CuteStagedTag {
   Part part;
 };
 
+template <typename TileShape, typename Part, typename IdxFrag>
+struct CuteGatherTag {
+  Part    part;
+  IdxFrag idx;
+};
+
 template <typename AEval, typename BEval, typename TiledMma>
 struct CuteContractTag {
   AEval    a;
@@ -627,6 +633,50 @@ class Evaluator<CutePolicyTag<ES>,
     if (part.active()) cute::copy(part(src.node().storage_), frag);
     return Impl::make_cute_fragment_value_evaluator<ES, Rank, TileShape>(
         frag, coords, src.node().hook_op);
+  }
+
+ private:
+  node_type   node_;
+  tiling_type tag_;
+};
+
+template <typename ES, typename IdxSlot, typename Source, typename OpModes,
+          typename ModesSeq, typename NodeTile, typename TV, typename TileShape,
+          typename Part, typename IdxFrag>
+class Evaluator<
+    CutePolicyTag<ES>,
+    NodeHandle<StagedTag, NodeHandle<GatherTag, IdxSlot, Source, OpModes>,
+               ModesSeq, NodeTile, TV>,
+    CuteGatherTag<TileShape, Part, IdxFrag>> {
+ public:
+  using node_type =
+      NodeHandle<StagedTag, NodeHandle<GatherTag, IdxSlot, Source, OpModes>,
+                 ModesSeq, NodeTile, TV>;
+  using policy_tag          = CutePolicyTag<ES>;
+  using tiling_type         = CuteGatherTag<TileShape, Part, IdxFrag>;
+  using value_type          = typename node_type::value_type;
+  using exec_space          = ES;
+  using modes_seq           = typename node_type::modes_seq;
+  static constexpr int Rank = node_type::Rank;
+
+  KOKKOS_FUNCTION Evaluator(node_type n, tiling_type tag)
+      : node_(n), tag_(tag) {}
+
+  KOKKOS_FUNCTION auto operator()() const {
+    const auto coords = tag_.part(cute::make_identity_tensor(TileShape{}));
+    auto       frag   = cute::make_tensor<value_type>(cute::shape(coords));
+    static_assert(decltype(cute::size(frag))::value ==
+                      decltype(cute::size(std::declval<IdxFrag>()))::value,
+                  "CuTe gather: the index fragment must hold one index per "
+                  "gathered value");
+    if (tag_.part.active()) {
+      CUTE_UNROLL
+      for (int v = 0; v < static_cast<int>(cute::size(frag)); ++v)
+        frag(v) = static_cast<value_type>(
+            node_.operand_.source_(static_cast<int>(tag_.idx(v))));
+    }
+    return Impl::make_cute_fragment_value_evaluator<ES, Rank, TileShape>(
+        frag, coords, NoHook{});
   }
 
  private:

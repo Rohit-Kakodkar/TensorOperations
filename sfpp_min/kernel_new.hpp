@@ -57,6 +57,7 @@
 #include <Kokkos_Core.hpp>
 
 #include <cstddef>
+#include <tuple>
 
 namespace sfpp_min {
 
@@ -295,6 +296,8 @@ auto row_of_e_mma() {
 }
 #endif
 
+enum class GatherMode { Functional, IndexView, IndexSlot };
+
 template <typename X, typename Eta = X, typename Gamma = X>
 struct ContractionMmas {
   using x     = X;
@@ -341,8 +344,9 @@ using RowOfIMmas = ContractionMmas<RowOfIMma<TE>>;
 // footprint reported at GATE C is the SAME graph the launch requests, never a
 // hand-copied upper bound that can drift from it.
 template <bool KeepRedundantLoads, int TE,
-          typename Mmas = ContractionMmas<TensorOperations::DefaultMma<>>,
-          typename MetricsAcc, typename PropertiesAcc, typename IglobView>
+          typename Mmas     = ContractionMmas<TensorOperations::DefaultMma<>>,
+          GatherMode Gather = GatherMode::Functional, typename MetricsAcc,
+          typename PropertiesAcc, typename IglobView>
 auto build_new_graph(
     const DummyKernelArgs<MetricsAcc, PropertiesAcc, IglobView>& args,
     GlobalHPrime                                                 hw) {
@@ -365,20 +369,27 @@ auto build_new_graph(
   const typename Mmas::eta   me{};
   const typename Mmas::gamma mg{};
 
-  auto g0           = make_level_graph<real_t, ES>(GMap{});
-  auto [g1, h, hwn] = g0.add(
+  auto g0    = make_level_graph<real_t, ES>(GMap{});
+  auto start = [&] {
+    if constexpr (Gather == GatherMode::IndexSlot)
+      return g0.add(make_index_node<'e', 'k', 'j', 'i'>(args.iglob));
+    else
+      return std::make_tuple(g0, args.iglob);
+  }();
+  const auto idx    = std::get<1>(start);
+  auto [g1, h, hwn] = std::get<0>(start).add(
       make_stage_node(make_input_node(make_handle<'r', 'p'>(args.hprime))),
       make_stage_node(make_input_node(make_handle<'p', 'r'>(hw))));
-  auto [g2, u0, u1, u2] = g1.add(
-      make_stage_node(make_functional_input_node<'e', 'k', 'j', 'i'>(
+  auto gather = [&](int c) {
+    if constexpr (Gather == GatherMode::Functional)
+      return make_stage_node(make_functional_input_node<'e', 'k', 'j', 'i'>(
           ext,
-          GatherDisplacement<IglobView>{args.displacement, args.iglob, 0})),
-      make_stage_node(make_functional_input_node<'e', 'k', 'j', 'i'>(
-          ext,
-          GatherDisplacement<IglobView>{args.displacement, args.iglob, 1})),
-      make_stage_node(make_functional_input_node<'e', 'k', 'j', 'i'>(
-          ext,
-          GatherDisplacement<IglobView>{args.displacement, args.iglob, 2})));
+          GatherDisplacement<IglobView>{args.displacement, args.iglob, c}));
+    else
+      return make_gather_node<'e', 'k', 'j', 'i'>(
+          idx, Kokkos::subview(args.displacement, Kokkos::ALL, c));
+  };
+  auto [g2, u0, u1, u2] = g1.add(gather(0), gather(1), gather(2));
 
   auto gx = [&](auto uu) {
     return make_contraction_node<'e', 'k', 'j', 'i'>(
@@ -427,11 +438,12 @@ auto build_new_graph(
   auto g7 = g6.add(make_combine_node<'e', 'k', 'j', 'i'>(r0, r1, r2, sink));
 
   using Plan = LevelPlan<std::decay_t<decltype(g7.levels)>>;
-  static_assert(Plan::num_levels == 7,
+  constexpr std::size_t IndexLevels = Gather == GatherMode::IndexSlot ? 1 : 0;
+  static_assert(Plan::num_levels == 7 + IndexLevels,
                 "two operator/stage levels then five compute levels: the "
                 "terminal scatter is its own level so its operand 0 is a "
                 "COMBINE result, in declared order, and the atomics walk i");
-  static_assert(Plan::num_slots == 2 + 3 + 9 + 9 + 9 + 3 + 0,
+  static_assert(Plan::num_slots == IndexLevels + 2 + 3 + 9 + 9 + 9 + 3 + 0,
                 "three accel slots; the terminal sink still contributes none");
   return g7;
 }
@@ -449,11 +461,16 @@ struct NewFootprint {
 };
 
 template <bool KeepRedundantLoads = false, int TE = kExecChunk,
-          typename MetricsAcc, typename PropertiesAcc, typename IglobView>
+          GatherMode Gather = GatherMode::Functional, typename MetricsAcc,
+          typename PropertiesAcc, typename IglobView>
 NewFootprint new_footprint(
     const DummyKernelArgs<MetricsAcc, PropertiesAcc, IglobView>& args,
     TensorOperations::TeamPolicyTag<KernelES>, GlobalHPrime hw) {
-  const auto out = build_new_graph<KeepRedundantLoads, TE>(args, hw).outputs();
+  const auto out =
+      build_new_graph<KeepRedundantLoads, TE,
+                      ContractionMmas<TensorOperations::DefaultMma<>>, Gather>(
+          args, hw)
+          .outputs();
   return {out.scratch_bytes(), out.slot_bytes(), -1};
 }
 
@@ -469,14 +486,17 @@ inline GlobalHPrime hprimewgll_or_build(const GlobalHPrime&  given,
 // region; tests let it build here. team_size exists only on the team backend --
 // CuTe's block size comes from the graph's contraction MMAs.
 template <bool KeepRedundantLoads = false, int TE = kExecChunk,
-          typename MetricsAcc, typename PropertiesAcc, typename IglobView>
+          GatherMode Gather = GatherMode::Functional, typename MetricsAcc,
+          typename PropertiesAcc, typename IglobView>
 int new_stiffness(
     const DummyKernelArgs<MetricsAcc, PropertiesAcc, IglobView>& args,
     TensorOperations::TeamPolicyTag<KernelES> policy, int team_size = -1,
     GlobalHPrime hprimewgll = GlobalHPrime{}) {
   const GlobalHPrime hw =
       hprimewgll_or_build(hprimewgll, args.hprime, args.weights);
-  return build_new_graph<KeepRedundantLoads, TE>(args, hw)
+  return build_new_graph<KeepRedundantLoads, TE,
+                         ContractionMmas<TensorOperations::DefaultMma<>>,
+                         Gather>(args, hw)
       .outputs()
       .team_size(team_size)
       .execute(policy);
@@ -484,19 +504,21 @@ int new_stiffness(
 
 #if defined(TENSOR_OPS_ENABLE_CUTE)
 template <bool KeepRedundantLoads = false, int TE = kExecChunk,
-          typename Mmas = RowOfIMmas<TE>, typename MetricsAcc,
+          typename Mmas     = RowOfIMmas<TE>,
+          GatherMode Gather = GatherMode::Functional, typename MetricsAcc,
           typename PropertiesAcc, typename IglobView>
 NewFootprint new_footprint(
     const DummyKernelArgs<MetricsAcc, PropertiesAcc, IglobView>& args,
     TensorOperations::CutePolicyTag<KernelES>, GlobalHPrime hw) {
   const auto out =
-      build_new_graph<KeepRedundantLoads, TE, Mmas>(args, hw).outputs();
+      build_new_graph<KeepRedundantLoads, TE, Mmas, Gather>(args, hw).outputs();
   return {out.cute_smem_bytes(), out.cute_unpooled_smem_bytes(),
           out.cute_num_threads()};
 }
 
 template <bool KeepRedundantLoads = false, int TE = kExecChunk,
-          typename Mmas = RowOfIMmas<TE>, typename MetricsAcc,
+          typename Mmas     = RowOfIMmas<TE>,
+          GatherMode Gather = GatherMode::Functional, typename MetricsAcc,
           typename PropertiesAcc, typename IglobView>
 int new_stiffness(
     const DummyKernelArgs<MetricsAcc, PropertiesAcc, IglobView>& args,
@@ -504,7 +526,7 @@ int new_stiffness(
     GlobalHPrime hprimewgll = GlobalHPrime{}) {
   const GlobalHPrime hw =
       hprimewgll_or_build(hprimewgll, args.hprime, args.weights);
-  return build_new_graph<KeepRedundantLoads, TE, Mmas>(args, hw)
+  return build_new_graph<KeepRedundantLoads, TE, Mmas, Gather>(args, hw)
       .outputs()
       .execute(policy);
 }

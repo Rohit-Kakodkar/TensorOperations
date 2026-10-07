@@ -374,19 +374,41 @@ KOKKOS_FUNCTION void lg_run_combine_level(
 // exactly what the staged evaluator builds internally before its own copy loop
 // (Evaluator/Team.hpp), lifted out so a whole level's sources can be built
 // before any of them is stored.
+template <typename IdxView, typename Source>
+struct GatherSlotView {
+  IdxView idx;
+  Source  source;
+
+  KOKKOS_FUNCTION auto layout() const { return idx.layout(); }
+  KOKKOS_FUNCTION int  size() const { return idx.size(); }
+  template <typename Coord>
+  KOKKOS_FUNCTION auto operator[](const Coord& c) const {
+    return source(idx[c]);
+  }
+};
+
 template <typename V, typename ES, typename LevelsT, typename GridModes,
-          std::size_t RootR, std::size_t L, std::size_t M, typename Team>
+          std::size_t RootR, std::size_t L, std::size_t M, typename Store,
+          typename Team>
 KOKKOS_FUNCTION auto lg_stage_src(const LevelsT&                   levels,
                                   const Kokkos::Array<int, RootR>& grid_idx,
-                                  const Team&                      team) {
+                                  const Store& store, const Team& team) {
   using Node     = tuple_element_t<M, tuple_element_t<L, LevelsT>>;
-  using Gather   = gather_seq_t<typename Node::modes_seq, GridModes>;
-  const auto idx = node_index<Node::Rank, RootR>(grid_idx, Gather{});
-  return make_evaluator<TeamPolicyTag<ES>>(
-             levels.template get<L>().template get<M>().operand_,
-             member_out_tile_t<Node>{}, team)(idx)
-      .node()
-      .storage_;
+  const auto& op = levels.template get<L>().template get<M>().operand_;
+  if constexpr (has_node_tag_v<GatherTag, typename Node::operand_type>) {
+    const auto& iv =
+        store.template get<Node::operand_type::idx_type::SlotIdx>();
+    return GatherSlotView<std::decay_t<decltype(iv)>,
+                          typename Node::operand_type::source_type>{iv,
+                                                                    op.source_};
+  } else {
+    using Gather   = gather_seq_t<typename Node::modes_seq, GridModes>;
+    const auto idx = node_index<Node::Rank, RootR>(grid_idx, Gather{});
+    return make_evaluator<TeamPolicyTag<ES>>(op, member_out_tile_t<Node>{},
+                                             team)(idx)
+        .node()
+        .storage_;
+  }
 }
 
 template <typename SrcsT, typename Store, typename Coord, std::size_t... Bs,
@@ -418,9 +440,9 @@ KOKKOS_FUNCTION void lg_run_staged_level(
     std::index_sequence<Ms...>) {
   const auto srcs =
       DeviceTuple<decltype(lg_stage_src<V, ES, LevelsT, GridModes, RootR, L,
-                                        Ms>(levels, grid_idx, team))...>{
+                                        Ms>(levels, grid_idx, store, team))...>{
           lg_stage_src<V, ES, LevelsT, GridModes, RootR, L, Ms>(
-              levels, grid_idx, team)...};
+              levels, grid_idx, store, team)...};
 
   using bases     = std::index_sequence<lg_member_base_v<LevelsT, L, Ms>...>;
   const auto src0 = srcs.template get<0>();

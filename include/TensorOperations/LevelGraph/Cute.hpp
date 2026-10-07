@@ -210,9 +210,22 @@ __device__ const auto& lg_cute_slot_node(const LevelsT& levels) {
 template <typename LevelsT, std::size_t L, std::size_t M, int N>
 struct lg_cute_combine_plan;
 
-template <typename LevelsT, std::size_t S, int N,
-          typename Tag = typename lg_cute_slot_node_t<LevelsT, S>::node_tag>
-struct lg_cute_slot_producer {
+template <typename Node>
+constexpr long lg_cute_gather_idx_slot() {
+  if constexpr (!has_node_tag_v<StagedTag, Node>)
+    return -1;
+  else if constexpr (!has_node_tag_v<GatherTag, typename Node::operand_type>)
+    return -1;
+  else
+    return static_cast<long>(Node::operand_type::idx_type::SlotIdx);
+}
+
+template <typename LevelsT, std::size_t S>
+inline constexpr long lg_cute_gather_idx_slot_v =
+    lg_cute_gather_idx_slot<lg_cute_slot_node_t<LevelsT, S>>();
+
+template <typename LevelsT, std::size_t S, int N>
+struct lg_cute_direct_slot_producer {
   using P          = lg_cute_producer<lg_cute_slot_node_t<LevelsT, S>, N>;
   using tile_shape = typename P::tile_shape;
   using part       = typename P::part;
@@ -222,10 +235,48 @@ struct lg_cute_slot_producer {
   }
 };
 
+template <typename LevelsT, std::size_t S, int N,
+          typename Tag = typename lg_cute_slot_node_t<LevelsT, S>::node_tag>
+struct lg_cute_slot_producer : lg_cute_direct_slot_producer<LevelsT, S, N> {};
+
 template <typename LevelsT, std::size_t S, int N>
 struct lg_cute_slot_producer<LevelsT, S, N, CombineTag>
     : lg_cute_combine_plan<LevelsT, lg_slot_level_v<LevelsT, S>,
                            lg_slot_member_v<LevelsT, S>, N> {};
+
+template <typename LevelsT, std::size_t S, int N,
+          long I = lg_cute_gather_idx_slot_v<LevelsT, S>>
+struct lg_cute_staged_slot_producer
+    : lg_cute_slot_producer<LevelsT, static_cast<std::size_t>(I), N> {};
+template <typename LevelsT, std::size_t S, int N>
+struct lg_cute_staged_slot_producer<LevelsT, S, N, -1>
+    : lg_cute_direct_slot_producer<LevelsT, S, N> {};
+
+template <typename LevelsT, std::size_t S, int N>
+struct lg_cute_slot_producer<LevelsT, S, N, StagedTag>
+    : lg_cute_staged_slot_producer<LevelsT, S, N> {};
+
+template <typename T, bool = has_node_tag_v<StagedTag, T>>
+struct lg_cute_node_tv {
+  using type = DefaultTV;
+};
+template <typename T>
+struct lg_cute_node_tv<T, true> {
+  using type = typename T::tv_type;
+};
+
+template <typename LevelsT, std::size_t S,
+          long I = lg_cute_gather_idx_slot_v<LevelsT, S>>
+struct lg_cute_slot_tv {
+  using type =
+      typename lg_cute_slot_tv<LevelsT, static_cast<std::size_t>(I)>::type;
+};
+template <typename LevelsT, std::size_t S>
+struct lg_cute_slot_tv<LevelsT, S, -1> {
+  using type = typename lg_cute_node_tv<lg_cute_slot_node_t<LevelsT, S>>::type;
+};
+template <typename LevelsT, std::size_t S>
+using lg_cute_slot_tv_t = typename lg_cute_slot_tv<LevelsT, S>::type;
 
 template <int R, std::size_t... Is>
 auto lg_cute_right_order(std::index_sequence<Is...>)
@@ -262,7 +313,7 @@ struct lg_cute_combine_plan {
     if constexpr (!has_node_tag_v<StagedTag, producer_node_t<K>>)
       return false;
     else
-      return !is_default_tv_v<typename producer_node_t<K>::tv_type>;
+      return !is_default_tv_v<lg_cute_slot_tv_t<LevelsT, slot<K>>>;
   }
 
   template <std::size_t K>
@@ -294,8 +345,8 @@ struct lg_cute_combine_plan {
   };
   template <std::size_t K>
   struct point_tv<K, true, true> {
-    using type = cute_point_tv_of_t<typename producer_node_t<K>::tv_type,
-                                    CModes, canon_t<K>, tile_shape>;
+    using type = cute_point_tv_of_t<lg_cute_slot_tv_t<LevelsT, slot<K>>, CModes,
+                                    canon_t<K>, tile_shape>;
   };
   template <std::size_t K>
   using point_tv_t = typename point_tv<K>::type;
@@ -588,18 +639,32 @@ __device__ auto lg_cute_slot_smem(V* base) {
 }
 
 template <typename ES, int NumThreads, typename LevelsT, typename GridModes,
-          std::size_t RootR, std::size_t L, std::size_t M>
-__device__ auto lg_cute_stage_member(
-    const LevelsT& levels, const Kokkos::Array<int, RootR>& grid_idx) {
-  using Node     = tuple_element_t<M, tuple_element_t<L, LevelsT>>;
-  using S        = lg_cute_stage<Node, NumThreads>;
-  using Gather   = gather_seq_t<typename Node::modes_seq, GridModes>;
-  const auto idx = node_index<Node::Rank, RootR>(grid_idx, Gather{});
-  auto       ev  = make_evaluator<CutePolicyTag<ES>>(
-      levels.template get<L>().template get<M>(),
-      CuteStagedTag<typename S::tile_shape, typename S::part>{S::make()});
-  using R = DeviceTuple<decltype(ev(idx))>;
-  return R{ev(idx)};
+          std::size_t RootR, std::size_t L, std::size_t M, typename Acc>
+__device__ auto lg_cute_stage_member(const LevelsT&                   levels,
+                                     const Kokkos::Array<int, RootR>& grid_idx,
+                                     const Acc&                       acc) {
+  using Node = tuple_element_t<M, tuple_element_t<L, LevelsT>>;
+  if constexpr (has_node_tag_v<GatherTag, typename Node::operand_type>) {
+    using P = lg_cute_slot_producer<LevelsT, lg_member_base_v<LevelsT, L, M>,
+                                    NumThreads>;
+    const auto& f =
+        acc.template get<Node::operand_type::idx_type::SlotIdx>().node().frag_;
+    const auto ev = make_evaluator<CutePolicyTag<ES>>(
+        levels.template get<L>().template get<M>(),
+        CuteGatherTag<typename P::tile_shape, typename P::part,
+                      std::decay_t<decltype(f)>>{P::make(levels), f});
+    using R = DeviceTuple<decltype(ev())>;
+    return R{ev()};
+  } else {
+    using S        = lg_cute_stage<Node, NumThreads>;
+    using Gather   = gather_seq_t<typename Node::modes_seq, GridModes>;
+    const auto idx = node_index<Node::Rank, RootR>(grid_idx, Gather{});
+    auto       ev  = make_evaluator<CutePolicyTag<ES>>(
+        levels.template get<L>().template get<M>(),
+        CuteStagedTag<typename S::tile_shape, typename S::part>{S::make()});
+    using R = DeviceTuple<decltype(ev(idx))>;
+    return R{ev(idx)};
+  }
 }
 
 template <typename V, typename ES, int NumThreads, typename LevelsT,
@@ -742,7 +807,7 @@ __device__ auto lg_cute_run_level(const LevelsT&                   levels,
     return lg_cute_cat(
         DeviceTuple<>{},
         lg_cute_stage_member<ES, NumThreads, LevelsT, GridModes, RootR, L, Ms>(
-            levels, grid_idx)...);
+            levels, grid_idx, acc)...);
   } else {
     if constexpr (lg_cute_reuses_at_v<LevelsT, NumThreads, L,
                                       std::index_sequence<Ss...>>)
