@@ -298,8 +298,10 @@ struct CuteSmemLoadTag : CuteThreadTag<ThrLayout> {};
 template <typename ThrLayout>
 struct CuteStoreTag : CuteThreadTag<ThrLayout> {};
 
-template <typename TileShape, typename ThrLayout>
-struct CuteStagedTag : CuteThreadTag<ThrLayout> {};
+template <typename TileShape, typename Part>
+struct CuteStagedTag {
+  Part part;
+};
 
 template <typename AEval, typename BEval, typename TiledMma>
 struct CuteContractTag {
@@ -341,6 +343,21 @@ struct CuteThreadPartitioner {
   template <typename Tensor>
   KOKKOS_FUNCTION auto operator()(const Tensor& t) const {
     return cute::local_partition(t, thr_layout, thr_idx);
+  }
+};
+
+template <typename TV>
+struct CuteTVPartitioner {
+  TV  tv;
+  int thr_idx;
+
+  KOKKOS_FUNCTION bool active() const {
+    return thr_idx < static_cast<int>(cute::size<0>(tv));
+  }
+
+  template <typename Tensor>
+  KOKKOS_FUNCTION auto operator()(const Tensor& t) const {
+    return cute::composition(t, tv)(thr_idx, cute::_);
   }
 };
 
@@ -579,14 +596,14 @@ class Evaluator<
 };
 
 template <typename ES, typename Operand, typename ModesSeq, typename NodeTile,
-          typename TileShape, typename ThrLayout>
+          typename TV, typename TileShape, typename Part>
 class Evaluator<CutePolicyTag<ES>,
-                NodeHandle<StagedTag, Operand, ModesSeq, NodeTile>,
-                CuteStagedTag<TileShape, ThrLayout>> {
+                NodeHandle<StagedTag, Operand, ModesSeq, NodeTile, TV>,
+                CuteStagedTag<TileShape, Part>> {
  public:
-  using node_type   = NodeHandle<StagedTag, Operand, ModesSeq, NodeTile>;
+  using node_type   = NodeHandle<StagedTag, Operand, ModesSeq, NodeTile, TV>;
   using policy_tag  = CutePolicyTag<ES>;
-  using tiling_type = CuteStagedTag<TileShape, ThrLayout>;
+  using tiling_type = CuteStagedTag<TileShape, Part>;
   using value_type  = typename node_type::value_type;
   using exec_space  = ES;
   using modes_seq   = typename node_type::modes_seq;
@@ -596,10 +613,6 @@ class Evaluator<CutePolicyTag<ES>,
                     cute::rank_v<TileShape> == Rank,
                 "CuTe staged: the tile shape must be static with one mode per "
                 "operand mode");
-  static_assert(cute::is_static<ThrLayout>::value &&
-                    cute::rank_v<ThrLayout> == Rank,
-                "CuTe staged: the thread layout must be static with one mode "
-                "per operand mode");
 
   KOKKOS_FUNCTION Evaluator(node_type n, tiling_type tag)
       : node_(n), tag_(tag) {}
@@ -608,7 +621,7 @@ class Evaluator<CutePolicyTag<ES>,
   KOKKOS_FUNCTION auto operator()(const Coord& coord) const {
     const auto src =
         make_evaluator<CutePolicyTag<ES>>(node_.operand_, TileShape{})(coord);
-    const CuteThreadPartitioner<ThrLayout> part{tag_.thr_layout, tag_.thr_idx};
+    const Part part   = tag_.part;
     const auto coords = part(cute::make_identity_tensor(TileShape{}));
     auto       frag   = cute::make_tensor<value_type>(cute::shape(coords));
     if (part.active()) cute::copy(part(src.node().storage_), frag);

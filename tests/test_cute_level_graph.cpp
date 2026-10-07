@@ -1329,6 +1329,300 @@ TEST(CuteLevelGraph, AlignedGradientsInADifferentValueOrderStillCombine) {
                                   RowOfEMma<4, ThrGamma, NT>>();
 }
 
+namespace {
+
+using IdxR = Kokkos::View<int****, Kokkos::LayoutRight, ES>;
+using IdxL = Kokkos::View<int****, Kokkos::LayoutLeft, ES>;
+
+int ival(int e, int a, int b, int c) {
+  return 1000 * e + 97 * a + 13 * b + c + 7;
+}
+
+template <typename V>
+void fill_index(const V& v) {
+  auto h = Kokkos::create_mirror_view(v);
+  for (int e = 0; e < static_cast<int>(h.extent(0)); ++e)
+    for (int a = 0; a < N; ++a)
+      for (int b = 0; b < N; ++b)
+        for (int c = 0; c < N; ++c) h(e, a, b, c) = ival(e, a, b, c);
+  Kokkos::deep_copy(v, h);
+}
+
+template <int TE, typename InView>
+void index_root_copies(int E) {
+  InView idx("idx", E, N, N, N);
+  IdxR   cute_out("cute_out", E, N, N, N), team_out("team_out", E, N, N, N);
+  fill_index(idx);
+  Kokkos::deep_copy(cute_out, -1);
+
+  auto g0        = make_level_graph<float, ES>(Map4<TE>{});
+  auto [g1, ig]  = g0.add(make_index_node<'e', 'a', 'b', 'c'>(idx));
+  const auto out = g1.outputs(ig);
+  EXPECT_EQ(out.cute_smem_bytes(), 0u);
+
+  EXPECT_EQ(out.execute(CutePolicyTag<>{}, cute_out), E / TE);
+  ASSERT_TRUE(synced());
+  out.execute(TeamPolicyTag<ES>{}, team_out);
+  ASSERT_TRUE(synced());
+
+  EXPECT_EQ(mismatches(cute_out, idx), 0);
+  EXPECT_EQ(mismatches(cute_out, team_out), 0);
+}
+
+struct ScaleIdx {
+  KOKKOS_FUNCTION float operator()(int, int, int, int, float v) const {
+    return 2.0f * v + 0.5f;
+  }
+};
+
+struct WriteScaled {
+  ViewR                out;
+  KOKKOS_FUNCTION void operator()(int e, int a, int b, int c, float v) const {
+    out(e, a, b, c) = 2.0f * v + 0.5f;
+  }
+};
+
+}  // namespace
+
+TEST(CuteIndexNode, RootCopiesLayoutRight) { index_root_copies<2, IdxR>(8); }
+
+TEST(CuteIndexNode, RootCopiesLayoutLeft) { index_root_copies<2, IdxL>(8); }
+
+TEST(CuteIndexNode, RootCopiesWithIdleThreads) {
+  index_root_copies<1, IdxR>(6);
+}
+
+TEST(CuteIndexNode, UnreadIndexLevelChangesNeitherResultNorSmem) {
+  constexpr int E = 8;
+  IdxL          idx("idx", E, N, N, N);
+  ViewR         u("u", E, N, N, N), with("with", E, N, N, N),
+      without("without", E, N, N, N);
+  fill_index(idx);
+  fill(u, 1.0f);
+
+  auto a0      = make_level_graph<float, ES>(Map4<2>{});
+  auto [a1, s] = a0.add(
+      make_stage_node(make_input_node(make_handle<'e', 'a', 'b', 'c'>(u))));
+  auto [a2, r] = a1.add(make_combine_node<'e', 'a', 'b', 'c'>(s, ScaleIdx{}));
+  const auto out_a = a2.outputs(r);
+
+  auto b0       = make_level_graph<float, ES>(Map4<2>{});
+  auto [b1, ig] = b0.add(make_index_node<'e', 'a', 'b', 'c'>(idx));
+  auto [b2, t]  = b1.add(
+      make_stage_node(make_input_node(make_handle<'e', 'a', 'b', 'c'>(u))));
+  auto [b3, q] = b2.add(make_combine_node<'e', 'a', 'b', 'c'>(t, ScaleIdx{}));
+  const auto out_b = b3.outputs(q);
+  (void)ig;
+
+  EXPECT_EQ(out_b.cute_smem_bytes(), out_a.cute_smem_bytes());
+  out_a.execute(CutePolicyTag<>{}, without);
+  out_b.execute(CutePolicyTag<>{}, with);
+  ASSERT_TRUE(synced());
+  EXPECT_EQ(mismatches(with, without), 0);
+}
+
+TEST(CuteIndexNode, LiveIndexRootBesideASink) {
+  constexpr int E = 8;
+  IdxL          idx("idx", E, N, N, N);
+  IdxR          iout("iout", E, N, N, N), tiout("tiout", E, N, N, N);
+  ViewR u("u", E, N, N, N), got("got", E, N, N, N), tgot("tgot", E, N, N, N);
+  fill_index(idx);
+  fill(u, 1.0f);
+  Kokkos::deep_copy(got, -7.0f);
+
+  auto build = [&](ViewR dst) {
+    auto g0       = make_level_graph<float, ES>(Map4<2>{});
+    auto [g1, ig] = g0.add(make_index_node<'e', 'a', 'b', 'c'>(idx));
+    auto [g2, s]  = g1.add(
+        make_stage_node(make_input_node(make_handle<'e', 'a', 'b', 'c'>(u))));
+    auto g3 =
+        g2.add(make_combine_node<'e', 'a', 'b', 'c'>(s, WriteScaled{dst}));
+    return g3.outputs(ig);
+  };
+  build(got).execute(CutePolicyTag<>{}, iout);
+  ASSERT_TRUE(synced());
+  build(tgot).execute(TeamPolicyTag<ES>{}, tiout);
+  ASSERT_TRUE(synced());
+
+  auto hu  = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, u);
+  auto hg  = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, got);
+  int  bad = 0;
+  for (int e = 0; e < E; ++e)
+    for (int a = 0; a < N; ++a)
+      for (int b = 0; b < N; ++b)
+        for (int c = 0; c < N; ++c)
+          if (hg(e, a, b, c) != 2.0f * hu(e, a, b, c) + 0.5f) ++bad;
+  EXPECT_EQ(bad, 0);
+  EXPECT_EQ(mismatches(iout, idx), 0);
+  EXPECT_EQ(mismatches(tiout, idx), 0);
+  EXPECT_EQ(mismatches(got, tgot), 0);
+}
+
+namespace {
+
+template <int TE>
+using RowOfETV = cute::Layout<
+    cute::Shape<cute::Shape<cute::_5, cute::_5, cute::_5>, cute::Int<TE>>,
+    cute::Stride<
+        cute::Stride<cute::Int<25 * TE>, cute::Int<5 * TE>, cute::Int<TE>>,
+        cute::_1>>;
+template <int TE>
+using SwappedRowOfETV = cute::Layout<
+    cute::Shape<cute::Shape<cute::_5, cute::_5, cute::_5>, cute::Int<TE>>,
+    cute::Stride<
+        cute::Stride<cute::Int<TE>, cute::Int<5 * TE>, cute::Int<25 * TE>>,
+        cute::_1>>;
+
+struct GradMixU {
+  KOKKOS_FUNCTION float operator()(int e, int k, int j, int i, float x, float y,
+                                   float z, float w) const {
+    return GradMix{}(e, k, j, i, x, y, z) + 3.0f * w;
+  }
+};
+
+template <int TE, typename TV, bool Aligned>
+void expect_tv_staged_gradient_combine() {
+  using MX        = RowOfEMma<TE, ThrX, RowOfENTile<TE>>;
+  using ME        = RowOfEMma<TE, ThrEta, RowOfENTile<TE>>;
+  using MG        = RowOfEMma<TE, ThrGamma, RowOfENTile<TE>>;
+  constexpr int E = 2 * TE;
+  OpView<5>     h("h", 5, 5);
+  ViewR         u("u", E, 5, 5, 5);
+  fill(h, 0.5f);
+  fill(u, -2.0f);
+  ViewR cp("cp", E, 5, 5, 5), tp("tp", E, 5, 5, 5);
+  Kokkos::deep_copy(cp, -999.0f);
+
+  auto g0 = make_level_graph<float, ES>(MapET<TE>{});
+  auto [g1, sh] =
+      g0.add(make_stage_node(make_input_node(make_handle<'r', 'p'>(h))));
+  auto [g2, su] = g1.add(make_stage_node(
+      make_input_node(make_handle<'e', 'k', 'j', 'i'>(u)), TV{}));
+  auto [g3, gx, ge, gg] =
+      g2.add(make_contraction_node<'e', 'k', 'j', 'i'>(
+                 sh.template as<'i', 'p'>(),
+                 su.template as<'e', 'k', 'j', 'p'>(), NoHook{}, MX{}),
+             make_contraction_node<'e', 'k', 'j', 'i'>(
+                 sh.template as<'j', 'p'>(),
+                 su.template as<'e', 'k', 'p', 'i'>(), NoHook{}, ME{}),
+             make_contraction_node<'e', 'k', 'j', 'i'>(
+                 sh.template as<'k', 'p'>(),
+                 su.template as<'e', 'p', 'j', 'i'>(), NoHook{}, MG{}));
+  auto [g4, pv] =
+      g3.add(make_combine_node<'e', 'k', 'j', 'i'>(gx, ge, gg, su, GradMixU{}));
+
+  using Levels    = LevelsOf<decltype(g4)>;
+  constexpr int N = Impl::lg_cute_num_threads_v<Levels>;
+  using Plan      = Impl::lg_cute_combine_plan<Levels, 3, 0, N>;
+  static_assert(N == 125);
+  static_assert(Plan::template in_register<3>() == Aligned,
+                "a staged operand reaches an MMA-driven combine in registers "
+                "exactly when its thread-value layout matches the MMAs'");
+  static_assert(Plan::aligned_driven == Aligned);
+  if constexpr (Aligned)
+    static_assert(Plan::template in_register<0>() &&
+                  Plan::template in_register<1>() &&
+                  Plan::template in_register<2>());
+
+  const auto out = g4.outputs(pv);
+  out.execute(CutePolicyTag<>{}, cp);
+  ASSERT_TRUE(synced());
+  out.execute(TeamPolicyTag<ES>{}, tp);
+  ASSERT_TRUE(synced());
+
+  auto   hh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, h);
+  auto   hu = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, u);
+  HostV4 r("r", E, 5, 5, 5);
+  for (int e = 0; e < E; ++e)
+    for (int k = 0; k < 5; ++k)
+      for (int j = 0; j < 5; ++j)
+        for (int i = 0; i < 5; ++i) {
+          float x = 0.0f, y = 0.0f, z = 0.0f;
+          for (int p = 0; p < 5; ++p) {
+            x += hh(i, p) * hu(e, k, j, p);
+            y += hh(j, p) * hu(e, k, p, i);
+            z += hh(k, p) * hu(e, p, j, i);
+          }
+          r(e, k, j, i) = GradMixU{}(e, k, j, i, x, y, z, hu(e, k, j, i));
+        }
+  EXPECT_LT(max_rel_err(cp, r), 1e-5f);
+  EXPECT_LT(max_rel_err(cp, tp), 1e-5f);
+}
+
+using NarrowTV =
+    cute::Layout<cute::Shape<cute::Shape<cute::_5, cute::_5>,
+                             cute::Shape<cute::_2, cute::_5>>,
+                 cute::Stride<cute::Stride<cute::Int<50>, cute::_10>,
+                              cute::Stride<cute::_1, cute::_2>>>;
+using WideTV = cute::Layout<cute::Shape<cute::Int<250>, cute::_1>>;
+
+}  // namespace
+
+TEST(CuteStageTV, RowOfELayoutReachesAlignedCombineInRegisters) {
+  expect_tv_staged_gradient_combine<2, RowOfETV<2>, true>();
+}
+
+TEST(CuteStageTV, RowOfELayoutAtTE4) {
+  expect_tv_staged_gradient_combine<4, RowOfETV<4>, true>();
+}
+
+TEST(CuteStageTV, MisalignedLayoutFallsBackToSharedMemory) {
+  expect_tv_staged_gradient_combine<2, SwappedRowOfETV<2>, false>();
+}
+
+TEST(CuteStageTV, NarrowLayoutSetsTheBlock) {
+  constexpr int E = 8;
+  ViewR         u("u", E, N, N, N), cu("cu", E, N, N, N), tu("tu", E, N, N, N);
+  fill(u, 1.0f);
+  auto g0        = make_level_graph<float, ES>(Map4<2>{});
+  auto [g1, s]   = g0.add(make_stage_node(
+      make_input_node(make_handle<'e', 'a', 'b', 'c'>(u)), NarrowTV{}));
+  const auto out = g1.outputs(s);
+  static_assert(decltype(out)::cute_num_threads() == 25);
+  EXPECT_EQ(out.execute(CutePolicyTag<>{}, cu), E / 2);
+  ASSERT_TRUE(synced());
+  out.execute(TeamPolicyTag<ES>{}, tu);
+  ASSERT_TRUE(synced());
+  EXPECT_EQ(mismatches(cu, u), 0);
+  EXPECT_EQ(mismatches(cu, tu), 0);
+}
+
+TEST(CuteStageTV, WideLayoutWidensTheBlockAndNarrowOneIdles) {
+  constexpr int E = 8;
+  ViewR         u("u", E, N, N, N), w("w", E, N, N, N);
+  ViewR         cu("cu", E, N, N, N), cw("cw", E, N, N, N);
+  fill(u, 1.0f);
+  fill(w, -3.0f);
+  auto g0        = make_level_graph<float, ES>(Map4<2>{});
+  auto [g1, su]  = g0.add(make_stage_node(
+      make_input_node(make_handle<'e', 'a', 'b', 'c'>(u)), NarrowTV{}));
+  auto [g2, sw]  = g1.add(make_stage_node(
+      make_input_node(make_handle<'e', 'a', 'b', 'c'>(w)), WideTV{}));
+  const auto out = g2.outputs(su, sw);
+  static_assert(decltype(out)::cute_num_threads() == 250);
+  EXPECT_EQ(out.execute(CutePolicyTag<>{}, cu, cw), E / 2);
+  ASSERT_TRUE(synced());
+  EXPECT_EQ(mismatches(cu, u), 0);
+  EXPECT_EQ(mismatches(cw, w), 0);
+}
+
+TEST(CuteStageTV, IndexNodeTakesALayout) {
+  constexpr int E = 8;
+  IdxL          idx("idx", E, N, N, N);
+  IdxR          cout_("cout", E, N, N, N), tout("tout", E, N, N, N);
+  fill_index(idx);
+  auto g0        = make_level_graph<float, ES>(Map4<2>{});
+  auto [g1, ig]  = g0.add(make_index_node<'e', 'a', 'b', 'c'>(idx, NarrowTV{}));
+  const auto out = g1.outputs(ig);
+  static_assert(decltype(out)::cute_num_threads() == 25);
+  out.execute(CutePolicyTag<>{}, cout_);
+  ASSERT_TRUE(synced());
+  out.execute(TeamPolicyTag<ES>{}, tout);
+  ASSERT_TRUE(synced());
+  EXPECT_EQ(mismatches(cout_, idx), 0);
+  EXPECT_EQ(mismatches(tout, idx), 0);
+}
+
 int main(int argc, char* argv[]) {
   ::testing::InitGoogleTest(&argc, argv);
   Kokkos::initialize(argc, argv);

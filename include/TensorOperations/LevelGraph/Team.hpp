@@ -54,6 +54,9 @@ struct lg_slot_member_node {
 template <typename LevelsT, std::size_t GS>
 using lg_slot_tile_t =
     member_out_tile_t<typename lg_slot_member_node<LevelsT, GS>::type>;
+template <typename LevelsT, std::size_t GS, typename V>
+using lg_slot_elem_t =
+    lg_member_elem_t<typename lg_slot_member_node<LevelsT, GS>::type, V>;
 
 // A staged member with its tile resolved from the graph's label map; every
 // other member kind passes through untouched.
@@ -71,8 +74,9 @@ template <typename LT, typename Member>
 struct lg_resolve_member<LT, Member, StagedTag> {
   using type = NodeHandle<StagedTag, typename Member::operand_type,
                           typename Member::modes_seq,
-                          tile_from_labels_t<LT, typename Member::modes_seq>>;
-  static type get(const Member& m) { return type{m.operand_}; }
+                          tile_from_labels_t<LT, typename Member::modes_seq>,
+                          typename Member::tv_type>;
+  static type get(const Member& m) { return type{m.operand_, m.tv_}; }
 };
 template <typename LT, typename Member>
 using lg_resolve_member_t = typename lg_resolve_member<LT, Member>::type;
@@ -164,14 +168,18 @@ using lg_pools_t = typename lg_pools_of<
 template <typename V, typename ES, typename LevelsT, typename RootsSeq,
           typename Team, std::size_t... Ls>
 KOKKOS_FUNCTION auto lg_carve(const Team& team, std::index_sequence<Ls...>) {
-  return carve_pooled_arena_slot_store<V, ES, lg_pools_t<LevelsT, RootsSeq>>(
+  return carve_pooled_arena_slot_store<
+      V, ES, lg_pools_t<LevelsT, RootsSeq>,
+      SlotElems<lg_slot_elem_t<LevelsT, Ls, V>...>>(
       team, lg_slot_tile_t<LevelsT, Ls>{}...);
 }
 
 template <typename V, typename ES, typename LevelsT, typename RootsSeq,
           std::size_t... Ls>
 std::size_t lg_scratch_bytes(std::index_sequence<Ls...>) {
-  return pooled_arena_slot_store_bytes<V, ES, lg_pools_t<LevelsT, RootsSeq>>(
+  return pooled_arena_slot_store_bytes<
+      V, ES, lg_pools_t<LevelsT, RootsSeq>,
+      SlotElems<lg_slot_elem_t<LevelsT, Ls, V>...>>(
       lg_slot_tile_t<LevelsT, Ls>{}...);
 }
 
@@ -181,7 +189,9 @@ std::size_t lg_scratch_bytes(std::index_sequence<Ls...>) {
 // number that decides whether a tile size is viable at all.
 template <typename V, typename ES, typename LevelsT, std::size_t... Ls>
 std::size_t lg_unpooled_scratch_bytes(std::index_sequence<Ls...>) {
-  return arena_slot_store_bytes<V, ES>(lg_slot_tile_t<LevelsT, Ls>{}...);
+  return pooled_arena_slot_store_bytes<
+      V, ES, SlotPools<Ls...>, SlotElems<lg_slot_elem_t<LevelsT, Ls, V>...>>(
+      lg_slot_tile_t<LevelsT, Ls>{}...);
 }
 
 template <typename V, typename ES, typename LevelsT, std::size_t L,

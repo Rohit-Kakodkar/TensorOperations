@@ -158,6 +158,11 @@ inline constexpr std::size_t lg_level_slots_v =
 template <typename LevelsT>
 inline constexpr std::size_t lg_total_members_v = lg_total_members<LevelsT>();
 
+template <typename Member, typename V>
+using lg_member_elem_t =
+    std::conditional_t<std::is_integral_v<typename Member::value_type>,
+                       std::remove_const_t<typename Member::value_type>, V>;
+
 // --- liveness, on a LEVEL timeline -----------------------------------------
 //
 // Slots that cannot be alive at once share a buffer, which is what takes the

@@ -209,7 +209,8 @@ struct LevelGraph {
     return std::make_tuple(
         make_slot_node_seq<Base + Os,
                            typename Impl::lg_member_decl_modes<Member>::type>(
-            SlotView<ValueType, ExecSpace, Tile>{},
+            SlotView<Impl::lg_member_elem_t<Member, ValueType>, ExecSpace,
+                     Tile>{},
             Impl::lg_member_decl_shape<Member>::get(m))...);
   }
 
