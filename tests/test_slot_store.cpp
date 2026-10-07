@@ -294,6 +294,33 @@ TEST(SlotStoreTest, SuccessiveCarvesDoNotAlias) {
       EXPECT_NE(p[i], p[j]) << "slot " << i << " and " << j << " alias";
 }
 
+TEST(SlotStoreTest, TypedStepCountsIntSlotsInValueUnits) {
+  constexpr std::size_t kA = Impl::slot_arena_align<double, ES>();
+  constexpr std::size_t n  = 25;
+  EXPECT_EQ((Impl::slot_arena_step_of<double, int, ES>(n)),
+            ((n * sizeof(int) + kA - 1) / kA * kA) / sizeof(double));
+  EXPECT_EQ((Impl::slot_arena_step_of<float, float, ES>(n)),
+            (Impl::slot_arena_step<float, ES>(n)));
+
+  using P = Impl::SlotPools<0, 1, 0>;
+  EXPECT_EQ(
+      (pooled_arena_slot_store_bytes<float, ES, P>(T1{}, T2{}, T4{})),
+      (pooled_arena_slot_store_bytes<float, ES, P,
+                                     Impl::SlotElems<float, float, float>>(
+          T1{}, T2{}, T4{})));
+
+  using Q = Impl::SlotPools<0, 1>;
+  const std::size_t typed =
+      pooled_arena_slot_store_bytes<double, ES, Q,
+                                    Impl::SlotElems<int, double>>(T1{}, T2{});
+  const std::size_t widened =
+      pooled_arena_slot_store_bytes<double, ES, Q>(T1{}, T2{});
+  EXPECT_EQ(widened - typed, (Impl::slot_arena_step<double, ES>(25) -
+                              Impl::slot_arena_step_of<double, int, ES>(25)) *
+                                 sizeof(double));
+  EXPECT_LT(typed, widened);
+}
+
 int main(int argc, char* argv[]) {
   ::testing::InitGoogleTest(&argc, argv);
   Kokkos::initialize(argc, argv);

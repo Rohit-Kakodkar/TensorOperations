@@ -38,6 +38,13 @@ template <int B>
 inline constexpr bool is_default_mma_v<DefaultMma<B>> = true;
 }  // namespace Impl
 
+struct DefaultTV {};
+
+namespace Impl {
+template <typename TV>
+inline constexpr bool is_default_tv_v = std::is_same_v<TV, DefaultTV>;
+}  // namespace Impl
+
 // Forward declaration — TiledLayout.hpp defines it; exec_space_of below has to
 // look through it, and including it here would be a cycle.
 template <typename ViewType, typename Layout>
@@ -335,13 +342,15 @@ struct NodeHandle<IntermTag, Storage, IntRank, ExecSpace, HookOp> {
 // LevelGraph::add fills it in: `add` is the first place where both the node and
 // the map are in scope. Downstream, `tile_type` is simply what MemberOutTile
 // reports.
-template <typename Operand, typename ModesSeq, typename Tile>
-struct NodeHandle<StagedTag, Operand, ModesSeq, Tile> {
-  Operand operand_;
+template <typename Operand, typename ModesSeq, typename Tile, typename TV>
+struct NodeHandle<StagedTag, Operand, ModesSeq, Tile, TV> {
+  Operand                  operand_;
+  [[no_unique_address]] TV tv_;
 
   using node_tag            = StagedTag;
   using operand_type        = Operand;
   using tile_type           = Tile;
+  using tv_type             = TV;
   static constexpr int Rank = Operand::Rank;
   using value_type          = typename Operand::value_type;
   using exec_space          = typename Operand::exec_space;
@@ -362,7 +371,8 @@ struct NodeHandle<StagedTag, Operand, ModesSeq, Tile> {
   template <int32_t... Modes>
   KOKKOS_FUNCTION auto as() const {
     return NodeHandle<StagedTag, Operand,
-                      std::integer_sequence<int32_t, Modes...>, void>{operand_};
+                      std::integer_sequence<int32_t, Modes...>, void, TV>{
+        operand_, tv_};
   }
 };
 
@@ -581,10 +591,20 @@ KOKKOS_FUNCTION auto make_interm_node(Storage storage, HookOp hook = {}) {
                     ExecSpace, HookOp>{std::move(storage), std::move(hook)};
 }
 
-template <typename Operand>
-KOKKOS_FUNCTION auto make_stage_node(Operand op) {
-  return NodeHandle<StagedTag, Operand, typename Operand::modes_seq, void>{
-      std::move(op)};
+template <typename Operand, typename TV = DefaultTV>
+KOKKOS_FUNCTION auto make_stage_node(Operand op, TV tv = {}) {
+  return NodeHandle<StagedTag, Operand, typename Operand::modes_seq, void, TV>{
+      std::move(op), std::move(tv)};
+}
+
+template <int32_t... Modes, TensorLike T, typename TV = DefaultTV>
+auto make_index_node(T view, TV tv = {}) {
+  static_assert(std::is_integral_v<typename Impl::value_type_of<T>::type>,
+                "index node: the view must hold integers");
+  static_assert(static_cast<int>(T::rank) == static_cast<int>(sizeof...(Modes)),
+                "index node: one label per view axis");
+  return make_stage_node(make_input_node(make_handle<Modes...>(view)),
+                         std::move(tv));
 }
 
 // Slot node — label an existing buffer (a producing node's output scratch) so
@@ -681,6 +701,10 @@ auto make_contraction_node_impl(NodeA a, NodeB b, HookOp hook, Mma mma) {
                 "a functional input has no address, and a contraction reads "
                 "its operands as strided memory. Wrap it in make_stage_node "
                 "first; the contraction then reads the staged tile");
+  static_assert(!std::is_integral_v<typename NodeA::value_type> &&
+                    !std::is_integral_v<typename NodeB::value_type>,
+                "contraction node: an index slot is read only by gather and "
+                "scatter nodes, not as a contraction operand");
   constexpr int Rank = static_cast<int>(sizeof...(OutModes));
   static_assert((NodeA::Rank + NodeB::Rank - Rank) % 2 == 0,
                 "Output rank is inconsistent with input ranks");
@@ -844,6 +868,9 @@ auto make_combine_node_impl(CombineFn fn, Ops... ops) {
                 "a functional input has no address, and a combine reads its "
                 "operands as strided memory. Wrap it in make_stage_node "
                 "first; the combine then reads the staged tile");
+  static_assert((!std::is_integral_v<typename Ops::value_type> && ...),
+                "combine node: an index slot is read only by gather and "
+                "scatter nodes, not as a combine operand");
   static_assert(((static_cast<int>(Ops::Rank) == Rank) && ...),
                 "combine node: every operand and the output must have equal "
                 "rank");

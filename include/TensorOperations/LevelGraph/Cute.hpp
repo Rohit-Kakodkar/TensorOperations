@@ -52,13 +52,46 @@ struct lg_cute_stage_order<Operand, R, FunctionalTag> {
   using type = order_contiguity_t<R, typename Operand::order_tag>;
 };
 
-template <typename Node, int NumThreads>
+template <typename TV, std::size_t N>
+constexpr bool lg_cute_tv_covers_tile() {
+  if constexpr (!cute::is_static<TV>::value || cute::rank_v<TV> != 2)
+    return true;
+  else
+    return cute_tv_is_bijection<TV, N>();
+}
+
+template <typename Node, int NumThreads, typename TV = typename Node::tv_type>
 struct lg_cute_stage {
+  using tile_shape = cute_shape_of_t<member_out_tile_t<Node>>;
+  static constexpr std::size_t tile_size =
+      decltype(cute::size(tile_shape{}))::value;
+
+  static_assert(cute::is_static<TV>::value,
+                "level graph (CuTe): a stage node's thread-value layout must "
+                "be static");
+  static_assert(cute::rank_v<TV> == 2,
+                "level graph (CuTe): a thread-value layout has exactly two "
+                "modes, (thread, value)");
+  static_assert(lg_cute_tv_covers_tile<TV, tile_size>(),
+                "level graph (CuTe): a stage node's thread-value layout must "
+                "cover every coordinate of its tile exactly once");
+
+  using part = CuteTVPartitioner<TV>;
+  __device__ static part make() {
+    return {TV{}, static_cast<int>(threadIdx.x)};
+  }
+};
+
+template <typename Node, int NumThreads>
+struct lg_cute_stage<Node, NumThreads, DefaultTV> {
   using tile_shape = cute_shape_of_t<member_out_tile_t<Node>>;
   using order      = typename lg_cute_stage_order<typename Node::operand_type,
                                                   Node::Rank>::type;
   using thr_layout = cute_thr_layout_t<tile_shape, order, NumThreads>;
   using part       = CuteThreadPartitioner<thr_layout>;
+  __device__ static part make() {
+    return {thr_layout{}, static_cast<int>(threadIdx.x)};
+  }
 };
 
 template <typename Tile>
@@ -108,7 +141,14 @@ constexpr int lg_cute_member_threads() {
   if constexpr (has_node_tag_v<ContractionTag, Node>)
     return static_cast<int>(
         decltype(cute::size(std::declval<lg_cute_mma_t<Node>>()))::value);
-  else
+  else if constexpr (has_node_tag_v<StagedTag, Node>) {
+    if constexpr (is_default_tv_v<typename Node::tv_type> ||
+                  !cute::is_static<typename Node::tv_type>::value)
+      return 0;
+    else
+      return static_cast<int>(
+          decltype(cute::size<0>(typename Node::tv_type{}))::value);
+  } else
     return 0;
 }
 
@@ -143,9 +183,7 @@ struct lg_cute_producer<Node, NumThreads, StagedTag> {
   using tile_shape = typename S::tile_shape;
   using part       = typename S::part;
 
-  __device__ static part make(const Node&) {
-    return {typename S::thr_layout{}, static_cast<int>(threadIdx.x)};
-  }
+  __device__ static part make(const Node&) { return S::make(); }
 };
 
 template <typename Node, int NumThreads>
@@ -217,40 +255,54 @@ struct lg_cute_combine_plan {
   using producer_t = lg_cute_slot_producer<LevelsT, slot<K>, N>;
 
   template <std::size_t K>
+  using producer_node_t = lg_cute_slot_node_t<LevelsT, slot<K>>;
+
+  template <std::size_t K>
+  static constexpr bool staged_tv() {
+    if constexpr (!has_node_tag_v<StagedTag, producer_node_t<K>>)
+      return false;
+    else
+      return !is_default_tv_v<typename producer_node_t<K>::tv_type>;
+  }
+
+  template <std::size_t K>
   static constexpr bool eligible() {
-    return std::is_same_v<canon_t<K>, CModes> &&
+    return !staged_tv<K>() && std::is_same_v<canon_t<K>, CModes> &&
            std::is_same_v<typename op_t<K>::modes_seq, CModes> &&
            std::is_same_v<typename producer_t<K>::tile_shape, tile_shape>;
   }
 
   template <std::size_t K>
-  using producer_node_t = lg_cute_slot_node_t<LevelsT, slot<K>>;
-
-  template <std::size_t K>
-  static constexpr bool contraction_fragment() {
-    if constexpr (!has_node_tag_v<ContractionTag, producer_node_t<K>>)
+  static constexpr bool point_fragment() {
+    if constexpr (!has_node_tag_v<ContractionTag, producer_node_t<K>> &&
+                  !staged_tv<K>())
       return false;
     else
       return same_label_set_v<canon_t<K>, CModes> &&
              std::is_same_v<typename op_t<K>::modes_seq, CModes>;
   }
 
-  template <std::size_t K, bool = contraction_fragment<K>()>
+  template <std::size_t K, bool = point_fragment<K>(), bool = staged_tv<K>()>
   struct point_tv {
     using type = void;
   };
   template <std::size_t K>
-  struct point_tv<K, true> {
+  struct point_tv<K, true, false> {
     using type =
         cute_point_tv_t<typename lg_cute_producer<producer_node_t<K>, N>::mma,
                         CModes, canon_t<K>, tile_shape>;
+  };
+  template <std::size_t K>
+  struct point_tv<K, true, true> {
+    using type = cute_point_tv_of_t<typename producer_node_t<K>::tv_type,
+                                    CModes, canon_t<K>, tile_shape>;
   };
   template <std::size_t K>
   using point_tv_t = typename point_tv<K>::type;
 
   template <std::size_t K>
   static constexpr bool aligned_candidate() {
-    if constexpr (!contraction_fragment<K>())
+    if constexpr (!point_fragment<K>())
       return false;
     else
       return decltype(cute::size(point_tv_t<K>{}))::value ==
@@ -280,7 +332,7 @@ struct lg_cute_combine_plan {
   template <std::size_t K>
   static constexpr bool aligned_with_first() {
     if constexpr (!aligned_candidate<K>())
-      return !contraction_fragment<K>();
+      return !point_fragment<K>();
     else
       return cute_points_aligned_v<point_tv_t<K>, point_tv_t<DA>>;
   }
@@ -442,6 +494,11 @@ inline constexpr std::size_t lg_cute_slot_pool_v =
 template <typename V, typename ES, typename LevelsT, int N, std::size_t... Ss>
 constexpr std::array<std::size_t, sizeof...(Ss)> lg_cute_smem_steps(
     std::index_sequence<Ss...>) {
+  static_assert(
+      ((!lg_cute_smem_slot_v<LevelsT, N, Ss> ||
+        std::is_same_v<lg_slot_elem_t<LevelsT, Ss, V>, V>) &&
+       ...),
+      "level graph (CuTe): an index slot never lives in shared memory");
   return {(lg_cute_smem_slot_v<LevelsT, N, Ss>
                ? slot_arena_step<V, ES>(
                      slot_tile_elems<lg_slot_tile_t<LevelsT, Ss>>())
@@ -540,8 +597,7 @@ __device__ auto lg_cute_stage_member(
   const auto idx = node_index<Node::Rank, RootR>(grid_idx, Gather{});
   auto       ev  = make_evaluator<CutePolicyTag<ES>>(
       levels.template get<L>().template get<M>(),
-      CuteStagedTag<typename S::tile_shape, typename S::thr_layout>{
-          {typename S::thr_layout{}, static_cast<int>(threadIdx.x)}});
+      CuteStagedTag<typename S::tile_shape, typename S::part>{S::make()});
   using R = DeviceTuple<decltype(ev(idx))>;
   return R{ev(idx)};
 }

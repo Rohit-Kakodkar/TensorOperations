@@ -307,11 +307,11 @@ class Evaluator<
 };
 
 template <typename ES, typename Operand, typename ModesSeq, typename NodeTile,
-          typename Tile_>
+          typename TV, typename Tile_>
 class Evaluator<TeamPolicyTag<ES>,
-                NodeHandle<StagedTag, Operand, ModesSeq, NodeTile>, Tile_> {
+                NodeHandle<StagedTag, Operand, ModesSeq, NodeTile, TV>, Tile_> {
  public:
-  using node_type     = NodeHandle<StagedTag, Operand, ModesSeq, NodeTile>;
+  using node_type     = NodeHandle<StagedTag, Operand, ModesSeq, NodeTile, TV>;
   using policy_tag    = TeamPolicyTag<ES>;
   using tiling_type   = Tile_;
   using value_type    = typename node_type::value_type;

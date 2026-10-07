@@ -139,6 +139,10 @@ add_executable(test_level_graph tests/test_level_graph.cpp)
 target_link_libraries(test_level_graph PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_level_graph)
 
+add_executable(test_index_node tests/test_index_node.cpp)
+target_link_libraries(test_index_node PRIVATE tensor GTest::gtest)
+gtest_discover_tests(test_index_node)
+
 # test_functional_input — a leaf whose elements are computed, not addressed.
 # Custom main() wraps Kokkos init/finalize; every case launches a graph.
 add_executable(test_functional_input tests/test_functional_input.cpp)
@@ -192,6 +196,26 @@ if(TENSOR_OPS_CUTLASS_DIR AND Kokkos_ENABLE_CUDA)
   add_executable(test_cute_fragment_store tests/test_cute_fragment_store.cpp)
   target_link_libraries(test_cute_fragment_store PRIVATE tensor GTest::gtest)
   gtest_discover_tests(test_cute_fragment_store)
+
+  foreach(case 0 1 2 3 4)
+    add_executable(stage_tv_guard_neg_${case} EXCLUDE_FROM_ALL
+                   tests/negative/stage_tv_guard_negative.cpp)
+    target_link_libraries(stage_tv_guard_neg_${case} PRIVATE tensor)
+    target_compile_definitions(stage_tv_guard_neg_${case}
+                               PRIVATE STAGE_TV_NEG_CASE=${case})
+    add_test(NAME StageTVGuardNegative.Case${case}
+             COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}
+                     --target stage_tv_guard_neg_${case} --config $<CONFIG>)
+  endforeach()
+  set_tests_properties(StageTVGuardNegative.Case1 StageTVGuardNegative.Case2
+                       PROPERTIES PASS_REGULAR_EXPRESSION
+                       "must cover every coordinate of its tile exactly once")
+  set_tests_properties(StageTVGuardNegative.Case3 PROPERTIES
+                       PASS_REGULAR_EXPRESSION
+                       "a thread-value layout has exactly two modes")
+  set_tests_properties(StageTVGuardNegative.Case4 PROPERTIES
+                       PASS_REGULAR_EXPRESSION
+                       "thread-value layout must be static")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -302,6 +326,29 @@ set_tests_properties(LevelGuardNegative.Case2 LevelGuardNegative.Case3
 set_tests_properties(LevelGuardNegative.Case4 PROPERTIES
                      PASS_REGULAR_EXPRESSION
                      "may not read a slot ITS OWN LEVEL")
+
+foreach(case 0 1 2 3 4)
+  add_executable(index_guard_neg_${case} EXCLUDE_FROM_ALL
+                 tests/negative/index_guard_negative.cpp)
+  target_link_libraries(index_guard_neg_${case} PRIVATE tensor)
+  target_compile_definitions(index_guard_neg_${case}
+                             PRIVATE INDEX_NEG_CASE=${case})
+  add_test(NAME IndexGuardNegative.Case${case}
+           COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}
+                   --target index_guard_neg_${case} --config $<CONFIG>)
+endforeach()
+set_tests_properties(IndexGuardNegative.Case1 PROPERTIES
+                     PASS_REGULAR_EXPRESSION
+                     "combine node: an index slot is read only by gather")
+set_tests_properties(IndexGuardNegative.Case2 PROPERTIES
+                     PASS_REGULAR_EXPRESSION
+                     "contraction node: an index slot is read only by gather")
+set_tests_properties(IndexGuardNegative.Case3 PROPERTIES
+                     PASS_REGULAR_EXPRESSION
+                     "index node: the view must hold integers")
+set_tests_properties(IndexGuardNegative.Case4 PROPERTIES
+                     PASS_REGULAR_EXPRESSION
+                     "index node: one label per view axis")
 
 # Benchmarks (opt-in: -DTENSOR_OPS_BUILD_BENCHMARKS=ON). No gtest; own main().
 if(TENSOR_OPS_BUILD_BENCHMARKS)
