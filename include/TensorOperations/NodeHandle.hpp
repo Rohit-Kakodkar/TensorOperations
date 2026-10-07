@@ -20,6 +20,7 @@ struct ContractionTag {};
 struct CombineTag {};
 struct SlotTag {};
 struct StagedTag {};
+struct GatherTag {};
 
 // Sentinel for "no hook"
 struct NoHook {};
@@ -605,6 +606,95 @@ auto make_index_node(T view, TV tv = {}) {
                 "index node: one label per view axis");
   return make_stage_node(make_input_node(make_handle<Modes...>(view)),
                          std::move(tv));
+}
+
+namespace Impl {
+
+template <typename S, typename = void>
+struct int_indexable : std::false_type {};
+template <typename S>
+struct int_indexable<S, std::void_t<decltype(std::declval<const S&>()(0))>>
+    : std::bool_constant<
+          !std::is_void_v<decltype(std::declval<const S&>()(0))>> {};
+
+template <typename S>
+constexpr bool int_indexable_check() {
+  if constexpr (Kokkos::is_view_v<S>)
+    return S::rank == 1;
+  else
+    return int_indexable<S>::value;
+}
+template <typename S>
+inline constexpr bool int_indexable_v = int_indexable_check<S>();
+
+template <typename S>
+using indexed_value_t = std::remove_cv_t<
+    std::remove_reference_t<decltype(std::declval<const S&>()(0))>>;
+
+template <typename IdxView, typename Source>
+struct GatherFn {
+  IdxView idx;
+  Source  source;
+
+  template <typename... I>
+  KOKKOS_FUNCTION indexed_value_t<Source> operator()(I... i) const {
+    return source(idx(i...));
+  }
+};
+
+}  // namespace Impl
+
+template <typename IdxSlot, typename Source, typename ModesSeq>
+struct NodeHandle<GatherTag, IdxSlot, Source, ModesSeq> {
+  IdxSlot idx_;
+  Source  source_;
+
+  using node_tag            = GatherTag;
+  using idx_type            = IdxSlot;
+  using source_type         = Source;
+  static constexpr int Rank = static_cast<int>(ModesSeq::size());
+  using value_type          = Impl::indexed_value_t<Source>;
+  using exec_space          = typename IdxSlot::exec_space;
+  using modes_seq           = ModesSeq;
+
+  KOKKOS_FUNCTION Kokkos::Array<int, Rank> shape() const {
+    return idx_.shape();
+  }
+};
+
+template <int32_t... Modes, typename Idx, typename Source,
+          typename TV = DefaultTV>
+auto make_gather_node(Idx idx, Source source, TV tv = {}) {
+  using ModesSeq = std::integer_sequence<int32_t, Modes...>;
+  static_assert(Impl::int_indexable_v<Source>,
+                "gather node: the source must be indexable by one integer, "
+                "source(int)");
+  if constexpr (Impl::has_node_tag_v<SlotTag, Idx>) {
+    static_assert(std::is_integral_v<typename Idx::value_type>,
+                  "gather node: the index must be an index node's handle or "
+                  "an integer view");
+    static_assert(std::is_same_v<typename Idx::modes_seq, ModesSeq>,
+                  "gather node: an index handle must be read with the "
+                  "gather's labels, in the same order");
+    static_assert(Impl::is_default_tv_v<TV>,
+                  "gather node: a gather fed by an index handle uses the "
+                  "index's thread map; give the layout to make_index_node");
+    return make_stage_node(NodeHandle<GatherTag, Idx, Source, ModesSeq>{
+        std::move(idx), std::move(source)});
+  } else {
+    static_assert(
+        Kokkos::is_view_v<Idx> && std::is_integral_v<typename Idx::value_type>,
+        "gather node: the index must be an index node's handle or "
+        "an integer view");
+    static_assert(
+        static_cast<int>(Idx::rank) == static_cast<int>(sizeof...(Modes)),
+        "gather node: one label per index view axis");
+    using ES = typename Idx::execution_space;
+    return make_stage_node(
+        make_functional_input_node<ES, Modes...>(
+            idx.layout(), Impl::GatherFn<Idx, Source>{idx, std::move(source)}),
+        std::move(tv));
+  }
 }
 
 // Slot node — label an existing buffer (a producing node's output scratch) so

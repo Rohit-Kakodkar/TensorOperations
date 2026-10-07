@@ -143,6 +143,10 @@ add_executable(test_index_node tests/test_index_node.cpp)
 target_link_libraries(test_index_node PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_index_node)
 
+add_executable(test_gather_node tests/test_gather_node.cpp)
+target_link_libraries(test_gather_node PRIVATE tensor GTest::gtest)
+gtest_discover_tests(test_gather_node)
+
 # test_functional_input — a leaf whose elements are computed, not addressed.
 # Custom main() wraps Kokkos init/finalize; every case launches a graph.
 add_executable(test_functional_input tests/test_functional_input.cpp)
@@ -350,6 +354,32 @@ set_tests_properties(IndexGuardNegative.Case4 PROPERTIES
                      PASS_REGULAR_EXPRESSION
                      "index node: one label per view axis")
 
+foreach(case 0 1 2 3 4 5)
+  add_executable(gather_guard_neg_${case} EXCLUDE_FROM_ALL
+                 tests/negative/gather_guard_negative.cpp)
+  target_link_libraries(gather_guard_neg_${case} PRIVATE tensor)
+  target_compile_definitions(gather_guard_neg_${case}
+                             PRIVATE GATHER_NEG_CASE=${case})
+  add_test(NAME GatherGuardNegative.Case${case}
+           COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}
+                   --target gather_guard_neg_${case} --config $<CONFIG>)
+endforeach()
+set_tests_properties(GatherGuardNegative.Case1 PROPERTIES
+                     PASS_REGULAR_EXPRESSION
+                     "gather node: an index handle must be read with the")
+set_tests_properties(GatherGuardNegative.Case2 PROPERTIES
+                     PASS_REGULAR_EXPRESSION
+                     "gather node: the source must be indexable by one integer")
+set_tests_properties(GatherGuardNegative.Case3 PROPERTIES
+                     PASS_REGULAR_EXPRESSION
+                     "gather node: the index must be an index node's handle")
+set_tests_properties(GatherGuardNegative.Case4 PROPERTIES
+                     PASS_REGULAR_EXPRESSION
+                     "uses the index's thread map")
+set_tests_properties(GatherGuardNegative.Case5 PROPERTIES
+                     PASS_REGULAR_EXPRESSION
+                     "may not read a slot ITS OWN LEVEL")
+
 # Benchmarks (opt-in: -DTENSOR_OPS_BUILD_BENCHMARKS=ON). No gtest; own main().
 if(TENSOR_OPS_BUILD_BENCHMARKS)
   # --- 3D SEM stiffness on the LEVEL GRAPH (Sprint 5) -----------------------
@@ -459,6 +489,21 @@ if(TENSOR_OPS_CUTLASS_DIR AND Kokkos_ENABLE_CUDA)
   target_compile_definitions(sfpp_min_bench_te_cute_rowe
                              PRIVATE SFPP_MIN_BENCH_TE_CUTE
                                      SFPP_MIN_BENCH_ROW_OF_E)
+
+  foreach(mode gview gslot)
+    if(mode STREQUAL "gview")
+      set(gather_mode 1)
+    else()
+      set(gather_mode 2)
+    endif()
+    add_executable(sfpp_min_bench_te_cute_rowe_${mode} sfpp_min/bench_te.cpp)
+    target_link_libraries(sfpp_min_bench_te_cute_rowe_${mode}
+                          PRIVATE sfpp_min tensor)
+    target_compile_definitions(sfpp_min_bench_te_cute_rowe_${mode}
+                               PRIVATE SFPP_MIN_BENCH_TE_CUTE
+                                       SFPP_MIN_BENCH_ROW_OF_E
+                                       SFPP_MIN_GATHER_MODE=${gather_mode})
+  endforeach()
 endif()
 
 # The same kernels at a higher polynomial order. NGLL is a compile-time

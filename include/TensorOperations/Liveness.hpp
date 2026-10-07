@@ -43,6 +43,8 @@ template <typename Op>
 constexpr int operand_slot() {
   if constexpr (has_node_tag_v<SlotTag, Op>)
     return static_cast<int>(Op::SlotIdx);
+  else if constexpr (has_node_tag_v<GatherTag, Op>)
+    return static_cast<int>(Op::idx_type::SlotIdx);
   else
     return -1;
 }

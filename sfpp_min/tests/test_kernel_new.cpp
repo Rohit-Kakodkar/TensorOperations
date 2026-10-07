@@ -169,12 +169,23 @@ struct ErrorReport {
   }
 };
 
+template <bool Keep, int TE, GatherMode G, typename Args>
+void launch_gather(const Args& args, TeamPolicy policy) {
+  new_stiffness<Keep, TE, G>(args, policy);
+}
+#if defined(TENSOR_OPS_ENABLE_CUTE)
+template <bool Keep, int TE, GatherMode G, typename Args>
+void launch_gather(const Args& args, CutePolicy policy) {
+  new_stiffness<Keep, TE, RowOfIMmas<TE>, G>(args, policy);
+}
+#endif
+
 template <typename Policy, bool KeepRedundantLoads = false, int TE = kTestTE,
-          typename Off>
+          GatherMode G = GatherMode::Functional, typename Off>
 ErrorReport run_and_compare(Case<Off>& k) {
   const GllViews q    = make_gll_views();
   auto           args = make_args(k, q);
-  new_stiffness<KeepRedundantLoads, TE>(args, Policy{});
+  launch_gather<KeepRedundantLoads, TE, G>(args, Policy{});
   Kokkos::fence();
   k.f.to_host();
 
@@ -197,7 +208,8 @@ ErrorReport run_and_compare(Case<Off>& k) {
 // on the serial oracle exactly as the LayoutLeft run does. A transposed
 // subscript would still produce a plausible-looking field, which is why the
 // oracle rather than a self-comparison is the judge.
-template <typename Policy, bool KeepRedundantLoads = false, typename Off>
+template <typename Policy, bool KeepRedundantLoads = false,
+          GatherMode G = GatherMode::Functional, typename Off>
 ErrorReport run_and_compare_iglob_right(Case<Off>& k) {
   IglobMapRight gr(k.set.nspec());
   for (int ispec = 0; ispec < k.set.nspec(); ++ispec)
@@ -215,7 +227,7 @@ ErrorReport run_and_compare_iglob_right(Case<Off>& k) {
   DummyKernelArgs args{make_accessor(k.m), make_accessor(k.p), gr.map,
                        k.f.displacement,   k.f.velocity,       k.f.acceleration,
                        q.hprime,           q.weights,          k.set.nspec()};
-  new_stiffness<KeepRedundantLoads, kTestTE>(args, Policy{});
+  launch_gather<KeepRedundantLoads, kTestTE, G>(args, Policy{});
   Kokkos::fence();
   k.f.to_host();
 
@@ -410,6 +422,35 @@ TYPED_TEST(SfppMinKernelNew, MatchesSerialOracleWithLayoutRightIglob) {
   }
 }
 
+template <typename Policy, GatherMode G>
+void expect_gather_mode_oracle(const char* name) {
+  for (int keep = 0; keep < 2; ++keep)
+    for (int right = 0; right < 2; ++right) {
+      auto k = make_case<ChunkTiledDynamicOffset>(/*ix_fastest=*/true);
+      set_linear_field(k);
+      set_velocity(k);
+      const ErrorReport e =
+          right ? (keep ? run_and_compare_iglob_right<Policy, true, G>(k)
+                        : run_and_compare_iglob_right<Policy, false, G>(k))
+                : (keep ? run_and_compare<Policy, true, kTestTE, G>(k)
+                        : run_and_compare<Policy, false, kTestTE, G>(k));
+      std::printf("[ INFO     ] %s (keep=%d, iglob %s): relative = %.3e\n",
+                  name, keep, right ? "LayoutRight" : "LayoutLeft",
+                  e.relative());
+      EXPECT_GT(e.scale, 0.0) << name << ": oracle produced a zero field";
+      EXPECT_LT(e.relative(), 1e-4)
+          << name << " keep=" << keep << " right=" << right;
+    }
+}
+
+TYPED_TEST(SfppMinKernelNew, GatherFromTheIglobViewMatchesTheOracle) {
+  expect_gather_mode_oracle<TypeParam, GatherMode::IndexView>("iglob view");
+}
+
+TYPED_TEST(SfppMinKernelNew, GatherFromTheIndexSlotMatchesTheOracle) {
+  expect_gather_mode_oracle<TypeParam, GatherMode::IndexSlot>("index slot");
+}
+
 TYPED_TEST(SfppMinKernelNew, MatchesSerialOracleWithIxFastestNumbering) {
   for (int keep = 0; keep < 2; ++keep) {
     auto k = make_case<ChunkTiledDynamicOffset>(/*ix_fastest=*/true);
@@ -593,13 +634,14 @@ TEST(SfppMinKernelNewCute, MatchesTheTeamBackend) {
 // Each TE is a different RowOfI thread map (NGLL*NGLL*TE threads, element
 // slowest), so every contraction and register-driven combine partitions
 // differently. The field must not move.
-template <int TE, typename Off, typename Mmas = RowOfIMmas<TE>>
+template <int        TE, typename Off, typename Mmas = RowOfIMmas<TE>,
+          GatherMode G = GatherMode::Functional>
 void expect_cute_oracle(const char* name) {
   auto k = make_case<Off>(/*ix_fastest=*/true);
   set_linear_field(k);
   set_velocity(k);
   const GllViews q = make_gll_views();
-  new_stiffness<false, TE, Mmas>(make_args(k, q), CutePolicy{});
+  new_stiffness<false, TE, Mmas, G>(make_args(k, q), CutePolicy{});
   Kokkos::fence();
   k.f.to_host();
 
@@ -640,6 +682,19 @@ TEST(SfppMinKernelNewCute, RowOfEMatchesTheOracleAtEveryTE) {
   expect_cute_oracle<4, ChunkTiledDynamicOffset, RowOfEMmas<4>>(
       "row-of-e chunk");
   expect_cute_oracle<4, LayoutLeftDynamicOffset, RowOfEMmas<4>>("row-of-e LL");
+}
+
+TEST(SfppMinKernelNewCute, RowOfEGatherModesMatchTheOracle) {
+  expect_cute_oracle<1, LayoutRightDynamicOffset, RowOfEMmas<1>,
+                     GatherMode::IndexView>("row-of-e iglob view");
+  expect_cute_oracle<4, LayoutRightDynamicOffset, RowOfEMmas<4>,
+                     GatherMode::IndexView>("row-of-e iglob view");
+  expect_cute_oracle<1, LayoutRightDynamicOffset, RowOfEMmas<1>,
+                     GatherMode::IndexSlot>("row-of-e index slot");
+  expect_cute_oracle<4, LayoutRightDynamicOffset, RowOfEMmas<4>,
+                     GatherMode::IndexSlot>("row-of-e index slot");
+  expect_cute_oracle<4, LayoutLeftDynamicOffset, RowOfEMmas<4>,
+                     GatherMode::IndexSlot>("row-of-e index slot LL");
 }
 
 template <typename Plan, std::size_t... Ks>

@@ -100,21 +100,32 @@ template <int TE>
 using BenchMmas = RowOfIMmas<TE>;
 #endif
 
+#if !defined(SFPP_MIN_GATHER_MODE) || SFPP_MIN_GATHER_MODE == 0
+inline constexpr GatherMode BenchGather = GatherMode::Functional;
+#define SFPP_MIN_GATHER_NAME ""
+#elif SFPP_MIN_GATHER_MODE == 1
+inline constexpr GatherMode BenchGather = GatherMode::IndexView;
+#define SFPP_MIN_GATHER_NAME ", gather from iglob view"
+#else
+inline constexpr GatherMode BenchGather = GatherMode::IndexSlot;
+#define SFPP_MIN_GATHER_NAME ", gather from index slot"
+#endif
+
 struct CuteBackend {
 #if defined(SFPP_MIN_BENCH_ROW_OF_E)
-  static constexpr const char* name = "cute (row of e)";
+  static constexpr const char* name = "cute (row of e" SFPP_MIN_GATHER_NAME ")";
 #else
-  static constexpr const char* name = "cute (row of i)";
+  static constexpr const char* name = "cute (row of i" SFPP_MIN_GATHER_NAME ")";
 #endif
 
   template <bool Keep, int TE, class Args>
   static NewFootprint footprint(const Args& args, const GlobalHPrime& hw) {
-    return new_footprint<Keep, TE, BenchMmas<TE>>(
+    return new_footprint<Keep, TE, BenchMmas<TE>, BenchGather>(
         args, TensorOperations::CutePolicyTag<KernelES>{}, hw);
   }
   template <bool Keep, int TE, class Args>
   static int launch(const Args& args, int, const GlobalHPrime& hw) {
-    return new_stiffness<Keep, TE, BenchMmas<TE>>(
+    return new_stiffness<Keep, TE, BenchMmas<TE>, BenchGather>(
         args, TensorOperations::CutePolicyTag<KernelES>{}, hw);
   }
 };

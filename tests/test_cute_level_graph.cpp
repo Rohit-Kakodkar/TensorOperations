@@ -1623,6 +1623,173 @@ TEST(CuteStageTV, IndexNodeTakesALayout) {
   EXPECT_EQ(mismatches(tout, idx), 0);
 }
 
+namespace {
+
+constexpr int kNG = 211;
+using VecG        = Kokkos::View<float*, ES>;
+
+int gid4(int e, int a, int b, int c) {
+  return (97 * e + 31 * a + 7 * b + 3 * c * c + 5) % kNG;
+}
+float gsrc(int g) { return static_cast<float>(37 * g - 1000) * 0.125f; }
+
+template <typename V>
+void fill_gid(const V& v) {
+  auto h = Kokkos::create_mirror_view(v);
+  for (int e = 0; e < static_cast<int>(h.extent(0)); ++e)
+    for (int a = 0; a < static_cast<int>(h.extent(1)); ++a)
+      for (int b = 0; b < static_cast<int>(h.extent(2)); ++b)
+        for (int c = 0; c < static_cast<int>(h.extent(3)); ++c)
+          h(e, a, b, c) = gid4(e, a, b, c);
+  Kokkos::deep_copy(v, h);
+}
+
+VecG make_gsrc() {
+  VecG v("gsrc", kNG);
+  auto h = Kokkos::create_mirror_view(v);
+  for (int g = 0; g < kNG; ++g) h(g) = gsrc(g);
+  Kokkos::deep_copy(v, h);
+  return v;
+}
+
+int gather_ref_mismatches(const ViewR& got) {
+  auto h   = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, got);
+  int  bad = 0;
+  for (int e = 0; e < static_cast<int>(h.extent(0)); ++e)
+    for (int a = 0; a < static_cast<int>(h.extent(1)); ++a)
+      for (int b = 0; b < static_cast<int>(h.extent(2)); ++b)
+        for (int c = 0; c < static_cast<int>(h.extent(3)); ++c)
+          if (h(e, a, b, c) != gsrc(gid4(e, a, b, c))) ++bad;
+  return bad;
+}
+
+template <bool Handle, typename IdxV, typename TV = DefaultTV>
+void gather_root_on_both(int threads) {
+  constexpr int E = 8;
+  IdxV          idx("idx", E, N, N, N);
+  fill_gid(idx);
+  const VecG src = make_gsrc();
+  ViewR      cg("cg", E, N, N, N), tg("tg", E, N, N, N);
+  Kokkos::deep_copy(cg, -999.0f);
+
+  auto g0  = make_level_graph<float, ES>(Map4<2>{});
+  auto run = [&](const auto& out) {
+    static_assert(std::decay_t<decltype(out)>::cute_num_threads() >= 1);
+    EXPECT_EQ(std::decay_t<decltype(out)>::cute_num_threads(), threads);
+    out.execute(CutePolicyTag<>{}, cg);
+    ASSERT_TRUE(synced());
+    out.execute(TeamPolicyTag<ES>{}, tg);
+    ASSERT_TRUE(synced());
+  };
+  if constexpr (Handle) {
+    auto [g1, ig] = g0.add(make_index_node<'e', 'a', 'b', 'c'>(idx, TV{}));
+    auto [g2, u]  = g1.add(make_gather_node<'e', 'a', 'b', 'c'>(ig, src));
+    run(g2.outputs(u));
+  } else {
+    auto [g1, u] = g0.add(make_gather_node<'e', 'a', 'b', 'c'>(idx, src, TV{}));
+    run(g1.outputs(u));
+  }
+  EXPECT_EQ(gather_ref_mismatches(cg), 0);
+  EXPECT_EQ(mismatches(cg, tg), 0);
+}
+
+}  // namespace
+
+TEST(CuteGather, ViewFormLayoutRightIndex) {
+  gather_root_on_both<false, IdxR>(128);
+}
+TEST(CuteGather, ViewFormLayoutLeftIndex) {
+  gather_root_on_both<false, IdxL>(128);
+}
+TEST(CuteGather, HandleFormLayoutRightIndex) {
+  gather_root_on_both<true, IdxR>(128);
+}
+TEST(CuteGather, HandleFormLayoutLeftIndex) {
+  gather_root_on_both<true, IdxL>(128);
+}
+TEST(CuteGather, HandleFormInheritsTheIndexLayout) {
+  gather_root_on_both<true, IdxL, NarrowTV>(25);
+}
+TEST(CuteGather, ViewFormTakesItsOwnLayout) {
+  gather_root_on_both<false, IdxR, NarrowTV>(25);
+}
+
+namespace {
+
+template <int TE, typename TV>
+void expect_gathered_gradient_combine() {
+  using MX        = RowOfEMma<TE, ThrX, RowOfENTile<TE>>;
+  using ME        = RowOfEMma<TE, ThrEta, RowOfENTile<TE>>;
+  using MG        = RowOfEMma<TE, ThrGamma, RowOfENTile<TE>>;
+  constexpr int E = 2 * TE;
+  OpView<5>     h("h", 5, 5);
+  IdxR          idx("idx", E, 5, 5, 5);
+  fill(h, 0.5f);
+  fill_gid(idx);
+  const VecG src = make_gsrc();
+  ViewR      cp("cp", E, 5, 5, 5), tp("tp", E, 5, 5, 5);
+  Kokkos::deep_copy(cp, -999.0f);
+
+  auto g0       = make_level_graph<float, ES>(MapET<TE>{});
+  auto [g1, ig] = g0.add(make_index_node<'e', 'k', 'j', 'i'>(idx, TV{}));
+  auto [g2, sh] =
+      g1.add(make_stage_node(make_input_node(make_handle<'r', 'p'>(h))));
+  auto [g3, su] = g2.add(make_gather_node<'e', 'k', 'j', 'i'>(ig, src));
+  auto [g4, gx, ge, gg] =
+      g3.add(make_contraction_node<'e', 'k', 'j', 'i'>(
+                 sh.template as<'i', 'p'>(),
+                 su.template as<'e', 'k', 'j', 'p'>(), NoHook{}, MX{}),
+             make_contraction_node<'e', 'k', 'j', 'i'>(
+                 sh.template as<'j', 'p'>(),
+                 su.template as<'e', 'k', 'p', 'i'>(), NoHook{}, ME{}),
+             make_contraction_node<'e', 'k', 'j', 'i'>(
+                 sh.template as<'k', 'p'>(),
+                 su.template as<'e', 'p', 'j', 'i'>(), NoHook{}, MG{}));
+  auto [g5, pv] =
+      g4.add(make_combine_node<'e', 'k', 'j', 'i'>(gx, ge, gg, su, GradMixU{}));
+
+  using Levels     = LevelsOf<decltype(g5)>;
+  constexpr int N5 = Impl::lg_cute_num_threads_v<Levels>;
+  using Plan       = Impl::lg_cute_combine_plan<Levels, 4, 0, N5>;
+  static_assert(N5 == 125);
+  static_assert(Plan::aligned_driven && Plan::template in_register<0>() &&
+                    Plan::template in_register<1>() &&
+                    Plan::template in_register<2>() &&
+                    Plan::template in_register<3>(),
+                "a gather fed by a row-of-e index reaches the aligned "
+                "combine in registers");
+
+  const auto out = g5.outputs(pv);
+  out.execute(CutePolicyTag<>{}, cp);
+  ASSERT_TRUE(synced());
+  out.execute(TeamPolicyTag<ES>{}, tp);
+  ASSERT_TRUE(synced());
+
+  auto   hh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, h);
+  HostV4 r("r", E, 5, 5, 5);
+  auto   u = [](int e, int k, int j, int i) { return gsrc(gid4(e, k, j, i)); };
+  for (int e = 0; e < E; ++e)
+    for (int k = 0; k < 5; ++k)
+      for (int j = 0; j < 5; ++j)
+        for (int i = 0; i < 5; ++i) {
+          float x = 0.0f, y = 0.0f, z = 0.0f;
+          for (int p = 0; p < 5; ++p) {
+            x += hh(i, p) * u(e, k, j, p);
+            y += hh(j, p) * u(e, k, p, i);
+            z += hh(k, p) * u(e, p, j, i);
+          }
+          r(e, k, j, i) = GradMixU{}(e, k, j, i, x, y, z, u(e, k, j, i));
+        }
+  EXPECT_LT(max_rel_err(cp, r), 1e-5f);
+  EXPECT_LT(max_rel_err(cp, tp), 1e-5f);
+}
+
+}  // namespace
+
+TEST(CuteGather, RowOfEIndexGatherFeedsContractionsAndAnAlignedCombine) {
+  expect_gathered_gradient_combine<2, RowOfETV<2>>();
+}
+
 int main(int argc, char* argv[]) {
   ::testing::InitGoogleTest(&argc, argv);
   Kokkos::initialize(argc, argv);
