@@ -106,7 +106,8 @@ class Evaluator<
 
   using layout_t =
       decltype(make_tile_layout(std::declval<Tile_>(), order_tag{}));
-  using view_t = FunctionalView<Fn, layout_t, ValueType, ES>;
+  using view_t =
+      FunctionalView<Fn, layout_t, typename node_type::result_type, ES>;
 
   KOKKOS_FUNCTION Evaluator(node_type n, Tile_ t, const team_member_t& team)
       : fn_(n.fn_), hook_(n.hook_op), tile_(t), team_(team) {}
@@ -311,9 +312,14 @@ template <typename ES, typename Operand, typename ModesSeq, typename NodeTile,
 class Evaluator<TeamPolicyTag<ES>,
                 NodeHandle<StagedTag, Operand, ModesSeq, NodeTile, TV>, Tile_> {
  public:
-  using node_type     = NodeHandle<StagedTag, Operand, ModesSeq, NodeTile, TV>;
-  using policy_tag    = TeamPolicyTag<ES>;
-  using tiling_type   = Tile_;
+  using node_type   = NodeHandle<StagedTag, Operand, ModesSeq, NodeTile, TV>;
+  using policy_tag  = TeamPolicyTag<ES>;
+  using tiling_type = Tile_;
+
+  static_assert(!node_type::is_register,
+                "register node: it runs only on the CuTe backend, which keeps "
+                "its values in registers across levels; use make_stage_node "
+                "for a team graph");
   using value_type    = typename node_type::value_type;
   using exec_space    = ES;
   using modes_seq     = typename node_type::modes_seq;
@@ -324,6 +330,9 @@ class Evaluator<TeamPolicyTag<ES>,
 
   static_assert(static_cast<int>(Tile_::rank) == node_type::Rank,
                 "staged tile rank must equal the operand's rank");
+  static_assert(node_type::NumOut == 1,
+                "a multi-output stage writes one slot per output, so it runs "
+                "only as a LevelGraph stage member");
 
   KOKKOS_FUNCTION Evaluator(node_type n, Tile_ t, const team_member_t& team)
       : node_(n),

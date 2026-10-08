@@ -666,6 +666,12 @@ __device__ auto lg_cute_slot_smem(V* base) {
       cute::make_layout(typename P::tile_shape{}, cute::LayoutRight{}));
 }
 
+template <typename Outs, std::size_t... Os>
+__device__ auto lg_cute_outputs_tuple(const Outs& outs,
+                                      std::index_sequence<Os...>) {
+  return DeviceTuple<std::decay_t<decltype(outs[Os])>...>{outs[Os]...};
+}
+
 template <typename ES, int NumThreads, typename LevelsT, typename GridModes,
           std::size_t RootR, std::size_t L, std::size_t M, typename Acc>
 __device__ auto lg_cute_stage_member(const LevelsT&                   levels,
@@ -690,8 +696,15 @@ __device__ auto lg_cute_stage_member(const LevelsT&                   levels,
     auto       ev  = make_evaluator<CutePolicyTag<ES>>(
         levels.template get<L>().template get<M>(),
         CuteStagedTag<typename S::tile_shape, typename S::part>{S::make()});
-    using R = DeviceTuple<decltype(ev(idx))>;
-    return R{ev(idx)};
+    if constexpr (Node::NumOut == 1) {
+      using R = DeviceTuple<decltype(ev(idx))>;
+      return R{ev(idx)};
+    } else {
+      const auto outs = ev(idx);
+      return lg_cute_outputs_tuple(
+          outs,
+          std::make_index_sequence<static_cast<std::size_t>(Node::NumOut)>{});
+    }
   }
 }
 
@@ -845,8 +858,7 @@ __device__ auto lg_cute_combine_member(
       ev();
       return DeviceTuple<>{};
     } else {
-      const auto outs = ev();
-      return DeviceTuple<std::decay_t<decltype(outs[Os])>...>{outs[Os]...};
+      return lg_cute_outputs_tuple(ev(), std::index_sequence<Os...>{});
     }
   }
 }

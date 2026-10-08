@@ -75,11 +75,34 @@ struct lg_resolve_member<LT, Member, StagedTag> {
   using type = NodeHandle<StagedTag, typename Member::operand_type,
                           typename Member::modes_seq,
                           tile_from_labels_t<LT, typename Member::modes_seq>,
-                          typename Member::tv_type>;
+                          typename Member::tv_param>;
   static type get(const Member& m) { return type{m.operand_, m.tv_}; }
 };
 template <typename LT, typename Member>
 using lg_resolve_member_t = typename lg_resolve_member<LT, Member>::type;
+
+template <typename Member, typename Tag = typename Member::node_tag>
+inline constexpr bool lg_is_register_member_v = false;
+template <typename Member>
+inline constexpr bool lg_is_register_member_v<Member, StagedTag> =
+    Member::is_register;
+
+template <typename LevelT, std::size_t... Ms>
+constexpr bool lg_level_has_register(std::index_sequence<Ms...>) {
+  return (lg_is_register_member_v<tuple_element_t<Ms, LevelT>> || ...);
+}
+
+template <typename LevelsT, std::size_t... Ls>
+constexpr bool lg_has_register(std::index_sequence<Ls...>) {
+  return (lg_level_has_register<tuple_element_t<Ls, LevelsT>>(
+              std::make_index_sequence<
+                  tuple_size_v<tuple_element_t<Ls, LevelsT>>>{}) ||
+          ...);
+}
+
+template <typename LevelsT>
+inline constexpr bool lg_has_register_v =
+    lg_has_register<LevelsT>(std::make_index_sequence<tuple_size_v<LevelsT>>{});
 
 template <typename Node, typename OpModes,
           typename Tag = typename Node::node_tag>
@@ -177,6 +200,10 @@ KOKKOS_FUNCTION auto lg_carve(const Team& team, std::index_sequence<Ls...>) {
 template <typename V, typename ES, typename LevelsT, typename RootsSeq,
           std::size_t... Ls>
 std::size_t lg_scratch_bytes(std::index_sequence<Ls...>) {
+  static_assert(!lg_has_register_v<LevelsT>,
+                "register node: it runs only on the CuTe backend, which keeps "
+                "its values in registers across levels; use make_stage_node "
+                "for a team graph");
   return pooled_arena_slot_store_bytes<
       V, ES, lg_pools_t<LevelsT, RootsSeq>,
       SlotElems<lg_slot_elem_t<LevelsT, Ls, V>...>>(
@@ -423,12 +450,27 @@ KOKKOS_FUNCTION auto lg_stage_src(const LevelsT&                   levels,
   }
 }
 
-template <typename SrcsT, typename Store, typename Coord, std::size_t... Bs,
-          std::size_t... Ms>
+template <std::size_t B, typename Src, typename Store, typename Coord,
+          std::size_t... Os>
+KOKKOS_FUNCTION void lg_copy_member(const Src& src, const Store& store,
+                                    Coord coord, std::index_sequence<Os...>) {
+  if constexpr (sizeof...(Os) == 1) {
+    store.template get<B>()[coord] = src[coord];
+  } else {
+    const auto r = src[coord];
+    ((store.template get<B + Os>()[coord] = r[Os]), ...);
+  }
+}
+
+template <typename LevelT, typename SrcsT, typename Store, typename Coord,
+          std::size_t... Bs, std::size_t... Ms>
 KOKKOS_FUNCTION void lg_copy_coord(const SrcsT& srcs, const Store& store,
                                    Coord coord, std::index_sequence<Ms...>,
                                    std::index_sequence<Bs...>) {
-  ((store.template get<Bs>()[coord] = srcs.template get<Ms>()[coord]), ...);
+  (lg_copy_member<Bs>(srcs.template get<Ms>(), store, coord,
+                      std::make_index_sequence<static_cast<std::size_t>(
+                          tuple_element_t<Ms, LevelT>::NumOut)>{}),
+   ...);
 }
 
 // A STAGE level: every member's global -> scratch copy, in ONE TeamVectorRange.
@@ -459,7 +501,8 @@ KOKKOS_FUNCTION void lg_run_staged_level(
   using bases     = std::index_sequence<lg_member_base_v<LevelsT, L, Ms>...>;
   const auto src0 = srcs.template get<0>();
   team_for_each_coord(team, src0, [=](auto coord) {
-    lg_copy_coord(srcs, store, coord, std::index_sequence<Ms...>{}, bases{});
+    lg_copy_coord<tuple_element_t<L, LevelsT>>(
+        srcs, store, coord, std::index_sequence<Ms...>{}, bases{});
   });
   team.team_barrier();
 }
@@ -690,6 +733,10 @@ template <typename V, typename ES, typename LT, typename LevelsT,
           typename RootsSeq, typename... ViewTs>
 int lg_execute(const LevelsT& levels, std::size_t bytes, int team_size,
                RootsSeq roots, const ViewTs&... views) {
+  static_assert(!lg_has_register_v<LevelsT>,
+                "register node: it runs only on the CuTe backend, which keeps "
+                "its values in registers across levels; use make_stage_node "
+                "for a team graph");
   using member_t            = team_member_t<ES>;
   constexpr std::size_t NL  = tuple_size_v<LevelsT>;
   constexpr std::size_t NLS = lg_num_slots_v<LevelsT>;

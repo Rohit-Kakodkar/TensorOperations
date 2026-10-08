@@ -205,7 +205,7 @@ if(TENSOR_OPS_CUTLASS_DIR AND Kokkos_ENABLE_CUDA)
   target_link_libraries(test_cute_fragment_store PRIVATE tensor GTest::gtest)
   gtest_discover_tests(test_cute_fragment_store)
 
-  foreach(case 0 1 2 3 4)
+  foreach(case 0 1 2 3 4 5)
     add_executable(stage_tv_guard_neg_${case} EXCLUDE_FROM_ALL
                    tests/negative/stage_tv_guard_negative.cpp)
     target_link_libraries(stage_tv_guard_neg_${case} PRIVATE tensor)
@@ -224,6 +224,9 @@ if(TENSOR_OPS_CUTLASS_DIR AND Kokkos_ENABLE_CUDA)
   set_tests_properties(StageTVGuardNegative.Case4 PROPERTIES
                        PASS_REGULAR_EXPRESSION
                        "thread-value layout must be static")
+  set_tests_properties(StageTVGuardNegative.Case5 PROPERTIES
+                       PASS_REGULAR_EXPRESSION
+                       "register node: give the thread-value layout")
 
   add_executable(scatter_guard_neg_4 EXCLUDE_FROM_ALL
                  tests/negative/scatter_guard_negative.cpp)
@@ -276,7 +279,7 @@ set_tests_properties(LabelTilesGuardNegative.Case3 PROPERTIES
 # are pinned separately because they are independent factories: one guard
 # present and the other missing must not read as both working.
 # ---------------------------------------------------------------------------
-foreach(case 0 1 2)
+foreach(case 0 1 2 3 4)
   add_executable(functional_guard_neg_${case} EXCLUDE_FROM_ALL
                  tests/negative/functional_guard_negative.cpp)
   target_link_libraries(functional_guard_neg_${case} PRIVATE tensor)
@@ -290,6 +293,12 @@ set_tests_properties(FunctionalGuardNegative.Case1
                      FunctionalGuardNegative.Case2
                      PROPERTIES PASS_REGULAR_EXPRESSION
                      "a functional input has no address")
+set_tests_properties(FunctionalGuardNegative.Case3
+                     PROPERTIES PASS_REGULAR_EXPRESSION
+                     "a multi-output functional input takes no hook")
+set_tests_properties(FunctionalGuardNegative.Case4
+                     PROPERTIES PASS_REGULAR_EXPRESSION
+                     "a void fn produces nothing")
 
 # ---------------------------------------------------------------------------
 # Negative-compilation tests for the ARENA guard. Same rationale and same
@@ -394,6 +403,20 @@ set_tests_properties(GatherGuardNegative.Case4 PROPERTIES
 set_tests_properties(GatherGuardNegative.Case5 PROPERTIES
                      PASS_REGULAR_EXPRESSION
                      "may not read a slot ITS OWN LEVEL")
+
+foreach(case 0 1 2)
+  add_executable(register_team_neg_${case} EXCLUDE_FROM_ALL
+                 tests/negative/register_team_negative.cpp)
+  target_link_libraries(register_team_neg_${case} PRIVATE tensor)
+  target_compile_definitions(register_team_neg_${case}
+                             PRIVATE REGISTER_NEG_CASE=${case})
+  add_test(NAME RegisterTeamNegative.Case${case}
+           COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}
+                   --target register_team_neg_${case} --config $<CONFIG>)
+endforeach()
+set_tests_properties(RegisterTeamNegative.Case1 RegisterTeamNegative.Case2
+                     PROPERTIES PASS_REGULAR_EXPRESSION
+                     "register node: it runs only on the CuTe backend")
 
 foreach(case 0 1 2 3 5 6)
   add_executable(scatter_guard_neg_${case} EXCLUDE_FROM_ALL

@@ -44,6 +44,26 @@ struct DefaultTV {};
 namespace Impl {
 template <typename TV>
 inline constexpr bool is_default_tv_v = std::is_same_v<TV, DefaultTV>;
+
+template <typename TV>
+struct RegisterTV {
+  TV tv;
+};
+
+template <typename TV>
+struct unwrap_tv {
+  using type                        = TV;
+  static constexpr bool is_register = false;
+};
+template <typename TV>
+struct unwrap_tv<RegisterTV<TV>> {
+  using type                        = TV;
+  static constexpr bool is_register = true;
+};
+template <typename TV>
+using unwrap_tv_t = typename unwrap_tv<TV>::type;
+template <typename TV>
+inline constexpr bool is_register_tv_v = unwrap_tv<TV>::is_register;
 }  // namespace Impl
 
 // Forward declaration — TiledLayout.hpp defines it; exec_space_of below has to
@@ -219,8 +239,28 @@ struct is_functional_layout<
 template <typename T>
 inline constexpr bool is_functional_layout_v = is_functional_layout<T>::value;
 
-// Number of output tensors a node emits: 1 for every node except a multi-output
-// combine, which exposes `NumOut`.
+// --- fn return-type introspection -----------------------------------------
+// Classify what a combine fn or a functional-input source returns: a scalar
+// (one output), a Kokkos::Array<U, M> (M outputs), or void (a sink, none).
+template <typename Ret>
+struct fn_result_arity {  // scalar result
+  static constexpr int num = 1;
+  using elem               = Ret;
+};
+template <typename U, std::size_t M>
+struct fn_result_arity<Kokkos::Array<U, M>> {  // Kokkos::Array<U, M> result
+  static constexpr int num = static_cast<int>(M);
+  using elem               = U;
+};
+template <>
+struct fn_result_arity<void> {  // sink: fn returns nothing and scatters itself,
+                                // so
+  static constexpr int num = 0;  // it contributes no output slot to the graph
+  using elem               = void;
+};
+
+// Number of output tensors a node emits: its `NumOut` when it declares one
+// (combine, functional-input and stage nodes), otherwise 1.
 template <typename Node, typename = void>
 struct output_arity : std::integral_constant<int, 1> {};
 template <typename Node>
@@ -291,14 +331,16 @@ struct NodeHandle<FunctionalTag, Fn, ModesSeq, ValueType, ExecSpace, Layout,
   Layout                       layout_;
   [[no_unique_address]] HookOp hook_op;
 
-  using node_tag            = FunctionalTag;
-  static constexpr int Rank = static_cast<int>(ModesSeq::size());
-  using value_type          = ValueType;
-  using exec_space          = ExecSpace;
-  using modes_seq           = ModesSeq;
-  using functor_type        = Fn;
-  using layout_type         = Layout;
-  using order_tag           = Impl::layout_order_t<Layout>;
+  using node_tag              = FunctionalTag;
+  static constexpr int Rank   = static_cast<int>(ModesSeq::size());
+  using value_type            = ValueType;
+  using exec_space            = ExecSpace;
+  using modes_seq             = ModesSeq;
+  using functor_type          = Fn;
+  using layout_type           = Layout;
+  using order_tag             = Impl::layout_order_t<Layout>;
+  using result_type           = functional_value_t<Fn, Rank>;
+  static constexpr int NumOut = Impl::fn_result_arity<result_type>::num;
 
   static_assert(Impl::labels_distinct_v<ModesSeq>,
                 "functional input node: labels must be distinct");
@@ -348,14 +390,17 @@ struct NodeHandle<StagedTag, Operand, ModesSeq, Tile, TV> {
   Operand                  operand_;
   [[no_unique_address]] TV tv_;
 
-  using node_tag            = StagedTag;
-  using operand_type        = Operand;
-  using tile_type           = Tile;
-  using tv_type             = TV;
-  static constexpr int Rank = Operand::Rank;
-  using value_type          = typename Operand::value_type;
-  using exec_space          = typename Operand::exec_space;
-  using modes_seq           = ModesSeq;
+  using node_tag                    = StagedTag;
+  using operand_type                = Operand;
+  using tile_type                   = Tile;
+  using tv_param                    = TV;
+  using tv_type                     = Impl::unwrap_tv_t<TV>;
+  static constexpr bool is_register = Impl::is_register_tv_v<TV>;
+  static constexpr int  Rank        = Operand::Rank;
+  static constexpr int  NumOut      = Impl::output_arity<Operand>::value;
+  using value_type                  = typename Operand::value_type;
+  using exec_space                  = typename Operand::exec_space;
+  using modes_seq                   = ModesSeq;
 
   static_assert(static_cast<int>(ModesSeq::size()) == Rank,
                 "staged node: one label per axis");
@@ -491,7 +536,13 @@ KOKKOS_FUNCTION auto make_functional_input_node_impl(Layout layout, Fn fn,
                 "DynamicTileLayout{Right,Left}, StaticTileLayout{Right,Left}, "
                 "or StaticTileLayoutStride -- these are the layouts whose "
                 "traversal order a tile can inherit");
-  using ValueType = functional_value_t<Fn, Rank>;
+  using OutInfo   = fn_result_arity<functional_value_t<Fn, Rank>>;
+  using ValueType = typename OutInfo::elem;
+  static_assert(OutInfo::num >= 1,
+                "functional input source must return a value or a "
+                "Kokkos::Array<V, M> of M values; a void fn produces nothing");
+  static_assert(OutInfo::num == 1 || std::same_as<HookOp, NoHook>,
+                "a multi-output functional input takes no hook");
   static_assert(
       std::same_as<HookOp, NoHook> || HookLike<HookOp, Rank, ValueType>,
       "functional input hook must be callable as op(i_0, ..., i_{Rank-1}, "
@@ -596,6 +647,14 @@ template <typename Operand, typename TV = DefaultTV>
 KOKKOS_FUNCTION auto make_stage_node(Operand op, TV tv = {}) {
   return NodeHandle<StagedTag, Operand, typename Operand::modes_seq, void, TV>{
       std::move(op), std::move(tv)};
+}
+
+template <typename Operand, typename TV>
+KOKKOS_FUNCTION auto make_register_node(Operand op, TV tv) {
+  static_assert(!Impl::is_default_tv_v<TV>,
+                "register node: give the thread-value layout of the combine "
+                "that reads it, so its fragments stay in registers");
+  return make_stage_node(std::move(op), Impl::RegisterTV<TV>{std::move(tv)});
 }
 
 template <int32_t... Modes, TensorLike T, typename TV = DefaultTV>
@@ -913,25 +972,6 @@ struct NodeHandle<CombineTag, CombineFn, IntRank, Scalar, ExecSpace, ModesSeq,
 // ---------------------------------------------------------------------------
 namespace Impl {
 
-// --- combine fn return-type introspection ----------------------------------
-// Classify combine_ret_t (Concept.hpp: the type fn returns for the combine call
-// shape) as a scalar (NumOut == 1) or a Kokkos::Array<U, M> (NumOut == M).
-template <typename Ret>
-struct combine_out {  // scalar result
-  static constexpr int num = 1;
-  using elem               = Ret;
-};
-template <typename U, std::size_t M>
-struct combine_out<Kokkos::Array<U, M>> {  // Kokkos::Array<U, M> result
-  static constexpr int num = static_cast<int>(M);
-  using elem               = U;
-};
-template <>
-struct combine_out<void> {  // sink: fn returns nothing and scatters itself, so
-  static constexpr int num = 0;  // it contributes no output slot to the graph
-  using elem               = void;
-};
-
 // An operand's shape() gathered into the TargetSeq (output) axis order, so
 // operand extents can be compared mode-for-mode whatever each operand's own
 // axis order is.
@@ -981,7 +1021,7 @@ auto make_combine_node_impl(CombineFn fn, Ops... ops) {
   // output, a Kokkos::Array<U, M> gives M. The element type must be the operand
   // scalar (homogeneous outputs sharing these modes).
   using Ret            = combine_ret_t<CombineFn, Rank, N, ActualScalar>;
-  using OutInfo        = combine_out<Ret>;
+  using OutInfo        = fn_result_arity<Ret>;
   constexpr int NumOut = OutInfo::num;
   static_assert(NumOut == 0 ||
                     std::is_convertible_v<typename OutInfo::elem, ActualScalar>,
