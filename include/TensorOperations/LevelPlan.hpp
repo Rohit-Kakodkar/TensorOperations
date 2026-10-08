@@ -361,8 +361,10 @@ constexpr int lg_max_operand_slot() {
     const int b = operand_slot<typename Node::node_b_type>();
     return a > b ? a : b;
   } else if constexpr (has_node_tag_v<CombineTag, Node>) {
-    return lg_max_combine_slot<Node>(
+    const int o = lg_max_combine_slot<Node>(
         std::make_index_sequence<static_cast<std::size_t>(Node::NumOps)>{});
+    const int i = combine_idx_slot<typename Node::combine_type>();
+    return o > i ? o : i;
   } else if constexpr (has_node_tag_v<StagedTag, Node>) {
     return operand_slot<typename Node::operand_type>();
   } else {

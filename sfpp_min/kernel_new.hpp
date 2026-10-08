@@ -37,11 +37,6 @@
 //   * the tail check. The dummy carries SPECFEM++'s per-work-item is_end()
 //     (num_elements = min(nspec-base,4)); the graph's tile map divides 21344
 //     evenly by TE and has none, so it does slightly LESS work.
-//
-// KeepRedundantLoads reproduces the dummy's redundant per-point global loads --
-// the second metric load, the dead displacement re-read, and the divergence-
-// stage property/velocity/metric loads that feed only no-ops -- so the two
-// variants bracket the load-once saving with its own opcode alibi.
 // ============================================================================
 
 #include <config.hpp>
@@ -83,13 +78,10 @@ struct GatherDisplacement {
 // load_metric/load_property, which is what preserves the offset arithmetic
 // under test. The stress is spelled EXACTLY as the dummy spells it (l2m/lam on
 // the diagonal, mu on the off-diagonal) so FFMA/pt stays a control.
-template <bool KeepRedundantLoads, typename MetricsAcc, typename PropertiesAcc,
-          typename IglobView>
+template <typename MetricsAcc, typename PropertiesAcc>
 struct Integrand9 {
-  MetricsAcc        metrics;
-  PropertiesAcc     properties;
-  Fields::view_type displacement;
-  IglobView         iglob;
+  MetricsAcc    metrics;
+  PropertiesAcc properties;
 
   KOKKOS_FUNCTION Kokkos::Array<real_t, 9> operator()(
       int e, int k, int j, int i, real_t x0, real_t x1, real_t x2, real_t y0,
@@ -98,18 +90,9 @@ struct Integrand9 {
     const real_t df_deta[3]   = {y0, y1, y2};
     const real_t df_dgamma[3] = {z0, z1, z2};
 
-    // Metric load #2 (10 comps) feeds F; the chain rule uses grad_metric. Under
-    // load-once they are the same 10-comp load; the dummy loads a separate
-    // 9-comp grad_metric first, so KeepRedundantLoads mirrors that order.
-    PointMetric grad_metric;
     PointMetric point_metric;
-    if constexpr (KeepRedundantLoads) {
-      load_metric(metrics, e, k, j, i, grad_metric, false);
-      load_metric(metrics, e, k, j, i, point_metric, true);
-    } else {
-      load_metric(metrics, e, k, j, i, point_metric, true);
-      grad_metric = point_metric;
-    }
+    load_metric(metrics, e, k, j, i, point_metric, true);
+    const PointMetric grad_metric = point_metric;
 
     real_t du[3][3];
     for (int c = 0; c < 3; ++c) {
@@ -124,14 +107,7 @@ struct Integrand9 {
     PointProperty point_property;
     load_property(properties, e, k, j, i, point_property);
 
-    // The dummy re-reads displacement from GLOBAL here even though it is
-    // staged, to feed the cosserat no-op. Reproduced only under
-    // KeepRedundantLoads.
-    real_t point_displacement[3] = {0, 0, 0};
-    if constexpr (KeepRedundantLoads) {
-      const int ig = iglob(e, k, j, i);
-      for (int c = 0; c < 3; ++c) point_displacement[c] = displacement(ig, c);
-    }
+    const real_t point_displacement[3] = {0, 0, 0};
 
     const real_t l2m = point_property.lambdaplus2mu();
     const real_t lam = point_property.lambda();
@@ -207,41 +183,17 @@ struct AccelFromDivergence {
   }
 };
 
-// The scatter, now reading three ready values. iglob is still read ONCE and the
-// three atomics still land in one member. The redundant-load block moved here
-// with the atomics it precedes, so the statement ORDER the dummy has --
-// accel, then damping/boundary, then atomic_add -- is unchanged by the split.
-template <bool KeepRedundantLoads, typename MetricsAcc, typename PropertiesAcc,
-          typename IglobView>
+template <typename IglobView>
 struct ScatterAccel {
   Fields::view_type a;
   IglobView         iglob;
-  GlobalWeights     w;
-  Fields::view_type velocity;
-  MetricsAcc        metrics;
-  PropertiesAcc     properties;
 
   KOKKOS_FUNCTION void operator()(int e, int k, int j, int i, real_t r0,
                                   real_t r1, real_t r2) const {
     const int ig = iglob(e, k, j, i);
-
-    real_t accel[3] = {r0, r1, r2};
-
-    if constexpr (KeepRedundantLoads) {
-      PointProperty div_property;
-      load_property(properties, e, k, j, i, div_property);
-      real_t point_velocity[3];
-      for (int c = 0; c < 3; ++c) point_velocity[c] = velocity(ig, c);
-      PointMetric div_metric;
-      load_metric(metrics, e, k, j, i, div_metric, true);
-      const real_t factor = w(i) * w(j) * w(k) * div_metric.jacobian;
-      compute_damping_force(factor, div_property, point_velocity, accel);
-      apply_boundary_conditions(div_property, point_velocity, accel);
-    }
-
-    Kokkos::atomic_add(&a(ig, 0), accel[0]);
-    Kokkos::atomic_add(&a(ig, 1), accel[1]);
-    Kokkos::atomic_add(&a(ig, 2), accel[2]);
+    Kokkos::atomic_add(&a(ig, 0), r0);
+    Kokkos::atomic_add(&a(ig, 1), r1);
+    Kokkos::atomic_add(&a(ig, 2), r2);
   }
 };
 
@@ -297,6 +249,7 @@ auto row_of_e_mma() {
 #endif
 
 enum class GatherMode { Functional, IndexView, IndexSlot };
+enum class ScatterMode { Functional, IndexView, IndexSlot };
 
 template <typename X, typename Eta = X, typename Gamma = X>
 struct ContractionMmas {
@@ -337,15 +290,39 @@ using RowOfEMmas = ContractionMmas<
 
 template <int TE>
 using RowOfIMmas = ContractionMmas<RowOfIMma<TE>>;
+
+template <int TE>
+using RowOfETV = cute::Layout<
+    cute::Shape<cute::Shape<cute::Int<NGLL>, cute::Int<NGLL>, cute::Int<NGLL>>,
+                cute::Int<TE>>,
+    cute::Stride<cute::Stride<cute::Int<NGLL * NGLL * TE>, cute::Int<NGLL * TE>,
+                              cute::Int<TE>>,
+                 cute::_1>>;
 #endif
+
+template <int TE, ScatterMode Scatter>
+auto index_tv() {
+#if defined(TENSOR_OPS_ENABLE_CUTE)
+  if constexpr (Scatter == ScatterMode::IndexSlot)
+    return RowOfETV<TE>{};
+  else
+    return TensorOperations::DefaultTV{};
+#else
+  static_assert(Scatter != ScatterMode::IndexSlot,
+                "a scatter from the index slot needs the CuTe backend's "
+                "thread-value layouts");
+  return TensorOperations::DefaultTV{};
+#endif
+}
 
 // The one place the graph is built. new_stiffness launches it; new_footprint
 // queries its scratch without launching -- both go through here, so the
 // footprint reported at GATE C is the SAME graph the launch requests, never a
 // hand-copied upper bound that can drift from it.
-template <bool KeepRedundantLoads, int TE,
-          typename Mmas     = ContractionMmas<TensorOperations::DefaultMma<>>,
-          GatherMode Gather = GatherMode::Functional, typename MetricsAcc,
+template <int TE,
+          typename Mmas       = ContractionMmas<TensorOperations::DefaultMma<>>,
+          GatherMode  Gather  = GatherMode::Functional,
+          ScatterMode Scatter = ScatterMode::Functional, typename MetricsAcc,
           typename PropertiesAcc, typename IglobView>
 auto build_new_graph(
     const DummyKernelArgs<MetricsAcc, PropertiesAcc, IglobView>& args,
@@ -358,21 +335,22 @@ auto build_new_graph(
 
   const Kokkos::Array<int, 4> ext{args.nspec, NGLL, NGLL, NGLL};
 
-  const Integrand9<KeepRedundantLoads, MetricsAcc, PropertiesAcc, IglobView>
-      integrand{args.metrics, args.properties, args.displacement, args.iglob};
-  const AccelFromDivergence<GlobalWeights> to_accel{args.weights};
-  const ScatterAccel<KeepRedundantLoads, MetricsAcc, PropertiesAcc, IglobView>
-      sink{args.acceleration, args.iglob,   args.weights,
-           args.velocity,     args.metrics, args.properties};
+  const Integrand9<MetricsAcc, PropertiesAcc> integrand{args.metrics,
+                                                        args.properties};
+  const AccelFromDivergence<GlobalWeights>    to_accel{args.weights};
+  const ScatterAccel<IglobView> sink{args.acceleration, args.iglob};
 
   const typename Mmas::x     mx{};
   const typename Mmas::eta   me{};
   const typename Mmas::gamma mg{};
 
-  auto g0    = make_level_graph<real_t, ES>(GMap{});
+  auto           g0 = make_level_graph<real_t, ES>(GMap{});
+  constexpr bool UseIndex =
+      Gather == GatherMode::IndexSlot || Scatter == ScatterMode::IndexSlot;
   auto start = [&] {
-    if constexpr (Gather == GatherMode::IndexSlot)
-      return g0.add(make_index_node<'e', 'k', 'j', 'i'>(args.iglob));
+    if constexpr (UseIndex)
+      return g0.add(make_index_node<'e', 'k', 'j', 'i'>(
+          args.iglob, index_tv<TE, Scatter>()));
     else
       return std::make_tuple(g0, args.iglob);
   }();
@@ -385,6 +363,9 @@ auto build_new_graph(
       return make_stage_node(make_functional_input_node<'e', 'k', 'j', 'i'>(
           ext,
           GatherDisplacement<IglobView>{args.displacement, args.iglob, c}));
+    else if constexpr (Gather == GatherMode::IndexView)
+      return make_gather_node<'e', 'k', 'j', 'i'>(
+          args.iglob, Kokkos::subview(args.displacement, Kokkos::ALL, c));
     else
       return make_gather_node<'e', 'k', 'j', 'i'>(
           idx, Kokkos::subview(args.displacement, Kokkos::ALL, c));
@@ -435,16 +416,30 @@ auto build_new_graph(
   auto [g6, r0, r1, r2] = g5.add(make_combine_node<'e', 'k', 'j', 'i'>(
       tx0, tx1, tx2, te0, te1, te2, tg0, tg1, tg2, to_accel));
 
-  auto g7 = g6.add(make_combine_node<'e', 'k', 'j', 'i'>(r0, r1, r2, sink));
+  auto scatter = [&](auto dst, auto rc) {
+    if constexpr (Scatter == ScatterMode::IndexView)
+      return make_scatter_add_node<'e', 'k', 'j', 'i'>(args.iglob, dst, rc);
+    else
+      return make_scatter_add_node<'e', 'k', 'j', 'i'>(idx, dst, rc);
+  };
+  auto accel = [&](int c) {
+    return Kokkos::subview(args.acceleration, Kokkos::ALL, c);
+  };
+  auto g7 = [&] {
+    if constexpr (Scatter == ScatterMode::Functional)
+      return g6.add(make_combine_node<'e', 'k', 'j', 'i'>(r0, r1, r2, sink));
+    else
+      return g6.add(scatter(accel(0), r0), scatter(accel(1), r1),
+                    scatter(accel(2), r2));
+  }();
 
   using Plan = LevelPlan<std::decay_t<decltype(g7.levels)>>;
-  constexpr std::size_t IndexLevels = Gather == GatherMode::IndexSlot ? 1 : 0;
+  constexpr std::size_t IndexLevels = UseIndex ? 1 : 0;
   static_assert(Plan::num_levels == 7 + IndexLevels,
-                "two operator/stage levels then five compute levels: the "
-                "terminal scatter is its own level so its operand 0 is a "
-                "COMBINE result, in declared order, and the atomics walk i");
+                "an optional index level, two operator/stage levels, then "
+                "five compute levels ending in the scatter level");
   static_assert(Plan::num_slots == IndexLevels + 2 + 3 + 9 + 9 + 9 + 3 + 0,
-                "three accel slots; the terminal sink still contributes none");
+                "three accel slots; the scatter level contributes none");
   return g7;
 }
 
@@ -460,16 +455,15 @@ struct NewFootprint {
   int         threads  = -1;
 };
 
-template <bool KeepRedundantLoads = false, int TE = kExecChunk,
-          GatherMode Gather = GatherMode::Functional, typename MetricsAcc,
+template <int TE = kExecChunk, GatherMode Gather = GatherMode::Functional,
+          ScatterMode Scatter = ScatterMode::Functional, typename MetricsAcc,
           typename PropertiesAcc, typename IglobView>
 NewFootprint new_footprint(
     const DummyKernelArgs<MetricsAcc, PropertiesAcc, IglobView>& args,
     TensorOperations::TeamPolicyTag<KernelES>, GlobalHPrime hw) {
   const auto out =
-      build_new_graph<KeepRedundantLoads, TE,
-                      ContractionMmas<TensorOperations::DefaultMma<>>, Gather>(
-          args, hw)
+      build_new_graph<TE, ContractionMmas<TensorOperations::DefaultMma<>>,
+                      Gather, Scatter>(args, hw)
           .outputs();
   return {out.scratch_bytes(), out.slot_bytes(), -1};
 }
@@ -485,8 +479,8 @@ inline GlobalHPrime hprimewgll_or_build(const GlobalHPrime&  given,
 // benchmark precomputes it once and passes it so it stays out of the timed
 // region; tests let it build here. team_size exists only on the team backend --
 // CuTe's block size comes from the graph's contraction MMAs.
-template <bool KeepRedundantLoads = false, int TE = kExecChunk,
-          GatherMode Gather = GatherMode::Functional, typename MetricsAcc,
+template <int TE = kExecChunk, GatherMode Gather = GatherMode::Functional,
+          ScatterMode Scatter = ScatterMode::Functional, typename MetricsAcc,
           typename PropertiesAcc, typename IglobView>
 int new_stiffness(
     const DummyKernelArgs<MetricsAcc, PropertiesAcc, IglobView>& args,
@@ -494,31 +488,30 @@ int new_stiffness(
     GlobalHPrime hprimewgll = GlobalHPrime{}) {
   const GlobalHPrime hw =
       hprimewgll_or_build(hprimewgll, args.hprime, args.weights);
-  return build_new_graph<KeepRedundantLoads, TE,
-                         ContractionMmas<TensorOperations::DefaultMma<>>,
-                         Gather>(args, hw)
+  return build_new_graph<TE, ContractionMmas<TensorOperations::DefaultMma<>>,
+                         Gather, Scatter>(args, hw)
       .outputs()
       .team_size(team_size)
       .execute(policy);
 }
 
 #if defined(TENSOR_OPS_ENABLE_CUTE)
-template <bool KeepRedundantLoads = false, int TE = kExecChunk,
-          typename Mmas     = RowOfIMmas<TE>,
-          GatherMode Gather = GatherMode::Functional, typename MetricsAcc,
+template <int         TE = kExecChunk, typename Mmas = RowOfIMmas<TE>,
+          GatherMode  Gather  = GatherMode::Functional,
+          ScatterMode Scatter = ScatterMode::Functional, typename MetricsAcc,
           typename PropertiesAcc, typename IglobView>
 NewFootprint new_footprint(
     const DummyKernelArgs<MetricsAcc, PropertiesAcc, IglobView>& args,
     TensorOperations::CutePolicyTag<KernelES>, GlobalHPrime hw) {
   const auto out =
-      build_new_graph<KeepRedundantLoads, TE, Mmas, Gather>(args, hw).outputs();
+      build_new_graph<TE, Mmas, Gather, Scatter>(args, hw).outputs();
   return {out.cute_smem_bytes(), out.cute_unpooled_smem_bytes(),
           out.cute_num_threads()};
 }
 
-template <bool KeepRedundantLoads = false, int TE = kExecChunk,
-          typename Mmas     = RowOfIMmas<TE>,
-          GatherMode Gather = GatherMode::Functional, typename MetricsAcc,
+template <int         TE = kExecChunk, typename Mmas = RowOfIMmas<TE>,
+          GatherMode  Gather  = GatherMode::Functional,
+          ScatterMode Scatter = ScatterMode::Functional, typename MetricsAcc,
           typename PropertiesAcc, typename IglobView>
 int new_stiffness(
     const DummyKernelArgs<MetricsAcc, PropertiesAcc, IglobView>& args,
@@ -526,9 +519,8 @@ int new_stiffness(
     GlobalHPrime hprimewgll = GlobalHPrime{}) {
   const GlobalHPrime hw =
       hprimewgll_or_build(hprimewgll, args.hprime, args.weights);
-  return build_new_graph<KeepRedundantLoads, TE, Mmas, Gather>(args, hw)
-      .outputs()
-      .execute(policy);
+  return build_new_graph<TE, Mmas, Gather, Scatter>(args, hw).outputs().execute(
+      policy);
 }
 #endif
 

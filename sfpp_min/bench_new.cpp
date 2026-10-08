@@ -5,10 +5,8 @@
 //
 // Two axes the dummy bench does not have, and one it has that this one drops:
 //
-//   * loads = once | redundant. The formulation saving and the load-once saving
-//     are reported separately (plan's two-variant decision); this selects which
-//     variant runs. `once` is the kernel as written; `redundant` reissues the
-//     dummy's dead global loads so a warp-inst delta has its own opcode alibi.
+//   * loads = once (argv[7]). The redundant-load variant is gone; the slot is
+//     kept so existing scripts keep their argument positions.
 //
 //   * hprimewgll is precomputed ONCE here and handed to new_stiffness, so the
 //     device build of hw(p,r)=hprime(p,r)*w(p) never lands in the timed region.
@@ -102,25 +100,25 @@ double best_ms(Fn&& fn, int warmup, int reps) {
 
 using TeamPolicy = TensorOperations::TeamPolicyTag<KernelES>;
 
-template <bool Keep, class Args>
+template <class Args>
 int launch(TeamPolicy policy, const Args& args, int team_arg,
            const GlobalHPrime& hw) {
-  return new_stiffness<Keep>(args, policy, team_arg, hw);
+  return new_stiffness(args, policy, team_arg, hw);
 }
 
 #if defined(TENSOR_OPS_ENABLE_CUTE)
 using CutePolicy = TensorOperations::CutePolicyTag<KernelES>;
 
-template <bool Keep, class Args>
+template <class Args>
 int launch(CutePolicy policy, const Args& args, int, const GlobalHPrime& hw) {
-  return new_stiffness<Keep>(args, policy, hw);
+  return new_stiffness(args, policy, hw);
 }
 #endif
 
 template <class Policy>
 constexpr bool is_team_policy = std::is_same_v<Policy, TeamPolicy>;
 
-template <class Policy, bool Keep, class Off, class Storage, class IglobLayout>
+template <class Policy, class Off, class Storage, class IglobLayout>
 int run_impl(int argc, char** argv, const char* tag) {
   const int  reps     = (argc > 1) ? std::atoi(argv[1]) : 5;
   const int  warmup   = (argc > 2) ? std::atoi(argv[2]) : 2;
@@ -135,9 +133,8 @@ int run_impl(int argc, char** argv, const char* tag) {
     return 2;
   }
 
-  std::printf("kernel      : new (level graph), backend=%s, loads=%s\n",
-              is_team_policy<Policy> ? "team" : "cute",
-              Keep ? "redundant" : "once");
+  std::printf("kernel      : new (level graph), backend=%s\n",
+              is_team_policy<Policy> ? "team" : "cute");
   std::printf("cell        : %s\n", tag);
 
   const MeshDims d{60, 48, 9};
@@ -199,9 +196,9 @@ int run_impl(int argc, char** argv, const char* tag) {
                        f.displacement,   f.velocity,       f.acceleration,
                        hprime,           weights,          nspec};
 
-  const NewFootprint fp = new_footprint<Keep>(args, Policy{}, hpwgll);
+  const NewFootprint fp = new_footprint(args, Policy{}, hpwgll);
 
-  const int league = launch<Keep>(Policy{}, args, team_arg, hpwgll);
+  const int league = launch(Policy{}, args, team_arg, hpwgll);
   Kokkos::fence();
 
   std::printf("mesh        : %dx%dx%d, interior nspec = %d, nglob = %d\n",
@@ -220,14 +217,14 @@ int run_impl(int argc, char** argv, const char* tag) {
 
   if (profile) {
     Kokkos::deep_copy(f.acceleration, static_cast<real_t>(0));
-    launch<Keep>(Policy{}, args, team_arg, hpwgll);
+    launch(Policy{}, args, team_arg, hpwgll);
     Kokkos::fence();
     std::printf("profile mode: one launch issued\n");
     return 0;
   }
 
-  const double ms = best_ms(
-      [&]() { launch<Keep>(Policy{}, args, team_arg, hpwgll); }, warmup, reps);
+  const double ms = best_ms([&]() { launch(Policy{}, args, team_arg, hpwgll); },
+                            warmup, reps);
   const double ns_per_element = ms * 1e6 / nspec;
   const double ns_per_point   = ns_per_element / kPointsPerElement;
 
@@ -239,55 +236,55 @@ int run_impl(int argc, char** argv, const char* tag) {
   return 0;
 }
 
-template <class Policy, bool Keep, class Storage, class IglobLayout>
+template <class Policy, class Storage, class IglobLayout>
 int dispatch_layout(int argc, char** argv, const char* layout,
                     const char* tag) {
   if (std::strcmp(layout, "chunk_tiled_static") == 0)
-    return run_impl<Policy, Keep, ChunkTiledOffset, Storage, IglobLayout>(
-        argc, argv, tag);
+    return run_impl<Policy, ChunkTiledOffset, Storage, IglobLayout>(argc, argv,
+                                                                    tag);
   if (std::strcmp(layout, "chunk_tiled_dynamic") == 0)
-    return run_impl<Policy, Keep, ChunkTiledDynamicOffset, Storage,
-                    IglobLayout>(argc, argv, tag);
+    return run_impl<Policy, ChunkTiledDynamicOffset, Storage, IglobLayout>(
+        argc, argv, tag);
   if (std::strcmp(layout, "layout_right") == 0)
-    return run_impl<Policy, Keep, LayoutRightOffset, Storage, IglobLayout>(
-        argc, argv, tag);
+    return run_impl<Policy, LayoutRightOffset, Storage, IglobLayout>(argc, argv,
+                                                                     tag);
   if (std::strcmp(layout, "layout_right_dynamic") == 0)
-    return run_impl<Policy, Keep, LayoutRightDynamicOffset, Storage,
-                    IglobLayout>(argc, argv, tag);
-  if (std::strcmp(layout, "layout_left") == 0)
-    return run_impl<Policy, Keep, LayoutLeftOffset, Storage, IglobLayout>(
+    return run_impl<Policy, LayoutRightDynamicOffset, Storage, IglobLayout>(
         argc, argv, tag);
+  if (std::strcmp(layout, "layout_left") == 0)
+    return run_impl<Policy, LayoutLeftOffset, Storage, IglobLayout>(argc, argv,
+                                                                    tag);
   if (std::strcmp(layout, "layout_left_dynamic") == 0)
-    return run_impl<Policy, Keep, LayoutLeftDynamicOffset, Storage,
-                    IglobLayout>(argc, argv, tag);
+    return run_impl<Policy, LayoutLeftDynamicOffset, Storage, IglobLayout>(
+        argc, argv, tag);
   std::printf("unknown layout: %s\n", layout);
   return 2;
 }
 
-template <class Policy, bool Keep, class IglobLayout>
+template <class Policy, class IglobLayout>
 int dispatch_storage(int argc, char** argv, const char* layout,
                      const char* storage, const char* tag) {
   if (std::strcmp(storage, "aos") == 0) {
     if (std::strcmp(layout, "chunk_tiled_static") == 0 ||
         std::strcmp(layout, "chunk_tiled_dynamic") == 0)
-      return dispatch_layout<Policy, Keep, AoS, IglobLayout>(argc, argv, layout,
-                                                             tag);
+      return dispatch_layout<Policy, AoS, IglobLayout>(argc, argv, layout, tag);
     std::printf(
         "storage=aos is measured only for chunk_tiled_static and "
         "chunk_tiled_dynamic\n");
     return 2;
   }
-  return dispatch_layout<Policy, Keep, SoA, IglobLayout>(argc, argv, layout,
-                                                         tag);
+  return dispatch_layout<Policy, SoA, IglobLayout>(argc, argv, layout, tag);
 }
 
 template <class Policy, class IglobLayout>
 int dispatch_loads(int argc, char** argv, const char* layout,
                    const char* storage, bool redundant, const char* tag) {
-  return redundant ? dispatch_storage<Policy, true, IglobLayout>(
-                         argc, argv, layout, storage, tag)
-                   : dispatch_storage<Policy, false, IglobLayout>(
-                         argc, argv, layout, storage, tag);
+  if (redundant) {
+    std::printf("loads=redundant is gone: the graph always loads once\n");
+    return 2;
+  }
+  return dispatch_storage<Policy, IglobLayout>(argc, argv, layout, storage,
+                                               tag);
 }
 
 template <class Policy>
