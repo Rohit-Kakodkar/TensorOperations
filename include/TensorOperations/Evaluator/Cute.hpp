@@ -215,6 +215,18 @@ KOKKOS_FUNCTION auto make_cute_fragment_value_evaluator(Frag   frag,
   return Evaluator<CutePolicyTag<ES>, decltype(node), void>(node);
 }
 
+template <typename ES, int R, typename TileShape, typename Frags,
+          typename Coords, std::size_t... Ms>
+KOKKOS_FUNCTION auto make_cute_fragment_value_evaluators(
+    const Frags& frags, const Coords& coords, std::index_sequence<Ms...>) {
+  using result_t =
+      decltype(make_cute_fragment_value_evaluator<ES, R, TileShape>(
+          frags[0], coords, NoHook{}));
+  return Kokkos::Array<result_t, sizeof...(Ms)>{
+      make_cute_fragment_value_evaluator<ES, R, TileShape>(frags[Ms], coords,
+                                                           NoHook{})...};
+}
+
 }  // namespace Impl
 
 template <typename ES, TensorLike T, typename ModesSeq, typename HookOp,
@@ -269,8 +281,9 @@ class Evaluator<
                 "CuTe functional input: tiler rank must equal the node's rank");
 
   KOKKOS_FUNCTION Evaluator(node_type n, Tiler t)
-      : tensor_(Impl::make_cute_functional_tensor<ValueType>(
-            n.fn_, n.shape(), std::make_index_sequence<Rank>{})),
+      : tensor_(
+            Impl::make_cute_functional_tensor<typename node_type::result_type>(
+                n.fn_, n.shape(), std::make_index_sequence<Rank>{})),
         tiler_(t),
         hook_(n.hook_op) {}
 
@@ -281,9 +294,10 @@ class Evaluator<
   }
 
  private:
-  Impl::cute_functional_tensor_t<ValueType, Fn, Rank> tensor_;
-  Tiler                                               tiler_;
-  [[no_unique_address]] HookOp                        hook_;
+  Impl::cute_functional_tensor_t<typename node_type::result_type, Fn, Rank>
+                               tensor_;
+  Tiler                        tiler_;
+  [[no_unique_address]] HookOp hook_;
 };
 
 template <typename ThrLayout>
@@ -623,16 +637,35 @@ class Evaluator<CutePolicyTag<ES>,
   KOKKOS_FUNCTION Evaluator(node_type n, tiling_type tag)
       : node_(n), tag_(tag) {}
 
+  static constexpr int NumOut = node_type::NumOut;
+
   template <typename Coord>
   KOKKOS_FUNCTION auto operator()(const Coord& coord) const {
     const auto src =
         make_evaluator<CutePolicyTag<ES>>(node_.operand_, TileShape{})(coord);
     const Part part   = tag_.part;
     const auto coords = part(cute::make_identity_tensor(TileShape{}));
-    auto       frag   = cute::make_tensor<value_type>(cute::shape(coords));
-    if (part.active()) cute::copy(part(src.node().storage_), frag);
-    return Impl::make_cute_fragment_value_evaluator<ES, Rank, TileShape>(
-        frag, coords, src.node().hook_op);
+    if constexpr (NumOut == 1) {
+      auto frag = cute::make_tensor<value_type>(cute::shape(coords));
+      if (part.active()) cute::copy(part(src.node().storage_), frag);
+      return Impl::make_cute_fragment_value_evaluator<ES, Rank, TileShape>(
+          frag, coords, src.node().hook_op);
+    } else {
+      using frag_t =
+          decltype(cute::make_tensor<value_type>(cute::shape(coords)));
+      Kokkos::Array<frag_t, NumOut> frags;
+      if (part.active()) {
+        const auto sp = part(src.node().storage_);
+        CUTE_UNROLL
+        for (int v = 0; v < static_cast<int>(cute::size(coords)); ++v) {
+          const auto r = sp(v);
+          CUTE_UNROLL
+          for (int o = 0; o < NumOut; ++o) frags[o](v) = r[o];
+        }
+      }
+      return Impl::make_cute_fragment_value_evaluators<ES, Rank, TileShape>(
+          frags, coords, std::make_index_sequence<NumOut>{});
+    }
   }
 
  private:
@@ -989,7 +1022,8 @@ class Evaluator<CutePolicyTag<ES>,
           for (int m = 0; m < NumOut; ++m) outs[m](v) = r[m];
         }
       }
-      return results(outs, std::make_index_sequence<NumOut>{});
+      return Impl::make_cute_fragment_value_evaluators<ES, Rank, TileShape>(
+          outs, coords_, std::make_index_sequence<NumOut>{});
     }
   }
 
@@ -1015,17 +1049,6 @@ class Evaluator<CutePolicyTag<ES>,
   KOKKOS_FUNCTION Kokkos::Array<int, Rank> global_index(
       const Coord& oc, std::index_sequence<Ds...>) const {
     return {origin_[Ds] + static_cast<int>(cute::get<Ds>(oc))...};
-  }
-
-  template <typename Frags, std::size_t... Ms>
-  KOKKOS_FUNCTION auto results(const Frags& outs,
-                               std::index_sequence<Ms...>) const {
-    using result_t =
-        decltype(Impl::make_cute_fragment_value_evaluator<ES, Rank, TileShape>(
-            outs[0], coords_, NoHook{}));
-    return Kokkos::Array<result_t, NumOut>{
-        Impl::make_cute_fragment_value_evaluator<ES, Rank, TileShape>(
-            outs[Ms], coords_, NoHook{})...};
   }
 
   [[no_unique_address]] CombineFn fn_;

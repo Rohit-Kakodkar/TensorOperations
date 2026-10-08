@@ -42,6 +42,7 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <tuple>
 
 using namespace TensorOperations;
 using ES = Kokkos::DefaultExecutionSpace;
@@ -99,6 +100,16 @@ struct ReadThroughView {
 struct GlobalCoordProbe {
   KOKKOS_INLINE_FUNCTION float operator()(int e, int a, int b) const {
     return 1000.0f * e + 10.0f * a + 1.0f * b;
+  }
+};
+
+struct GatherAllThroughMap {
+  ViewGlobal             data;
+  ViewMap                map;
+  KOKKOS_INLINE_FUNCTION Kokkos::Array<float, 3> operator()(int e, int a,
+                                                            int b) const {
+    const int n = map(e, a, b);
+    return {data(n, 0), data(n, 1), GlobalCoordProbe{}(e, a, b)};
   }
 };
 
@@ -460,6 +471,79 @@ TEST(FunctionalInput, FunctorSeesTheGlobalCoordinateNotTheTileLocalOne) {
 }
 
 }  // namespace
+
+TEST(FunctionalInput, MultiOutputStageIsBitwiseItsSingleOutputStages) {
+  ViewH      Hd("H", fQ, fA);
+  ViewMap    Md("map", fE, fA, fB);
+  ViewGlobal Gd("global", fNglob, fComp);
+  ViewC      C[4] = {ViewC("C0", fQ, fE, fB), ViewC("C1", fQ, fE, fB),
+                     ViewC("C2", fQ, fE, fB), ViewC("C3", fQ, fE, fB)};
+  ViewC      R[4] = {ViewC("R0", fQ, fE, fB), ViewC("R1", fQ, fE, fB),
+                     ViewC("R2", fQ, fE, fB), ViewC("R3", fQ, fE, fB)};
+
+  fill_operators(Hd);
+  auto Mh = Kokkos::create_mirror_view(Md);
+  for (int e = 0; e < fE; ++e)
+    for (int a = 0; a < fA; ++a)
+      for (int b = 0; b < fB; ++b) Mh(e, a, b) = gid(e, a, b);
+  Kokkos::deep_copy(Md, Mh);
+  auto Gh = Kokkos::create_mirror_view(Gd);
+  for (int n = 0; n < fNglob; ++n)
+    for (int c = 0; c < fComp; ++c) Gh(n, c) = gval(n, c);
+  Kokkos::deep_copy(Gd, Gh);
+
+  const Kokkos::Array<int, 3> ext{fE, fA, fB};
+  const auto                  contract_four = [&](auto stages, ViewC* out) {
+    auto g0 = make_level_graph<float, ES>(Map{});
+    auto [g1, h] =
+        g0.add(make_stage_node(make_input_node(make_handle<'q', 'a'>(Hd))));
+    auto [g2, s0, s1, s2, s3] =
+        std::apply([&](auto... st) { return g1.add(st...); }, stages);
+    auto [g3, c0, c1, c2, c3] =
+        g2.add(make_contraction_node<'q', 'e', 'b'>(h, s0),
+               make_contraction_node<'q', 'e', 'b'>(h, s1),
+               make_contraction_node<'q', 'e', 'b'>(h, s2),
+               make_contraction_node<'q', 'e', 'b'>(h, s3));
+    g3.outputs(c0, c1, c2, c3)
+        .execute(TeamPolicyTag<ES>{}, out[0], out[1], out[2], out[3]);
+    Kokkos::fence();
+  };
+  const auto gather = [&](int comp) {
+    return make_stage_node(make_functional_input_node<'e', 'a', 'b'>(
+        ext, GatherThroughMap{Gd, Md, comp}));
+  };
+
+  contract_four(
+      std::make_tuple(make_stage_node(make_functional_input_node<'e', 'a', 'b'>(
+                          ext, GatherAllThroughMap{Gd, Md})),
+                      gather(1)),
+      C);
+  contract_four(
+      std::make_tuple(gather(0), gather(1),
+                      make_stage_node(make_functional_input_node<'e', 'a', 'b'>(
+                          ext, GlobalCoordProbe{})),
+                      gather(1)),
+      R);
+
+  const auto bitwise = [](ViewC got, ViewC want) {
+    auto  g   = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, got);
+    auto  w   = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, want);
+    int   bad = 0;
+    float scale = 0.0f;
+    for (int q = 0; q < fQ; ++q)
+      for (int e = 0; e < fE; ++e)
+        for (int b = 0; b < fB; ++b) {
+          scale = std::max(scale, std::abs(w(q, e, b)));
+          if (g(q, e, b) != w(q, e, b)) ++bad;
+        }
+    EXPECT_GT(scale, 0.0f) << "void test: the reference is all zeros";
+    return bad;
+  };
+  EXPECT_EQ(bitwise(C[0], R[0]), 0) << "output 0 (component 0)";
+  EXPECT_EQ(bitwise(C[1], R[1]), 0) << "output 1 (component 1)";
+  EXPECT_EQ(bitwise(C[2], R[2]), 0) << "output 2 (global-coordinate probe)";
+  EXPECT_EQ(bitwise(C[3], R[3]), 0) << "single-output stage beside it";
+}
 
 int main(int argc, char* argv[]) {
   ::testing::InitGoogleTest(&argc, argv);
