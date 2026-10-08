@@ -312,9 +312,14 @@ template <typename ES, typename Operand, typename ModesSeq, typename NodeTile,
 class Evaluator<TeamPolicyTag<ES>,
                 NodeHandle<StagedTag, Operand, ModesSeq, NodeTile, TV>, Tile_> {
  public:
-  using node_type     = NodeHandle<StagedTag, Operand, ModesSeq, NodeTile, TV>;
-  using policy_tag    = TeamPolicyTag<ES>;
-  using tiling_type   = Tile_;
+  using node_type   = NodeHandle<StagedTag, Operand, ModesSeq, NodeTile, TV>;
+  using policy_tag  = TeamPolicyTag<ES>;
+  using tiling_type = Tile_;
+
+  static_assert(!node_type::is_register,
+                "register node: it runs only on the CuTe backend, which keeps "
+                "its values in registers across levels; use make_stage_node "
+                "for a team graph");
   using value_type    = typename node_type::value_type;
   using exec_space    = ES;
   using modes_seq     = typename node_type::modes_seq;

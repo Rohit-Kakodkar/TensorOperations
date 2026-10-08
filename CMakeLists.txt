@@ -404,6 +404,20 @@ set_tests_properties(GatherGuardNegative.Case5 PROPERTIES
                      PASS_REGULAR_EXPRESSION
                      "may not read a slot ITS OWN LEVEL")
 
+foreach(case 0 1 2)
+  add_executable(register_team_neg_${case} EXCLUDE_FROM_ALL
+                 tests/negative/register_team_negative.cpp)
+  target_link_libraries(register_team_neg_${case} PRIVATE tensor)
+  target_compile_definitions(register_team_neg_${case}
+                             PRIVATE REGISTER_NEG_CASE=${case})
+  add_test(NAME RegisterTeamNegative.Case${case}
+           COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}
+                   --target register_team_neg_${case} --config $<CONFIG>)
+endforeach()
+set_tests_properties(RegisterTeamNegative.Case1 RegisterTeamNegative.Case2
+                     PROPERTIES PASS_REGULAR_EXPRESSION
+                     "register node: it runs only on the CuTe backend")
+
 foreach(case 0 1 2 3 5 6)
   add_executable(scatter_guard_neg_${case} EXCLUDE_FROM_ALL
                  tests/negative/scatter_guard_negative.cpp)

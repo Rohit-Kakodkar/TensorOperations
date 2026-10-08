@@ -1693,7 +1693,7 @@ void expect_tv_multi_output_stage_combine() {
   ViewR         u("u", E, 5, 5, 5);
   fill(h, 0.5f);
   fill(u, -2.0f);
-  ViewR cp("cp", E, 5, 5, 5), tp("tp", E, 5, 5, 5);
+  ViewR cp("cp", E, 5, 5, 5);
   Kokkos::deep_copy(cp, -999.0f);
 
   auto g0 = make_level_graph<float, ES>(MapET<TE>{});
@@ -1738,8 +1738,6 @@ void expect_tv_multi_output_stage_combine() {
   const auto out = g4.outputs(pv);
   out.execute(CutePolicyTag<>{}, cp);
   ASSERT_TRUE(synced());
-  out.execute(TeamPolicyTag<ES>{}, tp);
-  ASSERT_TRUE(synced());
 
   auto   hh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, h);
   auto   hu = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, u);
@@ -1758,7 +1756,6 @@ void expect_tv_multi_output_stage_combine() {
           r(e, k, j, i) = GradMixPair{}(e, k, j, i, x, y, z, ab[0], ab[1]);
         }
   EXPECT_LT(max_rel_err(cp, r), 1e-5f);
-  EXPECT_LT(max_rel_err(cp, tp), 1e-5f);
 }
 
 using NarrowTV =

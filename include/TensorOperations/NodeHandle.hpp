@@ -44,6 +44,26 @@ struct DefaultTV {};
 namespace Impl {
 template <typename TV>
 inline constexpr bool is_default_tv_v = std::is_same_v<TV, DefaultTV>;
+
+template <typename TV>
+struct RegisterTV {
+  TV tv;
+};
+
+template <typename TV>
+struct unwrap_tv {
+  using type                        = TV;
+  static constexpr bool is_register = false;
+};
+template <typename TV>
+struct unwrap_tv<RegisterTV<TV>> {
+  using type                        = TV;
+  static constexpr bool is_register = true;
+};
+template <typename TV>
+using unwrap_tv_t = typename unwrap_tv<TV>::type;
+template <typename TV>
+inline constexpr bool is_register_tv_v = unwrap_tv<TV>::is_register;
 }  // namespace Impl
 
 // Forward declaration — TiledLayout.hpp defines it; exec_space_of below has to
@@ -370,15 +390,17 @@ struct NodeHandle<StagedTag, Operand, ModesSeq, Tile, TV> {
   Operand                  operand_;
   [[no_unique_address]] TV tv_;
 
-  using node_tag              = StagedTag;
-  using operand_type          = Operand;
-  using tile_type             = Tile;
-  using tv_type               = TV;
-  static constexpr int Rank   = Operand::Rank;
-  static constexpr int NumOut = Impl::output_arity<Operand>::value;
-  using value_type            = typename Operand::value_type;
-  using exec_space            = typename Operand::exec_space;
-  using modes_seq             = ModesSeq;
+  using node_tag                    = StagedTag;
+  using operand_type                = Operand;
+  using tile_type                   = Tile;
+  using tv_param                    = TV;
+  using tv_type                     = Impl::unwrap_tv_t<TV>;
+  static constexpr bool is_register = Impl::is_register_tv_v<TV>;
+  static constexpr int  Rank        = Operand::Rank;
+  static constexpr int  NumOut      = Impl::output_arity<Operand>::value;
+  using value_type                  = typename Operand::value_type;
+  using exec_space                  = typename Operand::exec_space;
+  using modes_seq                   = ModesSeq;
 
   static_assert(static_cast<int>(ModesSeq::size()) == Rank,
                 "staged node: one label per axis");
@@ -632,7 +654,7 @@ KOKKOS_FUNCTION auto make_register_node(Operand op, TV tv) {
   static_assert(!Impl::is_default_tv_v<TV>,
                 "register node: give the thread-value layout of the combine "
                 "that reads it, so its fragments stay in registers");
-  return make_stage_node(std::move(op), std::move(tv));
+  return make_stage_node(std::move(op), Impl::RegisterTV<TV>{std::move(tv)});
 }
 
 template <int32_t... Modes, TensorLike T, typename TV = DefaultTV>
