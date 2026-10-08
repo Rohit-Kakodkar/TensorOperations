@@ -78,6 +78,7 @@ constexpr void note_node_reads(std::array<std::size_t, NS>& last,
     note_combine_reads<Node, NS>(
         last, k,
         std::make_index_sequence<static_cast<std::size_t>(Node::NumOps)>{});
+    note_read<NS>(last, combine_idx_slot<typename Node::combine_type>(), k);
   } else if constexpr (has_node_tag_v<StagedTag, Node>) {
     note_read<NS>(last, operand_slot<typename Node::operand_type>(), k);
   }

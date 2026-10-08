@@ -449,6 +449,34 @@ struct lg_cute_combine_plan {
   template <std::size_t K, std::size_t Driver = D>
   using remap_t = cute_value_remap_t<point_tv_t<K>, point_tv_t<Driver>>;
 
+  template <int Z = 0>
+  static constexpr auto self_tv_impl() {
+    if constexpr (aligned_driven) {
+      return std::type_identity<point_tv_t<DA>>{};
+    } else if constexpr (register_driven) {
+      using PN = producer_node_t<D>;
+      if constexpr (has_node_tag_v<ContractionTag, PN>)
+        return std::type_identity<
+            cute_point_tv_t<typename lg_cute_producer<PN, N>::mma, CModes,
+                            canon_t<D>, tile_shape>>{};
+      else if constexpr (has_node_tag_v<CombineTag, PN>)
+        return std::type_identity<typename lg_cute_combine_plan<
+            LevelsT, lg_slot_level_v<LevelsT, slot<D>>,
+            lg_slot_member_v<LevelsT, slot<D>>, N>::template self_tv_t<Z>>{};
+      else if constexpr (has_node_tag_v<StagedTag, PN> &&
+                         !is_default_tv_v<lg_cute_slot_tv_t<LevelsT, slot<D>>>)
+        return std::type_identity<
+            cute_point_tv_of_t<lg_cute_slot_tv_t<LevelsT, slot<D>>, CModes,
+                               canon_t<D>, tile_shape>>{};
+      else
+        return std::type_identity<void>{};
+    } else {
+      return std::type_identity<void>{};
+    }
+  }
+  template <int Z = 0>
+  using self_tv_t = typename decltype(self_tv_impl<Z>())::type;
+
   __device__ static part make(const LevelsT& levels) {
     return picked::make(levels);
   }
@@ -741,6 +769,21 @@ __device__ auto lg_cute_combine_operand(const LevelsT& levels, const Acc& acc,
                            typename Plan::template op_t<K>>(base);
 }
 
+template <typename IdxTV, typename SelfTV, typename CModes, typename IdxModes,
+          typename TileShape>
+constexpr bool lg_cute_scatter_aligned() {
+  if constexpr (std::is_void_v<SelfTV> || is_default_tv_v<IdxTV>)
+    return false;
+  else
+    return cute_points_aligned_v<
+        cute_point_tv_of_t<IdxTV, CModes, IdxModes, TileShape>, SelfTV>;
+}
+
+template <typename IdxTV, typename SelfTV, typename CModes, typename IdxModes,
+          typename TileShape>
+inline constexpr bool lg_cute_scatter_aligned_v =
+    lg_cute_scatter_aligned<IdxTV, SelfTV, CModes, IdxModes, TileShape>();
+
 template <typename V, typename ES, int NumThreads, typename LevelsT,
           typename GridModes, std::size_t RootR, std::size_t L, std::size_t M,
           typename Acc, std::size_t... Ks, std::size_t... Os>
@@ -762,15 +805,49 @@ __device__ auto lg_cute_combine_member(
   const Ops   ops{lg_cute_combine_operand<V, ES, NumThreads, LevelsT, L, M, Ks>(
       levels, acc, base)...};
   const auto& node = levels.template get<L>().template get<M>();
-  const auto  ev   = make_evaluator<CutePolicyTag<ES>>(
-      node, make_cute_combine_tag<typename Plan::tile_shape>(
-                Plan::make(levels), origin, ops.template get<Ks>()...));
-  if constexpr (Node::NumOut == 0) {
-    ev();
+  if constexpr (is_scatter_slot_fn_v<typename Node::combine_type>) {
+    using Fn                = typename Node::combine_type;
+    using IdxSlot           = typename Fn::idx_type;
+    constexpr std::size_t I = IdxSlot::SlotIdx;
+    using TileShape         = typename Plan::tile_shape;
+    using IdxTV             = lg_cute_slot_tv_t<LevelsT, I>;
+    using SelfTV            = typename Plan::template self_tv_t<>;
+    static_assert(
+        lg_cute_scatter_aligned_v<IdxTV, SelfTV, typename Node::modes_seq,
+                                  typename IdxSlot::modes_seq, TileShape>,
+        "scatter node: the index's thread-value layout must match "
+        "the scatter's thread map; give make_index_node the layout "
+        "of the scatter's driving MMA");
+    using IdxPT   = cute_point_tv_of_t<IdxTV, typename Node::modes_seq,
+                                       typename IdxSlot::modes_seq, TileShape>;
+    using Remap   = cute_value_remap_t<IdxPT, SelfTV>;
+    const auto& f = acc.template get<I>().node().frag_;
+    const auto  coords =
+        Plan::make(levels)(cute::make_identity_tensor(TileShape{}));
+    auto frag =
+        cute::make_tensor<typename std::decay_t<decltype(f)>::value_type>(
+            cute::shape(coords));
+    CUTE_UNROLL
+    for (int v = 0; v < static_cast<int>(cute::size(frag)); ++v)
+      frag(v) = f(Remap{}(v));
+    const auto bound = rebind_combine_fn(
+        node, ScatterAddFragFn<decltype(frag), typename Fn::dst_type>{
+                  frag, node.fn.dst});
+    make_evaluator<CutePolicyTag<ES>>(
+        bound, make_cute_combine_tag<TileShape>(Plan::make(levels), origin,
+                                                ops.template get<Ks>()...))();
     return DeviceTuple<>{};
   } else {
-    const auto outs = ev();
-    return DeviceTuple<std::decay_t<decltype(outs[Os])>...>{outs[Os]...};
+    const auto ev = make_evaluator<CutePolicyTag<ES>>(
+        node, make_cute_combine_tag<typename Plan::tile_shape>(
+                  Plan::make(levels), origin, ops.template get<Ks>()...));
+    if constexpr (Node::NumOut == 0) {
+      ev();
+      return DeviceTuple<>{};
+    } else {
+      const auto outs = ev();
+      return DeviceTuple<std::decay_t<decltype(outs[Os])>...>{outs[Os]...};
+    }
   }
 }
 

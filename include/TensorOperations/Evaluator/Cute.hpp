@@ -967,9 +967,12 @@ class Evaluator<CutePolicyTag<ES>,
         CUTE_UNROLL
         for (int v = 0; v < nv; ++v) {
           const auto oc = cute::flatten(coords_(v));
-          Impl::apply_combine(
-              fn_, global_index(oc, std::make_index_sequence<Rank>{}),
-              gather(v, oc, std::make_index_sequence<NumOps>{}));
+          if constexpr (Impl::is_scatter_frag_fn_v<CombineFn>)
+            fn_.add(v, read<0>(v, oc));
+          else
+            Impl::apply_combine(
+                fn_, global_index(oc, std::make_index_sequence<Rank>{}),
+                gather(v, oc, std::make_index_sequence<NumOps>{}));
         }
       }
     } else {

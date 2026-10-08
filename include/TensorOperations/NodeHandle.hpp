@@ -1074,4 +1074,163 @@ KOKKOS_FUNCTION auto canonicalize_input(
 
 }  // namespace Impl
 
+namespace Impl {
+
+template <typename D, typename = void>
+struct atomic_target : std::false_type {};
+template <typename D>
+struct atomic_target<D, std::void_t<decltype(std::declval<const D&>()(0))>>
+    : std::bool_constant<
+          std::is_lvalue_reference_v<decltype(std::declval<const D&>()(0))> &&
+          !std::is_const_v<
+              std::remove_reference_t<decltype(std::declval<const D&>()(0))>>> {
+};
+
+template <typename D>
+constexpr bool atomic_target_check() {
+  if constexpr (Kokkos::is_view_v<D>)
+    return D::rank == 1 && !std::is_const_v<typename D::value_type>;
+  else
+    return atomic_target<D>::value;
+}
+template <typename D>
+inline constexpr bool atomic_target_v = atomic_target_check<D>();
+
+template <typename Dst>
+using atomic_elem_t =
+    std::remove_reference_t<decltype(std::declval<const Dst&>()(0))>;
+
+template <typename Dst, typename V>
+KOKKOS_FORCEINLINE_FUNCTION void scatter_add_at(const Dst& dst, int ig, V v) {
+  Kokkos::atomic_add(&dst(ig), static_cast<atomic_elem_t<Dst>>(v));
+}
+
+template <typename IdxView, typename Dst>
+struct ScatterAddFn {
+  IdxView idx;
+  Dst     dst;
+
+  template <typename... A>
+  KOKKOS_FUNCTION void operator()(A... a) const {
+    call(std::make_index_sequence<sizeof...(A) - 1>{}, DeviceTuple<A...>(a...));
+  }
+
+ private:
+  template <std::size_t... Is, typename T>
+  KOKKOS_FUNCTION void call(std::index_sequence<Is...>, const T& t) const {
+    scatter_add_at(dst, static_cast<int>(idx(t.template get<Is>()...)),
+                   t.template get<sizeof...(Is)>());
+  }
+};
+
+template <typename IdxSlot, typename Dst>
+struct ScatterAddSlotFn {
+  using idx_type = IdxSlot;
+  using dst_type = Dst;
+  IdxSlot idx;
+  Dst     dst;
+};
+
+template <typename SlotView, std::size_t R, typename Dst>
+struct ScatterAddBoundFn {
+  SlotView              slot;
+  Kokkos::Array<int, R> origin;
+  Dst                   dst;
+
+  template <typename... A>
+  KOKKOS_FUNCTION void operator()(A... a) const {
+    call(std::make_index_sequence<sizeof...(A) - 1>{}, DeviceTuple<A...>(a...));
+  }
+
+ private:
+  template <std::size_t... Is, typename T>
+  KOKKOS_FUNCTION void call(std::index_sequence<Is...>, const T& t) const {
+    scatter_add_at(
+        dst,
+        static_cast<int>(
+            slot((static_cast<int>(t.template get<Is>()) - origin[Is])...)),
+        t.template get<sizeof...(Is)>());
+  }
+};
+
+template <typename Frag, typename Dst>
+struct ScatterAddFragFn {
+  Frag idx;
+  Dst  dst;
+
+  template <typename V>
+  KOKKOS_FUNCTION void add(int v, V val) const {
+    scatter_add_at(dst, static_cast<int>(idx(v)), val);
+  }
+};
+
+template <typename Fn>
+inline constexpr bool is_scatter_slot_fn_v = false;
+template <typename I, typename D>
+inline constexpr bool is_scatter_slot_fn_v<ScatterAddSlotFn<I, D>> = true;
+
+template <typename Fn>
+inline constexpr bool is_scatter_frag_fn_v = false;
+template <typename F, typename D>
+inline constexpr bool is_scatter_frag_fn_v<ScatterAddFragFn<F, D>> = true;
+
+template <typename Fn>
+constexpr int combine_idx_slot() {
+  if constexpr (is_scatter_slot_fn_v<Fn>)
+    return static_cast<int>(Fn::idx_type::SlotIdx);
+  else
+    return -1;
+}
+
+template <typename NewFn, typename Fn, typename IntRank, typename S,
+          typename ES, typename ModesSeq, typename IntNumOut, typename... Ops>
+KOKKOS_FUNCTION auto rebind_combine_fn(
+    const NodeHandle<CombineTag, Fn, IntRank, S, ES, ModesSeq, IntNumOut,
+                     Ops...>& n,
+    NewFn                     fn) {
+  return NodeHandle<CombineTag, NewFn, IntRank, S, ES, ModesSeq, IntNumOut,
+                    Ops...>{std::move(fn), n.operands, n.shape_};
+}
+
+}  // namespace Impl
+
+template <int32_t... Modes, typename Idx, typename Dst, typename Val>
+auto make_scatter_add_node(Idx idx, Dst dst, Val val) {
+  using ModesSeq     = std::integer_sequence<int32_t, Modes...>;
+  constexpr int Rank = static_cast<int>(sizeof...(Modes));
+  static_assert(Impl::atomic_target_v<Dst>,
+                "scatter node: the destination must give an assignable "
+                "element, dst(int) -> T&");
+  static_assert(Impl::is_node_handle_v<Val> &&
+                    !std::is_integral_v<typename Val::value_type>,
+                "scatter node: the value must be a value node, not an index");
+  if constexpr (Impl::has_node_tag_v<SlotTag, Idx>) {
+    static_assert(std::is_integral_v<typename Idx::value_type>,
+                  "scatter node: the index must be an index node's handle or "
+                  "an integer view");
+    static_assert(std::is_same_v<typename Idx::modes_seq, ModesSeq>,
+                  "scatter node: an index handle must be read with the "
+                  "scatter's labels, in the same order");
+    static_assert(static_cast<int>(Val::Rank) == Rank &&
+                      Impl::same_label_set<typename Val::modes_seq, ModesSeq>(),
+                  "scatter node: the value must carry the scatter's labels");
+    using Fn = Impl::ScatterAddSlotFn<Idx, Dst>;
+    return NodeHandle<CombineTag, Fn, std::integral_constant<int, Rank>,
+                      typename Val::value_type, Kokkos::DefaultExecutionSpace,
+                      ModesSeq, std::integral_constant<int, 0>, Val>{
+        Fn{std::move(idx), std::move(dst)}, DeviceTuple<Val>(val),
+        Impl::gathered_shape<ModesSeq>(val)};
+  } else {
+    static_assert(
+        Kokkos::is_view_v<Idx> && std::is_integral_v<typename Idx::value_type>,
+        "scatter node: the index must be an index node's handle or "
+        "an integer view");
+    static_assert(static_cast<int>(Idx::rank) == Rank,
+                  "scatter node: one label per index view axis");
+    return make_combine_node<Modes...>(
+        std::move(val),
+        Impl::ScatterAddFn<Idx, Dst>{std::move(idx), std::move(dst)});
+  }
+}
+
 }  // namespace TensorOperations

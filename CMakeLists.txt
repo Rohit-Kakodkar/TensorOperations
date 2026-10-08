@@ -147,6 +147,10 @@ add_executable(test_gather_node tests/test_gather_node.cpp)
 target_link_libraries(test_gather_node PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_gather_node)
 
+add_executable(test_scatter_add_node tests/test_scatter_add_node.cpp)
+target_link_libraries(test_scatter_add_node PRIVATE tensor GTest::gtest)
+gtest_discover_tests(test_scatter_add_node)
+
 # test_functional_input — a leaf whose elements are computed, not addressed.
 # Custom main() wraps Kokkos init/finalize; every case launches a graph.
 add_executable(test_functional_input tests/test_functional_input.cpp)
@@ -220,6 +224,17 @@ if(TENSOR_OPS_CUTLASS_DIR AND Kokkos_ENABLE_CUDA)
   set_tests_properties(StageTVGuardNegative.Case4 PROPERTIES
                        PASS_REGULAR_EXPRESSION
                        "thread-value layout must be static")
+
+  add_executable(scatter_guard_neg_4 EXCLUDE_FROM_ALL
+                 tests/negative/scatter_guard_negative.cpp)
+  target_link_libraries(scatter_guard_neg_4 PRIVATE tensor)
+  target_compile_definitions(scatter_guard_neg_4 PRIVATE SCATTER_NEG_CASE=4)
+  add_test(NAME ScatterGuardNegative.Case4
+           COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}
+                   --target scatter_guard_neg_4 --config $<CONFIG>)
+  set_tests_properties(ScatterGuardNegative.Case4 PROPERTIES
+                       PASS_REGULAR_EXPRESSION
+                       "the index's thread-value layout must match")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -380,6 +395,32 @@ set_tests_properties(GatherGuardNegative.Case5 PROPERTIES
                      PASS_REGULAR_EXPRESSION
                      "may not read a slot ITS OWN LEVEL")
 
+foreach(case 0 1 2 3 5 6)
+  add_executable(scatter_guard_neg_${case} EXCLUDE_FROM_ALL
+                 tests/negative/scatter_guard_negative.cpp)
+  target_link_libraries(scatter_guard_neg_${case} PRIVATE tensor)
+  target_compile_definitions(scatter_guard_neg_${case}
+                             PRIVATE SCATTER_NEG_CASE=${case})
+  add_test(NAME ScatterGuardNegative.Case${case}
+           COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}
+                   --target scatter_guard_neg_${case} --config $<CONFIG>)
+endforeach()
+set_tests_properties(ScatterGuardNegative.Case1 PROPERTIES
+                     PASS_REGULAR_EXPRESSION
+                     "scatter node: an index handle must be read with the")
+set_tests_properties(ScatterGuardNegative.Case2 PROPERTIES
+                     PASS_REGULAR_EXPRESSION
+                     "scatter node: the destination must give an assignable")
+set_tests_properties(ScatterGuardNegative.Case3 PROPERTIES
+                     PASS_REGULAR_EXPRESSION
+                     "scatter node: the index must be an index node's handle")
+set_tests_properties(ScatterGuardNegative.Case5 PROPERTIES
+                     PASS_REGULAR_EXPRESSION
+                     "may not read a slot ITS OWN LEVEL")
+set_tests_properties(ScatterGuardNegative.Case6 PROPERTIES
+                     PASS_REGULAR_EXPRESSION
+                     "scatter node: the value must be a value node")
+
 # Benchmarks (opt-in: -DTENSOR_OPS_BUILD_BENCHMARKS=ON). No gtest; own main().
 if(TENSOR_OPS_BUILD_BENCHMARKS)
   # --- 3D SEM stiffness on the LEVEL GRAPH (Sprint 5) -----------------------
@@ -490,11 +531,18 @@ if(TENSOR_OPS_CUTLASS_DIR AND Kokkos_ENABLE_CUDA)
                              PRIVATE SFPP_MIN_BENCH_TE_CUTE
                                      SFPP_MIN_BENCH_ROW_OF_E)
 
-  foreach(mode gview gslot)
+  foreach(mode gview gslot sview gslot_sslot)
+    set(gather_mode 0)
+    set(scatter_mode 0)
     if(mode STREQUAL "gview")
       set(gather_mode 1)
+    elseif(mode STREQUAL "gslot")
+      set(gather_mode 2)
+    elseif(mode STREQUAL "sview")
+      set(scatter_mode 1)
     else()
       set(gather_mode 2)
+      set(scatter_mode 2)
     endif()
     add_executable(sfpp_min_bench_te_cute_rowe_${mode} sfpp_min/bench_te.cpp)
     target_link_libraries(sfpp_min_bench_te_cute_rowe_${mode}
@@ -502,7 +550,8 @@ if(TENSOR_OPS_CUTLASS_DIR AND Kokkos_ENABLE_CUDA)
     target_compile_definitions(sfpp_min_bench_te_cute_rowe_${mode}
                                PRIVATE SFPP_MIN_BENCH_TE_CUTE
                                        SFPP_MIN_BENCH_ROW_OF_E
-                                       SFPP_MIN_GATHER_MODE=${gather_mode})
+                                       SFPP_MIN_GATHER_MODE=${gather_mode}
+                                       SFPP_MIN_SCATTER_MODE=${scatter_mode})
   endforeach()
 endif()
 

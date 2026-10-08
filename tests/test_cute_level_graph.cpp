@@ -1790,6 +1790,148 @@ TEST(CuteGather, RowOfEIndexGatherFeedsContractionsAndAnAlignedCombine) {
   expect_gathered_gradient_combine<2, RowOfETV<2>>();
 }
 
+namespace {
+
+struct Twice {
+  KOKKOS_FUNCTION float operator()(int, int, int, int, float v) const {
+    return 2.0f * v;
+  }
+};
+
+std::vector<double> scatter_reference(int E, const std::vector<double>& val) {
+  std::vector<double> r(kNG, 0.0);
+  int                 n = 0;
+  for (int e = 0; e < E; ++e)
+    for (int a = 0; a < 5; ++a)
+      for (int b = 0; b < 5; ++b)
+        for (int c = 0; c < 5; ++c) r[gid4(e, a, b, c)] += val[n++];
+  return r;
+}
+
+double max_rel(const VecG& got, const std::vector<double>& want) {
+  auto   h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, got);
+  double m = 0.0, scale = 0.0;
+  for (int g = 0; g < kNG; ++g) scale = std::max(scale, std::abs(want[g]));
+  for (int g = 0; g < kNG; ++g)
+    m = std::max(m, std::abs(h(g) - want[g]) / (1.0 + scale));
+  return m;
+}
+
+}  // namespace
+
+TEST(CuteScatter, ViewFormMatchesTeamAndReference) {
+  constexpr int E = 8;
+  IdxR          idx("idx", E, N, N, N);
+  ViewR         u("u", E, N, N, N);
+  fill_gid(idx);
+  fill(u, 1.0f);
+  VecG cd("cd", kNG), td("td", kNG);
+
+  auto g0      = make_level_graph<float, ES>(Map4<2>{});
+  auto [g1, s] = g0.add(
+      make_stage_node(make_input_node(make_handle<'e', 'a', 'b', 'c'>(u))));
+  auto [g2, r] = g1.add(make_combine_node<'e', 'a', 'b', 'c'>(s, Twice{}));
+  auto run     = [&](VecG dst, auto policy) {
+    auto g3 = g2.add(make_scatter_add_node<'e', 'a', 'b', 'c'>(idx, dst, r));
+    g3.outputs().execute(policy);
+    ASSERT_TRUE(synced());
+  };
+  run(cd, CutePolicyTag<>{});
+  run(td, TeamPolicyTag<ES>{});
+
+  auto hu = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, u);
+  std::vector<double> val;
+  for (int e = 0; e < E; ++e)
+    for (int a = 0; a < N; ++a)
+      for (int b = 0; b < N; ++b)
+        for (int c = 0; c < N; ++c) val.push_back(2.0 * hu(e, a, b, c));
+  const auto want = scatter_reference(E, val);
+  EXPECT_LT(max_rel(cd, want), 1e-6);
+  EXPECT_LT(max_rel(td, want), 1e-6);
+}
+
+namespace {
+
+template <int TE, typename NT>
+void expect_index_slot_scatter() {
+  using MX        = RowOfEMma<TE, ThrX, NT>;
+  using ME        = RowOfEMma<TE, ThrEta, NT>;
+  using MG        = RowOfEMma<TE, ThrGamma, NT>;
+  constexpr int E = 2 * TE;
+  OpView<5>     h("h", 5, 5);
+  IdxR          idx("idx", E, 5, 5, 5);
+  fill(h, 0.5f);
+  fill_gid(idx);
+  const VecG src = make_gsrc();
+  VecG       cd("cd", kNG), td("td", kNG);
+
+  auto build = [&](VecG dst) {
+    auto g0 = make_level_graph<float, ES>(MapET<TE>{});
+    auto [g1, ig] =
+        g0.add(make_index_node<'e', 'k', 'j', 'i'>(idx, RowOfETV<TE>{}));
+    auto [g2, sh] =
+        g1.add(make_stage_node(make_input_node(make_handle<'r', 'p'>(h))));
+    auto [g3, su] = g2.add(make_gather_node<'e', 'k', 'j', 'i'>(ig, src));
+    auto [g4, gx, ge, gg] =
+        g3.add(make_contraction_node<'e', 'k', 'j', 'i'>(
+                   sh.template as<'i', 'p'>(),
+                   su.template as<'e', 'k', 'j', 'p'>(), NoHook{}, MX{}),
+               make_contraction_node<'e', 'k', 'j', 'i'>(
+                   sh.template as<'j', 'p'>(),
+                   su.template as<'e', 'k', 'p', 'i'>(), NoHook{}, ME{}),
+               make_contraction_node<'e', 'k', 'j', 'i'>(
+                   sh.template as<'k', 'p'>(),
+                   su.template as<'e', 'p', 'j', 'i'>(), NoHook{}, MG{}));
+    auto [g5, pv] =
+        g4.add(make_combine_node<'e', 'k', 'j', 'i'>(gx, ge, gg, GradMix{}));
+    return g5.add(make_scatter_add_node<'e', 'k', 'j', 'i'>(ig, dst, pv));
+  };
+
+  using Levels     = LevelsOf<decltype(build(cd))>;
+  constexpr int N5 = Impl::lg_cute_num_threads_v<Levels>;
+  using Scatter    = Impl::lg_cute_combine_plan<Levels, 5, 0, N5>;
+  static_assert(!std::is_void_v<typename Scatter::template self_tv_t<>>,
+                "the scatter's thread map comes from the aligned gradients");
+
+  build(cd).outputs().execute(CutePolicyTag<>{});
+  ASSERT_TRUE(synced());
+  build(td).outputs().execute(TeamPolicyTag<ES>{});
+  ASSERT_TRUE(synced());
+
+  auto hh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, h);
+  auto uf = [](int e, int k, int j, int i) {
+    return static_cast<double>(gsrc(gid4(e, k, j, i)));
+  };
+  std::vector<double> val;
+  for (int e = 0; e < E; ++e)
+    for (int k = 0; k < 5; ++k)
+      for (int j = 0; j < 5; ++j)
+        for (int i = 0; i < 5; ++i) {
+          double x = 0, y = 0, z = 0;
+          for (int p = 0; p < 5; ++p) {
+            x += hh(i, p) * uf(e, k, j, p);
+            y += hh(j, p) * uf(e, k, p, i);
+            z += hh(k, p) * uf(e, p, j, i);
+          }
+          val.push_back(GradMix{}(e, k, j, i, static_cast<float>(x),
+                                  static_cast<float>(y),
+                                  static_cast<float>(z)));
+        }
+  const auto want = scatter_reference(E, val);
+  EXPECT_LT(max_rel(cd, want), 1e-5);
+  EXPECT_LT(max_rel(td, want), 1e-5);
+}
+
+}  // namespace
+
+TEST(CuteScatter, IndexSlotScatterFromRowOfEGradients) {
+  expect_index_slot_scatter<2, RowOfENTile<2>>();
+}
+
+TEST(CuteScatter, IndexSlotScatterRemapsAValueOrderSwappedDriver) {
+  expect_index_slot_scatter<4, RowOfENTileSwappedE<4>>();
+}
+
 int main(int argc, char* argv[]) {
   ::testing::InitGoogleTest(&argc, argv);
   Kokkos::initialize(argc, argv);

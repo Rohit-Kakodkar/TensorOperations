@@ -286,8 +286,20 @@ KOKKOS_FUNCTION auto lg_make_combine_member_impl(
                                          typename Node::ops_tuple_t>::modes_seq,
                 typename Node::modes_seq>(store, team)...)
             .at(origin);
-    return make_evaluator<TeamPolicyTag<ES>>(
-        levels.template get<L>().template get<M>(), ops, team);
+    const auto& node = levels.template get<L>().template get<M>();
+    if constexpr (is_scatter_slot_fn_v<typename Node::combine_type>) {
+      using Fn       = typename Node::combine_type;
+      const auto& sv = store.template get<Fn::idx_type::SlotIdx>();
+      return make_evaluator<TeamPolicyTag<ES>>(
+          rebind_combine_fn(
+              node, ScatterAddBoundFn<std::decay_t<decltype(sv)>,
+                                      static_cast<std::size_t>(Node::Rank),
+                                      typename Fn::dst_type>{sv, origin,
+                                                             node.fn.dst}),
+          ops, team);
+    } else {
+      return make_evaluator<TeamPolicyTag<ES>>(node, ops, team);
+    }
   } else {
     using OutNode = decltype(make_interm_node(store.template get<Base>()));
     Kokkos::Array<OutNode, static_cast<std::size_t>(Node::NumOut)> outs{

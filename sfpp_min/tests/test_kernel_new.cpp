@@ -7,11 +7,6 @@
 // and AoS storage, and -- the one that catches a transposed operator -- the
 // rigid-body null test. The new axes are the two the dummy does not have:
 //
-//   * KeepRedundantLoads. Both values must give the SAME field. The redundant
-//     loads feed no-ops (cosserat, damping, boundary) exactly as in the dummy,
-//     so toggling them is a performance choice, never a numeric one. Every
-//     oracle test runs both.
-//
 //   * the gather and the scatter. Correctness of both is implied by the oracle
 //     match -- a wrong iglob on either end moves the answer -- but the atomic
 //     accumulate is the reason acceleration is zeroed before each launch and
@@ -169,23 +164,26 @@ struct ErrorReport {
   }
 };
 
-template <bool Keep, int TE, GatherMode G, typename Args>
-void launch_gather(const Args& args, TeamPolicy policy) {
-  new_stiffness<Keep, TE, G>(args, policy);
+template <int TE, GatherMode G, ScatterMode Sc, typename Args>
+void launch_modes(const Args& args, TeamPolicy policy) {
+  new_stiffness<TE, G, Sc>(args, policy);
 }
 #if defined(TENSOR_OPS_ENABLE_CUTE)
-template <bool Keep, int TE, GatherMode G, typename Args>
-void launch_gather(const Args& args, CutePolicy policy) {
-  new_stiffness<Keep, TE, RowOfIMmas<TE>, G>(args, policy);
+template <int TE, GatherMode G, ScatterMode Sc, typename Args>
+void launch_modes(const Args& args, CutePolicy policy) {
+  using Mmas = std::conditional_t<Sc == ScatterMode::IndexSlot, RowOfEMmas<TE>,
+                                  RowOfIMmas<TE>>;
+  new_stiffness<TE, Mmas, G, Sc>(args, policy);
 }
 #endif
 
-template <typename Policy, bool KeepRedundantLoads = false, int TE = kTestTE,
-          GatherMode G = GatherMode::Functional, typename Off>
+template <typename Policy, int TE = kTestTE,
+          GatherMode  G  = GatherMode::Functional,
+          ScatterMode Sc = ScatterMode::Functional, typename Off>
 ErrorReport run_and_compare(Case<Off>& k) {
   const GllViews q    = make_gll_views();
   auto           args = make_args(k, q);
-  launch_gather<KeepRedundantLoads, TE, G>(args, Policy{});
+  launch_modes<TE, G, Sc>(args, Policy{});
   Kokkos::fence();
   k.f.to_host();
 
@@ -208,8 +206,8 @@ ErrorReport run_and_compare(Case<Off>& k) {
 // on the serial oracle exactly as the LayoutLeft run does. A transposed
 // subscript would still produce a plausible-looking field, which is why the
 // oracle rather than a self-comparison is the judge.
-template <typename Policy, bool KeepRedundantLoads = false,
-          GatherMode G = GatherMode::Functional, typename Off>
+template <typename Policy, GatherMode G = GatherMode::Functional,
+          ScatterMode Sc = ScatterMode::Functional, typename Off>
 ErrorReport run_and_compare_iglob_right(Case<Off>& k) {
   IglobMapRight gr(k.set.nspec());
   for (int ispec = 0; ispec < k.set.nspec(); ++ispec)
@@ -227,7 +225,7 @@ ErrorReport run_and_compare_iglob_right(Case<Off>& k) {
   DummyKernelArgs args{make_accessor(k.m), make_accessor(k.p), gr.map,
                        k.f.displacement,   k.f.velocity,       k.f.acceleration,
                        q.hprime,           q.weights,          k.set.nspec()};
-  launch_gather<KeepRedundantLoads, kTestTE, G>(args, Policy{});
+  launch_modes<kTestTE, G, Sc>(args, Policy{});
   Kokkos::fence();
   k.f.to_host();
 
@@ -245,7 +243,7 @@ ErrorReport run_and_compare_iglob_right(Case<Off>& k) {
   return e;
 }
 
-template <typename Policy, bool KeepRedundantLoads = false, typename Off>
+template <typename Policy, typename Off>
 ErrorReport run_and_compare_aos(Case<Off>& k) {
   MetricsAoS<Off>    m(k.set.nspec());
   PropertiesAoS<Off> p(k.set.nspec());
@@ -278,7 +276,7 @@ ErrorReport run_and_compare_aos(Case<Off>& k) {
   DummyKernelArgs args{make_accessor(m), make_accessor(p), k.g.map,
                        k.f.displacement, k.f.velocity,     k.f.acceleration,
                        q.hprime,         q.weights,        k.set.nspec()};
-  new_stiffness<KeepRedundantLoads, kTestTE>(args, Policy{});
+  new_stiffness<kTestTE>(args, Policy{});
   Kokkos::fence();
   k.f.to_host();
 
@@ -296,25 +294,17 @@ ErrorReport run_and_compare_aos(Case<Off>& k) {
   return e;
 }
 
-// Every oracle test runs both KeepRedundantLoads values through one body.
-template <typename Policy, bool Keep, typename Off>
-void expect_oracle(const char* name) {
+template <typename Policy, typename Off>
+void expect_layout_invariant(const char* name) {
   auto k = make_case<Off>();
   set_linear_field(k);
   set_velocity(k);
-  const ErrorReport e = run_and_compare<Policy, Keep>(k);
+  const ErrorReport e = run_and_compare<Policy>(k);
   std::printf(
-      "[ INFO     ] %s (keep=%d): max|diff| = %.3e, scale = %.3e, "
-      "relative = %.3e\n",
-      name, static_cast<int>(Keep), e.worst_abs, e.scale, e.relative());
+      "[ INFO     ] %s: max|diff| = %.3e, scale = %.3e, relative = %.3e\n",
+      name, e.worst_abs, e.scale, e.relative());
   EXPECT_GT(e.scale, 0.0) << name << ": oracle produced an all-zero field";
-  EXPECT_LT(e.relative(), 1e-4) << name << " keep=" << Keep;
-}
-
-template <typename Policy, typename Off>
-void expect_layout_invariant(const char* name) {
-  expect_oracle<Policy, false, Off>(name);
-  expect_oracle<Policy, true, Off>(name);
+  EXPECT_LT(e.relative(), 1e-4) << name;
 }
 
 template <typename Policy>
@@ -365,30 +355,15 @@ TYPED_TEST(SfppMinKernelNew, MatchesSerialOracleLayoutLeftDynamic) {
 
 template <typename Policy, typename Off>
 void expect_aos_invariant(const char* name) {
-  {
-    auto k = make_case<Off>();
-    set_linear_field(k);
-    set_velocity(k);
-    const ErrorReport e = run_and_compare_aos<Policy, false>(k);
-    std::printf(
-        "[ INFO     ] %s (keep=0): max|diff| = %.3e, scale = %.3e, "
-        "relative = %.3e\n",
-        name, e.worst_abs, e.scale, e.relative());
-    EXPECT_GT(e.scale, 0.0) << name << ": oracle produced an all-zero field";
-    EXPECT_LT(e.relative(), 1e-4) << name << " keep=0";
-  }
-  {
-    auto k = make_case<Off>();
-    set_linear_field(k);
-    set_velocity(k);
-    const ErrorReport e = run_and_compare_aos<Policy, true>(k);
-    std::printf(
-        "[ INFO     ] %s (keep=1): max|diff| = %.3e, scale = %.3e, "
-        "relative = %.3e\n",
-        name, e.worst_abs, e.scale, e.relative());
-    EXPECT_GT(e.scale, 0.0) << name << ": oracle produced an all-zero field";
-    EXPECT_LT(e.relative(), 1e-4) << name << " keep=1";
-  }
+  auto k = make_case<Off>();
+  set_linear_field(k);
+  set_velocity(k);
+  const ErrorReport e = run_and_compare_aos<Policy>(k);
+  std::printf(
+      "[ INFO     ] %s: max|diff| = %.3e, scale = %.3e, relative = %.3e\n",
+      name, e.worst_abs, e.scale, e.relative());
+  EXPECT_GT(e.scale, 0.0) << name << ": oracle produced an all-zero field";
+  EXPECT_LT(e.relative(), 1e-4) << name;
 }
 
 TYPED_TEST(SfppMinKernelNew, MatchesSerialOracleAoSStaticExtents) {
@@ -406,65 +381,70 @@ TYPED_TEST(SfppMinKernelNew, MatchesSerialOracleAoSDynamicExtents) {
 // graph builds itself -- puts the residual at the order of the output, ratio
 // near 1. This is the one test that catches either transpose.
 TYPED_TEST(SfppMinKernelNew, MatchesSerialOracleWithLayoutRightIglob) {
-  for (int keep = 0; keep < 2; ++keep) {
-    auto k = make_case<ChunkTiledDynamicOffset>();
-    set_linear_field(k);
-    set_velocity(k);
-    const ErrorReport e =
-        keep ? run_and_compare_iglob_right<TypeParam, true>(k)
-             : run_and_compare_iglob_right<TypeParam, false>(k);
-    std::printf(
-        "[ INFO     ] LayoutRight iglob (keep=%d): max|diff| = %.3e, "
-        "scale = %.3e, relative = %.3e\n",
-        keep, e.worst_abs, e.scale, e.relative());
-    EXPECT_GT(e.scale, 0.0) << "LayoutRight iglob: oracle produced zero field";
-    EXPECT_LT(e.relative(), 1e-4) << "LayoutRight iglob keep=" << keep;
-  }
+  auto k = make_case<ChunkTiledDynamicOffset>();
+  set_linear_field(k);
+  set_velocity(k);
+  const ErrorReport e = run_and_compare_iglob_right<TypeParam>(k);
+  std::printf(
+      "[ INFO     ] LayoutRight iglob: max|diff| = %.3e, scale = %.3e, "
+      "relative = %.3e\n",
+      e.worst_abs, e.scale, e.relative());
+  EXPECT_GT(e.scale, 0.0) << "LayoutRight iglob: oracle produced zero field";
+  EXPECT_LT(e.relative(), 1e-4) << "LayoutRight iglob";
 }
 
-template <typename Policy, GatherMode G>
-void expect_gather_mode_oracle(const char* name) {
-  for (int keep = 0; keep < 2; ++keep)
-    for (int right = 0; right < 2; ++right) {
-      auto k = make_case<ChunkTiledDynamicOffset>(/*ix_fastest=*/true);
-      set_linear_field(k);
-      set_velocity(k);
-      const ErrorReport e =
-          right ? (keep ? run_and_compare_iglob_right<Policy, true, G>(k)
-                        : run_and_compare_iglob_right<Policy, false, G>(k))
-                : (keep ? run_and_compare<Policy, true, kTestTE, G>(k)
-                        : run_and_compare<Policy, false, kTestTE, G>(k));
-      std::printf("[ INFO     ] %s (keep=%d, iglob %s): relative = %.3e\n",
-                  name, keep, right ? "LayoutRight" : "LayoutLeft",
-                  e.relative());
-      EXPECT_GT(e.scale, 0.0) << name << ": oracle produced a zero field";
-      EXPECT_LT(e.relative(), 1e-4)
-          << name << " keep=" << keep << " right=" << right;
-    }
-}
-
-TYPED_TEST(SfppMinKernelNew, GatherFromTheIglobViewMatchesTheOracle) {
-  expect_gather_mode_oracle<TypeParam, GatherMode::IndexView>("iglob view");
-}
-
-TYPED_TEST(SfppMinKernelNew, GatherFromTheIndexSlotMatchesTheOracle) {
-  expect_gather_mode_oracle<TypeParam, GatherMode::IndexSlot>("index slot");
-}
-
-TYPED_TEST(SfppMinKernelNew, MatchesSerialOracleWithIxFastestNumbering) {
-  for (int keep = 0; keep < 2; ++keep) {
+template <typename Policy, GatherMode G, ScatterMode Sc>
+void expect_mode_oracle(const char* name) {
+  for (int right = 0; right < 2; ++right) {
     auto k = make_case<ChunkTiledDynamicOffset>(/*ix_fastest=*/true);
     set_linear_field(k);
     set_velocity(k);
-    const ErrorReport e = keep ? run_and_compare<TypeParam, true>(k)
-                               : run_and_compare<TypeParam, false>(k);
-    std::printf(
-        "[ INFO     ] ix-fastest numbering (keep=%d): max|diff| = %.3e, "
-        "scale = %.3e, relative = %.3e\n",
-        keep, e.worst_abs, e.scale, e.relative());
-    EXPECT_GT(e.scale, 0.0) << "ix-fastest: oracle produced an all-zero field";
-    EXPECT_LT(e.relative(), 1e-4) << "ix-fastest numbering keep=" << keep;
+    const ErrorReport e = right ? run_and_compare_iglob_right<Policy, G, Sc>(k)
+                                : run_and_compare<Policy, kTestTE, G, Sc>(k);
+    std::printf("[ INFO     ] %s (iglob %s): relative = %.3e\n", name,
+                right ? "LayoutRight" : "LayoutLeft", e.relative());
+    EXPECT_GT(e.scale, 0.0) << name << ": oracle produced a zero field";
+    EXPECT_LT(e.relative(), 1e-4) << name << " right=" << right;
   }
+}
+
+TYPED_TEST(SfppMinKernelNew, GatherFromTheIglobViewMatchesTheOracle) {
+  expect_mode_oracle<TypeParam, GatherMode::IndexView, ScatterMode::Functional>(
+      "gather iglob view");
+}
+
+TYPED_TEST(SfppMinKernelNew, GatherFromTheIndexSlotMatchesTheOracle) {
+  expect_mode_oracle<TypeParam, GatherMode::IndexSlot, ScatterMode::Functional>(
+      "gather index slot");
+}
+
+TYPED_TEST(SfppMinKernelNew, ScatterToTheIglobViewMatchesTheOracle) {
+  expect_mode_oracle<TypeParam, GatherMode::Functional, ScatterMode::IndexView>(
+      "scatter iglob view");
+  expect_mode_oracle<TypeParam, GatherMode::IndexSlot, ScatterMode::IndexView>(
+      "gather index slot + scatter iglob view");
+}
+
+#if defined(TENSOR_OPS_ENABLE_CUTE)
+TYPED_TEST(SfppMinKernelNew, ScatterFromTheIndexSlotMatchesTheOracle) {
+  expect_mode_oracle<TypeParam, GatherMode::Functional, ScatterMode::IndexSlot>(
+      "scatter index slot");
+  expect_mode_oracle<TypeParam, GatherMode::IndexSlot, ScatterMode::IndexSlot>(
+      "gather + scatter index slot");
+}
+#endif
+
+TYPED_TEST(SfppMinKernelNew, MatchesSerialOracleWithIxFastestNumbering) {
+  auto k = make_case<ChunkTiledDynamicOffset>(/*ix_fastest=*/true);
+  set_linear_field(k);
+  set_velocity(k);
+  const ErrorReport e = run_and_compare<TypeParam>(k);
+  std::printf(
+      "[ INFO     ] ix-fastest numbering: max|diff| = %.3e, scale = %.3e, "
+      "relative = %.3e\n",
+      e.worst_abs, e.scale, e.relative());
+  EXPECT_GT(e.scale, 0.0) << "ix-fastest: oracle produced an all-zero field";
+  EXPECT_LT(e.relative(), 1e-4) << "ix-fastest numbering";
 }
 
 // The two axes together: the graph's numbering AND a LayoutRight index map.
@@ -472,7 +452,7 @@ TYPED_TEST(SfppMinKernelNew, MatchesSerialOracleIxFastestWithLayoutRightIglob) {
   auto k = make_case<ChunkTiledDynamicOffset>(/*ix_fastest=*/true);
   set_linear_field(k);
   set_velocity(k);
-  const ErrorReport e = run_and_compare_iglob_right<TypeParam, false>(k);
+  const ErrorReport e = run_and_compare_iglob_right<TypeParam>(k);
   std::printf(
       "[ INFO     ] ix-fastest + LayoutRight iglob: max|diff| = %.3e, "
       "scale = %.3e, relative = %.3e\n",
@@ -491,7 +471,7 @@ void expect_te_invariant() {
   auto k = make_case<ChunkTiledDynamicOffset>(/*ix_fastest=*/true);
   set_linear_field(k);
   set_velocity(k);
-  const ErrorReport e = run_and_compare<Policy, false, TE>(k);
+  const ErrorReport e = run_and_compare<Policy, TE>(k);
   std::printf(
       "[ INFO     ] TE=%d: max|diff| = %.3e, scale = %.3e, relative = %.3e\n",
       TE, e.worst_abs, e.scale, e.relative());
@@ -516,7 +496,7 @@ TYPED_TEST(SfppMinKernelNew, RigidBodyTranslationIsAtTheFloatRoundoffFloor) {
 
   const GllViews q    = make_gll_views();
   auto           args = make_args(k, q);
-  new_stiffness<false, kTestTE>(args, TypeParam{});
+  new_stiffness<kTestTE>(args, TypeParam{});
   Kokkos::fence();
   k.f.to_host();
 
@@ -546,54 +526,6 @@ TYPED_TEST(SfppMinKernelNew, RigidBodyTranslationIsAtTheFloatRoundoffFloor) {
   EXPECT_LT(ratio, NGLL == 5 ? 1e-5 : 1e-4);
 }
 
-// The two variants are a performance choice, never a physics one: the redundant
-// loads feed only no-ops, so they must not move the field. They agree to
-// floating-point ROUNDOFF, not bit-for-bit -- the scatter is atomic_add and
-// float addition is non-associative, so the two schedules accumulate shared
-// nodes in a different order (bitwise-identical only on a deterministic host
-// backend). A real leak of the redundant path into `accel` would be O(scale),
-// relative O(1); the atomic-reorder floor is ~1e-6, so a 1e-4 bound separates
-// them cleanly -- the same bound and the same discriminating power as bitwise,
-// without a false failure on the GPU's nondeterministic reduction order.
-TYPED_TEST(SfppMinKernelNew, RedundantLoadsDoNotChangeTheField) {
-  auto k0 = make_case<ChunkTiledDynamicOffset>();
-  set_linear_field(k0);
-  set_velocity(k0);
-  const GllViews q0    = make_gll_views();
-  auto           args0 = make_args(k0, q0);
-  new_stiffness<false, kTestTE>(args0, TypeParam{});
-  Kokkos::fence();
-  k0.f.to_host();
-
-  auto k1 = make_case<ChunkTiledDynamicOffset>();
-  set_linear_field(k1);
-  set_velocity(k1);
-  const GllViews q1    = make_gll_views();
-  auto           args1 = make_args(k1, q1);
-  new_stiffness<true, kTestTE>(args1, TypeParam{});
-  Kokkos::fence();
-  k1.f.to_host();
-
-  double worst = 0.0;
-  double scale = 0.0;
-  for (int ig = 0; ig < k0.nglob; ++ig)
-    for (int c = 0; c < 3; ++c) {
-      const double once      = k0.f.h_acceleration(ig, c);
-      const double redundant = k1.f.h_acceleration(ig, c);
-      scale                  = std::max(scale, std::abs(once));
-      worst                  = std::max(worst, std::abs(once - redundant));
-    }
-  const double relative = scale > 0.0 ? worst / scale : worst;
-  std::printf(
-      "[ INFO     ] redundant vs once: max|diff| = %.3e, scale = %.3e, "
-      "relative = %.3e\n",
-      worst, scale, relative);
-  EXPECT_GT(scale, 0.0) << "void test: load-once produced an all-zero field";
-  EXPECT_LT(relative, 1e-4)
-      << "the redundant loads feed no-ops; they must not move the field beyond "
-         "the atomic-reorder roundoff floor";
-}
-
 #if defined(TENSOR_OPS_ENABLE_CUTE)
 // The two backends run the same graph, so they must agree far tighter than
 // either agrees with the double-precision oracle. Only the atomic scatter's
@@ -603,7 +535,7 @@ TEST(SfppMinKernelNewCute, MatchesTheTeamBackend) {
   set_linear_field(kt);
   set_velocity(kt);
   const GllViews qt = make_gll_views();
-  new_stiffness<false, kTestTE>(make_args(kt, qt), TeamPolicy{});
+  new_stiffness<kTestTE>(make_args(kt, qt), TeamPolicy{});
   Kokkos::fence();
   kt.f.to_host();
 
@@ -611,7 +543,7 @@ TEST(SfppMinKernelNewCute, MatchesTheTeamBackend) {
   set_linear_field(kc);
   set_velocity(kc);
   const GllViews qc = make_gll_views();
-  new_stiffness<false, kTestTE>(make_args(kc, qc), CutePolicy{});
+  new_stiffness<kTestTE>(make_args(kc, qc), CutePolicy{});
   Kokkos::fence();
   kc.f.to_host();
 
@@ -634,14 +566,15 @@ TEST(SfppMinKernelNewCute, MatchesTheTeamBackend) {
 // Each TE is a different RowOfI thread map (NGLL*NGLL*TE threads, element
 // slowest), so every contraction and register-driven combine partitions
 // differently. The field must not move.
-template <int        TE, typename Off, typename Mmas = RowOfIMmas<TE>,
-          GatherMode G = GatherMode::Functional>
+template <int         TE, typename Off, typename Mmas = RowOfIMmas<TE>,
+          GatherMode  G  = GatherMode::Functional,
+          ScatterMode Sc = ScatterMode::Functional>
 void expect_cute_oracle(const char* name) {
   auto k = make_case<Off>(/*ix_fastest=*/true);
   set_linear_field(k);
   set_velocity(k);
   const GllViews q = make_gll_views();
-  new_stiffness<false, TE, Mmas, G>(make_args(k, q), CutePolicy{});
+  new_stiffness<TE, Mmas, G, Sc>(make_args(k, q), CutePolicy{});
   Kokkos::fence();
   k.f.to_host();
 
@@ -697,6 +630,21 @@ TEST(SfppMinKernelNewCute, RowOfEGatherModesMatchTheOracle) {
                      GatherMode::IndexSlot>("row-of-e index slot LL");
 }
 
+TEST(SfppMinKernelNewCute, RowOfEScatterFromTheIndexSlotMatchesTheOracle) {
+  expect_cute_oracle<1, LayoutRightDynamicOffset, RowOfEMmas<1>,
+                     GatherMode::Functional, ScatterMode::IndexSlot>(
+      "row-of-e scatter index slot");
+  expect_cute_oracle<4, LayoutRightDynamicOffset, RowOfEMmas<4>,
+                     GatherMode::IndexSlot, ScatterMode::IndexSlot>(
+      "row-of-e gather + scatter index slot");
+  expect_cute_oracle<4, LayoutLeftDynamicOffset, RowOfEMmas<4>,
+                     GatherMode::IndexSlot, ScatterMode::IndexSlot>(
+      "row-of-e gather + scatter index slot LL");
+  expect_cute_oracle<2, LayoutRightDynamicOffset, RowOfEMmas<2>,
+                     GatherMode::IndexSlot, ScatterMode::IndexSlot>(
+      "row-of-e gather + scatter index slot TE2");
+}
+
 template <typename Plan, std::size_t... Ks>
 constexpr bool all_in_register(std::index_sequence<Ks...>) {
   return (Plan::template in_register<Ks>() && ...);
@@ -707,8 +655,7 @@ TEST(SfppMinKernelNewCute, RowOfECombinesReadEveryContractionInRegisters) {
   const GllViews q    = make_gll_views();
   const auto     args = make_args(k, q);
   const auto     hw   = make_hprimewgll(args.hprime, args.weights);
-  using G =
-      decltype(build_new_graph<false, kTestTE, RowOfEMmas<kTestTE>>(args, hw));
+  using G = decltype(build_new_graph<kTestTE, RowOfEMmas<kTestTE>>(args, hw));
   using Levels    = typename G::levels_type;
   constexpr int N = TensorOperations::Impl::lg_cute_num_threads_v<Levels>;
   using Integrand =
@@ -719,10 +666,9 @@ TEST(SfppMinKernelNewCute, RowOfECombinesReadEveryContractionInRegisters) {
                 all_in_register<Integrand>(std::make_index_sequence<9>{}));
   static_assert(ToAccel::aligned_driven &&
                 all_in_register<ToAccel>(std::make_index_sequence<9>{}));
-  const NewFootprint row_e = new_footprint<false, kTestTE, RowOfEMmas<kTestTE>>(
-      args, CutePolicy{}, hw);
-  const NewFootprint row_i =
-      new_footprint<false, kTestTE>(args, CutePolicy{}, hw);
+  const NewFootprint row_e =
+      new_footprint<kTestTE, RowOfEMmas<kTestTE>>(args, CutePolicy{}, hw);
+  const NewFootprint row_i = new_footprint<kTestTE>(args, CutePolicy{}, hw);
   std::printf("[ INFO     ] smem pooled: row-of-e %zu B, row-of-i %zu B\n",
               row_e.pooled, row_i.pooled);
   EXPECT_LT(row_e.pooled, row_i.pooled);
@@ -736,7 +682,7 @@ TEST(SfppMinKernelNewCute, FootprintIsPooledAndFitsTheDefaultSharedMemory) {
   const GllViews     q    = make_gll_views();
   const auto         args = make_args(k, q);
   const auto         hw   = make_hprimewgll(args.hprime, args.weights);
-  const NewFootprint fp = new_footprint<false, kTestTE>(args, CutePolicy{}, hw);
+  const NewFootprint fp   = new_footprint<kTestTE>(args, CutePolicy{}, hw);
   std::printf(
       "[ INFO     ] cute TE=%d: pooled %zu B, unpooled %zu B, block %d\n",
       kTestTE, fp.pooled, fp.unpooled, fp.threads);
