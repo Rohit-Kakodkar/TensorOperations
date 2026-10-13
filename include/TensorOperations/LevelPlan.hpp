@@ -152,6 +152,12 @@ template <typename LevelsT, std::size_t S>
 inline constexpr std::size_t lg_slot_level_v = lg_slot_level<LevelsT>(S);
 template <typename LevelsT, std::size_t S>
 inline constexpr std::size_t lg_slot_member_v = lg_slot_member<LevelsT>(S);
+template <typename Member, typename Tag = typename Member::node_tag>
+inline constexpr bool lg_is_register_member_v = false;
+template <typename Member>
+inline constexpr bool lg_is_register_member_v<Member, StagedTag> =
+    Member::is_register;
+
 template <typename LevelsT, std::size_t L>
 inline constexpr std::size_t lg_level_slots_v =
     lg_level_slots<tuple_element_t<L, LevelsT>>();
@@ -206,6 +212,14 @@ constexpr void lg_note_all_reads(std::array<std::size_t, NS>& last,
    ...);
 }
 
+template <typename LevelsT, std::size_t... Ss>
+constexpr std::array<bool, sizeof...(Ss)> lg_register_slots(
+    std::index_sequence<Ss...>) {
+  return {lg_is_register_member_v<tuple_element_t<
+      lg_slot_member_v<LevelsT, Ss>,
+      tuple_element_t<lg_slot_level_v<LevelsT, Ss>, LevelsT>>>...};
+}
+
 template <typename LevelsT, std::size_t... Roots>
 constexpr auto lg_pool_of_slot() {
   constexpr std::size_t NS = lg_num_slots<LevelsT>();
@@ -224,6 +238,16 @@ constexpr auto lg_pool_of_slot() {
   // A designated output is read by lg_store_roots AFTER every level has run.
   const std::array<std::size_t, sizeof...(Roots)> roots{Roots...};
   for (std::size_t i = 0; i < sizeof...(Roots); ++i) last[roots[i]] = NL;
+
+  // A register slot is never written or read on team (its combines call the
+  // source instead) and is one element. Its read interval would still claim a
+  // pool across every level it spans and push the real slots apart (+53%
+  // scratch on sfpp's metric bundle), so give it a private instant after the
+  // last level, as the CuTe planner does for a slot it never stores: it joins
+  // an existing pool without overlapping anything.
+  const auto reg = lg_register_slots<LevelsT>(std::make_index_sequence<NS>{});
+  for (std::size_t s = 0; s < NS; ++s)
+    if (reg[s]) def[s] = last[s] = NL + 1 + s;
 
   return left_edge_colour<NS>(def, last);
 }
