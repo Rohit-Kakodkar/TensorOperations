@@ -532,6 +532,10 @@ target_compile_options(sfpp_min_bench_new_li PRIVATE -lineinfo)
 add_executable(sfpp_min_bench_te sfpp_min/bench_te.cpp)
 target_link_libraries(sfpp_min_bench_te PRIVATE sfpp_min tensor)
 
+add_executable(sfpp_min_bench_te_bundle sfpp_min/bench_te.cpp)
+target_link_libraries(sfpp_min_bench_te_bundle PRIVATE sfpp_min tensor)
+target_compile_definitions(sfpp_min_bench_te_bundle PRIVATE SFPP_MIN_METRICS_MODE=2)
+
 add_executable(sfpp_min_bench_te_li sfpp_min/bench_te.cpp)
 target_link_libraries(sfpp_min_bench_te_li PRIVATE sfpp_min tensor)
 target_compile_options(sfpp_min_bench_te_li PRIVATE -lineinfo)
