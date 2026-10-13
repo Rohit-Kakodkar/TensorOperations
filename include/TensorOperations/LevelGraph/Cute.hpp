@@ -570,6 +570,22 @@ template <typename LevelsT, int N, std::size_t S>
 inline constexpr std::size_t lg_cute_slot_pool_v =
     lg_cute_pool_of_slot<LevelsT, N>()[S];
 
+// A CuTe slot's span in the arena, rounded to 16 bytes. cute::copy on a static
+// layout ASSUMES 128-bit aligned pointers (cute/algorithm/copy.hpp) and will
+// emit LDS.128 / STS.128 for any 4-element contiguous run, so every slot base
+// must really be 16-byte aligned -- Kokkos' scratch ALIGN (8) is not enough.
+inline constexpr std::size_t lg_cute_slot_align = 16;
+
+template <typename V>
+constexpr std::size_t lg_cute_slot_step(std::size_t elems) {
+  static_assert(lg_cute_slot_align % sizeof(V) == 0,
+                "level graph (CuTe): the slot alignment must be a whole number "
+                "of elements");
+  const std::size_t b = elems * sizeof(V);
+  return (b + lg_cute_slot_align - 1) / lg_cute_slot_align *
+         lg_cute_slot_align / sizeof(V);
+}
+
 template <typename V, typename ES, typename LevelsT, int N, std::size_t... Ss>
 constexpr std::array<std::size_t, sizeof...(Ss)> lg_cute_smem_steps(
     std::index_sequence<Ss...>) {
@@ -578,10 +594,10 @@ constexpr std::array<std::size_t, sizeof...(Ss)> lg_cute_smem_steps(
         std::is_same_v<lg_slot_elem_t<LevelsT, Ss, V>, V>) &&
        ...),
       "level graph (CuTe): an index slot never lives in shared memory");
-  return {(lg_cute_smem_slot_v<LevelsT, N, Ss>
-               ? slot_arena_step<V, ES>(
-                     slot_tile_elems<lg_slot_tile_t<LevelsT, Ss>>())
-               : std::size_t{0})...};
+  return {(
+      lg_cute_smem_slot_v<LevelsT, N, Ss>
+          ? lg_cute_slot_step<V>(slot_tile_elems<lg_slot_tile_t<LevelsT, Ss>>())
+          : std::size_t{0})...};
 }
 
 template <typename V, typename ES, typename LevelsT, int N>
@@ -660,6 +676,11 @@ template <typename V, typename ES, int NumThreads, typename LevelsT,
           std::size_t S>
 __device__ auto lg_cute_slot_smem(V* base) {
   using P = lg_cute_slot_producer<LevelsT, S, NumThreads>;
+  static_assert(lg_cute_smem_offset_v<V, ES, LevelsT, NumThreads, S> *
+                        sizeof(V) % lg_cute_slot_align ==
+                    0,
+                "level graph (CuTe): a slot base must be 16-byte aligned; "
+                "cute::copy assumes it");
   return cute::make_tensor(
       cute::make_smem_ptr(base +
                           lg_cute_smem_offset_v<V, ES, LevelsT, NumThreads, S>),
