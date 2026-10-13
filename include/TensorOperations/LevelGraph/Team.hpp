@@ -81,28 +81,63 @@ struct lg_resolve_member<LT, Member, StagedTag> {
 template <typename LT, typename Member>
 using lg_resolve_member_t = typename lg_resolve_member<LT, Member>::type;
 
-template <typename Member, typename Tag = typename Member::node_tag>
-inline constexpr bool lg_is_register_member_v = false;
-template <typename Member>
-inline constexpr bool lg_is_register_member_v<Member, StagedTag> =
-    Member::is_register;
+// A REGISTER slot on team: the output of a register node. Team levels are
+// separate team loops with no fixed thread-to-coordinate map, so nothing can
+// be carried in registers between them. Instead the slot is never written;
+// every combine that reads it calls the node's source at the combine's own
+// global coordinate (RegisterBoundFn below), and the slot keeps a one-element
+// tile only so slot numbering stays shared with the CuTe planner.
+template <typename LevelsT, std::size_t S>
+inline constexpr bool lg_slot_is_register_v =
+    lg_is_register_member_v<typename lg_slot_member_node<LevelsT, S>::type>;
 
-template <typename LevelT, std::size_t... Ms>
-constexpr bool lg_level_has_register(std::index_sequence<Ms...>) {
-  return (lg_is_register_member_v<tuple_element_t<Ms, LevelT>> || ...);
+template <typename Tile>
+struct lg_unit_tile {
+  static_assert(sizeof(Tile) == 0,
+                "register node: its slot tile must be a StaticTile");
+};
+template <int... E>
+struct lg_unit_tile<StaticTile<E...>> {
+  using type = StaticTile<(E * 0 + 1)...>;
+};
+
+template <typename LevelsT, std::size_t S,
+          bool = lg_slot_is_register_v<LevelsT, S>>
+struct lg_team_slot_tile {
+  using type = lg_slot_tile_t<LevelsT, S>;
+};
+template <typename LevelsT, std::size_t S>
+struct lg_team_slot_tile<LevelsT, S, true> {
+  using type = typename lg_unit_tile<lg_slot_tile_t<LevelsT, S>>::type;
+};
+template <typename LevelsT, std::size_t S>
+using lg_team_slot_tile_t = typename lg_team_slot_tile<LevelsT, S>::type;
+
+// The members of stage level L that are actually copied: every one but the
+// register nodes, as an index_sequence (empty when the whole level is them).
+template <typename LevelsT, std::size_t L, std::size_t... Ms>
+constexpr std::size_t lg_num_copied(std::index_sequence<Ms...>) {
+  using LevelT = tuple_element_t<L, LevelsT>;
+  return ((lg_is_register_member_v<tuple_element_t<Ms, LevelT>> ? 0 : 1) + ... +
+          0);
 }
-
-template <typename LevelsT, std::size_t... Ls>
-constexpr bool lg_has_register(std::index_sequence<Ls...>) {
-  return (lg_level_has_register<tuple_element_t<Ls, LevelsT>>(
-              std::make_index_sequence<
-                  tuple_size_v<tuple_element_t<Ls, LevelsT>>>{}) ||
-          ...);
+template <typename LevelsT, std::size_t L, std::size_t N, std::size_t... Ms>
+constexpr std::array<std::size_t, N> lg_copied_array(
+    std::index_sequence<Ms...>) {
+  using LevelT = tuple_element_t<L, LevelsT>;
+  std::array<std::size_t, N> out{};
+  std::size_t                n = 0;
+  ((lg_is_register_member_v<tuple_element_t<Ms, LevelT>> ? void()
+                                                         : void(out[n++] = Ms)),
+   ...);
+  return out;
 }
-
-template <typename LevelsT>
-inline constexpr bool lg_has_register_v =
-    lg_has_register<LevelsT>(std::make_index_sequence<tuple_size_v<LevelsT>>{});
+template <typename LevelsT, std::size_t L>
+using lg_copied_members_t = array_to_seq_t<lg_copied_array<
+    LevelsT, L,
+    lg_num_copied<LevelsT, L>(
+        std::make_index_sequence<tuple_size_v<tuple_element_t<L, LevelsT>>>{})>(
+    std::make_index_sequence<tuple_size_v<tuple_element_t<L, LevelsT>>>{})>;
 
 template <typename Node, typename OpModes,
           typename Tag = typename Node::node_tag>
@@ -194,20 +229,16 @@ KOKKOS_FUNCTION auto lg_carve(const Team& team, std::index_sequence<Ls...>) {
   return carve_pooled_arena_slot_store<
       V, ES, lg_pools_t<LevelsT, RootsSeq>,
       SlotElems<lg_slot_elem_t<LevelsT, Ls, V>...>>(
-      team, lg_slot_tile_t<LevelsT, Ls>{}...);
+      team, lg_team_slot_tile_t<LevelsT, Ls>{}...);
 }
 
 template <typename V, typename ES, typename LevelsT, typename RootsSeq,
           std::size_t... Ls>
 std::size_t lg_scratch_bytes(std::index_sequence<Ls...>) {
-  static_assert(!lg_has_register_v<LevelsT>,
-                "register node: it runs only on the CuTe backend, which keeps "
-                "its values in registers across levels; use make_stage_node "
-                "for a team graph");
   return pooled_arena_slot_store_bytes<
       V, ES, lg_pools_t<LevelsT, RootsSeq>,
       SlotElems<lg_slot_elem_t<LevelsT, Ls, V>...>>(
-      lg_slot_tile_t<LevelsT, Ls>{}...);
+      lg_team_slot_tile_t<LevelsT, Ls>{}...);
 }
 
 // The same store WITHOUT pooling: one buffer per slot. Not what the launch
@@ -218,7 +249,7 @@ template <typename V, typename ES, typename LevelsT, std::size_t... Ls>
 std::size_t lg_unpooled_scratch_bytes(std::index_sequence<Ls...>) {
   return pooled_arena_slot_store_bytes<
       V, ES, SlotPools<Ls...>, SlotElems<lg_slot_elem_t<LevelsT, Ls, V>...>>(
-      lg_slot_tile_t<LevelsT, Ls>{}...);
+      lg_team_slot_tile_t<LevelsT, Ls>{}...);
 }
 
 template <typename V, typename ES, typename LevelsT, std::size_t L,
@@ -231,6 +262,11 @@ KOKKOS_FUNCTION auto lg_make_contraction_member(const LevelsT& levels,
   constexpr std::size_t SlotA = Node::node_a_type::SlotIdx;
   constexpr std::size_t SlotB = Node::node_b_type::SlotIdx;
   constexpr std::size_t SlotC = lg_member_base_v<LevelsT, L, M>;
+  static_assert(!lg_slot_is_register_v<LevelsT, SlotA> &&
+                    !lg_slot_is_register_v<LevelsT, SlotB>,
+                "register node: on the team backend only a combine may read it "
+                "(its values are recomputed at the combine's coordinate); a "
+                "contraction needs the tile in memory, so use make_stage_node");
 
   using AModes = typename Node::node_a_type::modes_seq;
   using BModes = typename Node::node_b_type::modes_seq;
@@ -284,13 +320,214 @@ KOKKOS_FUNCTION void lg_run_contraction_level(const LevelsT& levels,
   team.team_barrier();
 }
 
+// Where each operand K of a combine comes from: a slot in memory, or output
+// out[K] of a register node. Operands of one register node share a reader
+// (pos[K]), so a multi-output source is evaluated once per point, not once per
+// output -- calling it per output is what made in-place reads 215x slower.
+template <std::size_t N>
+struct lg_reg_layout {
+  std::array<std::size_t, N> pos{};        // slot position, or reader index
+  std::array<std::size_t, N> slot_ks{};    // operands still read from memory
+  std::array<std::size_t, N> reader_ks{};  // first operand of each reader
+  std::size_t                num_slot    = 0;
+  std::size_t                num_readers = 0;
+};
+
+template <std::size_t M, std::size_t N>
+constexpr std::array<std::size_t, M> lg_prefix(
+    const std::array<std::size_t, N>& a) {
+  std::array<std::size_t, M> out{};
+  for (std::size_t i = 0; i < M; ++i) out[i] = a[i];
+  return out;
+}
+
+template <typename LevelsT, typename Node, typename KsSeq>
+struct lg_combine_reg_map;
+template <typename LevelsT, typename Node, std::size_t... Ks>
+struct lg_combine_reg_map<LevelsT, Node, std::index_sequence<Ks...>> {
+  using OpsT                     = typename Node::ops_tuple_t;
+  static constexpr std::size_t N = sizeof...(Ks);
+  template <std::size_t K>
+  static constexpr std::size_t slot_of = tuple_element_t<K, OpsT>::SlotIdx;
+
+  static constexpr std::array<bool, N> reg{
+      lg_slot_is_register_v<LevelsT, slot_of<Ks>>...};
+  static constexpr std::array<std::size_t, N> lvl{
+      lg_slot_level_v<LevelsT, slot_of<Ks>>...};
+  static constexpr std::array<std::size_t, N> mem{
+      lg_slot_member_v<LevelsT, slot_of<Ks>>...};
+  static constexpr std::array<std::size_t, N> out{
+      (slot_of<Ks> - lg_member_base_v<LevelsT, lvl[Ks], mem[Ks]>)...};
+
+  static constexpr lg_reg_layout<N> layout() {
+    lg_reg_layout<N> r{};
+    for (std::size_t k = 0; k < N; ++k) {
+      if (!reg[k]) {
+        r.pos[k]                = r.num_slot;
+        r.slot_ks[r.num_slot++] = k;
+        continue;
+      }
+      std::size_t j = 0;
+      while (j < k && !(reg[j] && lvl[j] == lvl[k] && mem[j] == mem[k])) ++j;
+      if (j < k) {
+        r.pos[k] = r.pos[j];
+      } else {
+        r.pos[k]                     = r.num_readers;
+        r.reader_ks[r.num_readers++] = k;
+      }
+    }
+    return r;
+  }
+  static constexpr lg_reg_layout<N>           lay         = layout();
+  static constexpr std::size_t                num_slot    = lay.num_slot;
+  static constexpr std::size_t                num_readers = lay.num_readers;
+  static constexpr std::array<std::size_t, N> pos         = lay.pos;
+  using slot_seq   = array_to_seq_t<lg_prefix<num_slot>(lay.slot_ks)>;
+  using reader_seq = array_to_seq_t<lg_prefix<num_readers>(lay.reader_ks)>;
+
+  // A reader permutes the combine's coordinate with ONE operand's labels, so
+  // every operand it serves must use those labels.
+  static constexpr bool modes_agree =
+      ((!reg[Ks] ||
+        std::is_same_v<typename tuple_element_t<Ks, OpsT>::modes_seq,
+                       typename tuple_element_t<lay.reader_ks[lay.pos[Ks]],
+                                                OpsT>::modes_seq>) &&
+       ...);
+};
+
+// A register node's source, read at a global coordinate given in the
+// combine's label order: P[d] is the combine axis carrying source axis d.
+template <typename Src, typename Perm>
+struct LgPointReader;
+template <typename Src, int... P>
+struct LgPointReader<Src, std::integer_sequence<int, P...>> {
+  Src src;
+  template <std::size_t R>
+  KOKKOS_FORCEINLINE_FUNCTION auto operator()(
+      const Kokkos::Array<int, R>& g) const {
+    return src(g[P]...);
+  }
+};
+
+// The register node behind combine operand K, as a point reader: a functional
+// input's functor, or an input's view. These are exactly what the stage copy
+// would have read at that coordinate -- team tiles never overhang the tensor
+// (subview_tile asserts it), so there is no boundary to reproduce.
+template <typename LevelsT, typename Node, std::size_t K>
+KOKKOS_FUNCTION auto lg_make_point_reader(const LevelsT& levels) {
+  using Op                 = tuple_element_t<K, typename Node::ops_tuple_t>;
+  constexpr std::size_t S  = Op::SlotIdx;
+  constexpr std::size_t RL = lg_slot_level_v<LevelsT, S>;
+  constexpr std::size_t RM = lg_slot_member_v<LevelsT, S>;
+  using Operand =
+      typename tuple_element_t<RM, tuple_element_t<RL, LevelsT>>::operand_type;
+  using Perm =
+      label_perm_seq_t<typename Op::modes_seq, typename Node::modes_seq>;
+  const auto& op = levels.template get<RL>().template get<RM>().operand_;
+  static_assert(
+      has_node_tag_v<FunctionalTag, Operand> ||
+          has_node_tag_v<InputTag, Operand>,
+      "register node: on the team backend it must wrap an input or a "
+      "functional input node, which the reading combine calls at its own "
+      "coordinate; stage a gather with make_stage_node");
+  static_assert(std::is_same_v<std::remove_cv_t<decltype(op.hook_op)>, NoHook>,
+                "register node: a hooked source is not supported on the team "
+                "backend; use make_stage_node");
+  if constexpr (has_node_tag_v<FunctionalTag, Operand>)
+    return LgPointReader<std::decay_t<decltype(op.fn_)>, Perm>{op.fn_};
+  else
+    return LgPointReader<std::decay_t<decltype(op.handle)>, Perm>{op.handle};
+}
+
+// A combine fn with its register operands bound in. Called as
+// fn(i_0..i_{Rank-1}, slot values...) -- the evaluator only gathers the slot
+// operands -- it evaluates each register reader ONCE at the global coordinate
+// and calls the user's fn with the original operand order restored. After
+// inlining this is the code a hand-captured lambda would produce.
+template <typename Fn, typename V, int Rank, typename Map, typename... Readers>
+struct RegisterBoundFn {
+  Fn                      fn;
+  DeviceTuple<Readers...> readers;
+
+  template <typename... A>
+  KOKKOS_FORCEINLINE_FUNCTION auto operator()(A... a) const {
+    return call(std::make_index_sequence<Rank>{},
+                std::index_sequence_for<Readers...>{},
+                std::make_index_sequence<Map::N>{}, DeviceTuple<A...>(a...));
+  }
+
+ private:
+  template <std::size_t O, typename T>
+  static KOKKOS_FORCEINLINE_FUNCTION V output(const T& x) {
+    if constexpr (std::is_arithmetic_v<T>)
+      return static_cast<V>(x);
+    else
+      return static_cast<V>(x[O]);
+  }
+
+  template <std::size_t K, typename T, typename R>
+  KOKKOS_FORCEINLINE_FUNCTION V pick(const T& t, const R& r) const {
+    if constexpr (Map::reg[K])
+      return output<Map::out[K]>(r.template get<Map::pos[K]>());
+    else
+      return static_cast<V>(t.template get<Rank + Map::pos[K]>());
+  }
+
+  template <std::size_t... Ds, std::size_t... Rs, std::size_t... Ks, typename T>
+  KOKKOS_FORCEINLINE_FUNCTION auto call(std::index_sequence<Ds...>,
+                                        std::index_sequence<Rs...>,
+                                        std::index_sequence<Ks...>,
+                                        const T& t) const {
+    const Kokkos::Array<int, Rank> g{static_cast<int>(t.template get<Ds>())...};
+    const DeviceTuple<std::decay_t<decltype(readers.template get<Rs>()(g))>...>
+        r{readers.template get<Rs>()(g)...};
+    return fn(t.template get<Ds>()..., pick<Ks>(t, r)...);
+  }
+};
+
+// What the combine member does to its node before evaluating it: nothing, or
+// bind its register operands into the fn and drop them from the operand list.
+struct LgNoBind {
+  template <typename N>
+  KOKKOS_FORCEINLINE_FUNCTION const N& operator()(const N& n) const {
+    return n;
+  }
+};
+
+template <typename V, int Rank, typename Map, typename... Readers>
+struct LgRegisterBind {
+  DeviceTuple<Readers...> readers;
+
+  template <typename N>
+  KOKKOS_FUNCTION auto operator()(const N& n) const {
+    return rebind_combine_fn_ops(
+        n,
+        RegisterBoundFn<typename N::combine_type, V, Rank, Map, Readers...>{
+            n.fn, readers},
+        typename Map::slot_seq{});
+  }
+};
+
+template <typename LevelsT, typename Node, typename Map, std::size_t... RKs>
+KOKKOS_FUNCTION auto lg_register_bind(const LevelsT& levels,
+                                      std::index_sequence<RKs...>) {
+  using Readers = DeviceTuple<decltype(lg_make_point_reader<LevelsT, Node, RKs>(
+      levels))...>;
+  return LgRegisterBind<typename Node::value_type, Node::Rank, Map,
+                        decltype(lg_make_point_reader<LevelsT, Node, RKs>(
+                            levels))...>{
+      Readers(lg_make_point_reader<LevelsT, Node, RKs>(levels)...)};
+}
+
+// Ks are the operands read from slots (all of them unless a register node is
+// bound in by `bind`).
 template <typename V, typename ES, typename LevelsT, typename GridModes,
           std::size_t RootR, std::size_t L, std::size_t M, typename Store,
-          typename Team, std::size_t... Ks, std::size_t... Os>
+          typename Team, typename Bind, std::size_t... Ks, std::size_t... Os>
 KOKKOS_FUNCTION auto lg_make_combine_member_impl(
     const LevelsT& levels, const Store& store,
     const Kokkos::Array<int, RootR>& grid_idx, const Team& team,
-    std::index_sequence<Ks...>, std::index_sequence<Os...>) {
+    std::index_sequence<Ks...>, std::index_sequence<Os...>, const Bind& bind) {
   using Node                 = tuple_element_t<M, tuple_element_t<L, LevelsT>>;
   constexpr std::size_t Base = lg_member_base_v<LevelsT, L, M>;
 
@@ -315,17 +552,20 @@ KOKKOS_FUNCTION auto lg_make_combine_member_impl(
             .at(origin);
     const auto& node = levels.template get<L>().template get<M>();
     if constexpr (is_scatter_slot_fn_v<typename Node::combine_type>) {
-      using Fn       = typename Node::combine_type;
+      using Fn = typename Node::combine_type;
+      static_assert(!lg_slot_is_register_v<LevelsT, Fn::idx_type::SlotIdx>,
+                    "register node: a scatter index must be in memory on the "
+                    "team backend; use make_index_node");
       const auto& sv = store.template get<Fn::idx_type::SlotIdx>();
       return make_evaluator<TeamPolicyTag<ES>>(
-          rebind_combine_fn(
+          bind(rebind_combine_fn(
               node, ScatterAddBoundFn<std::decay_t<decltype(sv)>,
                                       static_cast<std::size_t>(Node::Rank),
                                       typename Fn::dst_type>{sv, origin,
-                                                             node.fn.dst}),
+                                                             node.fn.dst})),
           ops, team);
     } else {
-      return make_evaluator<TeamPolicyTag<ES>>(node, ops, team);
+      return make_evaluator<TeamPolicyTag<ES>>(bind(node), ops, team);
     }
   } else {
     using OutNode = decltype(make_interm_node(store.template get<Base>()));
@@ -342,7 +582,7 @@ KOKKOS_FUNCTION auto lg_make_combine_member_impl(
             outs)
             .at(origin);
     return make_evaluator<TeamPolicyTag<ES>>(
-        levels.template get<L>().template get<M>(), ops, team);
+        bind(levels.template get<L>().template get<M>()), ops, team);
   }
 }
 
@@ -353,11 +593,30 @@ KOKKOS_FUNCTION auto lg_make_combine_member(
     const LevelsT& levels, const Store& store,
     const Kokkos::Array<int, RootR>& grid_idx, const Team& team) {
   using Node = tuple_element_t<M, tuple_element_t<L, LevelsT>>;
-  return lg_make_combine_member_impl<V, ES, LevelsT, GridModes, RootR, L, M>(
-      levels, store, grid_idx, team,
-      std::make_index_sequence<static_cast<std::size_t>(Node::NumOps)>{},
-      std::make_index_sequence<static_cast<std::size_t>(Node::NumOut)>{});
+  using Ops  = std::make_index_sequence<static_cast<std::size_t>(Node::NumOps)>;
+  using Outs = std::make_index_sequence<static_cast<std::size_t>(Node::NumOut)>;
+  using Map  = lg_combine_reg_map<LevelsT, Node, Ops>;
+  if constexpr (Map::num_readers == 0) {
+    return lg_make_combine_member_impl<V, ES, LevelsT, GridModes, RootR, L, M>(
+        levels, store, grid_idx, team, Ops{}, Outs{}, LgNoBind{});
+  } else {
+    static_assert(Map::modes_agree,
+                  "register node: every operand read from one register node "
+                  "must carry the same labels");
+    return lg_make_combine_member_impl<V, ES, LevelsT, GridModes, RootR, L, M>(
+        levels, store, grid_idx, team, typename Map::slot_seq{}, Outs{},
+        lg_register_bind<LevelsT, Node, Map>(levels,
+                                             typename Map::reader_seq{}));
+  }
 }
+
+// A bare tile layout as something team_for_each_coord can walk.
+template <typename Layout>
+struct LgTileIter {
+  Layout                        layout_;
+  KOKKOS_FUNCTION const Layout& layout() const { return layout_; }
+  KOKKOS_FUNCTION int           size() const { return layout_.size(); }
+};
 
 // Every member's GATHER, then every member's STORE -- the combine twin of
 // lg_store_ij. Both sides are shared memory for a multi-output combine, so a
@@ -394,11 +653,24 @@ KOKKOS_FUNCTION void lg_run_combine_level(
   constexpr bool AllSink =
       ((tuple_element_t<Ms, tuple_element_t<L, LevelsT>>::NumOut == 0) && ...);
   if constexpr (AllSink) {
-    // No output slot exists; drive the tile from a sink's operand-0 storage.
-    const auto it = evs.template get<0>().iter_view();
-    team_for_each_coord(team, it, [=](auto coord) {
-      lg_store_coord(evs, coord, std::index_sequence<Ms...>{});
-    });
+    // No output slot exists; drive the tile from a sink's operand-0 storage,
+    // or -- when register binding left it no operand in memory -- from its
+    // output tile, which enumerates the same coordinates.
+    using Ev0 = std::decay_t<decltype(evs.template get<0>())>;
+    if constexpr (Ev0::NumOps > 0) {
+      const auto it = evs.template get<0>().iter_view();
+      team_for_each_coord(team, it, [=](auto coord) {
+        lg_store_coord(evs, coord, std::index_sequence<Ms...>{});
+      });
+    } else {
+      using Tile0 =
+          member_out_tile_t<tuple_element_t<0, tuple_element_t<L, LevelsT>>>;
+      const LgTileIter<decltype(make_tile_layout(Tile0{}, LayoutRight{}))> it{
+          make_tile_layout(Tile0{}, LayoutRight{})};
+      team_for_each_coord(team, it, [=](auto coord) {
+        lg_store_coord(evs, coord, std::index_sequence<Ms...>{});
+      });
+    }
   } else {
     constexpr std::size_t Base0 = lg_member_base_v<LevelsT, L, 0>;
     const auto            out0  = store.template get<Base0>();
@@ -435,6 +707,10 @@ KOKKOS_FUNCTION auto lg_stage_src(const LevelsT&                   levels,
   using Node     = tuple_element_t<M, tuple_element_t<L, LevelsT>>;
   const auto& op = levels.template get<L>().template get<M>().operand_;
   if constexpr (has_node_tag_v<GatherTag, typename Node::operand_type>) {
+    static_assert(
+        !lg_slot_is_register_v<LevelsT, Node::operand_type::idx_type::SlotIdx>,
+        "register node: a gather index must be in memory on the team "
+        "backend; use make_index_node");
     const auto& iv =
         store.template get<Node::operand_type::idx_type::SlotIdx>();
     return GatherSlotView<std::decay_t<decltype(iv)>,
@@ -462,12 +738,15 @@ KOKKOS_FUNCTION void lg_copy_member(const Src& src, const Store& store,
   }
 }
 
+// Is are positions in `srcs`; Ms the members they belong to (the copied ones
+// only -- a register member has no source here and is never stored).
 template <typename LevelT, typename SrcsT, typename Store, typename Coord,
-          std::size_t... Bs, std::size_t... Ms>
+          std::size_t... Is, std::size_t... Bs, std::size_t... Ms>
 KOKKOS_FUNCTION void lg_copy_coord(const SrcsT& srcs, const Store& store,
-                                   Coord coord, std::index_sequence<Ms...>,
+                                   Coord coord, std::index_sequence<Is...>,
+                                   std::index_sequence<Ms...>,
                                    std::index_sequence<Bs...>) {
-  (lg_copy_member<Bs>(srcs.template get<Ms>(), store, coord,
+  (lg_copy_member<Bs>(srcs.template get<Is>(), store, coord,
                       std::make_index_sequence<static_cast<std::size_t>(
                           tuple_element_t<Ms, LevelT>::NumOut)>{}),
    ...);
@@ -485,6 +764,10 @@ KOKKOS_FUNCTION void lg_copy_coord(const SrcsT& srcs, const Store& store,
 // Legal only because lg_layout_space_impl already forced every member of the
 // level to share one output tile layout, which is what makes a single range
 // able to drive all of them.
+//
+// Ms are the members copied (lg_copied_members_t): register members are read
+// by their combines instead, so a level of nothing but register nodes is no
+// loop and no barrier at all.
 template <typename V, typename ES, typename LevelsT, typename GridModes,
           std::size_t RootR, std::size_t L, typename Store, typename Team,
           std::size_t... Ms>
@@ -492,19 +775,22 @@ KOKKOS_FUNCTION void lg_run_staged_level(
     const LevelsT& levels, const Store& store,
     const Kokkos::Array<int, RootR>& grid_idx, const Team& team,
     std::index_sequence<Ms...>) {
-  const auto srcs =
-      DeviceTuple<decltype(lg_stage_src<V, ES, LevelsT, GridModes, RootR, L,
-                                        Ms>(levels, grid_idx, store, team))...>{
-          lg_stage_src<V, ES, LevelsT, GridModes, RootR, L, Ms>(
-              levels, grid_idx, store, team)...};
+  if constexpr (sizeof...(Ms) > 0) {
+    const auto srcs = DeviceTuple<
+        decltype(lg_stage_src<V, ES, LevelsT, GridModes, RootR, L, Ms>(
+            levels, grid_idx, store, team))...>{
+        lg_stage_src<V, ES, LevelsT, GridModes, RootR, L, Ms>(levels, grid_idx,
+                                                              store, team)...};
 
-  using bases     = std::index_sequence<lg_member_base_v<LevelsT, L, Ms>...>;
-  const auto src0 = srcs.template get<0>();
-  team_for_each_coord(team, src0, [=](auto coord) {
-    lg_copy_coord<tuple_element_t<L, LevelsT>>(
-        srcs, store, coord, std::index_sequence<Ms...>{}, bases{});
-  });
-  team.team_barrier();
+    using bases     = std::index_sequence<lg_member_base_v<LevelsT, L, Ms>...>;
+    const auto src0 = srcs.template get<0>();
+    team_for_each_coord(team, src0, [=](auto coord) {
+      lg_copy_coord<tuple_element_t<L, LevelsT>>(
+          srcs, store, coord, std::make_index_sequence<sizeof...(Ms)>{},
+          std::index_sequence<Ms...>{}, bases{});
+    });
+    team.team_barrier();
+  }
 }
 
 template <typename V, typename ES, typename LevelsT, typename GridModes,
@@ -516,7 +802,7 @@ KOKKOS_FUNCTION void lg_run_level(const LevelsT& levels, const Store& store,
   constexpr std::size_t NM = tuple_size_v<LevelT>;
   if constexpr (lg_all_staged_v<LevelT>) {
     lg_run_staged_level<V, ES, LevelsT, GridModes, RootR, L>(
-        levels, store, grid_idx, team, std::make_index_sequence<NM>{});
+        levels, store, grid_idx, team, lg_copied_members_t<LevelsT, L>{});
   } else if constexpr (lg_all_contraction_v<LevelT>) {
     lg_run_contraction_level<V, ES, LevelsT, L>(levels, store, team,
                                                 std::make_index_sequence<NM>{});
@@ -547,6 +833,9 @@ KOKKOS_FUNCTION void lg_store_root(const LevelsT& levels, const Store& store,
   constexpr std::size_t M = lg_slot_member_v<LevelsT, R>;
   using Node              = tuple_element_t<M, tuple_element_t<L, LevelsT>>;
   using Gather            = gather_seq_t<typename Node::modes_seq, GridModes>;
+  static_assert(!lg_slot_is_register_v<LevelsT, R>,
+                "register node: it cannot be a graph output on the team "
+                "backend (it is never stored); use make_stage_node");
 
   using Tile = typename lg_member_decl_tile<Node>::type;
 
@@ -733,10 +1022,6 @@ template <typename V, typename ES, typename LT, typename LevelsT,
           typename RootsSeq, typename... ViewTs>
 int lg_execute(const LevelsT& levels, std::size_t bytes, int team_size,
                RootsSeq roots, const ViewTs&... views) {
-  static_assert(!lg_has_register_v<LevelsT>,
-                "register node: it runs only on the CuTe backend, which keeps "
-                "its values in registers across levels; use make_stage_node "
-                "for a team graph");
   using member_t            = team_member_t<ES>;
   constexpr std::size_t NL  = tuple_size_v<LevelsT>;
   constexpr std::size_t NLS = lg_num_slots_v<LevelsT>;

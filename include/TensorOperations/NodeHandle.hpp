@@ -1232,6 +1232,25 @@ KOKKOS_FUNCTION auto rebind_combine_fn(
                     Ops...>{std::move(fn), n.operands, n.shape_};
 }
 
+// rebind_combine_fn that also keeps only operands Ks. The new fn takes over
+// the dropped operands itself (a team register node read at the coordinate),
+// so the evaluator gathers -- and counts -- just the ones still in memory.
+template <typename NewFn, typename Fn, typename IntRank, typename S,
+          typename ES, typename ModesSeq, typename IntNumOut, typename... Ops,
+          std::size_t... Ks>
+KOKKOS_FUNCTION auto rebind_combine_fn_ops(
+    const NodeHandle<CombineTag, Fn, IntRank, S, ES, ModesSeq, IntNumOut,
+                     Ops...>& n,
+    NewFn                     fn, std::index_sequence<Ks...>) {
+  using OpsT = DeviceTuple<Ops...>;
+  return NodeHandle<CombineTag, NewFn, IntRank, S, ES, ModesSeq, IntNumOut,
+                    tuple_element_t<Ks, OpsT>...>{
+      std::move(fn),
+      DeviceTuple<tuple_element_t<Ks, OpsT>...>(
+          n.operands.template get<Ks>()...),
+      n.shape_};
+}
+
 }  // namespace Impl
 
 template <int32_t... Modes, typename Idx, typename Dst, typename Val>

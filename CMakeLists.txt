@@ -404,7 +404,7 @@ set_tests_properties(GatherGuardNegative.Case5 PROPERTIES
                      PASS_REGULAR_EXPRESSION
                      "may not read a slot ITS OWN LEVEL")
 
-foreach(case 0 1 2)
+foreach(case 0 1 2 3 4 5)
   add_executable(register_team_neg_${case} EXCLUDE_FROM_ALL
                  tests/negative/register_team_negative.cpp)
   target_link_libraries(register_team_neg_${case} PRIVATE tensor)
@@ -414,9 +414,12 @@ foreach(case 0 1 2)
            COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}
                    --target register_team_neg_${case} --config $<CONFIG>)
 endforeach()
-set_tests_properties(RegisterTeamNegative.Case1 RegisterTeamNegative.Case2
-                     PROPERTIES PASS_REGULAR_EXPRESSION
-                     "register node: it runs only on the CuTe backend")
+set_tests_properties(RegisterTeamNegative.Case3 PROPERTIES
+                     PASS_REGULAR_EXPRESSION
+                     "a contraction needs the tile in memory")
+set_tests_properties(RegisterTeamNegative.Case4 PROPERTIES
+                     PASS_REGULAR_EXPRESSION
+                     "it cannot be a graph output on the team")
 
 foreach(case 0 1 2 3 5 6)
   add_executable(scatter_guard_neg_${case} EXCLUDE_FROM_ALL
@@ -528,6 +531,10 @@ target_compile_options(sfpp_min_bench_new_li PRIVATE -lineinfo)
 # harness's whole axis matrix by the number of TE values.
 add_executable(sfpp_min_bench_te sfpp_min/bench_te.cpp)
 target_link_libraries(sfpp_min_bench_te PRIVATE sfpp_min tensor)
+
+add_executable(sfpp_min_bench_te_bundle sfpp_min/bench_te.cpp)
+target_link_libraries(sfpp_min_bench_te_bundle PRIVATE sfpp_min tensor)
+target_compile_definitions(sfpp_min_bench_te_bundle PRIVATE SFPP_MIN_METRICS_MODE=2)
 
 add_executable(sfpp_min_bench_te_li sfpp_min/bench_te.cpp)
 target_link_libraries(sfpp_min_bench_te_li PRIVATE sfpp_min tensor)
