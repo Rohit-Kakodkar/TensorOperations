@@ -464,8 +464,8 @@ TEST(CuteLevelGraph, PooledChainReusesBuffers) {
   const auto out = g.outputs(z);
 
   constexpr std::size_t tile =
-      Impl::slot_arena_step<float, ES>(kPN * kPTE * kPN * kPN);
-  constexpr std::size_t hstep = Impl::slot_arena_step<float, ES>(kPN * kPN);
+      Impl::lg_cute_slot_step<float>(kPN * kPTE * kPN * kPN);
+  constexpr std::size_t hstep = Impl::lg_cute_slot_step<float>(kPN * kPN);
   EXPECT_EQ(out.cute_unpooled_smem_bytes(), (hstep + 3 * tile) * sizeof(float));
   EXPECT_EQ(out.cute_smem_bytes(), (hstep + tile) * sizeof(float));
 
