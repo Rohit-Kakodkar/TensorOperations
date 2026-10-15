@@ -1072,6 +1072,147 @@ TEST(LevelGraphRegisterTeam, HandleSourceAndPermutedLabels) {
 
 }  // namespace reg
 
+// ===========================================================================
+// Scratch level, chosen at launch from the store size against the backend's
+// own TeamPolicy::scratch_size_max: level 0 when it fits, else level 1, else
+// an abort. Host backends cap
+// level 0 at 32 KB, so the N = 8, TE = 4 gradient (U plus three roots, 8 KB
+// each) runs from level 1 there and from level 0 on a GPU; the N = 4, TE = 1
+// one fits level 0 everywhere.
+// ===========================================================================
+namespace lvl {
+
+constexpr int E = 8;
+
+using ViewH = Kokkos::View<float**, Kokkos::LayoutRight, ES>;
+using ViewU = Kokkos::View<float****, Kokkos::LayoutRight, ES>;
+
+template <int N, int TE>
+using Map =
+    LabelTiles<LabelWhole<'q', N>, LabelWhole<'a', N>, LabelTile<'e', TE>,
+               LabelWhole<'b', N>, LabelWhole<'c', N>>;
+
+constexpr bool kOnHost =
+    Kokkos::SpaceAccessibility<ES, Kokkos::HostSpace>::accessible;
+
+std::size_t level0_cap() {
+  return static_cast<std::size_t>(Kokkos::TeamPolicy<ES>::scratch_size_max(0));
+}
+
+float hv(int q, int a) { return 0.3f + 0.17f * q - 0.11f * a + 0.02f * q * a; }
+float uv(int e, int a, int b, int c) {
+  return 0.1f + 0.05f * e - 0.09f * a + 0.07f * b - 0.04f * c +
+         0.006f * (e + 2 * a) * (c + 1);
+}
+
+template <int N, int TE>
+struct Gradient {
+  ViewH H{"H", N, N};
+  ViewU U{"U", E, N, N, N};
+
+  Gradient() {
+    auto Hh = Kokkos::create_mirror_view(H);
+    auto Uh = Kokkos::create_mirror_view(U);
+    for (int q = 0; q < N; ++q)
+      for (int a = 0; a < N; ++a) Hh(q, a) = hv(q, a);
+    for (int e = 0; e < E; ++e)
+      for (int a = 0; a < N; ++a)
+        for (int b = 0; b < N; ++b)
+          for (int c = 0; c < N; ++c) Uh(e, a, b, c) = uv(e, a, b, c);
+    Kokkos::deep_copy(H, Hh);
+    Kokkos::deep_copy(U, Uh);
+  }
+
+  auto outputs() const {
+    auto g0 = make_level_graph<float, ES>(Map<N, TE>{});
+    auto [g1, h] =
+        g0.add(make_stage_node(make_input_node(make_handle<'q', 'a'>(H))));
+    auto [g2, u] = g1.add(
+        make_stage_node(make_input_node(make_handle<'e', 'a', 'b', 'c'>(U))));
+    auto [g3, ga, gb, gc] = g2.add(
+        make_contraction_node<'q', 'e', 'b', 'c'>(h, u),
+        make_contraction_node<'q', 'e', 'a', 'c'>(h.template as<'q', 'b'>(), u),
+        make_contraction_node<'q', 'e', 'a', 'b'>(h.template as<'q', 'c'>(),
+                                                  u));
+    return g3.outputs(ga, gb, gc);
+  }
+
+  void run_and_check() const {
+    ViewU A("A", N, E, N, N), B("B", N, E, N, N), C("C", N, E, N, N);
+    outputs().execute(TeamPolicyTag<ES>{}, A, B, C);
+    Kokkos::fence();
+
+    auto   Ah = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, A);
+    auto   Bh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, B);
+    auto   Ch = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, C);
+    double ea = 0.0, eb = 0.0, ec = 0.0;
+    for (int q = 0; q < N; ++q)
+      for (int e = 0; e < E; ++e)
+        for (int m = 0; m < N; ++m)
+          for (int n = 0; n < N; ++n) {
+            double ra = 0.0, rb = 0.0, rc = 0.0;
+            for (int k = 0; k < N; ++k) {
+              ra += hv(q, k) * uv(e, k, m, n);
+              rb += hv(q, k) * uv(e, m, k, n);
+              rc += hv(q, k) * uv(e, m, n, k);
+            }
+            ea = std::max(ea, std::abs(ra - Ah(q, e, m, n)));
+            eb = std::max(eb, std::abs(rb - Bh(q, e, m, n)));
+            ec = std::max(ec, std::abs(rc - Ch(q, e, m, n)));
+          }
+    EXPECT_LT(ea, 1e-4) << "member a";
+    EXPECT_LT(eb, 1e-4) << "member b";
+    EXPECT_LT(ec, 1e-4) << "member c";
+  }
+};
+
+TEST(LevelGraphScratchLevel, AStoreAboveTheHostLevelZeroCapRunsFromLevelOne) {
+  const Gradient<8, 4> g;
+  const auto           out = g.outputs();
+  EXPECT_EQ(out.scratch_level(), kOnHost ? 1 : 0);
+  if (kOnHost)
+    ASSERT_GT(out.scratch_bytes(), level0_cap())
+        << "the store must exceed the host level-0 cap to prove anything";
+  g.run_and_check();
+}
+
+TEST(LevelGraphScratchLevel, AStoreThatFitsLevelZeroStaysThere) {
+  const Gradient<4, 1> g;
+  const auto           out = g.outputs();
+  ASSERT_LE(out.scratch_bytes(), level0_cap());
+  EXPECT_EQ(out.scratch_level(), 0);
+  g.run_and_check();
+}
+
+namespace huge {
+constexpr int M = 4608;
+using ViewIn =
+    Kokkos::View<float***, Kokkos::LayoutRight, ES, Kokkos::MemoryUnmanaged>;
+using MapH =
+    LabelTiles<LabelTile<'e', 1>, LabelWhole<'i', M>, LabelWhole<'j', M>>;
+
+auto outputs(const ViewIn& in) {
+  auto g0 = make_level_graph<float, ES>(MapH{});
+  auto [g1, s] =
+      g0.add(make_stage_node(make_input_node(make_handle<'e', 'i', 'j'>(in))));
+  return g1.outputs(s);
+}
+}  // namespace huge
+
+TEST(LevelGraphScratchLevelDeathTest, AStoreAboveEveryLevelAbortsClearly) {
+  if (!kOnHost) GTEST_SKIP() << "death tests fork; run them on host only";
+  const huge::ViewIn in(nullptr, 1, huge::M, huge::M);
+  const huge::ViewIn out_view(nullptr, 1, huge::M, huge::M);
+  const auto         out = huge::outputs(in);
+  ASSERT_GT(
+      out.scratch_bytes(),
+      static_cast<std::size_t>(Kokkos::TeamPolicy<ES>::scratch_size_max(1)));
+  EXPECT_EQ(out.scratch_level(), -1);
+  EXPECT_DEATH(out.execute(TeamPolicyTag<ES>{}, out_view), "every level");
+}
+
+}  // namespace lvl
+
 int main(int argc, char* argv[]) {
   ::testing::InitGoogleTest(&argc, argv);
   Kokkos::initialize(argc, argv);

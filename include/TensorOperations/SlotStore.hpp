@@ -314,9 +314,9 @@ std::size_t pooled_arena_slot_store_bytes(const Tiles&...) {
 }
 
 template <typename ValueType, typename ExecSpace, typename PoolsList,
-          typename Team, typename... Elems, typename... Tiles,
+          typename Scratch, typename... Elems, typename... Tiles,
           std::size_t... Is>
-KOKKOS_FUNCTION auto place_pooled_arena_slot_store(const Team& team,
+KOKKOS_FUNCTION auto place_pooled_arena_slot_store(const Scratch& scratch,
                                                    Impl::SlotElems<Elems...>,
                                                    std::index_sequence<Is...>,
                                                    const Tiles&... tiles)
@@ -325,8 +325,7 @@ KOKKOS_FUNCTION auto place_pooled_arena_slot_store(const Team& team,
   constexpr std::size_t elems =
       Impl::slot_pool_arena<ValueType, ExecSpace, PoolsList,
                             Impl::SlotTiles<Tiles...>, ElemsList>::total();
-  Impl::scratch_backing_t<ValueType, ExecSpace> arena(team.team_scratch(0),
-                                                      elems);
+  Impl::scratch_backing_t<ValueType, ExecSpace> arena(scratch, elems);
   ValueType*                                    base = arena.data();
   return {DeviceTuple<SlotView<Elems, ExecSpace, Tiles>...>{
       Impl::alloc_scratch_tile_at<Elems, ExecSpace>(
@@ -338,11 +337,11 @@ KOKKOS_FUNCTION auto place_pooled_arena_slot_store(const Team& team,
 }
 
 template <typename ValueType, typename ExecSpace, typename PoolsList,
-          typename ElemsList = void, typename Team, typename... Tiles>
-KOKKOS_FUNCTION auto carve_pooled_arena_slot_store(const Team& team,
+          typename ElemsList = void, typename Scratch, typename... Tiles>
+KOKKOS_FUNCTION auto carve_pooled_arena_slot_store(const Scratch& scratch,
                                                    const Tiles&... tiles) {
   return place_pooled_arena_slot_store<ValueType, ExecSpace, PoolsList>(
-      team, Impl::slot_elems_t<ValueType, ElemsList, Tiles...>{},
+      scratch, Impl::slot_elems_t<ValueType, ElemsList, Tiles...>{},
       std::index_sequence_for<Tiles...>{}, tiles...);
 }
 
