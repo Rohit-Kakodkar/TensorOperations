@@ -1762,6 +1762,134 @@ void expect_tv_multi_output_stage_combine() {
   EXPECT_LT(max_rel_err(tp, r), 1e-5f);
 }
 
+// Register sources given as a view or a handle, against the same field read
+// through a functor. All three must reach the combine in registers and read
+// identical values.
+template <typename V>
+struct FieldAt {
+  V                     v;
+  KOKKOS_FUNCTION float operator()(int e, int k, int j, int i) const {
+    return v(e, k, j, i);
+  }
+};
+
+struct GradMixAB {
+  KOKKOS_FUNCTION float operator()(int e, int k, int j, int i, float x, float y,
+                                   float z, float a, float b) const {
+    return GradMix{}(e, k, j, i, x, y, z) + 3.0f * a - 1.5f * b;
+  }
+};
+
+enum class RegSrc { View, Handle, Functor };
+
+template <RegSrc S, typename TV>
+auto view_register_source(const ViewR& w) {
+  if constexpr (S == RegSrc::View)
+    return make_register_node<'e', 'k', 'j', 'i'>(w, TV{});
+  else if constexpr (S == RegSrc::Handle)
+    return make_register_node<'e', 'k', 'j', 'i'>(
+        make_handle<'e', 'k', 'j', 'i'>(w), TV{});
+  else
+    return make_register_node(
+        make_functional_input_node<ES, 'e', 'k', 'j', 'i'>(
+            Kokkos::Array<int, 4>{static_cast<int>(w.extent(0)), 5, 5, 5},
+            FieldAt<ViewR>{w}),
+        TV{});
+}
+
+template <RegSrc S, int TE>
+std::pair<ViewR, ViewR> run_view_register_source(const OpView<5>& h,
+                                                 const ViewR& u, const ViewR& a,
+                                                 const ViewR& b) {
+  using MX        = RowOfEMma<TE, ThrX, RowOfENTile<TE>>;
+  using ME        = RowOfEMma<TE, ThrEta, RowOfENTile<TE>>;
+  using MG        = RowOfEMma<TE, ThrGamma, RowOfENTile<TE>>;
+  constexpr int E = 2 * TE;
+  ViewR         cp("cp", E, 5, 5, 5), tp("tp", E, 5, 5, 5);
+  Kokkos::deep_copy(cp, -999.0f);
+
+  auto g0 = make_level_graph<float, ES>(MapET<TE>{});
+  auto [g1, sh] =
+      g0.add(make_stage_node(make_input_node(make_handle<'r', 'p'>(h))));
+  auto [g2, su, ra, rb] = g1.add(
+      make_stage_node(make_input_node(make_handle<'e', 'k', 'j', 'i'>(u)),
+                      RowOfETV<TE>{}),
+      view_register_source<S, RowOfETV<TE>>(a),
+      view_register_source<S, RowOfETV<TE>>(b));
+  auto [g3, gx, ge, gg] =
+      g2.add(make_contraction_node<'e', 'k', 'j', 'i'>(
+                 sh.template as<'i', 'p'>(),
+                 su.template as<'e', 'k', 'j', 'p'>(), NoHook{}, MX{}),
+             make_contraction_node<'e', 'k', 'j', 'i'>(
+                 sh.template as<'j', 'p'>(),
+                 su.template as<'e', 'k', 'p', 'i'>(), NoHook{}, ME{}),
+             make_contraction_node<'e', 'k', 'j', 'i'>(
+                 sh.template as<'k', 'p'>(),
+                 su.template as<'e', 'p', 'j', 'i'>(), NoHook{}, MG{}));
+  auto [g4, pv] = g3.add(
+      make_combine_node<'e', 'k', 'j', 'i'>(gx, ge, gg, ra, rb, GradMixAB{}));
+
+  using Levels    = LevelsOf<decltype(g4)>;
+  constexpr int N = Impl::lg_cute_num_threads_v<Levels>;
+  using Plan      = Impl::lg_cute_combine_plan<Levels, 3, 0, N>;
+  static_assert(Plan::aligned_driven);
+  static_assert(
+      Plan::template in_register<3>() && Plan::template in_register<4>(),
+      "a view or handle register source reaches the combine in "
+      "registers");
+  static_assert(
+      !Impl::lg_cute_smem_slot_v<Levels, N, Plan::template slot<3>> &&
+          !Impl::lg_cute_smem_slot_v<Levels, N, Plan::template slot<4>>,
+      "a register source takes no shared memory");
+
+  const auto out = g4.outputs(pv);
+  out.execute(CutePolicyTag<>{}, cp);
+  EXPECT_TRUE(synced());
+  out.execute(TeamPolicyTag<ES>{}, tp);
+  EXPECT_TRUE(synced());
+  return {cp, tp};
+}
+
+template <int TE>
+void expect_view_register_source() {
+  constexpr int E = 2 * TE;
+  OpView<5>     h("h", 5, 5);
+  ViewR         u("u", E, 5, 5, 5), a("a", E, 5, 5, 5), b("b", E, 5, 5, 5);
+  fill(h, 0.5f);
+  fill(u, -2.0f);
+  fill(a, 1.25f);
+  fill(b, -0.75f);
+
+  const auto v  = run_view_register_source<RegSrc::View, TE>(h, u, a, b);
+  const auto hd = run_view_register_source<RegSrc::Handle, TE>(h, u, a, b);
+  const auto f  = run_view_register_source<RegSrc::Functor, TE>(h, u, a, b);
+
+  auto   hh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, h);
+  auto   hu = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, u);
+  auto   ha = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, a);
+  auto   hb = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, b);
+  HostV4 r("r", E, 5, 5, 5);
+  for (int e = 0; e < E; ++e)
+    for (int k = 0; k < 5; ++k)
+      for (int j = 0; j < 5; ++j)
+        for (int i = 0; i < 5; ++i) {
+          float x = 0.0f, y = 0.0f, z = 0.0f;
+          for (int p = 0; p < 5; ++p) {
+            x += hh(i, p) * hu(e, k, j, p);
+            y += hh(j, p) * hu(e, k, p, i);
+            z += hh(k, p) * hu(e, p, j, i);
+          }
+          r(e, k, j, i) =
+              GradMixAB{}(e, k, j, i, x, y, z, ha(e, k, j, i), hb(e, k, j, i));
+        }
+  EXPECT_LT(max_rel_err(v.first, r), 1e-5f);
+  EXPECT_LT(max_rel_err(v.second, r), 1e-5f);
+  EXPECT_EQ(mismatches(v.first, f.first), 0) << "CuTe: view vs functor";
+  EXPECT_EQ(mismatches(hd.first, f.first), 0) << "CuTe: handle vs functor";
+  EXPECT_EQ(mismatches(v.second, f.second), 0) << "team: view vs functor";
+  EXPECT_EQ(mismatches(hd.second, f.second), 0) << "team: handle vs functor";
+}
+
 using NarrowTV =
     cute::Layout<cute::Shape<cute::Shape<cute::_5, cute::_5>,
                              cute::Shape<cute::_2, cute::_5>>,
@@ -1790,6 +1918,10 @@ TEST(CuteStageTV, MultiOutputStageReachesAlignedCombineInRegisters) {
 TEST(CuteStageTV, MultiOutputStageAtTE4) {
   expect_tv_multi_output_stage_combine<4, RowOfETV<4>, true>();
 }
+
+TEST(CuteStageTV, ViewRegisterSourceTE2) { expect_view_register_source<2>(); }
+
+TEST(CuteStageTV, ViewRegisterSourceTE4) { expect_view_register_source<4>(); }
 
 TEST(CuteStageTV, MisalignedMultiOutputStageFallsBackToSharedMemory) {
   expect_tv_multi_output_stage_combine<2, SwappedRowOfETV<2>, false>();

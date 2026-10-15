@@ -651,10 +651,49 @@ KOKKOS_FUNCTION auto make_stage_node(Operand op, TV tv = {}) {
 
 template <typename Operand, typename TV>
 KOKKOS_FUNCTION auto make_register_node(Operand op, TV tv) {
+  static_assert(
+      requires { typename Operand::node_tag; },
+      "register node: label a view or handle source, as in "
+      "make_register_node<'e', ...>(view, tv)");
   static_assert(!Impl::is_default_tv_v<TV>,
                 "register node: give the thread-value layout of the combine "
                 "that reads it, so its fragments stay in registers");
   return make_stage_node(std::move(op), Impl::RegisterTV<TV>{std::move(tv)});
+}
+
+namespace Impl {
+template <typename Src, typename ModesSeq>
+struct register_source {
+  static_assert(TensorLike<Src>,
+                "register node: the source must be a view, a handle or a node");
+  static_assert(static_cast<int>(Src::rank) ==
+                    static_cast<int>(ModesSeq::size()),
+                "register node: one label per view axis");
+
+  static auto make(Src src) {
+    return make_input_node(make_handle_seq(std::move(src), ModesSeq{}));
+  }
+};
+
+template <typename T, typename HandleSeq, typename ModesSeq>
+struct register_source<TensorHandle<T, HandleSeq>, ModesSeq> {
+  static_assert(std::is_same_v<HandleSeq, ModesSeq>,
+                "register node: a handle's labels must equal the labels "
+                "given to make_register_node");
+
+  static auto make(TensorHandle<T, HandleSeq> h) {
+    return make_input_node(std::move(h));
+  }
+};
+}  // namespace Impl
+
+template <int32_t... Modes, typename Src, typename TV>
+  requires(sizeof...(Modes) > 0)
+auto make_register_node(Src src, TV tv) {
+  return make_register_node(
+      Impl::register_source<
+          Src, std::integer_sequence<int32_t, Modes...>>::make(std::move(src)),
+      std::move(tv));
 }
 
 template <int32_t... Modes, TensorLike T, typename TV = DefaultTV>

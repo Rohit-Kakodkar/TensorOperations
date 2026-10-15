@@ -577,11 +577,19 @@ auto build_new_graph(
     if constexpr (RegisterMetrics) {
       const auto& m   = args.metrics;
       const auto& pr  = args.properties;
-      auto        reg = [&](auto v, auto off) {
+      auto        reg = [&](auto v, [[maybe_unused]] auto off) {
+#if defined(SFPP_MIN_REGISTER_SOURCE_VIEW)
+        using Field = Kokkos::View<real_t****, Kokkos::LayoutRight,
+                                   typename decltype(v)::device_type,
+                                   Kokkos::MemoryUnmanaged>;
+        return make_register_node<'e', 'k', 'j', 'i'>(
+            Field(v.data(), ext[0], ext[1], ext[2], ext[3]), MetricTV<TE>{});
+#else
         return make_register_node(
             make_functional_input_node<'e', 'k', 'j', 'i'>(
                 ext, SoAComponent<decltype(v), decltype(off)>{v, off}),
             MetricTV<TE>{});
+#endif
       };
       static_assert(
           std::is_same_v<std::decay_t<decltype(m.off)>,
