@@ -434,6 +434,26 @@ set_tests_properties(RegisterTeamNegative.Case4 PROPERTIES
                      PASS_REGULAR_EXPRESSION
                      "it cannot be a graph output on the team")
 
+foreach(case 0 1 2)
+  add_executable(register_source_neg_${case} EXCLUDE_FROM_ALL
+                 tests/negative/register_source_negative.cpp)
+  target_link_libraries(register_source_neg_${case} PRIVATE tensor)
+  target_compile_definitions(register_source_neg_${case}
+                             PRIVATE REGISTER_SRC_NEG_CASE=${case})
+  add_test(NAME RegisterSourceNegative.Case${case}
+           COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}
+                   --target register_source_neg_${case} --config $<CONFIG>)
+endforeach()
+set_tests_properties(RegisterSourceNegative.Case0 PROPERTIES
+                     PASS_REGULAR_EXPRESSION
+                     "a handle's labels must equal the labels")
+set_tests_properties(RegisterSourceNegative.Case1 PROPERTIES
+                     PASS_REGULAR_EXPRESSION
+                     "label a view or handle source")
+set_tests_properties(RegisterSourceNegative.Case2 PROPERTIES
+                     PASS_REGULAR_EXPRESSION
+                     "one label per view axis")
+
 foreach(case 0 1 2 3 5 6)
   add_executable(scatter_guard_neg_${case} EXCLUDE_FROM_ALL
                  tests/negative/scatter_guard_negative.cpp)
@@ -568,6 +588,25 @@ if(TENSOR_OPS_CUTLASS_DIR AND Kokkos_ENABLE_CUDA)
                              PRIVATE SFPP_MIN_BENCH_TE_CUTE)
   target_compile_options(sfpp_min_bench_te_cute_li PRIVATE -lineinfo)
 
+  # Report-only: row of e with the twelve metric inputs in register nodes.
+  add_executable(sfpp_min_bench_te_cute_rowe_mreg sfpp_min/bench_te.cpp)
+  target_link_libraries(sfpp_min_bench_te_cute_rowe_mreg PRIVATE sfpp_min tensor)
+  target_compile_definitions(sfpp_min_bench_te_cute_rowe_mreg
+                             PRIVATE SFPP_MIN_BENCH_TE_CUTE
+                                     SFPP_MIN_BENCH_ROW_OF_E
+                                     SFPP_MIN_METRICS_MODE=1)
+
+  # The same, with each metric register node built from a view rather than
+  # a functor.
+  add_executable(sfpp_min_bench_te_cute_rowe_mreg_view sfpp_min/bench_te.cpp)
+  target_link_libraries(sfpp_min_bench_te_cute_rowe_mreg_view
+                        PRIVATE sfpp_min tensor)
+  target_compile_definitions(sfpp_min_bench_te_cute_rowe_mreg_view
+                             PRIVATE SFPP_MIN_BENCH_TE_CUTE
+                                     SFPP_MIN_BENCH_ROW_OF_E
+                                     SFPP_MIN_METRICS_MODE=1
+                                     SFPP_MIN_REGISTER_SOURCE_VIEW)
+
   add_executable(sfpp_min_bench_te_cute_rowe sfpp_min/bench_te.cpp)
   target_link_libraries(sfpp_min_bench_te_cute_rowe PRIVATE sfpp_min tensor)
   target_compile_definitions(sfpp_min_bench_te_cute_rowe
@@ -627,6 +666,15 @@ foreach(n IN LISTS SFPP_MIN_EXTRA_NGLL)
     target_link_libraries(sfpp_min_bench_te_cute_n${n} PRIVATE sfpp_min tensor)
     target_compile_definitions(sfpp_min_bench_te_cute_n${n}
                                PRIVATE SFPP_MIN_BENCH_TE_CUTE SFPP_MIN_NGLL=${n})
+    # Report-only: row of e with the twelve metric inputs in register nodes.
+    add_executable(sfpp_min_bench_te_cute_rowe_mreg_n${n} sfpp_min/bench_te.cpp)
+    target_link_libraries(sfpp_min_bench_te_cute_rowe_mreg_n${n}
+                          PRIVATE sfpp_min tensor)
+    target_compile_definitions(sfpp_min_bench_te_cute_rowe_mreg_n${n}
+                               PRIVATE SFPP_MIN_BENCH_TE_CUTE
+                                       SFPP_MIN_BENCH_ROW_OF_E
+                                       SFPP_MIN_METRICS_MODE=1
+                                       SFPP_MIN_NGLL=${n})
   endif()
 endforeach()
 endif()

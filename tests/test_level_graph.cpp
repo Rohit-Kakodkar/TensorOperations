@@ -995,6 +995,81 @@ TEST(LevelGraphRegisterTeam, SinkScatterOfRegisterValue) {
                  "scatter through an index node");
 }
 
+// make_register_node<Modes...>(src, tv) with a view or handle as the source:
+// the same node as wrapping it in make_input_node by hand, so it must read
+// exactly what a stage copy of the view stores.
+template <bool Register, int32_t... Modes, typename Src>
+auto src_labelled(Src s) {
+  if constexpr (Register)
+    return make_register_node<Modes...>(std::move(s), SomeTV{});
+  else
+    return make_stage_node(make_input_node(make_handle<Modes...>(s)));
+}
+
+template <bool Register, int32_t... Modes, typename T, typename Seq>
+auto src_labelled(TensorHandle<T, Seq> h) {
+  if constexpr (Register)
+    return make_register_node<Modes...>(std::move(h), SomeTV{});
+  else
+    return make_stage_node(make_input_node(std::move(h)));
+}
+
+TEST(LevelGraphRegisterTeam, ViewSourceMatchesStage) {
+  const V3 w = make_w();
+  V3       x("x", E, N, N);
+  {
+    auto h = Kokkos::create_mirror_view(x);
+    for (int e = 0; e < E; ++e)
+      for (int a = 0; a < N; ++a)
+        for (int b = 0; b < N; ++b) h(e, a, b) = 0.3f * e - 0.7f * a + b;
+    Kokkos::deep_copy(x, h);
+  }
+  auto run = [&](auto is_reg) {
+    constexpr bool R = decltype(is_reg)::value;
+    V3             out("out", E, N, N);
+    auto           g0 = make_level_graph<float, ES>(Map{});
+    auto [g1, p, s] =
+        g0.add(src_labelled<R, 'e', 'a', 'b'>(x),
+               make_stage_node(make_input_node(make_handle<'e', 'a', 'b'>(w))));
+    auto [g2, r]   = g1.add(make_combine_node<'e', 'a', 'b'>(p, s, Sum2{}));
+    const auto res = g2.outputs(r);
+    res.execute(TeamPolicyTag<ES>{}, out);
+    Kokkos::fence();
+    return std::make_pair(out, res.scratch_bytes());
+  };
+  const auto a = run(std::true_type{});
+  const auto b = run(std::false_type{});
+  expect_bitwise(a.first, b.first, "view source");
+  EXPECT_LT(a.second, b.second);
+}
+
+TEST(LevelGraphRegisterTeam, HandleSourceAndPermutedLabels) {
+  const V3 w = make_w();
+  V3       t("t", E, N, N);
+  {
+    auto h = Kokkos::create_mirror_view(t);
+    for (int e = 0; e < E; ++e)
+      for (int b = 0; b < N; ++b)
+        for (int a = 0; a < N; ++a) h(e, b, a) = 0.2f * e + 0.9f * b - a;
+    Kokkos::deep_copy(t, h);
+  }
+  auto run = [&](auto is_reg) {
+    constexpr bool R = decltype(is_reg)::value;
+    V3             out("out", E, N, N);
+    auto           g0 = make_level_graph<float, ES>(Map{});
+    auto [g1, x] =
+        g0.add(src_labelled<R, 'e', 'b', 'a'>(make_handle<'e', 'b', 'a'>(t)));
+    auto [g2, s] =
+        g1.add(make_stage_node(make_input_node(make_handle<'e', 'a', 'b'>(w))));
+    auto [g3, r] = g2.add(make_combine_node<'e', 'a', 'b'>(x, s, Sum2{}));
+    g3.outputs(r).execute(TeamPolicyTag<ES>{}, out);
+    Kokkos::fence();
+    return out;
+  };
+  expect_bitwise(run(std::true_type{}), run(std::false_type{}),
+                 "permuted handle source");
+}
+
 }  // namespace reg
 
 int main(int argc, char* argv[]) {
