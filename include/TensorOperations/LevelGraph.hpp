@@ -44,6 +44,11 @@ struct LevelOutputs {
   }
   std::size_t slot_bytes() const { return graph.slot_bytes(); }
 
+  int scratch_level() const {
+    return Impl::team_scratch_level<typename Graph::exec_space>(
+        scratch_bytes());
+  }
+
   static constexpr std::size_t num_pools =
       Impl::lg_pool_count_v<typename Graph::levels_type, roots_seq>;
 
@@ -70,6 +75,7 @@ struct LevelOutputs {
 template <typename ValueType, typename ExecSpace, typename LabelTilesT,
           typename LevelsT>
 struct LevelGraph {
+  using exec_space                        = ExecSpace;
   using label_tiles_type                  = LabelTilesT;
   using levels_type                       = LevelsT;
   static constexpr std::size_t num_levels = tuple_size_v<LevelsT>;

@@ -224,12 +224,12 @@ using lg_pools_t = typename lg_pools_of<
     LevelsT, RootsSeq, std::make_index_sequence<lg_num_slots_v<LevelsT>>>::type;
 
 template <typename V, typename ES, typename LevelsT, typename RootsSeq,
-          typename Team, std::size_t... Ls>
+          int Level, typename Team, std::size_t... Ls>
 KOKKOS_FUNCTION auto lg_carve(const Team& team, std::index_sequence<Ls...>) {
   return carve_pooled_arena_slot_store<
       V, ES, lg_pools_t<LevelsT, RootsSeq>,
       SlotElems<lg_slot_elem_t<LevelsT, Ls, V>...>>(
-      team, lg_team_slot_tile_t<LevelsT, Ls>{}...);
+      team.team_scratch(Level), lg_team_slot_tile_t<LevelsT, Ls>{}...);
 }
 
 template <typename V, typename ES, typename LevelsT, typename RootsSeq,
@@ -1018,10 +1018,10 @@ auto lg_view_array(const ViewTs&... views) {
   return Kokkos::Array<ViewT, sizeof...(ViewTs)>{views...};
 }
 
-template <typename V, typename ES, typename LT, typename LevelsT,
+template <typename V, typename ES, typename LT, typename LevelsT, int Level,
           typename RootsSeq, typename... ViewTs>
-int lg_execute(const LevelsT& levels, std::size_t bytes, int team_size,
-               RootsSeq roots, const ViewTs&... views) {
+int lg_execute_at(const LevelsT& levels, std::size_t bytes, int team_size,
+                  RootsSeq roots, const ViewTs&... views) {
   using member_t            = team_member_t<ES>;
   constexpr std::size_t NL  = tuple_size_v<LevelsT>;
   constexpr std::size_t NLS = lg_num_slots_v<LevelsT>;
@@ -1044,7 +1044,7 @@ int lg_execute(const LevelsT& levels, std::size_t bytes, int team_size,
   Kokkos::TeamPolicy<ES> policy =
       team_size > 0 ? Kokkos::TeamPolicy<ES>(wk, team_size)
                     : Kokkos::TeamPolicy<ES>(wk, Kokkos::AUTO);
-  policy.set_scratch_size(0, Kokkos::PerTeam(static_cast<int>(bytes)));
+  policy.set_scratch_size(Level, Kokkos::PerTeam(static_cast<int>(bytes)));
 
   const auto varr = lg_view_array(views...);
 
@@ -1054,7 +1054,8 @@ int lg_execute(const LevelsT& levels, std::size_t bytes, int team_size,
         const auto grid_idx = decode_tile_index<RootR>(
             static_cast<int>(team.league_rank()), grid_shape, GridTile{});
 
-        auto store = lg_carve<V, ES, LevelsT, RootsSeq>(team, level_slot_seq{});
+        auto store =
+            lg_carve<V, ES, LevelsT, RootsSeq, Level>(team, level_slot_seq{});
 
         lg_run_all_levels<V, ES, LevelsT, GridModes, RootR>(ld, store, grid_idx,
                                                             team, level_seq{});
@@ -1062,6 +1063,21 @@ int lg_execute(const LevelsT& levels, std::size_t bytes, int team_size,
                                                          team, varr, roots);
       });
   return wk;
+}
+
+template <typename V, typename ES, typename LT, typename LevelsT,
+          typename RootsSeq, typename... ViewTs>
+int lg_execute(const LevelsT& levels, std::size_t bytes, int team_size,
+               RootsSeq roots, const ViewTs&... views) {
+  const int level = team_scratch_level<ES>(bytes);
+  if (level < 0)
+    Kokkos::abort(
+        "level graph: the slot store exceeds this backend's team scratch at "
+        "every level; use a smaller tile");
+  return level == 0 ? lg_execute_at<V, ES, LT, LevelsT, 0>(
+                          levels, bytes, team_size, roots, views...)
+                    : lg_execute_at<V, ES, LT, LevelsT, 1>(
+                          levels, bytes, team_size, roots, views...);
 }
 
 template <int Rank, typename NodeTile, typename GridTile, std::size_t GridRank>
