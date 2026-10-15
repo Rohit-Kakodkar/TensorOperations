@@ -570,6 +570,22 @@ template <typename LevelsT, int N, std::size_t S>
 inline constexpr std::size_t lg_cute_slot_pool_v =
     lg_cute_pool_of_slot<LevelsT, N>()[S];
 
+// A CuTe slot's span in the arena, rounded to 16 bytes. cute::copy on a static
+// layout ASSUMES 128-bit aligned pointers (cute/algorithm/copy.hpp) and will
+// emit LDS.128 / STS.128 for any 4-element contiguous run, so every slot base
+// must really be 16-byte aligned -- Kokkos' scratch ALIGN (8) is not enough.
+inline constexpr std::size_t lg_cute_slot_align = 16;
+
+template <typename V>
+constexpr std::size_t lg_cute_slot_step(std::size_t elems) {
+  static_assert(lg_cute_slot_align % sizeof(V) == 0,
+                "level graph (CuTe): the slot alignment must be a whole number "
+                "of elements");
+  const std::size_t b = elems * sizeof(V);
+  return (b + lg_cute_slot_align - 1) / lg_cute_slot_align *
+         lg_cute_slot_align / sizeof(V);
+}
+
 template <typename V, typename ES, typename LevelsT, int N, std::size_t... Ss>
 constexpr std::array<std::size_t, sizeof...(Ss)> lg_cute_smem_steps(
     std::index_sequence<Ss...>) {
@@ -578,10 +594,10 @@ constexpr std::array<std::size_t, sizeof...(Ss)> lg_cute_smem_steps(
         std::is_same_v<lg_slot_elem_t<LevelsT, Ss, V>, V>) &&
        ...),
       "level graph (CuTe): an index slot never lives in shared memory");
-  return {(lg_cute_smem_slot_v<LevelsT, N, Ss>
-               ? slot_arena_step<V, ES>(
-                     slot_tile_elems<lg_slot_tile_t<LevelsT, Ss>>())
-               : std::size_t{0})...};
+  return {(
+      lg_cute_smem_slot_v<LevelsT, N, Ss>
+          ? lg_cute_slot_step<V>(slot_tile_elems<lg_slot_tile_t<LevelsT, Ss>>())
+          : std::size_t{0})...};
 }
 
 template <typename V, typename ES, typename LevelsT, int N>
@@ -660,6 +676,11 @@ template <typename V, typename ES, int NumThreads, typename LevelsT,
           std::size_t S>
 __device__ auto lg_cute_slot_smem(V* base) {
   using P = lg_cute_slot_producer<LevelsT, S, NumThreads>;
+  static_assert(lg_cute_smem_offset_v<V, ES, LevelsT, NumThreads, S> *
+                        sizeof(V) % lg_cute_slot_align ==
+                    0,
+                "level graph (CuTe): a slot base must be 16-byte aligned; "
+                "cute::copy assumes it");
   return cute::make_tensor(
       cute::make_smem_ptr(base +
                           lg_cute_smem_offset_v<V, ES, LevelsT, NumThreads, S>),
@@ -980,11 +1001,35 @@ __device__ void lg_cute_store_roots(const LevelsT& levels, const Slots& slots,
    ...);
 }
 
+// Device-side check that the kernel really was launched as a (NumThreads, 1, 1)
+// block -- the shape lg_cute_kernel ASSUMES. A debug-build check: on when
+// NDEBUG is absent or Kokkos' bounds checking is on (the switch
+// TileLayout.hpp's TENSOR_OPS_VERIFY_RESHAPE uses), off in a release build.
+// Define it to 0 or 1 on the command line to override either way.
+#if !defined(TENSOR_OPS_CHECK_CUTE_LAUNCH)
+#if defined(KOKKOS_ENABLE_DEBUG_BOUNDS_CHECK) || !defined(NDEBUG)
+#define TENSOR_OPS_CHECK_CUTE_LAUNCH 1
+#else
+#define TENSOR_OPS_CHECK_CUTE_LAUNCH 0
+#endif
+#endif
+
 template <typename V, typename ES, int NumThreads, typename LevelsT,
           typename GridModes, typename GridTile, typename Scheduler,
           typename RootsSeq, std::size_t RootR, typename ViewArr>
 __global__ void lg_cute_kernel(LevelsT levels, Kokkos::Array<int, RootR> shape,
                                ViewArr views) {
+#if TENSOR_OPS_CHECK_CUTE_LAUNCH
+  if (blockDim.x != NumThreads || blockDim.y != 1 || blockDim.z != 1) __trap();
+#endif
+  // lg_execute_cute launches this kernel with exactly a (NumThreads, 1, 1)
+  // block, and it is the only launch site. Saying so lets every partitioner's
+  // `thr_idx < size(...)` guard fold away whenever that size is at least
+  // NumThreads, instead of costing a branch and reconvergence per member; on
+  // sfpp_min that halved the wait stalls. If the shape were ever different
+  // this is undefined behaviour, which is why the launch builds the block from
+  // the same constant and the debug check above traps on any other shape.
+  __builtin_assume(threadIdx.x < static_cast<unsigned>(NumThreads));
   extern __shared__ __align__(16) unsigned char lg_cute_smem[];
   V* const   base     = reinterpret_cast<V*>(lg_cute_smem);
   const auto grid_idx = Scheduler::template tile_coord<RootR, GridTile>(shape);
@@ -1047,10 +1092,13 @@ int lg_execute_cute(const LevelsT& levels, RootsSeq, const ViewTs&... views) {
                     std::make_index_sequence<tuple_size_v<LevelsT>>{}),
                 "level graph (CuTe): every level must be all stage, all "
                 "contraction or all combine members");
+  // The block size. It is both the kernel's template argument and the launch's
+  // block, and the kernel ASSUMES threadIdx.x < NumThreads -- so this one
+  // constant must feed both, and nothing else may launch lg_cute_kernel.
   constexpr int NumThreads = lg_cute_num_threads_v<LevelsT>;
-  static_assert(NumThreads <= 1024,
-                "level graph (CuTe): the largest contraction TiledMMA needs "
-                "more than 1024 threads");
+  static_assert(NumThreads >= 1 && NumThreads <= 1024,
+                "level graph (CuTe): the block needs between 1 and 1024 "
+                "threads; the largest contraction TiledMMA asks for more");
   using GridModes      = lg_grid_modes_t<LT, LevelsT>;
   using GridTile       = lg_grid_tile_t<LT, LevelsT>;
   using Scheduler      = LinearTileScheduler;
@@ -1075,7 +1123,19 @@ int lg_execute_cute(const LevelsT& levels, RootsSeq, const ViewTs&... views) {
         "level graph (CuTe): the graph's scratch exceeds the device's "
         "shared memory per block");
 
-  kernel<<<Scheduler::grid(wk), NumThreads, bytes, ES{}.cuda_stream()>>>(
+  // The kernel's own thread limit (registers included, not just the device's
+  // 1024). A launch above it would fail anyway; this says why.
+  cudaFuncAttributes attr{};
+  if (cudaFuncGetAttributes(&attr, kernel) != cudaSuccess)
+    Kokkos::abort("level graph (CuTe): cannot query the kernel's attributes");
+  if (NumThreads > attr.maxThreadsPerBlock)
+    Kokkos::abort(
+        "level graph (CuTe): the kernel's register use allows fewer threads "
+        "per block than the graph's contractions need; use a smaller tile");
+
+  // Exactly (NumThreads, 1, 1): the shape lg_cute_kernel assumes.
+  const dim3 block(static_cast<unsigned>(NumThreads), 1u, 1u);
+  kernel<<<Scheduler::grid(wk), block, bytes, ES{}.cuda_stream()>>>(
       levels, grid_shape, varr);
   if (cudaGetLastError() != cudaSuccess)
     Kokkos::abort("level graph (CuTe): kernel launch failed");

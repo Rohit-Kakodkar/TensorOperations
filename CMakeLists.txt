@@ -199,7 +199,20 @@ if(TENSOR_OPS_CUTLASS_DIR AND Kokkos_ENABLE_CUDA)
 
   add_executable(test_cute_level_graph tests/test_cute_level_graph.cpp)
   target_link_libraries(test_cute_level_graph PRIVATE tensor GTest::gtest)
+  # Every CuTe launch in the suite runs with the block-shape check on, so the
+  # real launch path is proven to match what lg_cute_kernel assumes.
+  target_compile_definitions(test_cute_level_graph
+                             PRIVATE TENSOR_OPS_CHECK_CUTE_LAUNCH=1)
   gtest_discover_tests(test_cute_level_graph)
+
+  # And the check itself: a launch with the wrong block shape must trap.
+  add_executable(cute_launch_guard tests/negative/cute_launch_guard.cpp)
+  target_link_libraries(cute_launch_guard PRIVATE tensor)
+  target_compile_definitions(cute_launch_guard
+                             PRIVATE TENSOR_OPS_CHECK_CUTE_LAUNCH=1)
+  add_test(NAME CuteLaunchGuard.WrongBlockShapeTraps COMMAND cute_launch_guard)
+  set_tests_properties(CuteLaunchGuard.WrongBlockShapeTraps PROPERTIES
+                       PASS_REGULAR_EXPRESSION "trap fired")
 
   add_executable(test_cute_fragment_store tests/test_cute_fragment_store.cpp)
   target_link_libraries(test_cute_fragment_store PRIVATE tensor GTest::gtest)
