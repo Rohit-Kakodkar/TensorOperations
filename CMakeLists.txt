@@ -214,6 +214,14 @@ if(TENSOR_OPS_CUTLASS_DIR AND Kokkos_ENABLE_CUDA)
   set_tests_properties(CuteLaunchGuard.WrongBlockShapeTraps PROPERTIES
                        PASS_REGULAR_EXPRESSION "trap fired")
 
+  add_executable(cute_global_layout_guard
+                 tests/negative/cute_global_layout_guard.cpp)
+  target_link_libraries(cute_global_layout_guard PRIVATE tensor)
+  add_test(NAME CuteGlobalLayoutGuard.NonContiguousLayoutRightAborts
+           COMMAND cute_global_layout_guard)
+  set_tests_properties(CuteGlobalLayoutGuard.NonContiguousLayoutRightAborts
+                       PROPERTIES PASS_REGULAR_EXPRESSION "input view is padded")
+
   add_executable(test_cute_fragment_store tests/test_cute_fragment_store.cpp)
   target_link_libraries(test_cute_fragment_store PRIVATE tensor GTest::gtest)
   gtest_discover_tests(test_cute_fragment_store)

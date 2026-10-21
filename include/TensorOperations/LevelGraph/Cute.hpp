@@ -82,6 +82,48 @@ struct lg_cute_stage {
   }
 };
 
+template <typename OutModes, typename NodeModes, typename TileShape,
+          typename GridModes>
+constexpr auto lg_cute_static_ext() {
+  constexpr auto o = seq_to_array(OutModes{});
+  constexpr auto n = seq_to_array(NodeModes{});
+  constexpr auto g = seq_to_array(GridModes{});
+  constexpr auto t =
+      cute_static_extents<TileShape>(std::make_index_sequence<n.size()>{});
+  std::array<int, o.size()> e{};
+  for (std::size_t d = 0; d < o.size(); ++d) {
+    bool gridded = false;
+    for (std::size_t k = 0; k < g.size(); ++k)
+      gridded = gridded || g[k] == o[d];
+    e[d] = 0;
+    if (!gridded)
+      for (std::size_t k = 0; k < n.size(); ++k)
+        if (n[k] == o[d]) e[d] = t[k];
+  }
+  return e;
+}
+
+template <typename OutModes, typename NodeModes, typename TileShape,
+          typename GridModes>
+using lg_cute_static_ext_t = array_to_seq_t<
+    lg_cute_static_ext<OutModes, NodeModes, TileShape, GridModes>()>;
+
+template <typename Node, typename GridModes>
+using lg_cute_input_ext_t =
+    lg_cute_static_ext_t<typename Node::modes_seq, typename Node::modes_seq,
+                         cute_shape_of_t<member_out_tile_t<Node>>, GridModes>;
+
+template <typename Node>
+constexpr bool lg_cute_global_input() {
+  if constexpr (has_node_tag_v<StagedTag, Node>)
+    return has_node_tag_v<InputTag, typename Node::operand_type>;
+  else
+    return false;
+}
+
+template <typename Node>
+inline constexpr bool lg_cute_global_input_v = lg_cute_global_input<Node>();
+
 template <typename Node, int NumThreads>
 struct lg_cute_stage<Node, NumThreads, DefaultTV> {
   using tile_shape = cute_shape_of_t<member_out_tile_t<Node>>;
@@ -711,12 +753,15 @@ __device__ auto lg_cute_stage_member(const LevelsT&                   levels,
     using R = DeviceTuple<decltype(ev())>;
     return R{ev()};
   } else {
-    using S        = lg_cute_stage<Node, NumThreads>;
-    using Gather   = gather_seq_t<typename Node::modes_seq, GridModes>;
+    using S      = lg_cute_stage<Node, NumThreads>;
+    using Gather = gather_seq_t<typename Node::modes_seq, GridModes>;
+    using Ext = std::conditional_t<lg_cute_global_input_v<Node>,
+                                   lg_cute_input_ext_t<Node, GridModes>, void>;
     const auto idx = node_index<Node::Rank, RootR>(grid_idx, Gather{});
     auto       ev  = make_evaluator<CutePolicyTag<ES>>(
         levels.template get<L>().template get<M>(),
-        CuteStagedTag<typename S::tile_shape, typename S::part>{S::make()});
+        CuteStagedTag<typename S::tile_shape, typename S::part, Ext>{
+            S::make()});
     if constexpr (Node::NumOut == 1) {
       using R = DeviceTuple<decltype(ev(idx))>;
       return R{ev(idx)};
@@ -981,11 +1026,13 @@ __device__ void lg_cute_store_root(const LevelsT& levels, const Slots& slots,
   const auto  node =
       make_cute_fragment_node<ES, Node::Rank, typename P::tile_shape>(
           f.frag_, f.coords_);
-  const auto out =
-      make_handle_seq(view, typename lg_member_decl_modes<Node>::type{});
+  using DeclModes = typename lg_member_decl_modes<Node>::type;
+  using Ext       = lg_cute_static_ext_t<DeclModes, typename Node::modes_seq,
+                                         typename P::tile_shape, GridModes>;
+  const auto out  = make_handle_seq(view, DeclModes{});
   make_evaluator<CutePolicyTag<ES>>(
       node, CuteFragmentStoreTag<typename P::part>{P::make(levels)})(
-      idx, out, output_perm_seq<Node>());
+      idx, out, output_perm_seq<Node>(), Ext{});
 }
 
 template <typename ES, int NumThreads, typename LevelsT, typename GridModes,
@@ -1072,6 +1119,52 @@ void lg_cute_check_wholes(const LevelsT& levels, std::index_sequence<Ls...>) {
       ...);
 }
 
+template <typename GridModes, typename Node>
+void lg_cute_check_global_input(const Node& n) {
+  if constexpr (lg_cute_global_input_v<Node>)
+    if (!cute_global_layout_holds<lg_cute_input_ext_t<Node, GridModes>>(
+            n.operand_.handle))
+      Kokkos::abort(
+          "level graph (CuTe): an input view is padded, or a LabelWhole "
+          "label's extent differs from its tile; the CuTe backend reads "
+          "LayoutRight and LayoutLeft views as contiguous");
+}
+
+template <typename GridModes, typename LevelsT, std::size_t... Ls>
+void lg_cute_check_global_inputs(const LevelsT& levels,
+                                 std::index_sequence<Ls...>) {
+  (
+      [&]<std::size_t... Ms>(const auto& lv, std::index_sequence<Ms...>) {
+        (lg_cute_check_global_input<GridModes>(lv.template get<Ms>()), ...);
+      }(levels.template get<Ls>(),
+        std::make_index_sequence<tuple_size_v<tuple_element_t<Ls, LevelsT>>>{}),
+      ...);
+}
+
+template <typename GridModes, int NumThreads, typename LevelsT,
+          typename ViewArr, std::size_t... Rts>
+void lg_cute_check_global_outputs(const ViewArr& views,
+                                  std::index_sequence<Rts...>) {
+  int  i  = 0;
+  bool ok = true;
+  (
+      [&] {
+        using Node      = lg_cute_slot_node_t<LevelsT, Rts>;
+        using P         = lg_cute_slot_producer<LevelsT, Rts, NumThreads>;
+        using DeclModes = typename lg_member_decl_modes<Node>::type;
+        using Ext = lg_cute_static_ext_t<DeclModes, typename Node::modes_seq,
+                                         typename P::tile_shape, GridModes>;
+        ok        = ok && cute_global_layout_holds<Ext>(
+                              make_handle_seq(views[i++], DeclModes{}));
+      }(),
+      ...);
+  if (!ok)
+    Kokkos::abort(
+        "level graph (CuTe): an output view is padded, or a LabelWhole "
+        "label's extent differs from its tile; the CuTe backend writes "
+        "LayoutRight and LayoutLeft views as contiguous");
+}
+
 template <typename V, typename ES, typename LevelsT>
 std::size_t lg_cute_smem_bytes() {
   return lg_cute_smem_elems_v<V, ES, LevelsT, lg_cute_num_threads_v<LevelsT>> *
@@ -1109,8 +1202,12 @@ int lg_execute_cute(const LevelsT& levels, RootsSeq, const ViewTs&... views) {
   lg_cute_check_divisible<LT, GridModes>(grid_shape);
   lg_cute_check_wholes<LT>(levels,
                            std::make_index_sequence<tuple_size_v<LevelsT>>{});
-  const int         wk    = lg_league_size<GridTile>(grid_shape);
-  const auto        varr  = lg_view_array(views...);
+  lg_cute_check_global_inputs<GridModes>(
+      levels, std::make_index_sequence<tuple_size_v<LevelsT>>{});
+  const int  wk   = lg_league_size<GridTile>(grid_shape);
+  const auto varr = lg_view_array(views...);
+  lg_cute_check_global_outputs<GridModes, NumThreads, LevelsT>(varr,
+                                                               RootsSeq{});
   const std::size_t bytes = lg_cute_smem_bytes<V, ES, LevelsT>();
 
   const auto kernel =
