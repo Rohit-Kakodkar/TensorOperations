@@ -46,14 +46,21 @@
 // the whole kernel: 200 + 16500*TE bytes, against `library2`'s hand-aliased 18
 // tiles. It does not bite at the tile that wins -- see the table this prints.
 //
+// A THIRD PATH, `structured`, is the same pipeline with the gradient and the
+// divergence written through make_stack_node / make_outer_product_node /
+// make_delta_node, the reference gradient of SPECFEM++'s direct kernel. See
+// IMPLEMENTATION 3.
+//
 // Usage: bench_sem3d_levelgraph [nspec [reps [warmup [TE team]]]]
 //        5 arguments selects PROFILE MODE: one launch per implementation.
 // ===========================================================================
 
 #include <Kokkos_Core.hpp>
 #include <TensorOperations/Evaluator.hpp>
+#include <TensorOperations/GeneralContraction.hpp>
 #include <TensorOperations/LevelGraph.hpp>
 #include <TensorOperations/LevelPlan.hpp>
+#include <TensorOperations/Structured.hpp>
 #include <TensorOperations/Tiling.hpp>
 
 #include <algorithm>
@@ -412,6 +419,144 @@ std::size_t levelgraph_scratch(Fields d) {
       make_combine_node<'e', 'k', 'j', 'i'>(tx1, te1, tg1, WeightedSum{d}),
       make_combine_node<'e', 'k', 'j', 'i'>(tx2, te2, tg2, WeightedSum{d}));
   return g6.outputs(r0, r1, r2).scratch_bytes();
+}
+
+// ===========================================================================
+// IMPLEMENTATION 3 -- the same pipeline through structured operands
+//
+// The reference gradient of SPECFEM++'s direct kernel,
+//
+//   B = make_stack_node<'r', ...>(make_outer_product_node<...>(h, delta,
+//                                                            delta), ...)
+//
+// replaces the nine hand-relabelled gradient contractions, and its divergence
+// twin D replaces the nine divergences AND the three weighted sums:
+//
+//   grad_r u_c = make_contraction_node(make_delta_node<'r'>(idx<r>), B, u_c)
+//   f_c        = make_contraction_node(D, make_stack_node<'r', ...>(
+//                                             F^0_c, F^1_c, F^2_c))
+//
+// The deltas are eliminated at compile time, so each gradient is one
+// length-N sum and each f_c three: the level graph's arithmetic. The stress
+// stays the one 9-output combine; it now also applies the two transverse
+// weights, which D's deltas put at the quadrature point (branch 0 makes
+// j == y, k == z). D is built from Hw, not B^T, because the reference weights
+// Hw at the output index.
+//
+// Four compute levels become three, and the three divergence roots stream
+// straight to f.
+// ===========================================================================
+inline constexpr int kStructFnBegin = __LINE__;
+// Integrand9, times the two weights transverse to each direction.
+struct WeightedIntegrand9 {
+  Integrand9      in;
+  KOKKOS_FUNCTION Kokkos::Array<float, 9> operator()(
+      int e, int k, int j, int i, float x0, float x1, float x2, float y0,
+      float y1, float y2, float z0, float z1, float z2) const {
+    auto        f  = in(e, k, j, i, x0, x1, x2, y0, y1, y2, z0, z1, z2);
+    const float wi = in.d.w(i), wj = in.d.w(j), wk = in.d.w(k);
+    for (int c = 0; c < 3; ++c) {
+      f[0 + c] *= wj * wk;
+      f[3 + c] *= wi * wk;
+      f[6 + c] *= wi * wj;
+    }
+    return f;
+  }
+};
+inline constexpr int kStructFnEnd = __LINE__;
+
+// z y x the quadrature point, n m l the input node, k j i the output node,
+// r the reference direction, u f the two axes of H and Hw.
+template <int TE>
+using SMap =
+    LabelTiles<LabelTile<'e', TE>, LabelWhole<'z', cfg::N>,
+               LabelWhole<'y', cfg::N>, LabelWhole<'x', cfg::N>,
+               LabelWhole<'n', cfg::N>, LabelWhole<'m', cfg::N>,
+               LabelWhole<'l', cfg::N>, LabelWhole<'k', cfg::N>,
+               LabelWhole<'j', cfg::N>, LabelWhole<'i', cfg::N>,
+               LabelWhole<'u', cfg::N>, LabelWhole<'f', cfg::N>,
+               LabelWhole<'r', 3>>;
+
+// One builder for both the launch and the scratch query.
+inline constexpr int kStructBegin = __LINE__;
+template <int TE>
+auto structured_outputs(Fields d) {
+  auto g0 = make_level_graph<float, ES>(SMap<TE>{});
+  auto [g1, h, hw] =
+      g0.add(make_stage_node(make_input_node(make_handle<'u', 'f'>(d.H))),
+             make_stage_node(make_input_node(make_handle<'u', 'f'>(d.Hw))));
+  // u staged on the input node's labels, so B reads it without a relabel.
+  auto [g2, u0, u1, u2] = g1.add(
+      make_stage_node(make_input_node(make_handle<'e', 'n', 'm', 'l'>(d.u0))),
+      make_stage_node(make_input_node(make_handle<'e', 'n', 'm', 'l'>(d.u1))),
+      make_stage_node(make_input_node(make_handle<'e', 'n', 'm', 'l'>(d.u2))));
+
+  // B(r; x,l, y,m, z,n): the derivative of basis function (n, m, l) along r
+  // at point (z, y, x) -- H(point, function) along r, the identity along the
+  // other two.
+  const auto B = make_stack_node<'r', 'x', 'l', 'y', 'm', 'z', 'n'>(
+      make_outer_product_node<'x', 'l', 'y', 'm', 'z', 'n'>(
+          h.template as<'x', 'l'>(), make_delta_node<'y', 'm'>(),
+          make_delta_node<'z', 'n'>()),
+      make_outer_product_node<'x', 'l', 'y', 'm', 'z', 'n'>(
+          make_delta_node<'x', 'l'>(), h.template as<'y', 'm'>(),
+          make_delta_node<'z', 'n'>()),
+      make_outer_product_node<'x', 'l', 'y', 'm', 'z', 'n'>(
+          make_delta_node<'x', 'l'>(), make_delta_node<'y', 'm'>(),
+          h.template as<'z', 'n'>()));
+  // Branch r of B against one component: the unit vector binds r, so the
+  // other two branches vanish at compile time.
+  auto grad = [&](auto r, auto uu) {
+    return make_contraction_node<'e', 'z', 'y', 'x'>(make_delta_node<'r'>(r),
+                                                     B, uu);
+  };
+  auto [g3, gx0, gx1, gx2, ge0, ge1, ge2, gg0, gg1, gg2] =
+      g2.add(grad(idx<0>, u0), grad(idx<0>, u1), grad(idx<0>, u2),
+             grad(idx<1>, u0), grad(idx<1>, u1), grad(idx<1>, u2),
+             grad(idx<2>, u0), grad(idx<2>, u1), grad(idx<2>, u2));
+
+  auto [g4, fx0, fx1, fx2, fe0, fe1, fe2, fg0, fg1, fg2] =
+      g3.add(make_combine_node<'e', 'z', 'y', 'x'>(gx0, gx1, gx2, ge0, ge1,
+                                                   ge2, gg0, gg1, gg2,
+                                                   WeightedIntegrand9{{d}}));
+
+  // D(r; x,i, y,j, z,k): Hw(summed point, output) along r, the identity
+  // along the other two.
+  const auto D = make_stack_node<'r', 'x', 'i', 'y', 'j', 'z', 'k'>(
+      make_outer_product_node<'x', 'i', 'y', 'j', 'z', 'k'>(
+          hw.template as<'x', 'i'>(), make_delta_node<'y', 'j'>(),
+          make_delta_node<'z', 'k'>()),
+      make_outer_product_node<'x', 'i', 'y', 'j', 'z', 'k'>(
+          make_delta_node<'x', 'i'>(), hw.template as<'y', 'j'>(),
+          make_delta_node<'z', 'k'>()),
+      make_outer_product_node<'x', 'i', 'y', 'j', 'z', 'k'>(
+          make_delta_node<'x', 'i'>(), make_delta_node<'y', 'j'>(),
+          hw.template as<'z', 'k'>()));
+  // f_c = sum_r D_r F^r_c, the three directions stacked on r.
+  auto div = [&](auto fx, auto fe, auto fg) {
+    return make_contraction_node<'e', 'k', 'j', 'i'>(
+        D, make_stack_node<'r', 'e', 'z', 'y', 'x'>(fx, fe, fg));
+  };
+  auto [g5, r0, r1, r2] =
+      g4.add(div(fx0, fe0, fg0), div(fx1, fe1, fg1), div(fx2, fe2, fg2));
+
+  using Plan = LevelPlan<std::decay_t<decltype(g5.levels)>>;
+  static_assert(Plan::num_levels == 5,
+                "two stage levels and three compute levels: gradient, "
+                "integrand, divergence");
+  return g5.outputs(r0, r1, r2);
+}
+
+template <int TE>
+void structured_sem3d(Fields d, int team) {
+  structured_outputs<TE>(d).team_size(team).execute(TeamPolicyTag<ES>{}, d.f0,
+                                                    d.f1, d.f2);
+}
+inline constexpr int kStructEnd = __LINE__;
+
+template <int TE>
+std::size_t structured_scratch(Fields d) {
+  return structured_outputs<TE>(d).scratch_bytes();
 }
 
 // ===========================================================================
@@ -787,20 +932,23 @@ int run(int argc, char* argv[]) {
                 cfg::N, E, ES::name());
     std::printf(
         "declarative 4-level graph vs a hand-written kernel of the "
-        "same 4 stages\n\n");
+        "same 4 stages,\nand the same pipeline through structured "
+        "operands (stack/outer/delta)\n\n");
 
     // --- scratch, before anything launches ------------------------------
     // Printed rather than derived: LevelGraph carves one buffer per slot with
     // no liveness pooling, and shmem_size rounds each allocation up, so a
     // closed-form estimate is a lower bound and not the number that decides
     // whether a tile launches at all.
-    std::printf("%4s %12s %12s %9s\n", "TE", "graph(B)", "hand(B)", "ratio");
-    std::printf("---- ------------ ------------ ---------\n");
+    std::printf("%4s %12s %12s %9s %12s\n", "TE", "graph(B)", "hand(B)",
+                "ratio", "struct(B)");
+    std::printf("---- ------------ ------------ --------- ------------\n");
     for_each_TE([&](auto tag) {
       constexpr int     TE = decltype(tag)::value;
       const std::size_t g  = levelgraph_scratch<TE>(d);
       const std::size_t h  = hand4_scratch<TE>();
-      std::printf("%4d %12zu %12zu %8.2fx\n", TE, g, h, double(g) / double(h));
+      std::printf("%4d %12zu %12zu %8.2fx %12zu\n", TE, g, h,
+                  double(g) / double(h), structured_scratch<TE>(d));
     });
     std::printf("\n");
     std::fflush(stdout);
@@ -824,6 +972,11 @@ int run(int argc, char* argv[]) {
         const double he = check(d, Echk, r0, r1, r2);
         std::printf("profile TE=%d team=%d: graph err %.1e, hand err %.1e\n",
                     TE, pteam, ge, he);
+        if (structured_scratch<TE>(d) > cfg::kScratchCap) return;
+        structured_sem3d<TE>(d, pteam);
+        Kokkos::fence();
+        std::printf("profile TE=%d team=%d: structured err %.1e\n", TE, pteam,
+                    check(d, Echk, r0, r1, r2));
       };
       for_each_TE(one);
       return 0;
@@ -833,18 +986,23 @@ int run(int argc, char* argv[]) {
     // Best-vs-best across TE x team size, never at a fixed team size. The team
     // sweep is CAPPED at the iteration space: every level's range is exactly
     // 125*TE items, so a larger team idles threads in all four phases.
-    Best graph, hand;
-    std::printf("%4s %6s %10s %10s %11s %7s\n", "TE", "team", "graph(ms)",
-                "hand(ms)", "gscratch", "blk/SM");
-    std::printf("---- ------ ---------- ---------- ----------- -------\n");
+    Best graph, hand, structured;
+    std::printf("%4s %6s %10s %10s %10s %11s %7s %11s\n", "TE", "team",
+                "graph(ms)", "hand(ms)", "struct(ms)", "gscratch", "blk/SM",
+                "sscratch");
+    std::printf(
+        "---- ------ ---------- ---------- ---------- ----------- ------- "
+        "-----------\n");
 
     const auto sweep = [&](auto tag) {
       constexpr int     TE  = decltype(tag)::value;
       const std::size_t gsc = levelgraph_scratch<TE>(d);
       const std::size_t hsc = hand4_scratch<TE>();
-      if (gsc > cfg::kScratchCap || hsc > cfg::kScratchCap) {
-        std::printf("%4d %6s %10s %10s %11zu %7s  over %zu B cap\n", TE, "-",
-                    "-", "-", gsc, "-", cfg::kScratchCap);
+      const std::size_t ssc = structured_scratch<TE>(d);
+      if (gsc > cfg::kScratchCap || hsc > cfg::kScratchCap ||
+          ssc > cfg::kScratchCap) {
+        std::printf("%4d %6s %10s %10s %10s %11zu %7s %11zu  over %zu B cap\n",
+                    TE, "-", "-", "-", "-", gsc, "-", ssc, cfg::kScratchCap);
         return;
       }
       // The Serial backend permits a team of 1 only, so it is a correctness
@@ -862,10 +1020,16 @@ int run(int argc, char* argv[]) {
         const double hms =
             best_ms([&] { hand4_sem3d<TE>(d, E, team); }, warmup, reps);
         const double herr = check(d, Echk, r0, r1, r2);
-        std::printf("%4d %6d %10.3f %10.3f %11zu %7zu\n", TE, team, gms, hms,
-                    gsc, gsc ? (227u * 1024u) / gsc : 0u);
+        const double sms =
+            best_ms([&] { structured_sem3d<TE>(d, team); }, warmup, reps);
+        const double serr = check(d, Echk, r0, r1, r2);
+        std::printf("%4d %6d %10.3f %10.3f %10.3f %11zu %7zu %11zu\n", TE,
+                    team, gms, hms, sms, gsc, gsc ? (227u * 1024u) / gsc : 0u,
+                    ssc);
         if (gms < graph.ms) graph = Best{gms, TE, team, gerr, gsc};
         if (hms < hand.ms) hand = Best{hms, TE, team, herr, hsc};
+        if (sms < structured.ms)
+          structured = Best{sms, TE, team, serr, ssc};
       }
     };
     for_each_TE(sweep);
@@ -883,8 +1047,11 @@ int run(int argc, char* argv[]) {
     };
     row("levelgraph", graph);
     row("hand4", hand);
+    row("structured", structured);
     std::printf("\nlevelgraph vs hand (best against best): %.3fx\n",
                 hand.ms / graph.ms);
+    std::printf("structured vs levelgraph (best against best): %.3fx\n",
+                graph.ms / structured.ms);
 
     // --- source size ----------------------------------------------------
     // Two columns, not one total: the claim under test is that the graph's
@@ -900,12 +1067,18 @@ int run(int argc, char* argv[]) {
                 "two functors; stages + 4 add() calls");
     std::printf("%-12s %9d %9d   %s\n", "hand4", 0, kHandEnd - kHandBegin - 1,
                 "scratch views, 4 ranges, 4 barriers, index decode");
+    std::printf("%-12s %9d %9d   %s\n", "structured",
+                kStructFnEnd - kStructFnBegin - 1,
+                kStructEnd - kStructBegin - 1,
+                "one functor; stages + 3 add() calls, B and D");
     std::printf(
         "\nFor reference, a caller-driven walk of the same levels spent 353 "
         "lines\nand the removed TeamPolicyTag DAG 210, on this same "
         "pipeline.\n");
 
-    return (graph.err < 1e-4 && hand.err < 1e-4) ? 0 : 1;
+    const bool pass =
+        graph.err < 1e-4 && hand.err < 1e-4 && structured.err < 1e-4;
+    return pass ? 0 : 1;
   }
 }
 
