@@ -1184,7 +1184,10 @@ int lg_execute_cute(const LevelsT& levels, RootsSeq, const ViewTs&... views) {
   static_assert(lg_cute_supported<LevelsT>(
                     std::make_index_sequence<tuple_size_v<LevelsT>>{}),
                 "level graph (CuTe): every level must be all stage, all "
-                "contraction or all combine members");
+                "contraction or all combine members; a general contraction "
+                "(make_contraction_node with more than two operands, a shared "
+                "batch label or a structured operand) runs on the team "
+                "backend only");
   // The block size. It is both the kernel's template argument and the launch's
   // block, and the kernel ASSUMES threadIdx.x < NumThreads -- so this one
   // constant must feed both, and nothing else may launch lg_cute_kernel.
