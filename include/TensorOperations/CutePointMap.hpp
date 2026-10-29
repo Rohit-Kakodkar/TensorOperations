@@ -59,11 +59,32 @@ using cute_relabel_t = typename cute_relabel_layout<
     cute_relabel_info<CModes, CanonModes, CombineShape>,
     std::make_index_sequence<CModes::size()>>::type;
 
+template <typename TV, typename CModes, typename CanonModes,
+          typename CombineShape>
+using cute_point_tv_of_t = decltype(cute::composition(
+    cute_relabel_t<CModes, CanonModes, CombineShape>{},
+    std::declval<const TV&>()));
+
 template <typename Mma, typename CModes, typename CanonModes,
           typename CombineShape>
-using cute_point_tv_t = decltype(cute::composition(
-    cute_relabel_t<CModes, CanonModes, CombineShape>{},
-    std::declval<const Mma&>().get_layoutC_TV()));
+using cute_point_tv_t =
+    cute_point_tv_of_t<decltype(std::declval<const Mma&>().get_layoutC_TV()),
+                       CModes, CanonModes, CombineShape>;
+
+template <typename TV, std::size_t N>
+constexpr bool cute_tv_is_bijection() {
+  if constexpr (decltype(cute::size(TV{}))::value != N) {
+    return false;
+  } else {
+    std::array<bool, N> hit{};
+    for (std::size_t n = 0; n < N; ++n) {
+      const auto i = static_cast<long>(TV{}(static_cast<int>(n)));
+      if (i < 0 || i >= static_cast<long>(N) || hit[i]) return false;
+      hit[i] = true;
+    }
+    return true;
+  }
+}
 
 template <typename TVK, typename TVD>
 constexpr bool cute_points_aligned() {
