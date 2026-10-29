@@ -67,7 +67,8 @@ __global__ void stage_node_tiles(StageNode sn, OutHandle out) {
   const int thr           = static_cast<int>(threadIdx.x);
 
   auto ev = make_evaluator<CutePolicyTag<>>(
-      sn, CuteStagedTag<Tiler, ThrLayout>{{ThrLayout{}, thr}});
+      sn, CuteStagedTag<Tiler, CuteThreadPartitioner<ThrLayout>>{
+              {ThrLayout{}, thr}});
   const auto coord = cute::make_coord(tp, tq, tr);
   auto       frag  = ev(coord);
   static_assert(

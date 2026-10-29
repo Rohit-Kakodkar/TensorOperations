@@ -18,8 +18,10 @@ struct FunctionalTag {};
 struct IntermTag {};
 struct ContractionTag {};
 struct CombineTag {};
+struct GeneralContractionTag {};
 struct SlotTag {};
 struct StagedTag {};
+struct GatherTag {};
 
 // Sentinel for "no hook"
 struct NoHook {};
@@ -36,6 +38,33 @@ template <typename M>
 inline constexpr bool is_default_mma_v = false;
 template <int B>
 inline constexpr bool is_default_mma_v<DefaultMma<B>> = true;
+}  // namespace Impl
+
+struct DefaultTV {};
+
+namespace Impl {
+template <typename TV>
+inline constexpr bool is_default_tv_v = std::is_same_v<TV, DefaultTV>;
+
+template <typename TV>
+struct RegisterTV {
+  TV tv;
+};
+
+template <typename TV>
+struct unwrap_tv {
+  using type                        = TV;
+  static constexpr bool is_register = false;
+};
+template <typename TV>
+struct unwrap_tv<RegisterTV<TV>> {
+  using type                        = TV;
+  static constexpr bool is_register = true;
+};
+template <typename TV>
+using unwrap_tv_t = typename unwrap_tv<TV>::type;
+template <typename TV>
+inline constexpr bool is_register_tv_v = unwrap_tv<TV>::is_register;
 }  // namespace Impl
 
 // Forward declaration — TiledLayout.hpp defines it; exec_space_of below has to
@@ -85,6 +114,29 @@ struct is_node_handle<NodeHandle<Tag, Args...>> : std::true_type {};
 template <typename T>
 inline constexpr bool is_node_handle_v =
     is_node_handle<std::remove_cv_t<std::remove_reference_t<T>>>::value;
+
+template <typename T, typename = void>
+struct has_modes_seq : std::false_type {};
+template <typename T>
+struct has_modes_seq<T, std::void_t<typename T::modes_seq>> : std::true_type {};
+
+// A STRUCTURED operand of make_contraction_node -- the result of
+// make_delta_node, make_outer_product_node or make_stack_node, or a relabel of
+// one (Structured.hpp). Not a node, and it carries no data: the
+// general contraction lowers it to terms. Recognised by a nested
+// `structured_operand_tag`, so this header need not include Structured.hpp.
+template <typename T>
+inline constexpr bool is_structured_operand_v = requires {
+  typename std::remove_cv_t<std::remove_reference_t<T>>::structured_operand_tag;
+};
+
+// Anything make_contraction_node takes as an operand: a labelled node, or a
+// structured operand.
+template <typename T>
+inline constexpr bool is_contraction_operand_v =
+    (is_node_handle_v<T> &&
+     has_modes_seq<std::remove_cv_t<std::remove_reference_t<T>>>::value) ||
+    is_structured_operand_v<T>;
 
 // Safely extracts T::value_type when it exists; falls back to void.
 template <typename T, typename = void>
@@ -211,8 +263,28 @@ struct is_functional_layout<
 template <typename T>
 inline constexpr bool is_functional_layout_v = is_functional_layout<T>::value;
 
-// Number of output tensors a node emits: 1 for every node except a multi-output
-// combine, which exposes `NumOut`.
+// --- fn return-type introspection -----------------------------------------
+// Classify what a combine fn or a functional-input source returns: a scalar
+// (one output), a Kokkos::Array<U, M> (M outputs), or void (a sink, none).
+template <typename Ret>
+struct fn_result_arity {  // scalar result
+  static constexpr int num = 1;
+  using elem               = Ret;
+};
+template <typename U, std::size_t M>
+struct fn_result_arity<Kokkos::Array<U, M>> {  // Kokkos::Array<U, M> result
+  static constexpr int num = static_cast<int>(M);
+  using elem               = U;
+};
+template <>
+struct fn_result_arity<void> {  // sink: fn returns nothing and scatters itself,
+                                // so
+  static constexpr int num = 0;  // it contributes no output slot to the graph
+  using elem               = void;
+};
+
+// Number of output tensors a node emits: its `NumOut` when it declares one
+// (combine, functional-input and stage nodes), otherwise 1.
 template <typename Node, typename = void>
 struct output_arity : std::integral_constant<int, 1> {};
 template <typename Node>
@@ -283,14 +355,16 @@ struct NodeHandle<FunctionalTag, Fn, ModesSeq, ValueType, ExecSpace, Layout,
   Layout                       layout_;
   [[no_unique_address]] HookOp hook_op;
 
-  using node_tag            = FunctionalTag;
-  static constexpr int Rank = static_cast<int>(ModesSeq::size());
-  using value_type          = ValueType;
-  using exec_space          = ExecSpace;
-  using modes_seq           = ModesSeq;
-  using functor_type        = Fn;
-  using layout_type         = Layout;
-  using order_tag           = Impl::layout_order_t<Layout>;
+  using node_tag              = FunctionalTag;
+  static constexpr int Rank   = static_cast<int>(ModesSeq::size());
+  using value_type            = ValueType;
+  using exec_space            = ExecSpace;
+  using modes_seq             = ModesSeq;
+  using functor_type          = Fn;
+  using layout_type           = Layout;
+  using order_tag             = Impl::layout_order_t<Layout>;
+  using result_type           = functional_value_t<Fn, Rank>;
+  static constexpr int NumOut = Impl::fn_result_arity<result_type>::num;
 
   static_assert(Impl::labels_distinct_v<ModesSeq>,
                 "functional input node: labels must be distinct");
@@ -335,17 +409,22 @@ struct NodeHandle<IntermTag, Storage, IntRank, ExecSpace, HookOp> {
 // LevelGraph::add fills it in: `add` is the first place where both the node and
 // the map are in scope. Downstream, `tile_type` is simply what MemberOutTile
 // reports.
-template <typename Operand, typename ModesSeq, typename Tile>
-struct NodeHandle<StagedTag, Operand, ModesSeq, Tile> {
-  Operand operand_;
+template <typename Operand, typename ModesSeq, typename Tile, typename TV>
+struct NodeHandle<StagedTag, Operand, ModesSeq, Tile, TV> {
+  Operand                  operand_;
+  [[no_unique_address]] TV tv_;
 
-  using node_tag            = StagedTag;
-  using operand_type        = Operand;
-  using tile_type           = Tile;
-  static constexpr int Rank = Operand::Rank;
-  using value_type          = typename Operand::value_type;
-  using exec_space          = typename Operand::exec_space;
-  using modes_seq           = ModesSeq;
+  using node_tag                    = StagedTag;
+  using operand_type                = Operand;
+  using tile_type                   = Tile;
+  using tv_param                    = TV;
+  using tv_type                     = Impl::unwrap_tv_t<TV>;
+  static constexpr bool is_register = Impl::is_register_tv_v<TV>;
+  static constexpr int  Rank        = Operand::Rank;
+  static constexpr int  NumOut      = Impl::output_arity<Operand>::value;
+  using value_type                  = typename Operand::value_type;
+  using exec_space                  = typename Operand::exec_space;
+  using modes_seq                   = ModesSeq;
 
   static_assert(static_cast<int>(ModesSeq::size()) == Rank,
                 "staged node: one label per axis");
@@ -362,7 +441,8 @@ struct NodeHandle<StagedTag, Operand, ModesSeq, Tile> {
   template <int32_t... Modes>
   KOKKOS_FUNCTION auto as() const {
     return NodeHandle<StagedTag, Operand,
-                      std::integer_sequence<int32_t, Modes...>, void>{operand_};
+                      std::integer_sequence<int32_t, Modes...>, void, TV>{
+        operand_, tv_};
   }
 };
 
@@ -480,7 +560,13 @@ KOKKOS_FUNCTION auto make_functional_input_node_impl(Layout layout, Fn fn,
                 "DynamicTileLayout{Right,Left}, StaticTileLayout{Right,Left}, "
                 "or StaticTileLayoutStride -- these are the layouts whose "
                 "traversal order a tile can inherit");
-  using ValueType = functional_value_t<Fn, Rank>;
+  using OutInfo   = fn_result_arity<functional_value_t<Fn, Rank>>;
+  using ValueType = typename OutInfo::elem;
+  static_assert(OutInfo::num >= 1,
+                "functional input source must return a value or a "
+                "Kokkos::Array<V, M> of M values; a void fn produces nothing");
+  static_assert(OutInfo::num == 1 || std::same_as<HookOp, NoHook>,
+                "a multi-output functional input takes no hook");
   static_assert(
       std::same_as<HookOp, NoHook> || HookLike<HookOp, Rank, ValueType>,
       "functional input hook must be callable as op(i_0, ..., i_{Rank-1}, "
@@ -581,10 +667,156 @@ KOKKOS_FUNCTION auto make_interm_node(Storage storage, HookOp hook = {}) {
                     ExecSpace, HookOp>{std::move(storage), std::move(hook)};
 }
 
-template <typename Operand>
-KOKKOS_FUNCTION auto make_stage_node(Operand op) {
-  return NodeHandle<StagedTag, Operand, typename Operand::modes_seq, void>{
-      std::move(op)};
+template <typename Operand, typename TV = DefaultTV>
+KOKKOS_FUNCTION auto make_stage_node(Operand op, TV tv = {}) {
+  return NodeHandle<StagedTag, Operand, typename Operand::modes_seq, void, TV>{
+      std::move(op), std::move(tv)};
+}
+
+template <typename Operand, typename TV>
+KOKKOS_FUNCTION auto make_register_node(Operand op, TV tv) {
+  static_assert(
+      requires { typename Operand::node_tag; },
+      "register node: label a view or handle source, as in "
+      "make_register_node<'e', ...>(view, tv)");
+  static_assert(!Impl::is_default_tv_v<TV>,
+                "register node: give the thread-value layout of the combine "
+                "that reads it, so its fragments stay in registers");
+  return make_stage_node(std::move(op), Impl::RegisterTV<TV>{std::move(tv)});
+}
+
+namespace Impl {
+template <typename Src, typename ModesSeq>
+struct register_source {
+  static_assert(TensorLike<Src>,
+                "register node: the source must be a view, a handle or a node");
+  static_assert(static_cast<int>(Src::rank) ==
+                    static_cast<int>(ModesSeq::size()),
+                "register node: one label per view axis");
+
+  static auto make(Src src) {
+    return make_input_node(make_handle_seq(std::move(src), ModesSeq{}));
+  }
+};
+
+template <typename T, typename HandleSeq, typename ModesSeq>
+struct register_source<TensorHandle<T, HandleSeq>, ModesSeq> {
+  static_assert(std::is_same_v<HandleSeq, ModesSeq>,
+                "register node: a handle's labels must equal the labels "
+                "given to make_register_node");
+
+  static auto make(TensorHandle<T, HandleSeq> h) {
+    return make_input_node(std::move(h));
+  }
+};
+}  // namespace Impl
+
+template <int32_t... Modes, typename Src, typename TV>
+  requires(sizeof...(Modes) > 0)
+auto make_register_node(Src src, TV tv) {
+  return make_register_node(
+      Impl::register_source<
+          Src, std::integer_sequence<int32_t, Modes...>>::make(std::move(src)),
+      std::move(tv));
+}
+
+template <int32_t... Modes, TensorLike T, typename TV = DefaultTV>
+auto make_index_node(T view, TV tv = {}) {
+  static_assert(std::is_integral_v<typename Impl::value_type_of<T>::type>,
+                "index node: the view must hold integers");
+  static_assert(static_cast<int>(T::rank) == static_cast<int>(sizeof...(Modes)),
+                "index node: one label per view axis");
+  return make_stage_node(make_input_node(make_handle<Modes...>(view)),
+                         std::move(tv));
+}
+
+namespace Impl {
+
+template <typename S, typename = void>
+struct int_indexable : std::false_type {};
+template <typename S>
+struct int_indexable<S, std::void_t<decltype(std::declval<const S&>()(0))>>
+    : std::bool_constant<
+          !std::is_void_v<decltype(std::declval<const S&>()(0))>> {};
+
+template <typename S>
+constexpr bool int_indexable_check() {
+  if constexpr (Kokkos::is_view_v<S>)
+    return S::rank == 1;
+  else
+    return int_indexable<S>::value;
+}
+template <typename S>
+inline constexpr bool int_indexable_v = int_indexable_check<S>();
+
+template <typename S>
+using indexed_value_t = std::remove_cv_t<
+    std::remove_reference_t<decltype(std::declval<const S&>()(0))>>;
+
+template <typename IdxView, typename Source>
+struct GatherFn {
+  IdxView idx;
+  Source  source;
+
+  template <typename... I>
+  KOKKOS_FUNCTION indexed_value_t<Source> operator()(I... i) const {
+    return source(idx(i...));
+  }
+};
+
+}  // namespace Impl
+
+template <typename IdxSlot, typename Source, typename ModesSeq>
+struct NodeHandle<GatherTag, IdxSlot, Source, ModesSeq> {
+  IdxSlot idx_;
+  Source  source_;
+
+  using node_tag            = GatherTag;
+  using idx_type            = IdxSlot;
+  using source_type         = Source;
+  static constexpr int Rank = static_cast<int>(ModesSeq::size());
+  using value_type          = Impl::indexed_value_t<Source>;
+  using exec_space          = typename IdxSlot::exec_space;
+  using modes_seq           = ModesSeq;
+
+  KOKKOS_FUNCTION Kokkos::Array<int, Rank> shape() const {
+    return idx_.shape();
+  }
+};
+
+template <int32_t... Modes, typename Idx, typename Source,
+          typename TV = DefaultTV>
+auto make_gather_node(Idx idx, Source source, TV tv = {}) {
+  using ModesSeq = std::integer_sequence<int32_t, Modes...>;
+  static_assert(Impl::int_indexable_v<Source>,
+                "gather node: the source must be indexable by one integer, "
+                "source(int)");
+  if constexpr (Impl::has_node_tag_v<SlotTag, Idx>) {
+    static_assert(std::is_integral_v<typename Idx::value_type>,
+                  "gather node: the index must be an index node's handle or "
+                  "an integer view");
+    static_assert(std::is_same_v<typename Idx::modes_seq, ModesSeq>,
+                  "gather node: an index handle must be read with the "
+                  "gather's labels, in the same order");
+    static_assert(Impl::is_default_tv_v<TV>,
+                  "gather node: a gather fed by an index handle uses the "
+                  "index's thread map; give the layout to make_index_node");
+    return make_stage_node(NodeHandle<GatherTag, Idx, Source, ModesSeq>{
+        std::move(idx), std::move(source)});
+  } else {
+    static_assert(
+        Kokkos::is_view_v<Idx> && std::is_integral_v<typename Idx::value_type>,
+        "gather node: the index must be an index node's handle or "
+        "an integer view");
+    static_assert(
+        static_cast<int>(Idx::rank) == static_cast<int>(sizeof...(Modes)),
+        "gather node: one label per index view axis");
+    using ES = typename Idx::execution_space;
+    return make_stage_node(
+        make_functional_input_node<ES, Modes...>(
+            idx.layout(), Impl::GatherFn<Idx, Source>{idx, std::move(source)}),
+        std::move(tv));
+  }
 }
 
 // Slot node — label an existing buffer (a producing node's output scratch) so
@@ -681,6 +913,10 @@ auto make_contraction_node_impl(NodeA a, NodeB b, HookOp hook, Mma mma) {
                 "a functional input has no address, and a contraction reads "
                 "its operands as strided memory. Wrap it in make_stage_node "
                 "first; the contraction then reads the staged tile");
+  static_assert(!std::is_integral_v<typename NodeA::value_type> &&
+                    !std::is_integral_v<typename NodeB::value_type>,
+                "contraction node: an index slot is read only by gather and "
+                "scatter nodes, not as a contraction operand");
   constexpr int Rank = static_cast<int>(sizeof...(OutModes));
   static_assert((NodeA::Rank + NodeB::Rank - Rank) % 2 == 0,
                 "Output rank is inconsistent with input ranks");
@@ -729,12 +965,41 @@ auto make_contraction_node_impl(NodeA a, NodeB b, HookOp hook, Mma mma) {
       std::move(a), std::move(b), c_shape, std::move(hook), std::move(mma)};
 }
 
+// Whether make_contraction_node<Out...>(a, b[, hook[, mma]]) is this binary
+// GEMM: two node operands whose labels make a valid A x B -> C{Out} (each
+// output label on exactly one side, every other label on both), and trailing
+// arguments, if any, that are a hook and an MMA rather than more operands.
+// Every other call is a general contraction -- GeneralContraction.hpp, whose
+// overloads of make_contraction_node carry the complementary constraint (it
+// cannot be included here: it includes this header).
+template <typename OutSeq, typename A, typename B, typename... Rest>
+constexpr bool gemm_call() {
+  if constexpr (sizeof...(Rest) > 2 || !is_node_handle_v<A> ||
+                !is_node_handle_v<B> || (is_contraction_operand_v<Rest> || ...))
+    return false;
+  else if constexpr (!has_modes_seq<A>::value || !has_modes_seq<B>::value)
+    return false;
+  else
+    return valid_contraction_v<static_cast<int>(OutSeq::size()),
+                               typename A::modes_seq, typename B::modes_seq,
+                               OutSeq>;
+}
+template <typename OutSeq, typename... Args>
+inline constexpr bool gemm_call_v = gemm_call<OutSeq, Args...>();
+
 }  // namespace Impl
 
+// These two overloads are taken only when the call IS a binary GEMM
+// (Impl::gemm_call_v); any other make_contraction_node call -- more operands,
+// a structured operand, a label shared with the output -- is the general
+// contraction in GeneralContraction.hpp.
+//
 // Primary form: infer the output scalar from NodeA, default execution space.
 //   make_contraction_node<'l','i'>(a, b)
 template <int32_t... OutModes, typename NodeA, typename NodeB,
           typename HookOp = NoHook, typename Mma = DefaultMma<>>
+  requires(Impl::gemm_call_v<std::integer_sequence<int32_t, OutModes...>, NodeA,
+                             NodeB, HookOp, Mma>)
 auto make_contraction_node(NodeA a, NodeB b, HookOp hook = {}, Mma mma = {}) {
   return Impl::make_contraction_node_impl<
       typename NodeA::value_type, Kokkos::DefaultExecutionSpace, OutModes...>(
@@ -746,6 +1011,8 @@ auto make_contraction_node(NodeA a, NodeB b, HookOp hook = {}, Mma mma = {}) {
 template <typename Scalar, typename ExecSpace = Kokkos::DefaultExecutionSpace,
           int32_t... OutModes, typename NodeA, typename NodeB,
           typename HookOp = NoHook, typename Mma = DefaultMma<>>
+  requires(Impl::gemm_call_v<std::integer_sequence<int32_t, OutModes...>, NodeA,
+                             NodeB, HookOp, Mma>)
 auto make_contraction_node(NodeA a, NodeB b, HookOp hook = {}, Mma mma = {}) {
   return Impl::make_contraction_node_impl<Scalar, ExecSpace, OutModes...>(
       std::move(a), std::move(b), std::move(hook), std::move(mma));
@@ -799,25 +1066,6 @@ struct NodeHandle<CombineTag, CombineFn, IntRank, Scalar, ExecSpace, ModesSeq,
 // ---------------------------------------------------------------------------
 namespace Impl {
 
-// --- combine fn return-type introspection ----------------------------------
-// Classify combine_ret_t (Concept.hpp: the type fn returns for the combine call
-// shape) as a scalar (NumOut == 1) or a Kokkos::Array<U, M> (NumOut == M).
-template <typename Ret>
-struct combine_out {  // scalar result
-  static constexpr int num = 1;
-  using elem               = Ret;
-};
-template <typename U, std::size_t M>
-struct combine_out<Kokkos::Array<U, M>> {  // Kokkos::Array<U, M> result
-  static constexpr int num = static_cast<int>(M);
-  using elem               = U;
-};
-template <>
-struct combine_out<void> {  // sink: fn returns nothing and scatters itself, so
-  static constexpr int num = 0;  // it contributes no output slot to the graph
-  using elem               = void;
-};
-
 // An operand's shape() gathered into the TargetSeq (output) axis order, so
 // operand extents can be compared mode-for-mode whatever each operand's own
 // axis order is.
@@ -844,6 +1092,9 @@ auto make_combine_node_impl(CombineFn fn, Ops... ops) {
                 "a functional input has no address, and a combine reads its "
                 "operands as strided memory. Wrap it in make_stage_node "
                 "first; the combine then reads the staged tile");
+  static_assert((!std::is_integral_v<typename Ops::value_type> && ...),
+                "combine node: an index slot is read only by gather and "
+                "scatter nodes, not as a combine operand");
   static_assert(((static_cast<int>(Ops::Rank) == Rank) && ...),
                 "combine node: every operand and the output must have equal "
                 "rank");
@@ -864,7 +1115,7 @@ auto make_combine_node_impl(CombineFn fn, Ops... ops) {
   // output, a Kokkos::Array<U, M> gives M. The element type must be the operand
   // scalar (homogeneous outputs sharing these modes).
   using Ret            = combine_ret_t<CombineFn, Rank, N, ActualScalar>;
-  using OutInfo        = combine_out<Ret>;
+  using OutInfo        = fn_result_arity<Ret>;
   constexpr int NumOut = OutInfo::num;
   static_assert(NumOut == 0 ||
                     std::is_convertible_v<typename OutInfo::elem, ActualScalar>,
@@ -956,5 +1207,183 @@ KOKKOS_FUNCTION auto canonicalize_input(
 }
 
 }  // namespace Impl
+
+namespace Impl {
+
+template <typename D, typename = void>
+struct atomic_target : std::false_type {};
+template <typename D>
+struct atomic_target<D, std::void_t<decltype(std::declval<const D&>()(0))>>
+    : std::bool_constant<
+          std::is_lvalue_reference_v<decltype(std::declval<const D&>()(0))> &&
+          !std::is_const_v<
+              std::remove_reference_t<decltype(std::declval<const D&>()(0))>>> {
+};
+
+template <typename D>
+constexpr bool atomic_target_check() {
+  if constexpr (Kokkos::is_view_v<D>)
+    return D::rank == 1 && !std::is_const_v<typename D::value_type>;
+  else
+    return atomic_target<D>::value;
+}
+template <typename D>
+inline constexpr bool atomic_target_v = atomic_target_check<D>();
+
+template <typename Dst>
+using atomic_elem_t =
+    std::remove_reference_t<decltype(std::declval<const Dst&>()(0))>;
+
+template <typename Dst, typename V>
+KOKKOS_FORCEINLINE_FUNCTION void scatter_add_at(const Dst& dst, int ig, V v) {
+  Kokkos::atomic_add(&dst(ig), static_cast<atomic_elem_t<Dst>>(v));
+}
+
+template <typename IdxView, typename Dst>
+struct ScatterAddFn {
+  IdxView idx;
+  Dst     dst;
+
+  template <typename... A>
+  KOKKOS_FUNCTION void operator()(A... a) const {
+    call(std::make_index_sequence<sizeof...(A) - 1>{}, DeviceTuple<A...>(a...));
+  }
+
+ private:
+  template <std::size_t... Is, typename T>
+  KOKKOS_FUNCTION void call(std::index_sequence<Is...>, const T& t) const {
+    scatter_add_at(dst, static_cast<int>(idx(t.template get<Is>()...)),
+                   t.template get<sizeof...(Is)>());
+  }
+};
+
+template <typename IdxSlot, typename Dst>
+struct ScatterAddSlotFn {
+  using idx_type = IdxSlot;
+  using dst_type = Dst;
+  IdxSlot idx;
+  Dst     dst;
+};
+
+template <typename SlotView, std::size_t R, typename Dst>
+struct ScatterAddBoundFn {
+  SlotView              slot;
+  Kokkos::Array<int, R> origin;
+  Dst                   dst;
+
+  template <typename... A>
+  KOKKOS_FUNCTION void operator()(A... a) const {
+    call(std::make_index_sequence<sizeof...(A) - 1>{}, DeviceTuple<A...>(a...));
+  }
+
+ private:
+  template <std::size_t... Is, typename T>
+  KOKKOS_FUNCTION void call(std::index_sequence<Is...>, const T& t) const {
+    scatter_add_at(
+        dst,
+        static_cast<int>(
+            slot((static_cast<int>(t.template get<Is>()) - origin[Is])...)),
+        t.template get<sizeof...(Is)>());
+  }
+};
+
+template <typename Frag, typename Dst>
+struct ScatterAddFragFn {
+  Frag idx;
+  Dst  dst;
+
+  template <typename V>
+  KOKKOS_FUNCTION void add(int v, V val) const {
+    scatter_add_at(dst, static_cast<int>(idx(v)), val);
+  }
+};
+
+template <typename Fn>
+inline constexpr bool is_scatter_slot_fn_v = false;
+template <typename I, typename D>
+inline constexpr bool is_scatter_slot_fn_v<ScatterAddSlotFn<I, D>> = true;
+
+template <typename Fn>
+inline constexpr bool is_scatter_frag_fn_v = false;
+template <typename F, typename D>
+inline constexpr bool is_scatter_frag_fn_v<ScatterAddFragFn<F, D>> = true;
+
+template <typename Fn>
+constexpr int combine_idx_slot() {
+  if constexpr (is_scatter_slot_fn_v<Fn>)
+    return static_cast<int>(Fn::idx_type::SlotIdx);
+  else
+    return -1;
+}
+
+template <typename NewFn, typename Fn, typename IntRank, typename S,
+          typename ES, typename ModesSeq, typename IntNumOut, typename... Ops>
+KOKKOS_FUNCTION auto rebind_combine_fn(
+    const NodeHandle<CombineTag, Fn, IntRank, S, ES, ModesSeq, IntNumOut,
+                     Ops...>& n,
+    NewFn                     fn) {
+  return NodeHandle<CombineTag, NewFn, IntRank, S, ES, ModesSeq, IntNumOut,
+                    Ops...>{std::move(fn), n.operands, n.shape_};
+}
+
+// rebind_combine_fn that also keeps only operands Ks. The new fn takes over
+// the dropped operands itself (a team register node read at the coordinate),
+// so the evaluator gathers -- and counts -- just the ones still in memory.
+template <typename NewFn, typename Fn, typename IntRank, typename S,
+          typename ES, typename ModesSeq, typename IntNumOut, typename... Ops,
+          std::size_t... Ks>
+KOKKOS_FUNCTION auto rebind_combine_fn_ops(
+    const NodeHandle<CombineTag, Fn, IntRank, S, ES, ModesSeq, IntNumOut,
+                     Ops...>& n,
+    NewFn                     fn, std::index_sequence<Ks...>) {
+  using OpsT = DeviceTuple<Ops...>;
+  return NodeHandle<CombineTag, NewFn, IntRank, S, ES, ModesSeq, IntNumOut,
+                    tuple_element_t<Ks, OpsT>...>{
+      std::move(fn),
+      DeviceTuple<tuple_element_t<Ks, OpsT>...>(
+          n.operands.template get<Ks>()...),
+      n.shape_};
+}
+
+}  // namespace Impl
+
+template <int32_t... Modes, typename Idx, typename Dst, typename Val>
+auto make_scatter_add_node(Idx idx, Dst dst, Val val) {
+  using ModesSeq     = std::integer_sequence<int32_t, Modes...>;
+  constexpr int Rank = static_cast<int>(sizeof...(Modes));
+  static_assert(Impl::atomic_target_v<Dst>,
+                "scatter node: the destination must give an assignable "
+                "element, dst(int) -> T&");
+  static_assert(Impl::is_node_handle_v<Val> &&
+                    !std::is_integral_v<typename Val::value_type>,
+                "scatter node: the value must be a value node, not an index");
+  if constexpr (Impl::has_node_tag_v<SlotTag, Idx>) {
+    static_assert(std::is_integral_v<typename Idx::value_type>,
+                  "scatter node: the index must be an index node's handle or "
+                  "an integer view");
+    static_assert(std::is_same_v<typename Idx::modes_seq, ModesSeq>,
+                  "scatter node: an index handle must be read with the "
+                  "scatter's labels, in the same order");
+    static_assert(static_cast<int>(Val::Rank) == Rank &&
+                      Impl::same_label_set<typename Val::modes_seq, ModesSeq>(),
+                  "scatter node: the value must carry the scatter's labels");
+    using Fn = Impl::ScatterAddSlotFn<Idx, Dst>;
+    return NodeHandle<CombineTag, Fn, std::integral_constant<int, Rank>,
+                      typename Val::value_type, Kokkos::DefaultExecutionSpace,
+                      ModesSeq, std::integral_constant<int, 0>, Val>{
+        Fn{std::move(idx), std::move(dst)}, DeviceTuple<Val>(val),
+        Impl::gathered_shape<ModesSeq>(val)};
+  } else {
+    static_assert(
+        Kokkos::is_view_v<Idx> && std::is_integral_v<typename Idx::value_type>,
+        "scatter node: the index must be an index node's handle or "
+        "an integer view");
+    static_assert(static_cast<int>(Idx::rank) == Rank,
+                  "scatter node: one label per index view axis");
+    return make_combine_node<Modes...>(
+        std::move(val),
+        Impl::ScatterAddFn<Idx, Dst>{std::move(idx), std::move(dst)});
+  }
+}
 
 }  // namespace TensorOperations

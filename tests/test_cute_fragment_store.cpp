@@ -141,8 +141,8 @@ __global__ void epilogue_kernel(SH sh, SU su, SW sw, CN cn, GN gn, Mma mma,
   auto x = make_evaluator<CutePolicyTag<>>(
       cn, CuteContractTag<decltype(eh), decltype(eu), Mma>{eh, eu, mma, thr})();
   auto outs = make_evaluator<CutePolicyTag<>>(
-      gn, CuteCombineTag<decltype(x), decltype(ew)>{
-              DeviceTuple<decltype(x), decltype(ew)>(x, ew), origin})();
+      gn, make_cute_combine_tag<USh>(CuteMmaPartitioner<Mma, 1>{mma, thr},
+                                     origin, x, ew))();
 
   const CuteMmaPartitioner<Mma, 1> part{mma, thr};
   store_frag<How, USh, ThrOut>(b0, part, outs[0], thr, zeros<USh>(), out0,
@@ -175,10 +175,8 @@ __global__ void pointwise_kernel(SA sa, SB sb, GN gn, Out out0, Out out1) {
 
   const Kokkos::Array<int, 3> origin{TP * tp, TQ * tq, TR * tr};
   auto                        outs = make_evaluator<CutePolicyTag<>>(
-      gn, CuteCombineThreadTag<ThrC, decltype(ea), decltype(eb)>{
-              {ThrC{}, thr},
-              DeviceTuple<decltype(ea), decltype(eb)>(ea, eb),
-              origin})();
+      gn, make_cute_combine_tag<ATile>(CuteThreadPartitioner<ThrC>{ThrC{}, thr},
+                                       origin, ea, eb))();
 
   const CuteThreadPartitioner<ThrC> part{ThrC{}, thr};
   store_frag<How, ATile, ThrOut>(b0, part, outs[0], thr, coord, out0, Id3{});

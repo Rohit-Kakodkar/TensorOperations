@@ -59,6 +59,15 @@ using scratch_backing_t =
     Kokkos::View<ValueType*, typename ES::scratch_memory_space,
                  Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
 
+template <typename ES>
+int team_scratch_level(std::size_t bytes) {
+  for (int level = 0; level < 2; ++level)
+    if (bytes <= static_cast<std::size_t>(
+                     Kokkos::TeamPolicy<ES>::scratch_size_max(level)))
+      return level;
+  return -1;
+}
+
 template <typename ValueType, typename ES, typename Team, typename Tile>
 KOKKOS_FORCEINLINE_FUNCTION auto alloc_scratch_tile(const Team& team,
                                                     const Tile& tile) {
