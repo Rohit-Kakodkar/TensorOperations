@@ -31,13 +31,21 @@ using TV = cute::Layout<cute::Shape<cute::_5, cute::_2, cute::_1>,
                         cute::Stride<cute::_2, cute::_1, cute::_0>>;
 #elif STAGE_TV_NEG_CASE == 4
 using TV = cute::Layout<cute::Shape<int, int>, cute::Stride<int, cute::_1>>;
+#elif STAGE_TV_NEG_CASE == 5
+using TV = DefaultTV;
 #else
-#error "STAGE_TV_NEG_CASE must be 0..4"
+#error "STAGE_TV_NEG_CASE must be 0..5"
 #endif
 
-using Raw  = decltype(make_stage_node(
+#if STAGE_TV_NEG_CASE == 5
+using Raw = decltype(make_register_node(
     make_input_node(make_handle<'e', 'a'>(std::declval<ValV>())),
     std::declval<TV>()));
+#else
+using Raw = decltype(make_stage_node(
+    make_input_node(make_handle<'e', 'a'>(std::declval<ValV>())),
+    std::declval<TV>()));
+#endif
 using Node = typename Impl::lg_resolve_member<Map, Raw>::type;
 using Part = typename Impl::lg_cute_stage<Node, 128>::part;
 static_assert(sizeof(Part) > 0, "forces the stage's guards to instantiate");

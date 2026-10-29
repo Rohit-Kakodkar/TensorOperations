@@ -5,7 +5,10 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <string>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -40,6 +43,38 @@ template <typename Layout>
 using View4 = Kokkos::View<float****, Layout, ES>;
 using ViewR = View4<Kokkos::LayoutRight>;
 using View2 = Kokkos::View<float**, Kokkos::LayoutRight, ES>;
+
+using EABC = std::integer_sequence<int32_t, 'e', 'a', 'b', 'c'>;
+using Ext4 = std::integer_sequence<int, 0, N, N, N>;
+template <typename T>
+using GlobalLayout = std::remove_cvref_t<
+    decltype(Impl::make_cute_global_tensor<Ext4>(
+                 std::declval<const TensorHandle<T, EABC>&>())
+                 .layout())>;
+template <typename T>
+using GlobalStride =
+    std::remove_cvref_t<decltype(std::declval<GlobalLayout<T>>().stride())>;
+template <typename T>
+using GlobalShape =
+    std::remove_cvref_t<decltype(std::declval<GlobalLayout<T>>().shape())>;
+
+static_assert(
+    std::is_same_v<GlobalStride<ViewR>,
+                   cute::Stride<cute::Int<N * N * N>, cute::Int<N * N>,
+                                cute::Int<N>, cute::_1>>);
+static_assert(
+    std::is_same_v<GlobalShape<ViewR>,
+                   cute::Shape<int, cute::Int<N>, cute::Int<N>, cute::Int<N>>>);
+static_assert(std::is_same_v<
+              std::remove_cvref_t<decltype(cute::get<0>(
+                  std::declval<GlobalStride<View4<Kokkos::LayoutLeft>>>()))>,
+              cute::_1>);
+static_assert(!cute::is_static<GlobalStride<View4<Kokkos::LayoutLeft>>>::value);
+static_assert(
+    std::is_same_v<GlobalShape<View4<Kokkos::LayoutStride>>,
+                   cute::Shape<int, cute::Int<N>, cute::Int<N>, cute::Int<N>>>);
+static_assert(
+    !cute::is_static<GlobalStride<View4<Kokkos::LayoutStride>>>::value);
 
 template <int TE>
 using Map4 = LabelTiles<LabelTile<'e', TE>, LabelWhole<'a', N>,
@@ -139,6 +174,26 @@ void single_stage_root(int E, Policy policy, int expected_league) {
   EXPECT_EQ(mismatches(cute_out, team_out), 0);
 }
 
+template <int TE, typename InView>
+void stage_root_matches(const InView& u) {
+  const int E = static_cast<int>(u.extent(0));
+  ViewR     cute_out("cute_out", E, N, N, N), team_out("team_out", E, N, N, N);
+  Kokkos::deep_copy(cute_out, -999.0f);
+
+  auto g0      = make_level_graph<float, ES>(Map4<TE>{});
+  auto [g1, s] = g0.add(
+      make_stage_node(make_input_node(make_handle<'e', 'a', 'b', 'c'>(u))));
+  const auto out = g1.outputs(s);
+
+  out.execute(CutePolicyTag<>{}, cute_out);
+  ASSERT_TRUE(synced());
+  out.execute(TeamPolicyTag<ES>{}, team_out);
+  ASSERT_TRUE(synced());
+
+  EXPECT_EQ(mismatches(cute_out, u), 0);
+  EXPECT_EQ(mismatches(cute_out, team_out), 0);
+}
+
 }  // namespace
 
 TEST(CuteLevelGraph, SingleStageRootCopiesTheInput) {
@@ -148,6 +203,16 @@ TEST(CuteLevelGraph, SingleStageRootCopiesTheInput) {
 TEST(CuteLevelGraph, LayoutLeftInputToLayoutRightOutput) {
   single_stage_root<2, CutePolicyTag<>, View4<Kokkos::LayoutLeft>>(
       8, CutePolicyTag<>{}, 4);
+}
+
+TEST(CuteLevelGraph, LeadingRangeSubviewInputStaysContiguous) {
+  ViewR big("big", 10, N, N, N);
+  fill(big, 3.0f);
+  const auto u = Kokkos::subview(big, Kokkos::pair<int, int>(1, 9), Kokkos::ALL,
+                                 Kokkos::ALL, Kokkos::ALL);
+  static_assert(std::is_same_v<decltype(u)::array_layout, Kokkos::LayoutRight>);
+  ASSERT_TRUE(u.span_is_contiguous());
+  stage_root_matches<2>(u);
 }
 
 TEST(CuteLevelGraph, IdleThreadsWithDefaultBlock) {
@@ -461,8 +526,8 @@ TEST(CuteLevelGraph, PooledChainReusesBuffers) {
   const auto out = g.outputs(z);
 
   constexpr std::size_t tile =
-      Impl::slot_arena_step<float, ES>(kPN * kPTE * kPN * kPN);
-  constexpr std::size_t hstep = Impl::slot_arena_step<float, ES>(kPN * kPN);
+      Impl::lg_cute_slot_step<float>(kPN * kPTE * kPN * kPN);
+  constexpr std::size_t hstep = Impl::lg_cute_slot_step<float>(kPN * kPN);
   EXPECT_EQ(out.cute_unpooled_smem_bytes(), (hstep + 3 * tile) * sizeof(float));
   EXPECT_EQ(out.cute_smem_bytes(), (hstep + tile) * sizeof(float));
 
@@ -1040,6 +1105,122 @@ ViewR sink_view(const char* name) {
 
 }  // namespace
 
+namespace {
+
+struct GatherAllU {
+  ViewGlob        glob;
+  ViewMap         iglob;
+  KOKKOS_FUNCTION Kokkos::Array<float, 3> operator()(int e, int a, int b,
+                                                     int c) const {
+    const int n = iglob(e, a, b, c);
+    return {glob(n, 0), glob(n, 1), glob(n, 2)};
+  }
+};
+
+struct Mix3At {
+  KOKKOS_FUNCTION float operator()(int e, int, int, int c, float x, float y,
+                                   float z) const {
+    return x - 2.0f * y + 4.0f * z + 0.5f * static_cast<float>(e) -
+           0.25f * static_cast<float>(c);
+  }
+};
+
+}  // namespace
+
+TEST(CuteLevelGraph, MultiOutputFunctionalStageIsBitwiseThreeStages) {
+  const GatherFixture f;
+  const auto          contract_three = [&](auto stages, ViewR* cute_out,
+                                           ViewR* team_out) {
+    for (int k = 0; k < 3; ++k) Kokkos::deep_copy(cute_out[k], -999.0f);
+    auto g0 = make_level_graph<float, ES>(MapQ<kFN, kFTE>{});
+    auto [g1, sh] =
+        g0.add(make_stage_node(make_input_node(make_handle<'q', 'a'>(f.h))));
+    auto [g2, s0, s1, s2] =
+        std::apply([&](auto... st) { return g1.add(st...); }, stages);
+    auto [g3, c0, c1, c2] =
+        g2.add(make_contraction_node<'q', 'e', 'b', 'c'>(sh, s0),
+               make_contraction_node<'q', 'e', 'b', 'c'>(sh, s1),
+               make_contraction_node<'q', 'e', 'b', 'c'>(sh, s2));
+    const auto out = g3.outputs(c0, c1, c2);
+    EXPECT_EQ(
+        out.execute(CutePolicyTag<>{}, cute_out[0], cute_out[1], cute_out[2]),
+        kFE / kFTE);
+    EXPECT_TRUE(synced());
+    out.execute(TeamPolicyTag<ES>{}, team_out[0], team_out[1], team_out[2]);
+    EXPECT_TRUE(synced());
+    return g3;
+  };
+  const auto make3 = [](const char* p) {
+    return std::array<ViewR, 3>{
+        ViewR(std::string(p) + "0", kFN, kFE, kFN, kFN),
+        ViewR(std::string(p) + "1", kFN, kFE, kFN, kFN),
+        ViewR(std::string(p) + "2", kFN, kFE, kFN, kFN)};
+  };
+  auto mc = make3("mc"), mt = make3("mt"), sc = make3("sc"), st = make3("st");
+  const auto gather = [&](int comp) {
+    return make_stage_node(make_functional_input_node<ES, 'e', 'a', 'b', 'c'>(
+        kFExt, GatherU{f.glob, f.iglob, comp}));
+  };
+
+  const auto gm = contract_three(
+      std::make_tuple(
+          make_stage_node(make_functional_input_node<ES, 'e', 'a', 'b', 'c'>(
+              kFExt, GatherAllU{f.glob, f.iglob}))),
+      mc.data(), mt.data());
+  static_assert(Impl::lg_level_slots_v<LevelsOf<decltype(gm)>, 1> == 3);
+  contract_three(std::make_tuple(gather(0), gather(1), gather(2)), sc.data(),
+                 st.data());
+
+  for (int comp = 0; comp < 3; ++comp) {
+    EXPECT_EQ(mismatches(mc[comp], sc[comp]), 0) << "component " << comp;
+    EXPECT_EQ(mismatches(mt[comp], st[comp]), 0) << "component " << comp;
+    EXPECT_LT(
+        max_rel_err(mc[comp], gradient_ref(f.h, gathered_u(f.glob, comp), 0)),
+        1e-5f)
+        << "component " << comp;
+    EXPECT_LT(max_rel_err(mc[comp], mt[comp]), 1e-5f) << "component " << comp;
+  }
+}
+
+TEST(CuteLevelGraph, MultiOutputFunctionalStageFeedsACombineInRegisters) {
+  const GatherFixture f;
+  ViewR cp("cp", kFE, kFN, kFN, kFN), tp("tp", kFE, kFN, kFN, kFN);
+  Kokkos::deep_copy(cp, -999.0f);
+
+  auto g0 = make_level_graph<float, ES>(MapQ<kFN, kFTE>{});
+  auto [g1, s0, s1, s2] =
+      g0.add(make_stage_node(make_functional_input_node<ES, 'e', 'a', 'b', 'c'>(
+          kFExt, GatherAllU{f.glob, f.iglob})));
+  auto [g2, pv] =
+      g1.add(make_combine_node<'e', 'a', 'b', 'c'>(s0, s1, s2, Mix3At{}));
+  using Plan = Impl::lg_cute_combine_plan<LevelsOf<decltype(g2)>, 1, 0, 128>;
+  static_assert(Plan::register_driven && Plan::template in_register<0>() &&
+                Plan::template in_register<1>() &&
+                Plan::template in_register<2>());
+
+  const auto out = g2.outputs(pv);
+  EXPECT_EQ(out.cute_smem_bytes(), 0u);
+  out.execute(CutePolicyTag<>{}, cp);
+  ASSERT_TRUE(synced());
+  out.execute(TeamPolicyTag<ES>{}, tp);
+  ASSERT_TRUE(synced());
+
+  const ViewR u[3] = {gathered_u(f.glob, 0), gathered_u(f.glob, 1),
+                      gathered_u(f.glob, 2)};
+  auto   h0 = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, u[0]);
+  auto   h1 = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, u[1]);
+  auto   h2 = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, u[2]);
+  HostV4 r("r", kFE, kFN, kFN, kFN);
+  for (int e = 0; e < kFE; ++e)
+    for (int a = 0; a < kFN; ++a)
+      for (int b = 0; b < kFN; ++b)
+        for (int c = 0; c < kFN; ++c)
+          r(e, a, b, c) = Mix3At{}(e, a, b, c, h0(e, a, b, c), h1(e, a, b, c),
+                                   h2(e, a, b, c));
+  EXPECT_LT(max_rel_err(cp, r), 1e-5f);
+  EXPECT_LT(max_rel_err(cp, tp), 1e-5f);
+}
+
 TEST(CuteLevelGraph, PlainSinkIsBitwiseTheRootedGraph) {
   const SinkInputs in;
   ViewR            rooted = sink_view("rooted"), sunk = sink_view("sunk"),
@@ -1549,6 +1730,228 @@ void expect_tv_staged_gradient_combine() {
   EXPECT_LT(max_rel_err(cp, tp), 1e-5f);
 }
 
+struct PairAt {
+  KOKKOS_FUNCTION Kokkos::Array<float, 2> operator()(int e, int k, int j,
+                                                     int i) const {
+    return {0.5f * e + 0.25f * k - 0.125f * j + 0.0625f * i,
+            1.0f + 0.75f * e * k - 0.5f * j + 0.1f * i * i};
+  }
+};
+
+struct GradMixPair {
+  KOKKOS_FUNCTION float operator()(int e, int k, int j, int i, float x, float y,
+                                   float z, float a, float b) const {
+    return GradMix{}(e, k, j, i, x, y, z) + 3.0f * a - 2.0f * b;
+  }
+};
+
+template <int TE, typename TV, bool Aligned>
+void expect_tv_multi_output_stage_combine() {
+  using MX        = RowOfEMma<TE, ThrX, RowOfENTile<TE>>;
+  using ME        = RowOfEMma<TE, ThrEta, RowOfENTile<TE>>;
+  using MG        = RowOfEMma<TE, ThrGamma, RowOfENTile<TE>>;
+  constexpr int E = 2 * TE;
+  OpView<5>     h("h", 5, 5);
+  ViewR         u("u", E, 5, 5, 5);
+  fill(h, 0.5f);
+  fill(u, -2.0f);
+  ViewR cp("cp", E, 5, 5, 5), tp("tp", E, 5, 5, 5);
+  Kokkos::deep_copy(cp, -999.0f);
+
+  auto g0 = make_level_graph<float, ES>(MapET<TE>{});
+  auto [g1, sh] =
+      g0.add(make_stage_node(make_input_node(make_handle<'r', 'p'>(h))));
+  auto [g2, su, m0, m1] = g1.add(
+      make_stage_node(make_input_node(make_handle<'e', 'k', 'j', 'i'>(u))),
+      make_register_node(make_functional_input_node<ES, 'e', 'k', 'j', 'i'>(
+                             Kokkos::Array<int, 4>{E, 5, 5, 5}, PairAt{}),
+                         TV{}));
+  auto [g3, gx, ge, gg] =
+      g2.add(make_contraction_node<'e', 'k', 'j', 'i'>(
+                 sh.template as<'i', 'p'>(),
+                 su.template as<'e', 'k', 'j', 'p'>(), NoHook{}, MX{}),
+             make_contraction_node<'e', 'k', 'j', 'i'>(
+                 sh.template as<'j', 'p'>(),
+                 su.template as<'e', 'k', 'p', 'i'>(), NoHook{}, ME{}),
+             make_contraction_node<'e', 'k', 'j', 'i'>(
+                 sh.template as<'k', 'p'>(),
+                 su.template as<'e', 'p', 'j', 'i'>(), NoHook{}, MG{}));
+  auto [g4, pv] = g3.add(
+      make_combine_node<'e', 'k', 'j', 'i'>(gx, ge, gg, m0, m1, GradMixPair{}));
+
+  using Levels    = LevelsOf<decltype(g4)>;
+  constexpr int N = Impl::lg_cute_num_threads_v<Levels>;
+  using Plan      = Impl::lg_cute_combine_plan<Levels, 3, 0, N>;
+  static_assert(N == 125);
+  static_assert(Impl::lg_level_slots_v<Levels, 1> == 3,
+                "the multi-output stage contributes one slot per output");
+  static_assert(Plan::template in_register<3>() == Aligned &&
+                    Plan::template in_register<4>() == Aligned,
+                "every output of a multi-output stage inherits its "
+                "thread-value layout");
+  static_assert(Plan::aligned_driven == Aligned);
+  static_assert(
+      Impl::lg_cute_smem_slot_v<Levels, N, Plan::template slot<3>> != Aligned &&
+          Impl::lg_cute_smem_slot_v<Levels, N, Plan::template slot<4>> !=
+              Aligned,
+      "an output read in registers takes no shared memory; a misaligned one "
+      "is materialized");
+
+  const auto out = g4.outputs(pv);
+  out.execute(CutePolicyTag<>{}, cp);
+  ASSERT_TRUE(synced());
+  // Team reads the register node inside the combine (RegisterBoundFn).
+  out.execute(TeamPolicyTag<ES>{}, tp);
+  ASSERT_TRUE(synced());
+
+  auto   hh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, h);
+  auto   hu = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, u);
+  HostV4 r("r", E, 5, 5, 5);
+  for (int e = 0; e < E; ++e)
+    for (int k = 0; k < 5; ++k)
+      for (int j = 0; j < 5; ++j)
+        for (int i = 0; i < 5; ++i) {
+          float x = 0.0f, y = 0.0f, z = 0.0f;
+          for (int p = 0; p < 5; ++p) {
+            x += hh(i, p) * hu(e, k, j, p);
+            y += hh(j, p) * hu(e, k, p, i);
+            z += hh(k, p) * hu(e, p, j, i);
+          }
+          const auto ab = PairAt{}(e, k, j, i);
+          r(e, k, j, i) = GradMixPair{}(e, k, j, i, x, y, z, ab[0], ab[1]);
+        }
+  EXPECT_LT(max_rel_err(cp, r), 1e-5f);
+  EXPECT_LT(max_rel_err(tp, r), 1e-5f);
+}
+
+// Register sources given as a view or a handle, against the same field read
+// through a functor. All three must reach the combine in registers and read
+// identical values.
+template <typename V>
+struct FieldAt {
+  V                     v;
+  KOKKOS_FUNCTION float operator()(int e, int k, int j, int i) const {
+    return v(e, k, j, i);
+  }
+};
+
+struct GradMixAB {
+  KOKKOS_FUNCTION float operator()(int e, int k, int j, int i, float x, float y,
+                                   float z, float a, float b) const {
+    return GradMix{}(e, k, j, i, x, y, z) + 3.0f * a - 1.5f * b;
+  }
+};
+
+enum class RegSrc { View, Handle, Functor };
+
+template <RegSrc S, typename TV>
+auto view_register_source(const ViewR& w) {
+  if constexpr (S == RegSrc::View)
+    return make_register_node<'e', 'k', 'j', 'i'>(w, TV{});
+  else if constexpr (S == RegSrc::Handle)
+    return make_register_node<'e', 'k', 'j', 'i'>(
+        make_handle<'e', 'k', 'j', 'i'>(w), TV{});
+  else
+    return make_register_node(
+        make_functional_input_node<ES, 'e', 'k', 'j', 'i'>(
+            Kokkos::Array<int, 4>{static_cast<int>(w.extent(0)), 5, 5, 5},
+            FieldAt<ViewR>{w}),
+        TV{});
+}
+
+template <RegSrc S, int TE>
+std::pair<ViewR, ViewR> run_view_register_source(const OpView<5>& h,
+                                                 const ViewR& u, const ViewR& a,
+                                                 const ViewR& b) {
+  using MX        = RowOfEMma<TE, ThrX, RowOfENTile<TE>>;
+  using ME        = RowOfEMma<TE, ThrEta, RowOfENTile<TE>>;
+  using MG        = RowOfEMma<TE, ThrGamma, RowOfENTile<TE>>;
+  constexpr int E = 2 * TE;
+  ViewR         cp("cp", E, 5, 5, 5), tp("tp", E, 5, 5, 5);
+  Kokkos::deep_copy(cp, -999.0f);
+
+  auto g0 = make_level_graph<float, ES>(MapET<TE>{});
+  auto [g1, sh] =
+      g0.add(make_stage_node(make_input_node(make_handle<'r', 'p'>(h))));
+  auto [g2, su, ra, rb] = g1.add(
+      make_stage_node(make_input_node(make_handle<'e', 'k', 'j', 'i'>(u)),
+                      RowOfETV<TE>{}),
+      view_register_source<S, RowOfETV<TE>>(a),
+      view_register_source<S, RowOfETV<TE>>(b));
+  auto [g3, gx, ge, gg] =
+      g2.add(make_contraction_node<'e', 'k', 'j', 'i'>(
+                 sh.template as<'i', 'p'>(),
+                 su.template as<'e', 'k', 'j', 'p'>(), NoHook{}, MX{}),
+             make_contraction_node<'e', 'k', 'j', 'i'>(
+                 sh.template as<'j', 'p'>(),
+                 su.template as<'e', 'k', 'p', 'i'>(), NoHook{}, ME{}),
+             make_contraction_node<'e', 'k', 'j', 'i'>(
+                 sh.template as<'k', 'p'>(),
+                 su.template as<'e', 'p', 'j', 'i'>(), NoHook{}, MG{}));
+  auto [g4, pv] = g3.add(
+      make_combine_node<'e', 'k', 'j', 'i'>(gx, ge, gg, ra, rb, GradMixAB{}));
+
+  using Levels    = LevelsOf<decltype(g4)>;
+  constexpr int N = Impl::lg_cute_num_threads_v<Levels>;
+  using Plan      = Impl::lg_cute_combine_plan<Levels, 3, 0, N>;
+  static_assert(Plan::aligned_driven);
+  static_assert(
+      Plan::template in_register<3>() && Plan::template in_register<4>(),
+      "a view or handle register source reaches the combine in "
+      "registers");
+  static_assert(
+      !Impl::lg_cute_smem_slot_v<Levels, N, Plan::template slot<3>> &&
+          !Impl::lg_cute_smem_slot_v<Levels, N, Plan::template slot<4>>,
+      "a register source takes no shared memory");
+
+  const auto out = g4.outputs(pv);
+  out.execute(CutePolicyTag<>{}, cp);
+  EXPECT_TRUE(synced());
+  out.execute(TeamPolicyTag<ES>{}, tp);
+  EXPECT_TRUE(synced());
+  return {cp, tp};
+}
+
+template <int TE>
+void expect_view_register_source() {
+  constexpr int E = 2 * TE;
+  OpView<5>     h("h", 5, 5);
+  ViewR         u("u", E, 5, 5, 5), a("a", E, 5, 5, 5), b("b", E, 5, 5, 5);
+  fill(h, 0.5f);
+  fill(u, -2.0f);
+  fill(a, 1.25f);
+  fill(b, -0.75f);
+
+  const auto v  = run_view_register_source<RegSrc::View, TE>(h, u, a, b);
+  const auto hd = run_view_register_source<RegSrc::Handle, TE>(h, u, a, b);
+  const auto f  = run_view_register_source<RegSrc::Functor, TE>(h, u, a, b);
+
+  auto   hh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, h);
+  auto   hu = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, u);
+  auto   ha = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, a);
+  auto   hb = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, b);
+  HostV4 r("r", E, 5, 5, 5);
+  for (int e = 0; e < E; ++e)
+    for (int k = 0; k < 5; ++k)
+      for (int j = 0; j < 5; ++j)
+        for (int i = 0; i < 5; ++i) {
+          float x = 0.0f, y = 0.0f, z = 0.0f;
+          for (int p = 0; p < 5; ++p) {
+            x += hh(i, p) * hu(e, k, j, p);
+            y += hh(j, p) * hu(e, k, p, i);
+            z += hh(k, p) * hu(e, p, j, i);
+          }
+          r(e, k, j, i) =
+              GradMixAB{}(e, k, j, i, x, y, z, ha(e, k, j, i), hb(e, k, j, i));
+        }
+  EXPECT_LT(max_rel_err(v.first, r), 1e-5f);
+  EXPECT_LT(max_rel_err(v.second, r), 1e-5f);
+  EXPECT_EQ(mismatches(v.first, f.first), 0) << "CuTe: view vs functor";
+  EXPECT_EQ(mismatches(hd.first, f.first), 0) << "CuTe: handle vs functor";
+  EXPECT_EQ(mismatches(v.second, f.second), 0) << "team: view vs functor";
+  EXPECT_EQ(mismatches(hd.second, f.second), 0) << "team: handle vs functor";
+}
+
 using NarrowTV =
     cute::Layout<cute::Shape<cute::Shape<cute::_5, cute::_5>,
                              cute::Shape<cute::_2, cute::_5>>,
@@ -1568,6 +1971,22 @@ TEST(CuteStageTV, RowOfELayoutAtTE4) {
 
 TEST(CuteStageTV, MisalignedLayoutFallsBackToSharedMemory) {
   expect_tv_staged_gradient_combine<2, SwappedRowOfETV<2>, false>();
+}
+
+TEST(CuteStageTV, MultiOutputStageReachesAlignedCombineInRegisters) {
+  expect_tv_multi_output_stage_combine<2, RowOfETV<2>, true>();
+}
+
+TEST(CuteStageTV, MultiOutputStageAtTE4) {
+  expect_tv_multi_output_stage_combine<4, RowOfETV<4>, true>();
+}
+
+TEST(CuteStageTV, ViewRegisterSourceTE2) { expect_view_register_source<2>(); }
+
+TEST(CuteStageTV, ViewRegisterSourceTE4) { expect_view_register_source<4>(); }
+
+TEST(CuteStageTV, MisalignedMultiOutputStageFallsBackToSharedMemory) {
+  expect_tv_multi_output_stage_combine<2, SwappedRowOfETV<2>, false>();
 }
 
 TEST(CuteStageTV, NarrowLayoutSetsTheBlock) {

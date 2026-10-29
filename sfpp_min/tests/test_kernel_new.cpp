@@ -434,6 +434,74 @@ TYPED_TEST(SfppMinKernelNew, ScatterFromTheIndexSlotMatchesTheOracle) {
 }
 #endif
 
+// Metric loading on the TEAM backend. Register/Bundle/Partial put the metrics
+// in register nodes, which team reads inside the integrand combine at the
+// point's coordinate. All of them must land on the serial oracle. The register
+// modes assume layout_right_dynamic metric storage.
+template <MetricsMode Mt, typename PreSel = std::integer_sequence<int>>
+void expect_team_metrics_oracle(const char* name) {
+  auto k = make_case<LayoutRightDynamicOffset>(/*ix_fastest=*/true);
+  set_linear_field(k);
+  set_velocity(k);
+  const GllViews q    = make_gll_views();
+  auto           args = make_args(k, q);
+  new_stiffness<kTestTE, GatherMode::Functional, ScatterMode::Functional, Mt,
+                PreSel>(args, TeamPolicy{});
+  Kokkos::fence();
+  k.f.to_host();
+
+  const ReferenceOutput want =
+      reference_stiffness(k.set, k.m, k.p, k.g, k.f, k.nglob);
+  ErrorReport e;
+  for (int ig = 0; ig < k.nglob; ++ig)
+    for (int c = 0; c < 3; ++c) {
+      const double got = k.f.h_acceleration(ig, c);
+      const double ref = want.a(c, ig);
+      e.worst_abs      = std::max(e.worst_abs, std::abs(got - ref));
+      e.scale          = std::max(e.scale, std::abs(ref));
+    }
+  std::printf("[ INFO     ] team metrics %s: relative = %.3e\n", name,
+              e.relative());
+  EXPECT_GT(e.scale, 0.0) << name << ": oracle produced a zero field";
+  EXPECT_LT(e.relative(), 1e-4) << name;
+}
+
+TEST(SfppMinKernelNewTeam, MetricsModesMatchTheOracle) {
+  expect_team_metrics_oracle<MetricsMode::Captured>("captured");
+  expect_team_metrics_oracle<MetricsMode::Register>("12 register nodes");
+  expect_team_metrics_oracle<MetricsMode::Bundle>("one bundle register node");
+  expect_team_metrics_oracle<MetricsMode::Partial,
+                             std::integer_sequence<int, 0, 3, 6>>(
+      "partial bundle (3)");
+  expect_team_metrics_oracle<
+      MetricsMode::Partial,
+      std::integer_sequence<int, 0, 3, 6, 1, 4, 7, 2, 5, 8>>(
+      "partial bundle (9)");
+}
+
+// A register metric slot is one element and never written on team, so moving
+// the metrics into register nodes must not cost the team any scratch. (Left in
+// the pool liveness it once pushed the real slots apart: +53% at TE = 1.)
+template <MetricsMode Mt, typename PreSel = std::integer_sequence<int>>
+std::size_t team_pooled_bytes() {
+  auto           k  = make_case<LayoutRightDynamicOffset>(/*ix_fastest=*/true);
+  const GllViews q  = make_gll_views();
+  auto           a  = make_args(k, q);
+  const auto     hw = hprimewgll_or_build(GlobalHPrime{}, a.hprime, a.weights);
+  return new_footprint<kTestTE, GatherMode::Functional, ScatterMode::Functional,
+                       Mt, PreSel>(a, TeamPolicy{}, hw)
+      .pooled;
+}
+
+TEST(SfppMinKernelNewTeam, RegisterMetricsCostNoScratch) {
+  const std::size_t captured = team_pooled_bytes<MetricsMode::Captured>();
+  EXPECT_LE(team_pooled_bytes<MetricsMode::Register>(), captured);
+  EXPECT_LE(team_pooled_bytes<MetricsMode::Bundle>(), captured);
+  EXPECT_LE((team_pooled_bytes<MetricsMode::Partial,
+                               std::integer_sequence<int, 0, 3, 6>>()),
+            captured);
+}
+
 TYPED_TEST(SfppMinKernelNew, MatchesSerialOracleWithIxFastestNumbering) {
   auto k = make_case<ChunkTiledDynamicOffset>(/*ix_fastest=*/true);
   set_linear_field(k);

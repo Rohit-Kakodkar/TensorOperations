@@ -139,6 +139,20 @@ add_executable(test_level_graph tests/test_level_graph.cpp)
 target_link_libraries(test_level_graph PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_level_graph)
 
+# test_general_contraction — n-ary contractions; delta-structured operands.
+add_executable(test_general_contraction tests/test_general_contraction.cpp)
+target_link_libraries(test_general_contraction PRIVATE tensor GTest::gtest)
+gtest_discover_tests(test_general_contraction)
+
+# test_structured_operands — Structured.hpp: make_delta_node /
+# make_outer_product_node / make_stack_node used directly
+# as make_contraction_node operands, plus its ContractionTag vs
+# GeneralContractionTag dispatch. Custom main() wraps Kokkos init/finalize.
+add_executable(test_structured_operands tests/test_structured_operands.cpp)
+target_link_libraries(test_structured_operands PRIVATE tensor GTest::gtest)
+gtest_discover_tests(test_structured_operands)
+
+
 add_executable(test_index_node tests/test_index_node.cpp)
 target_link_libraries(test_index_node PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_index_node)
@@ -199,13 +213,34 @@ if(TENSOR_OPS_CUTLASS_DIR AND Kokkos_ENABLE_CUDA)
 
   add_executable(test_cute_level_graph tests/test_cute_level_graph.cpp)
   target_link_libraries(test_cute_level_graph PRIVATE tensor GTest::gtest)
+  # Every CuTe launch in the suite runs with the block-shape check on, so the
+  # real launch path is proven to match what lg_cute_kernel assumes.
+  target_compile_definitions(test_cute_level_graph
+                             PRIVATE TENSOR_OPS_CHECK_CUTE_LAUNCH=1)
   gtest_discover_tests(test_cute_level_graph)
+
+  # And the check itself: a launch with the wrong block shape must trap.
+  add_executable(cute_launch_guard tests/negative/cute_launch_guard.cpp)
+  target_link_libraries(cute_launch_guard PRIVATE tensor)
+  target_compile_definitions(cute_launch_guard
+                             PRIVATE TENSOR_OPS_CHECK_CUTE_LAUNCH=1)
+  add_test(NAME CuteLaunchGuard.WrongBlockShapeTraps COMMAND cute_launch_guard)
+  set_tests_properties(CuteLaunchGuard.WrongBlockShapeTraps PROPERTIES
+                       PASS_REGULAR_EXPRESSION "trap fired")
+
+  add_executable(cute_global_layout_guard
+                 tests/negative/cute_global_layout_guard.cpp)
+  target_link_libraries(cute_global_layout_guard PRIVATE tensor)
+  add_test(NAME CuteGlobalLayoutGuard.NonContiguousLayoutRightAborts
+           COMMAND cute_global_layout_guard)
+  set_tests_properties(CuteGlobalLayoutGuard.NonContiguousLayoutRightAborts
+                       PROPERTIES PASS_REGULAR_EXPRESSION "input view is padded")
 
   add_executable(test_cute_fragment_store tests/test_cute_fragment_store.cpp)
   target_link_libraries(test_cute_fragment_store PRIVATE tensor GTest::gtest)
   gtest_discover_tests(test_cute_fragment_store)
 
-  foreach(case 0 1 2 3 4)
+  foreach(case 0 1 2 3 4 5)
     add_executable(stage_tv_guard_neg_${case} EXCLUDE_FROM_ALL
                    tests/negative/stage_tv_guard_negative.cpp)
     target_link_libraries(stage_tv_guard_neg_${case} PRIVATE tensor)
@@ -224,6 +259,9 @@ if(TENSOR_OPS_CUTLASS_DIR AND Kokkos_ENABLE_CUDA)
   set_tests_properties(StageTVGuardNegative.Case4 PROPERTIES
                        PASS_REGULAR_EXPRESSION
                        "thread-value layout must be static")
+  set_tests_properties(StageTVGuardNegative.Case5 PROPERTIES
+                       PASS_REGULAR_EXPRESSION
+                       "register node: give the thread-value layout")
 
   add_executable(scatter_guard_neg_4 EXCLUDE_FROM_ALL
                  tests/negative/scatter_guard_negative.cpp)
@@ -276,7 +314,7 @@ set_tests_properties(LabelTilesGuardNegative.Case3 PROPERTIES
 # are pinned separately because they are independent factories: one guard
 # present and the other missing must not read as both working.
 # ---------------------------------------------------------------------------
-foreach(case 0 1 2)
+foreach(case 0 1 2 3 4)
   add_executable(functional_guard_neg_${case} EXCLUDE_FROM_ALL
                  tests/negative/functional_guard_negative.cpp)
   target_link_libraries(functional_guard_neg_${case} PRIVATE tensor)
@@ -290,6 +328,12 @@ set_tests_properties(FunctionalGuardNegative.Case1
                      FunctionalGuardNegative.Case2
                      PROPERTIES PASS_REGULAR_EXPRESSION
                      "a functional input has no address")
+set_tests_properties(FunctionalGuardNegative.Case3
+                     PROPERTIES PASS_REGULAR_EXPRESSION
+                     "a multi-output functional input takes no hook")
+set_tests_properties(FunctionalGuardNegative.Case4
+                     PROPERTIES PASS_REGULAR_EXPRESSION
+                     "a void fn produces nothing")
 
 # ---------------------------------------------------------------------------
 # Negative-compilation tests for the ARENA guard. Same rationale and same
@@ -395,6 +439,43 @@ set_tests_properties(GatherGuardNegative.Case5 PROPERTIES
                      PASS_REGULAR_EXPRESSION
                      "may not read a slot ITS OWN LEVEL")
 
+foreach(case 0 1 2 3 4 5)
+  add_executable(register_team_neg_${case} EXCLUDE_FROM_ALL
+                 tests/negative/register_team_negative.cpp)
+  target_link_libraries(register_team_neg_${case} PRIVATE tensor)
+  target_compile_definitions(register_team_neg_${case}
+                             PRIVATE REGISTER_NEG_CASE=${case})
+  add_test(NAME RegisterTeamNegative.Case${case}
+           COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}
+                   --target register_team_neg_${case} --config $<CONFIG>)
+endforeach()
+set_tests_properties(RegisterTeamNegative.Case3 PROPERTIES
+                     PASS_REGULAR_EXPRESSION
+                     "a contraction needs the tile in memory")
+set_tests_properties(RegisterTeamNegative.Case4 PROPERTIES
+                     PASS_REGULAR_EXPRESSION
+                     "it cannot be a graph output on the team")
+
+foreach(case 0 1 2)
+  add_executable(register_source_neg_${case} EXCLUDE_FROM_ALL
+                 tests/negative/register_source_negative.cpp)
+  target_link_libraries(register_source_neg_${case} PRIVATE tensor)
+  target_compile_definitions(register_source_neg_${case}
+                             PRIVATE REGISTER_SRC_NEG_CASE=${case})
+  add_test(NAME RegisterSourceNegative.Case${case}
+           COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}
+                   --target register_source_neg_${case} --config $<CONFIG>)
+endforeach()
+set_tests_properties(RegisterSourceNegative.Case0 PROPERTIES
+                     PASS_REGULAR_EXPRESSION
+                     "a handle's labels must equal the labels")
+set_tests_properties(RegisterSourceNegative.Case1 PROPERTIES
+                     PASS_REGULAR_EXPRESSION
+                     "label a view or handle source")
+set_tests_properties(RegisterSourceNegative.Case2 PROPERTIES
+                     PASS_REGULAR_EXPRESSION
+                     "one label per view axis")
+
 foreach(case 0 1 2 3 5 6)
   add_executable(scatter_guard_neg_${case} EXCLUDE_FROM_ALL
                  tests/negative/scatter_guard_negative.cpp)
@@ -420,6 +501,35 @@ set_tests_properties(ScatterGuardNegative.Case5 PROPERTIES
 set_tests_properties(ScatterGuardNegative.Case6 PROPERTIES
                      PASS_REGULAR_EXPRESSION
                      "scatter node: the value must be a value node")
+
+# ---------------------------------------------------------------------------
+# Structured-operand guards: make_stack_node<r, l...> and
+# make_outer_product_node<l...> declare every label positionally, and a label
+# kept from the operands may not move. Each case is pinned to its own guard's
+# wording; case 0 is the control and must compile.
+# ---------------------------------------------------------------------------
+foreach(case 0 1 2 3 4)
+  add_executable(structured_guard_neg_${case} EXCLUDE_FROM_ALL
+                 tests/negative/structured_guard_negative.cpp)
+  target_link_libraries(structured_guard_neg_${case} PRIVATE tensor)
+  target_compile_definitions(structured_guard_neg_${case}
+                             PRIVATE STRUCTURED_NEG_CASE=${case})
+  add_test(NAME StructuredGuardNegative.Case${case}
+           COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}
+                   --target structured_guard_neg_${case} --config $<CONFIG>)
+endforeach()
+set_tests_properties(StructuredGuardNegative.Case1 PROPERTIES
+                     PASS_REGULAR_EXPRESSION
+                     "a label kept from the branches must keep its position")
+set_tests_properties(StructuredGuardNegative.Case2 PROPERTIES
+                     PASS_REGULAR_EXPRESSION "declare one label per axis")
+set_tests_properties(StructuredGuardNegative.Case3 PROPERTIES
+                     PASS_REGULAR_EXPRESSION
+                     "a label kept from the operands must keep its position")
+set_tests_properties(StructuredGuardNegative.Case4 PROPERTIES
+                     PASS_REGULAR_EXPRESSION
+                     "declare the stacking label, then one label per branch")
+
 
 # Benchmarks (opt-in: -DTENSOR_OPS_BUILD_BENCHMARKS=ON). No gtest; own main().
 if(TENSOR_OPS_BUILD_BENCHMARKS)
@@ -506,6 +616,10 @@ target_compile_options(sfpp_min_bench_new_li PRIVATE -lineinfo)
 add_executable(sfpp_min_bench_te sfpp_min/bench_te.cpp)
 target_link_libraries(sfpp_min_bench_te PRIVATE sfpp_min tensor)
 
+add_executable(sfpp_min_bench_te_bundle sfpp_min/bench_te.cpp)
+target_link_libraries(sfpp_min_bench_te_bundle PRIVATE sfpp_min tensor)
+target_compile_definitions(sfpp_min_bench_te_bundle PRIVATE SFPP_MIN_METRICS_MODE=2)
+
 add_executable(sfpp_min_bench_te_li sfpp_min/bench_te.cpp)
 target_link_libraries(sfpp_min_bench_te_li PRIVATE sfpp_min tensor)
 target_compile_options(sfpp_min_bench_te_li PRIVATE -lineinfo)
@@ -524,6 +638,25 @@ if(TENSOR_OPS_CUTLASS_DIR AND Kokkos_ENABLE_CUDA)
   target_compile_definitions(sfpp_min_bench_te_cute_li
                              PRIVATE SFPP_MIN_BENCH_TE_CUTE)
   target_compile_options(sfpp_min_bench_te_cute_li PRIVATE -lineinfo)
+
+  # Report-only: row of e with the twelve metric inputs in register nodes.
+  add_executable(sfpp_min_bench_te_cute_rowe_mreg sfpp_min/bench_te.cpp)
+  target_link_libraries(sfpp_min_bench_te_cute_rowe_mreg PRIVATE sfpp_min tensor)
+  target_compile_definitions(sfpp_min_bench_te_cute_rowe_mreg
+                             PRIVATE SFPP_MIN_BENCH_TE_CUTE
+                                     SFPP_MIN_BENCH_ROW_OF_E
+                                     SFPP_MIN_METRICS_MODE=1)
+
+  # The same, with each metric register node built from a view rather than
+  # a functor.
+  add_executable(sfpp_min_bench_te_cute_rowe_mreg_view sfpp_min/bench_te.cpp)
+  target_link_libraries(sfpp_min_bench_te_cute_rowe_mreg_view
+                        PRIVATE sfpp_min tensor)
+  target_compile_definitions(sfpp_min_bench_te_cute_rowe_mreg_view
+                             PRIVATE SFPP_MIN_BENCH_TE_CUTE
+                                     SFPP_MIN_BENCH_ROW_OF_E
+                                     SFPP_MIN_METRICS_MODE=1
+                                     SFPP_MIN_REGISTER_SOURCE_VIEW)
 
   add_executable(sfpp_min_bench_te_cute_rowe sfpp_min/bench_te.cpp)
   target_link_libraries(sfpp_min_bench_te_cute_rowe PRIVATE sfpp_min tensor)
@@ -559,7 +692,6 @@ endif()
 # constant, so each order is its own set of binaries; the calibrated NGLL = 5
 # targets above are untouched.
 set(SFPP_MIN_EXTRA_NGLL 8 CACHE STRING "Extra NGLL values to build sfpp_min targets for")
-if(Kokkos_ENABLE_CUDA)
 foreach(n IN LISTS SFPP_MIN_EXTRA_NGLL)
   add_executable(sfpp_min_gll_n${n} sfpp_min/tests/test_gll.cpp)
   target_link_libraries(sfpp_min_gll_n${n} PRIVATE sfpp_min GTest::gtest)
@@ -570,6 +702,13 @@ foreach(n IN LISTS SFPP_MIN_EXTRA_NGLL)
   target_link_libraries(sfpp_min_kernel_new_n${n} PRIVATE sfpp_min tensor GTest::gtest)
   target_compile_definitions(sfpp_min_kernel_new_n${n} PRIVATE SFPP_MIN_NGLL=${n})
   gtest_discover_tests(sfpp_min_kernel_new_n${n} TEST_PREFIX sfpp_min.n${n}.)
+
+  if(NOT Kokkos_ENABLE_CUDA)
+    add_executable(sfpp_min_bench_new_n${n} sfpp_min/bench_new.cpp)
+    target_link_libraries(sfpp_min_bench_new_n${n} PRIVATE sfpp_min tensor)
+    target_compile_definitions(sfpp_min_bench_new_n${n} PRIVATE SFPP_MIN_NGLL=${n})
+    continue()
+  endif()
 
   add_executable(sfpp_min_bench_n${n} sfpp_min/bench.cpp)
   target_link_libraries(sfpp_min_bench_n${n} PRIVATE sfpp_min)
@@ -584,9 +723,17 @@ foreach(n IN LISTS SFPP_MIN_EXTRA_NGLL)
     target_link_libraries(sfpp_min_bench_te_cute_n${n} PRIVATE sfpp_min tensor)
     target_compile_definitions(sfpp_min_bench_te_cute_n${n}
                                PRIVATE SFPP_MIN_BENCH_TE_CUTE SFPP_MIN_NGLL=${n})
+    # Report-only: row of e with the twelve metric inputs in register nodes.
+    add_executable(sfpp_min_bench_te_cute_rowe_mreg_n${n} sfpp_min/bench_te.cpp)
+    target_link_libraries(sfpp_min_bench_te_cute_rowe_mreg_n${n}
+                          PRIVATE sfpp_min tensor)
+    target_compile_definitions(sfpp_min_bench_te_cute_rowe_mreg_n${n}
+                               PRIVATE SFPP_MIN_BENCH_TE_CUTE
+                                       SFPP_MIN_BENCH_ROW_OF_E
+                                       SFPP_MIN_METRICS_MODE=1
+                                       SFPP_MIN_NGLL=${n})
   endif()
 endforeach()
-endif()
 
 add_executable(sfpp_min_bench_mat sfpp_min/bench_mat.cpp)
 target_link_libraries(sfpp_min_bench_mat PRIVATE sfpp_min)
