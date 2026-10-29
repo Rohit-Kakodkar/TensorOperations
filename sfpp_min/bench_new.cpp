@@ -214,6 +214,7 @@ int run_impl(int argc, char** argv, const char* tag) {
       "scratch     : pooled %zu B (launch request)  |  unpooled %zu B  "
       "|  dummy incumbent 24124 B\n",
       fp.pooled, fp.unpooled);
+  if (is_team_policy<Policy>) std::printf("scratch lvl : %d\n", fp.level);
 
   if (profile) {
     Kokkos::deep_copy(f.acceleration, static_cast<real_t>(0));

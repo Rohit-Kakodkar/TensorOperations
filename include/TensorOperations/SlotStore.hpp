@@ -168,6 +168,12 @@ struct SlotTiles {};
 template <std::size_t... Pools>
 struct SlotPools {};
 
+// The pool of a slot that occupies NO storage: a streamed root, whose producer
+// writes the designated output directly (LevelPlan.hpp). It contributes
+// nothing to the arena, and its view -- still typed by its tile, so nothing
+// else changes -- is placed at the arena base and never touched.
+inline constexpr std::size_t slot_pool_none = ~std::size_t{0};
+
 // The arena laid out by POOL rather than by slot: pool P is as big as its
 // largest occupant, pools sit end to end, and every slot assigned to P starts
 // at P's base. Slots sharing a pool therefore ALIAS, which is the point -- the
@@ -204,10 +210,12 @@ struct slot_pool_arena<ValueType, ExecSpace, SlotPools<Pools...>,
     std::size_t pelems[N > 0 ? N : 1] = {};
     std::size_t np                    = 0;
     for (std::size_t k = 0; k < N; ++k) {
+      if (pools[k] == slot_pool_none) continue;  // no storage
       if (steps[k] > pelems[pools[k]]) pelems[pools[k]] = steps[k];
       if (pools[k] + 1 > np) np = pools[k] + 1;
     }
 
+    if (i < N && pools[i] == slot_pool_none) return 0;
     const std::size_t upto = (i >= N) ? np : pools[i];
     std::size_t       off  = 0;
     for (std::size_t p = 0; p < upto; ++p) off += pelems[p];
@@ -314,9 +322,9 @@ std::size_t pooled_arena_slot_store_bytes(const Tiles&...) {
 }
 
 template <typename ValueType, typename ExecSpace, typename PoolsList,
-          typename Team, typename... Elems, typename... Tiles,
+          typename Scratch, typename... Elems, typename... Tiles,
           std::size_t... Is>
-KOKKOS_FUNCTION auto place_pooled_arena_slot_store(const Team& team,
+KOKKOS_FUNCTION auto place_pooled_arena_slot_store(const Scratch& scratch,
                                                    Impl::SlotElems<Elems...>,
                                                    std::index_sequence<Is...>,
                                                    const Tiles&... tiles)
@@ -325,8 +333,7 @@ KOKKOS_FUNCTION auto place_pooled_arena_slot_store(const Team& team,
   constexpr std::size_t elems =
       Impl::slot_pool_arena<ValueType, ExecSpace, PoolsList,
                             Impl::SlotTiles<Tiles...>, ElemsList>::total();
-  Impl::scratch_backing_t<ValueType, ExecSpace> arena(team.team_scratch(0),
-                                                      elems);
+  Impl::scratch_backing_t<ValueType, ExecSpace> arena(scratch, elems);
   ValueType*                                    base = arena.data();
   return {DeviceTuple<SlotView<Elems, ExecSpace, Tiles>...>{
       Impl::alloc_scratch_tile_at<Elems, ExecSpace>(
@@ -338,11 +345,11 @@ KOKKOS_FUNCTION auto place_pooled_arena_slot_store(const Team& team,
 }
 
 template <typename ValueType, typename ExecSpace, typename PoolsList,
-          typename ElemsList = void, typename Team, typename... Tiles>
-KOKKOS_FUNCTION auto carve_pooled_arena_slot_store(const Team& team,
+          typename ElemsList = void, typename Scratch, typename... Tiles>
+KOKKOS_FUNCTION auto carve_pooled_arena_slot_store(const Scratch& scratch,
                                                    const Tiles&... tiles) {
   return place_pooled_arena_slot_store<ValueType, ExecSpace, PoolsList>(
-      team, Impl::slot_elems_t<ValueType, ElemsList, Tiles...>{},
+      scratch, Impl::slot_elems_t<ValueType, ElemsList, Tiles...>{},
       std::index_sequence_for<Tiles...>{}, tiles...);
 }
 

@@ -322,8 +322,11 @@ int dispatch_te(int argc, char** argv, int te) {
       return run_te<Backend, 5>(argc, argv);
     case 8:
       return run_te<Backend, 8>(argc, argv);
+#if !(defined(SFPP_MIN_BENCH_ROW_OF_E) && defined(SFPP_MIN_NGLL) && \
+      SFPP_MIN_NGLL > 5)
     case 16:
       return run_te<Backend, 16>(argc, argv);
+#endif
     case 32:
       return run_te<Backend, 32>(argc, argv);
     default:
