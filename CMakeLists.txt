@@ -139,6 +139,20 @@ add_executable(test_level_graph tests/test_level_graph.cpp)
 target_link_libraries(test_level_graph PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_level_graph)
 
+# test_general_contraction — n-ary contractions; delta-structured operands.
+add_executable(test_general_contraction tests/test_general_contraction.cpp)
+target_link_libraries(test_general_contraction PRIVATE tensor GTest::gtest)
+gtest_discover_tests(test_general_contraction)
+
+# test_structured_operands — Structured.hpp: make_delta_node /
+# make_outer_product_node / make_stack_node used directly
+# as make_contraction_node operands, plus its ContractionTag vs
+# GeneralContractionTag dispatch. Custom main() wraps Kokkos init/finalize.
+add_executable(test_structured_operands tests/test_structured_operands.cpp)
+target_link_libraries(test_structured_operands PRIVATE tensor GTest::gtest)
+gtest_discover_tests(test_structured_operands)
+
+
 add_executable(test_index_node tests/test_index_node.cpp)
 target_link_libraries(test_index_node PRIVATE tensor GTest::gtest)
 gtest_discover_tests(test_index_node)
@@ -213,6 +227,14 @@ if(TENSOR_OPS_CUTLASS_DIR AND Kokkos_ENABLE_CUDA)
   add_test(NAME CuteLaunchGuard.WrongBlockShapeTraps COMMAND cute_launch_guard)
   set_tests_properties(CuteLaunchGuard.WrongBlockShapeTraps PROPERTIES
                        PASS_REGULAR_EXPRESSION "trap fired")
+
+  add_executable(cute_global_layout_guard
+                 tests/negative/cute_global_layout_guard.cpp)
+  target_link_libraries(cute_global_layout_guard PRIVATE tensor)
+  add_test(NAME CuteGlobalLayoutGuard.NonContiguousLayoutRightAborts
+           COMMAND cute_global_layout_guard)
+  set_tests_properties(CuteGlobalLayoutGuard.NonContiguousLayoutRightAborts
+                       PROPERTIES PASS_REGULAR_EXPRESSION "input view is padded")
 
   add_executable(test_cute_fragment_store tests/test_cute_fragment_store.cpp)
   target_link_libraries(test_cute_fragment_store PRIVATE tensor GTest::gtest)
@@ -480,6 +502,35 @@ set_tests_properties(ScatterGuardNegative.Case6 PROPERTIES
                      PASS_REGULAR_EXPRESSION
                      "scatter node: the value must be a value node")
 
+# ---------------------------------------------------------------------------
+# Structured-operand guards: make_stack_node<r, l...> and
+# make_outer_product_node<l...> declare every label positionally, and a label
+# kept from the operands may not move. Each case is pinned to its own guard's
+# wording; case 0 is the control and must compile.
+# ---------------------------------------------------------------------------
+foreach(case 0 1 2 3 4)
+  add_executable(structured_guard_neg_${case} EXCLUDE_FROM_ALL
+                 tests/negative/structured_guard_negative.cpp)
+  target_link_libraries(structured_guard_neg_${case} PRIVATE tensor)
+  target_compile_definitions(structured_guard_neg_${case}
+                             PRIVATE STRUCTURED_NEG_CASE=${case})
+  add_test(NAME StructuredGuardNegative.Case${case}
+           COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}
+                   --target structured_guard_neg_${case} --config $<CONFIG>)
+endforeach()
+set_tests_properties(StructuredGuardNegative.Case1 PROPERTIES
+                     PASS_REGULAR_EXPRESSION
+                     "a label kept from the branches must keep its position")
+set_tests_properties(StructuredGuardNegative.Case2 PROPERTIES
+                     PASS_REGULAR_EXPRESSION "declare one label per axis")
+set_tests_properties(StructuredGuardNegative.Case3 PROPERTIES
+                     PASS_REGULAR_EXPRESSION
+                     "a label kept from the operands must keep its position")
+set_tests_properties(StructuredGuardNegative.Case4 PROPERTIES
+                     PASS_REGULAR_EXPRESSION
+                     "declare the stacking label, then one label per branch")
+
+
 # Benchmarks (opt-in: -DTENSOR_OPS_BUILD_BENCHMARKS=ON). No gtest; own main().
 if(TENSOR_OPS_BUILD_BENCHMARKS)
   # --- 3D SEM stiffness on the LEVEL GRAPH (Sprint 5) -----------------------
@@ -641,7 +692,6 @@ endif()
 # constant, so each order is its own set of binaries; the calibrated NGLL = 5
 # targets above are untouched.
 set(SFPP_MIN_EXTRA_NGLL 8 CACHE STRING "Extra NGLL values to build sfpp_min targets for")
-if(Kokkos_ENABLE_CUDA)
 foreach(n IN LISTS SFPP_MIN_EXTRA_NGLL)
   add_executable(sfpp_min_gll_n${n} sfpp_min/tests/test_gll.cpp)
   target_link_libraries(sfpp_min_gll_n${n} PRIVATE sfpp_min GTest::gtest)
@@ -652,6 +702,13 @@ foreach(n IN LISTS SFPP_MIN_EXTRA_NGLL)
   target_link_libraries(sfpp_min_kernel_new_n${n} PRIVATE sfpp_min tensor GTest::gtest)
   target_compile_definitions(sfpp_min_kernel_new_n${n} PRIVATE SFPP_MIN_NGLL=${n})
   gtest_discover_tests(sfpp_min_kernel_new_n${n} TEST_PREFIX sfpp_min.n${n}.)
+
+  if(NOT Kokkos_ENABLE_CUDA)
+    add_executable(sfpp_min_bench_new_n${n} sfpp_min/bench_new.cpp)
+    target_link_libraries(sfpp_min_bench_new_n${n} PRIVATE sfpp_min tensor)
+    target_compile_definitions(sfpp_min_bench_new_n${n} PRIVATE SFPP_MIN_NGLL=${n})
+    continue()
+  endif()
 
   add_executable(sfpp_min_bench_n${n} sfpp_min/bench.cpp)
   target_link_libraries(sfpp_min_bench_n${n} PRIVATE sfpp_min)
@@ -677,7 +734,6 @@ foreach(n IN LISTS SFPP_MIN_EXTRA_NGLL)
                                        SFPP_MIN_NGLL=${n})
   endif()
 endforeach()
-endif()
 
 add_executable(sfpp_min_bench_mat sfpp_min/bench_mat.cpp)
 target_link_libraries(sfpp_min_bench_mat PRIVATE sfpp_min)

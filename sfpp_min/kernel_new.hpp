@@ -743,6 +743,7 @@ struct NewFootprint {
   std::size_t pooled   = 0;
   std::size_t unpooled = 0;
   int         threads  = -1;
+  int         level    = -1;
 };
 
 template <int TE = kExecChunk, GatherMode Gather = GatherMode::Functional,
@@ -757,7 +758,7 @@ NewFootprint new_footprint(
       build_new_graph<TE, ContractionMmas<TensorOperations::DefaultMma<>>,
                       Gather, Scatter, Metrics, PreSel>(args, hw)
           .outputs();
-  return {out.scratch_bytes(), out.slot_bytes(), -1};
+  return {out.scratch_bytes(), out.slot_bytes(), -1, out.scratch_level()};
 }
 
 inline GlobalHPrime hprimewgll_or_build(const GlobalHPrime&  given,

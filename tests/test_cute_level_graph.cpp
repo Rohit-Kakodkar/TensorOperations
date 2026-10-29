@@ -44,6 +44,38 @@ using View4 = Kokkos::View<float****, Layout, ES>;
 using ViewR = View4<Kokkos::LayoutRight>;
 using View2 = Kokkos::View<float**, Kokkos::LayoutRight, ES>;
 
+using EABC = std::integer_sequence<int32_t, 'e', 'a', 'b', 'c'>;
+using Ext4 = std::integer_sequence<int, 0, N, N, N>;
+template <typename T>
+using GlobalLayout = std::remove_cvref_t<
+    decltype(Impl::make_cute_global_tensor<Ext4>(
+                 std::declval<const TensorHandle<T, EABC>&>())
+                 .layout())>;
+template <typename T>
+using GlobalStride =
+    std::remove_cvref_t<decltype(std::declval<GlobalLayout<T>>().stride())>;
+template <typename T>
+using GlobalShape =
+    std::remove_cvref_t<decltype(std::declval<GlobalLayout<T>>().shape())>;
+
+static_assert(
+    std::is_same_v<GlobalStride<ViewR>,
+                   cute::Stride<cute::Int<N * N * N>, cute::Int<N * N>,
+                                cute::Int<N>, cute::_1>>);
+static_assert(
+    std::is_same_v<GlobalShape<ViewR>,
+                   cute::Shape<int, cute::Int<N>, cute::Int<N>, cute::Int<N>>>);
+static_assert(std::is_same_v<
+              std::remove_cvref_t<decltype(cute::get<0>(
+                  std::declval<GlobalStride<View4<Kokkos::LayoutLeft>>>()))>,
+              cute::_1>);
+static_assert(!cute::is_static<GlobalStride<View4<Kokkos::LayoutLeft>>>::value);
+static_assert(
+    std::is_same_v<GlobalShape<View4<Kokkos::LayoutStride>>,
+                   cute::Shape<int, cute::Int<N>, cute::Int<N>, cute::Int<N>>>);
+static_assert(
+    !cute::is_static<GlobalStride<View4<Kokkos::LayoutStride>>>::value);
+
 template <int TE>
 using Map4 = LabelTiles<LabelTile<'e', TE>, LabelWhole<'a', N>,
                         LabelWhole<'b', N>, LabelWhole<'c', N>>;
@@ -142,6 +174,26 @@ void single_stage_root(int E, Policy policy, int expected_league) {
   EXPECT_EQ(mismatches(cute_out, team_out), 0);
 }
 
+template <int TE, typename InView>
+void stage_root_matches(const InView& u) {
+  const int E = static_cast<int>(u.extent(0));
+  ViewR     cute_out("cute_out", E, N, N, N), team_out("team_out", E, N, N, N);
+  Kokkos::deep_copy(cute_out, -999.0f);
+
+  auto g0      = make_level_graph<float, ES>(Map4<TE>{});
+  auto [g1, s] = g0.add(
+      make_stage_node(make_input_node(make_handle<'e', 'a', 'b', 'c'>(u))));
+  const auto out = g1.outputs(s);
+
+  out.execute(CutePolicyTag<>{}, cute_out);
+  ASSERT_TRUE(synced());
+  out.execute(TeamPolicyTag<ES>{}, team_out);
+  ASSERT_TRUE(synced());
+
+  EXPECT_EQ(mismatches(cute_out, u), 0);
+  EXPECT_EQ(mismatches(cute_out, team_out), 0);
+}
+
 }  // namespace
 
 TEST(CuteLevelGraph, SingleStageRootCopiesTheInput) {
@@ -151,6 +203,16 @@ TEST(CuteLevelGraph, SingleStageRootCopiesTheInput) {
 TEST(CuteLevelGraph, LayoutLeftInputToLayoutRightOutput) {
   single_stage_root<2, CutePolicyTag<>, View4<Kokkos::LayoutLeft>>(
       8, CutePolicyTag<>{}, 4);
+}
+
+TEST(CuteLevelGraph, LeadingRangeSubviewInputStaysContiguous) {
+  ViewR big("big", 10, N, N, N);
+  fill(big, 3.0f);
+  const auto u = Kokkos::subview(big, Kokkos::pair<int, int>(1, 9), Kokkos::ALL,
+                                 Kokkos::ALL, Kokkos::ALL);
+  static_assert(std::is_same_v<decltype(u)::array_layout, Kokkos::LayoutRight>);
+  ASSERT_TRUE(u.span_is_contiguous());
+  stage_root_matches<2>(u);
 }
 
 TEST(CuteLevelGraph, IdleThreadsWithDefaultBlock) {
