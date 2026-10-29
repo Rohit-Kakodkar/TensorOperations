@@ -782,6 +782,437 @@ TEST(LevelGraphDeclaredOrder, CombineFnSeesGlobalCoordinate) {
 
 }  // namespace declared
 
+// ---------------------------------------------------------------------------
+// Register nodes on the TEAM backend. A register node gets no stage copy there;
+// each combine that reads it calls its source at the combine's own global
+// coordinate (LevelGraph/Team.hpp, RegisterBoundFn). Every test runs the same
+// graph twice -- once with make_register_node, once with make_stage_node -- and
+// demands BITWISE equal results: the pass-through must read exactly what the
+// stage copy would have stored.
+// ---------------------------------------------------------------------------
+namespace reg {
+
+constexpr int E = 8, N = 5, TE = 2;
+
+using Map =
+    LabelTiles<LabelTile<'e', TE>, LabelWhole<'a', N>, LabelWhole<'b', N>>;
+using V3   = Kokkos::View<float***, Kokkos::LayoutRight, ES>;
+using IdxV = Kokkos::View<int***, Kokkos::LayoutRight, ES>;
+using Dst  = Kokkos::View<float*, ES>;
+
+struct SomeTV {};
+
+// Three outputs from one evaluation: the case a per-output read would
+// recompute.
+struct Tri {
+  KOKKOS_FUNCTION Kokkos::Array<float, 3> operator()(int e, int a,
+                                                     int b) const {
+    return {0.5f + 0.25f * e - 0.125f * a + 0.0625f * b,
+            1.0f - 0.5f * e + 0.375f * a * b, 0.03125f * (e + 1) * (a - b)};
+  }
+};
+
+// Operands interleave register outputs (p*) with a staged slot (w), out of
+// output order, so the operand map is exercised rather than the identity.
+struct MixFn {
+  KOKKOS_FUNCTION float operator()(int e, int a, int b, float p2, float w,
+                                   float p0, float p1) const {
+    return p0 * w - p1 + 3.0f * p2 + 0.001f * (100 * e + 10 * a + b);
+  }
+};
+struct Sum2 {
+  KOKKOS_FUNCTION float operator()(int, int, int, float x, float y) const {
+    return x * y + x;
+  }
+};
+struct Sq {
+  KOKKOS_FUNCTION float operator()(int, int, int, float x) const {
+    return x * x - 1.0f;
+  }
+};
+
+float wval(int e, int a, int b) { return 0.7f - 0.05f * e + 0.11f * a * b; }
+
+V3 make_w() {
+  V3   w("w", E, N, N);
+  auto h = Kokkos::create_mirror_view(w);
+  for (int e = 0; e < E; ++e)
+    for (int a = 0; a < N; ++a)
+      for (int b = 0; b < N; ++b) h(e, a, b) = wval(e, a, b);
+  Kokkos::deep_copy(w, h);
+  return w;
+}
+
+template <typename ViewT>
+auto to_host(const ViewT& v) {
+  return Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, v);
+}
+
+template <typename A, typename B>
+void expect_bitwise(const A& x, const B& y, const char* what) {
+  const auto hx = to_host(x);
+  const auto hy = to_host(y);
+  ASSERT_EQ(hx.size(), hy.size());
+  int bad = 0;
+  for (std::size_t i = 0; i < hx.size(); ++i)
+    if (hx.data()[i] != hy.data()[i]) ++bad;
+  EXPECT_EQ(bad, 0) << what << ": register read differs from the stage copy";
+}
+
+// The source node, as a register node or a plain stage node.
+template <bool Register, typename Operand>
+auto src(Operand op) {
+  if constexpr (Register)
+    return make_register_node(std::move(op), SomeTV{});
+  else
+    return make_stage_node(std::move(op));
+}
+
+// A multi-output functional register node and a staged view in ONE level,
+// read by a combine whose operands interleave the two.
+TEST(LevelGraphRegisterTeam, MultiOutputSourceInterleavedWithSlot) {
+  const V3 w   = make_w();
+  auto     run = [&](auto is_reg) {
+    constexpr bool R = decltype(is_reg)::value;
+    V3             out("out", E, N, N);
+    auto           g0 = make_level_graph<float, ES>(Map{});
+    auto [g1, p0, p1, p2, s] =
+        g0.add(src<R>(make_functional_input_node<'e', 'a', 'b'>(
+                   Kokkos::Array<int, 3>{E, N, N}, Tri{})),
+               make_stage_node(make_input_node(make_handle<'e', 'a', 'b'>(w))));
+    auto [g2, r] =
+        g1.add(make_combine_node<'e', 'a', 'b'>(p2, s, p0, p1, MixFn{}));
+    const auto res = g2.outputs(r);
+    res.execute(TeamPolicyTag<ES>{}, out);
+    Kokkos::fence();
+    return std::make_pair(out, res.scratch_bytes());
+  };
+  const auto a = run(std::true_type{});
+  const auto b = run(std::false_type{});
+  expect_bitwise(a.first, b.first, "multi-output source");
+  // The register node's three slots are one element each, not a tile: proof
+  // the pass-through ran rather than a silent stage copy.
+  EXPECT_LT(a.second, b.second);
+}
+
+// The register node is declared in ('e','b','a') order over a view stored that
+// way; the combine runs in ('e','a','b'). The reader must permute the
+// coordinate. The register node is also alone in its level, so that stage
+// level emits no copy loop at all.
+TEST(LevelGraphRegisterTeam, PermutedLabelsAndAllRegisterLevel) {
+  const V3 w = make_w();
+  V3       t("t", E, N, N);  // t(e, b, a)
+  {
+    auto h = Kokkos::create_mirror_view(t);
+    for (int e = 0; e < E; ++e)
+      for (int b = 0; b < N; ++b)
+        for (int a = 0; a < N; ++a) h(e, b, a) = 0.2f * e + 0.9f * b - a;
+    Kokkos::deep_copy(t, h);
+  }
+  auto run = [&](auto is_reg) {
+    constexpr bool R = decltype(is_reg)::value;
+    V3             out("out", E, N, N);
+    auto           g0 = make_level_graph<float, ES>(Map{});
+    auto [g1, x] =
+        g0.add(src<R>(make_input_node(make_handle<'e', 'b', 'a'>(t))));
+    auto [g2, s] =
+        g1.add(make_stage_node(make_input_node(make_handle<'e', 'a', 'b'>(w))));
+    auto [g3, r] = g2.add(make_combine_node<'e', 'a', 'b'>(x, s, Sum2{}));
+    g3.outputs(r).execute(TeamPolicyTag<ES>{}, out);
+    Kokkos::fence();
+    return out;
+  };
+  expect_bitwise(run(std::true_type{}), run(std::false_type{}),
+                 "permuted register node");
+}
+
+// Two combines in one level read the same register node; one of them reads
+// nothing else, so it has no operand in memory at all.
+TEST(LevelGraphRegisterTeam, TwoCombinesOneRegisterOneWithoutSlots) {
+  const V3 w   = make_w();
+  auto     run = [&](auto is_reg) {
+    constexpr bool R = decltype(is_reg)::value;
+    V3             o1("o1", E, N, N), o2("o2", E, N, N);
+    auto           g0 = make_level_graph<float, ES>(Map{});
+    auto [g1, p0, p1, p2, s] =
+        g0.add(src<R>(make_functional_input_node<'e', 'a', 'b'>(
+                   Kokkos::Array<int, 3>{E, N, N}, Tri{})),
+               make_stage_node(make_input_node(make_handle<'e', 'a', 'b'>(w))));
+    auto [g2, r1, r2] = g1.add(make_combine_node<'e', 'a', 'b'>(p1, s, Sum2{}),
+                               make_combine_node<'e', 'a', 'b'>(p2, Sq{}));
+    g2.outputs(r1, r2).execute(TeamPolicyTag<ES>{}, o1, o2);
+    Kokkos::fence();
+    return std::make_pair(o1, o2);
+  };
+  const auto a = run(std::true_type{});
+  const auto b = run(std::false_type{});
+  expect_bitwise(a.first, b.first, "combine with a slot operand");
+  expect_bitwise(a.second, b.second, "combine with only a register operand");
+}
+
+// A scatter (a sink combine) whose value IS the register node: no operand in
+// memory, the sink's output tile drives the loop. Once through an index view,
+// once through an index node, where the register binding wraps the
+// ScatterAddBoundFn. The index is a permutation, so each destination receives
+// exactly one add and the result is order-independent and exact.
+TEST(LevelGraphRegisterTeam, SinkScatterOfRegisterValue) {
+  IdxV idx("idx", E, N, N);
+  {
+    auto h = Kokkos::create_mirror_view(idx);
+    int  n = 0;
+    for (int e = 0; e < E; ++e)
+      for (int a = 0; a < N; ++a)
+        for (int b = 0; b < N; ++b, ++n) h(e, a, b) = (n * 37) % (E * N * N);
+    Kokkos::deep_copy(idx, h);
+  }
+  auto run = [&](auto is_reg, auto via_slot) {
+    constexpr bool R = decltype(is_reg)::value;
+    Dst            dst("dst", E * N * N);
+    auto           g0 = make_level_graph<float, ES>(Map{});
+    if constexpr (decltype(via_slot)::value) {
+      auto [g1, ig] = g0.add(make_index_node<'e', 'a', 'b'>(idx));
+      auto [g2, p0, p1, p2] =
+          g1.add(src<R>(make_functional_input_node<'e', 'a', 'b'>(
+              Kokkos::Array<int, 3>{E, N, N}, Tri{})));
+      g2.add(make_scatter_add_node<'e', 'a', 'b'>(ig, dst, p1))
+          .outputs()
+          .execute(TeamPolicyTag<ES>{});
+    } else {
+      auto [g1, x] =
+          g0.add(src<R>(make_input_node(make_handle<'e', 'a', 'b'>(make_w()))));
+      g1.add(make_scatter_add_node<'e', 'a', 'b'>(idx, dst, x))
+          .outputs()
+          .execute(TeamPolicyTag<ES>{});
+    }
+    Kokkos::fence();
+    return dst;
+  };
+  expect_bitwise(run(std::true_type{}, std::false_type{}),
+                 run(std::false_type{}, std::false_type{}),
+                 "scatter through an index view");
+  expect_bitwise(run(std::true_type{}, std::true_type{}),
+                 run(std::false_type{}, std::true_type{}),
+                 "scatter through an index node");
+}
+
+// make_register_node<Modes...>(src, tv) with a view or handle as the source:
+// the same node as wrapping it in make_input_node by hand, so it must read
+// exactly what a stage copy of the view stores.
+template <bool Register, int32_t... Modes, typename Src>
+auto src_labelled(Src s) {
+  if constexpr (Register)
+    return make_register_node<Modes...>(std::move(s), SomeTV{});
+  else
+    return make_stage_node(make_input_node(make_handle<Modes...>(s)));
+}
+
+template <bool Register, int32_t... Modes, typename T, typename Seq>
+auto src_labelled(TensorHandle<T, Seq> h) {
+  if constexpr (Register)
+    return make_register_node<Modes...>(std::move(h), SomeTV{});
+  else
+    return make_stage_node(make_input_node(std::move(h)));
+}
+
+TEST(LevelGraphRegisterTeam, ViewSourceMatchesStage) {
+  const V3 w = make_w();
+  V3       x("x", E, N, N);
+  {
+    auto h = Kokkos::create_mirror_view(x);
+    for (int e = 0; e < E; ++e)
+      for (int a = 0; a < N; ++a)
+        for (int b = 0; b < N; ++b) h(e, a, b) = 0.3f * e - 0.7f * a + b;
+    Kokkos::deep_copy(x, h);
+  }
+  auto run = [&](auto is_reg) {
+    constexpr bool R = decltype(is_reg)::value;
+    V3             out("out", E, N, N);
+    auto           g0 = make_level_graph<float, ES>(Map{});
+    auto [g1, p, s] =
+        g0.add(src_labelled<R, 'e', 'a', 'b'>(x),
+               make_stage_node(make_input_node(make_handle<'e', 'a', 'b'>(w))));
+    auto [g2, r]   = g1.add(make_combine_node<'e', 'a', 'b'>(p, s, Sum2{}));
+    const auto res = g2.outputs(r);
+    res.execute(TeamPolicyTag<ES>{}, out);
+    Kokkos::fence();
+    return std::make_pair(out, res.scratch_bytes());
+  };
+  const auto a = run(std::true_type{});
+  const auto b = run(std::false_type{});
+  expect_bitwise(a.first, b.first, "view source");
+  EXPECT_LT(a.second, b.second);
+}
+
+TEST(LevelGraphRegisterTeam, HandleSourceAndPermutedLabels) {
+  const V3 w = make_w();
+  V3       t("t", E, N, N);
+  {
+    auto h = Kokkos::create_mirror_view(t);
+    for (int e = 0; e < E; ++e)
+      for (int b = 0; b < N; ++b)
+        for (int a = 0; a < N; ++a) h(e, b, a) = 0.2f * e + 0.9f * b - a;
+    Kokkos::deep_copy(t, h);
+  }
+  auto run = [&](auto is_reg) {
+    constexpr bool R = decltype(is_reg)::value;
+    V3             out("out", E, N, N);
+    auto           g0 = make_level_graph<float, ES>(Map{});
+    auto [g1, x] =
+        g0.add(src_labelled<R, 'e', 'b', 'a'>(make_handle<'e', 'b', 'a'>(t)));
+    auto [g2, s] =
+        g1.add(make_stage_node(make_input_node(make_handle<'e', 'a', 'b'>(w))));
+    auto [g3, r] = g2.add(make_combine_node<'e', 'a', 'b'>(x, s, Sum2{}));
+    g3.outputs(r).execute(TeamPolicyTag<ES>{}, out);
+    Kokkos::fence();
+    return out;
+  };
+  expect_bitwise(run(std::true_type{}), run(std::false_type{}),
+                 "permuted handle source");
+}
+
+}  // namespace reg
+
+// ===========================================================================
+// Scratch level, chosen at launch from the store size against the backend's
+// own TeamPolicy::scratch_size_max: level 0 when it fits, else level 1, else
+// an abort. Host backends cap
+// level 0 at 32 KB, so the N = 8, TE = 4 gradient (U plus three roots, 8 KB
+// each) runs from level 1 there and from level 0 on a GPU; the N = 4, TE = 1
+// one fits level 0 everywhere.
+// ===========================================================================
+namespace lvl {
+
+constexpr int E = 8;
+
+using ViewH = Kokkos::View<float**, Kokkos::LayoutRight, ES>;
+using ViewU = Kokkos::View<float****, Kokkos::LayoutRight, ES>;
+
+template <int N, int TE>
+using Map =
+    LabelTiles<LabelWhole<'q', N>, LabelWhole<'a', N>, LabelTile<'e', TE>,
+               LabelWhole<'b', N>, LabelWhole<'c', N>>;
+
+constexpr bool kOnHost =
+    Kokkos::SpaceAccessibility<ES, Kokkos::HostSpace>::accessible;
+
+std::size_t level0_cap() {
+  return static_cast<std::size_t>(Kokkos::TeamPolicy<ES>::scratch_size_max(0));
+}
+
+float hv(int q, int a) { return 0.3f + 0.17f * q - 0.11f * a + 0.02f * q * a; }
+float uv(int e, int a, int b, int c) {
+  return 0.1f + 0.05f * e - 0.09f * a + 0.07f * b - 0.04f * c +
+         0.006f * (e + 2 * a) * (c + 1);
+}
+
+template <int N, int TE>
+struct Gradient {
+  ViewH H{"H", N, N};
+  ViewU U{"U", E, N, N, N};
+
+  Gradient() {
+    auto Hh = Kokkos::create_mirror_view(H);
+    auto Uh = Kokkos::create_mirror_view(U);
+    for (int q = 0; q < N; ++q)
+      for (int a = 0; a < N; ++a) Hh(q, a) = hv(q, a);
+    for (int e = 0; e < E; ++e)
+      for (int a = 0; a < N; ++a)
+        for (int b = 0; b < N; ++b)
+          for (int c = 0; c < N; ++c) Uh(e, a, b, c) = uv(e, a, b, c);
+    Kokkos::deep_copy(H, Hh);
+    Kokkos::deep_copy(U, Uh);
+  }
+
+  auto outputs() const {
+    auto g0 = make_level_graph<float, ES>(Map<N, TE>{});
+    auto [g1, h] =
+        g0.add(make_stage_node(make_input_node(make_handle<'q', 'a'>(H))));
+    auto [g2, u] = g1.add(
+        make_stage_node(make_input_node(make_handle<'e', 'a', 'b', 'c'>(U))));
+    auto [g3, ga, gb, gc] = g2.add(
+        make_contraction_node<'q', 'e', 'b', 'c'>(h, u),
+        make_contraction_node<'q', 'e', 'a', 'c'>(h.template as<'q', 'b'>(), u),
+        make_contraction_node<'q', 'e', 'a', 'b'>(h.template as<'q', 'c'>(),
+                                                  u));
+    return g3.outputs(ga, gb, gc);
+  }
+
+  void run_and_check() const {
+    ViewU A("A", N, E, N, N), B("B", N, E, N, N), C("C", N, E, N, N);
+    outputs().execute(TeamPolicyTag<ES>{}, A, B, C);
+    Kokkos::fence();
+
+    auto   Ah = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, A);
+    auto   Bh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, B);
+    auto   Ch = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, C);
+    double ea = 0.0, eb = 0.0, ec = 0.0;
+    for (int q = 0; q < N; ++q)
+      for (int e = 0; e < E; ++e)
+        for (int m = 0; m < N; ++m)
+          for (int n = 0; n < N; ++n) {
+            double ra = 0.0, rb = 0.0, rc = 0.0;
+            for (int k = 0; k < N; ++k) {
+              ra += hv(q, k) * uv(e, k, m, n);
+              rb += hv(q, k) * uv(e, m, k, n);
+              rc += hv(q, k) * uv(e, m, n, k);
+            }
+            ea = std::max(ea, std::abs(ra - Ah(q, e, m, n)));
+            eb = std::max(eb, std::abs(rb - Bh(q, e, m, n)));
+            ec = std::max(ec, std::abs(rc - Ch(q, e, m, n)));
+          }
+    EXPECT_LT(ea, 1e-4) << "member a";
+    EXPECT_LT(eb, 1e-4) << "member b";
+    EXPECT_LT(ec, 1e-4) << "member c";
+  }
+};
+
+TEST(LevelGraphScratchLevel, AStoreAboveTheHostLevelZeroCapRunsFromLevelOne) {
+  const Gradient<8, 4> g;
+  const auto           out = g.outputs();
+  EXPECT_EQ(out.scratch_level(), kOnHost ? 1 : 0);
+  if (kOnHost)
+    ASSERT_GT(out.scratch_bytes(), level0_cap())
+        << "the store must exceed the host level-0 cap to prove anything";
+  g.run_and_check();
+}
+
+TEST(LevelGraphScratchLevel, AStoreThatFitsLevelZeroStaysThere) {
+  const Gradient<4, 1> g;
+  const auto           out = g.outputs();
+  ASSERT_LE(out.scratch_bytes(), level0_cap());
+  EXPECT_EQ(out.scratch_level(), 0);
+  g.run_and_check();
+}
+
+namespace huge {
+constexpr int M = 4608;
+using ViewIn =
+    Kokkos::View<float***, Kokkos::LayoutRight, ES, Kokkos::MemoryUnmanaged>;
+using MapH =
+    LabelTiles<LabelTile<'e', 1>, LabelWhole<'i', M>, LabelWhole<'j', M>>;
+
+auto outputs(const ViewIn& in) {
+  auto g0 = make_level_graph<float, ES>(MapH{});
+  auto [g1, s] =
+      g0.add(make_stage_node(make_input_node(make_handle<'e', 'i', 'j'>(in))));
+  return g1.outputs(s);
+}
+}  // namespace huge
+
+TEST(LevelGraphScratchLevelDeathTest, AStoreAboveEveryLevelAbortsClearly) {
+  if (!kOnHost) GTEST_SKIP() << "death tests fork; run them on host only";
+  const huge::ViewIn in(nullptr, 1, huge::M, huge::M);
+  const huge::ViewIn out_view(nullptr, 1, huge::M, huge::M);
+  const auto         out = huge::outputs(in);
+  ASSERT_GT(
+      out.scratch_bytes(),
+      static_cast<std::size_t>(Kokkos::TeamPolicy<ES>::scratch_size_max(1)));
+  EXPECT_EQ(out.scratch_level(), -1);
+  EXPECT_DEATH(out.execute(TeamPolicyTag<ES>{}, out_view), "every level");
+}
+
+}  // namespace lvl
+
 int main(int argc, char* argv[]) {
   ::testing::InitGoogleTest(&argc, argv);
   Kokkos::initialize(argc, argv);

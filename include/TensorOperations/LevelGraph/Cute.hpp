@@ -82,6 +82,48 @@ struct lg_cute_stage {
   }
 };
 
+template <typename OutModes, typename NodeModes, typename TileShape,
+          typename GridModes>
+constexpr auto lg_cute_static_ext() {
+  constexpr auto o = seq_to_array(OutModes{});
+  constexpr auto n = seq_to_array(NodeModes{});
+  constexpr auto g = seq_to_array(GridModes{});
+  constexpr auto t =
+      cute_static_extents<TileShape>(std::make_index_sequence<n.size()>{});
+  std::array<int, o.size()> e{};
+  for (std::size_t d = 0; d < o.size(); ++d) {
+    bool gridded = false;
+    for (std::size_t k = 0; k < g.size(); ++k)
+      gridded = gridded || g[k] == o[d];
+    e[d] = 0;
+    if (!gridded)
+      for (std::size_t k = 0; k < n.size(); ++k)
+        if (n[k] == o[d]) e[d] = t[k];
+  }
+  return e;
+}
+
+template <typename OutModes, typename NodeModes, typename TileShape,
+          typename GridModes>
+using lg_cute_static_ext_t = array_to_seq_t<
+    lg_cute_static_ext<OutModes, NodeModes, TileShape, GridModes>()>;
+
+template <typename Node, typename GridModes>
+using lg_cute_input_ext_t =
+    lg_cute_static_ext_t<typename Node::modes_seq, typename Node::modes_seq,
+                         cute_shape_of_t<member_out_tile_t<Node>>, GridModes>;
+
+template <typename Node>
+constexpr bool lg_cute_global_input() {
+  if constexpr (has_node_tag_v<StagedTag, Node>)
+    return has_node_tag_v<InputTag, typename Node::operand_type>;
+  else
+    return false;
+}
+
+template <typename Node>
+inline constexpr bool lg_cute_global_input_v = lg_cute_global_input<Node>();
+
 template <typename Node, int NumThreads>
 struct lg_cute_stage<Node, NumThreads, DefaultTV> {
   using tile_shape = cute_shape_of_t<member_out_tile_t<Node>>;
@@ -210,9 +252,22 @@ __device__ const auto& lg_cute_slot_node(const LevelsT& levels) {
 template <typename LevelsT, std::size_t L, std::size_t M, int N>
 struct lg_cute_combine_plan;
 
-template <typename LevelsT, std::size_t S, int N,
-          typename Tag = typename lg_cute_slot_node_t<LevelsT, S>::node_tag>
-struct lg_cute_slot_producer {
+template <typename Node>
+constexpr long lg_cute_gather_idx_slot() {
+  if constexpr (!has_node_tag_v<StagedTag, Node>)
+    return -1;
+  else if constexpr (!has_node_tag_v<GatherTag, typename Node::operand_type>)
+    return -1;
+  else
+    return static_cast<long>(Node::operand_type::idx_type::SlotIdx);
+}
+
+template <typename LevelsT, std::size_t S>
+inline constexpr long lg_cute_gather_idx_slot_v =
+    lg_cute_gather_idx_slot<lg_cute_slot_node_t<LevelsT, S>>();
+
+template <typename LevelsT, std::size_t S, int N>
+struct lg_cute_direct_slot_producer {
   using P          = lg_cute_producer<lg_cute_slot_node_t<LevelsT, S>, N>;
   using tile_shape = typename P::tile_shape;
   using part       = typename P::part;
@@ -222,10 +277,48 @@ struct lg_cute_slot_producer {
   }
 };
 
+template <typename LevelsT, std::size_t S, int N,
+          typename Tag = typename lg_cute_slot_node_t<LevelsT, S>::node_tag>
+struct lg_cute_slot_producer : lg_cute_direct_slot_producer<LevelsT, S, N> {};
+
 template <typename LevelsT, std::size_t S, int N>
 struct lg_cute_slot_producer<LevelsT, S, N, CombineTag>
     : lg_cute_combine_plan<LevelsT, lg_slot_level_v<LevelsT, S>,
                            lg_slot_member_v<LevelsT, S>, N> {};
+
+template <typename LevelsT, std::size_t S, int N,
+          long I = lg_cute_gather_idx_slot_v<LevelsT, S>>
+struct lg_cute_staged_slot_producer
+    : lg_cute_slot_producer<LevelsT, static_cast<std::size_t>(I), N> {};
+template <typename LevelsT, std::size_t S, int N>
+struct lg_cute_staged_slot_producer<LevelsT, S, N, -1>
+    : lg_cute_direct_slot_producer<LevelsT, S, N> {};
+
+template <typename LevelsT, std::size_t S, int N>
+struct lg_cute_slot_producer<LevelsT, S, N, StagedTag>
+    : lg_cute_staged_slot_producer<LevelsT, S, N> {};
+
+template <typename T, bool = has_node_tag_v<StagedTag, T>>
+struct lg_cute_node_tv {
+  using type = DefaultTV;
+};
+template <typename T>
+struct lg_cute_node_tv<T, true> {
+  using type = typename T::tv_type;
+};
+
+template <typename LevelsT, std::size_t S,
+          long I = lg_cute_gather_idx_slot_v<LevelsT, S>>
+struct lg_cute_slot_tv {
+  using type =
+      typename lg_cute_slot_tv<LevelsT, static_cast<std::size_t>(I)>::type;
+};
+template <typename LevelsT, std::size_t S>
+struct lg_cute_slot_tv<LevelsT, S, -1> {
+  using type = typename lg_cute_node_tv<lg_cute_slot_node_t<LevelsT, S>>::type;
+};
+template <typename LevelsT, std::size_t S>
+using lg_cute_slot_tv_t = typename lg_cute_slot_tv<LevelsT, S>::type;
 
 template <int R, std::size_t... Is>
 auto lg_cute_right_order(std::index_sequence<Is...>)
@@ -262,7 +355,7 @@ struct lg_cute_combine_plan {
     if constexpr (!has_node_tag_v<StagedTag, producer_node_t<K>>)
       return false;
     else
-      return !is_default_tv_v<typename producer_node_t<K>::tv_type>;
+      return !is_default_tv_v<lg_cute_slot_tv_t<LevelsT, slot<K>>>;
   }
 
   template <std::size_t K>
@@ -294,8 +387,8 @@ struct lg_cute_combine_plan {
   };
   template <std::size_t K>
   struct point_tv<K, true, true> {
-    using type = cute_point_tv_of_t<typename producer_node_t<K>::tv_type,
-                                    CModes, canon_t<K>, tile_shape>;
+    using type = cute_point_tv_of_t<lg_cute_slot_tv_t<LevelsT, slot<K>>, CModes,
+                                    canon_t<K>, tile_shape>;
   };
   template <std::size_t K>
   using point_tv_t = typename point_tv<K>::type;
@@ -398,6 +491,34 @@ struct lg_cute_combine_plan {
   template <std::size_t K, std::size_t Driver = D>
   using remap_t = cute_value_remap_t<point_tv_t<K>, point_tv_t<Driver>>;
 
+  template <int Z = 0>
+  static constexpr auto self_tv_impl() {
+    if constexpr (aligned_driven) {
+      return std::type_identity<point_tv_t<DA>>{};
+    } else if constexpr (register_driven) {
+      using PN = producer_node_t<D>;
+      if constexpr (has_node_tag_v<ContractionTag, PN>)
+        return std::type_identity<
+            cute_point_tv_t<typename lg_cute_producer<PN, N>::mma, CModes,
+                            canon_t<D>, tile_shape>>{};
+      else if constexpr (has_node_tag_v<CombineTag, PN>)
+        return std::type_identity<typename lg_cute_combine_plan<
+            LevelsT, lg_slot_level_v<LevelsT, slot<D>>,
+            lg_slot_member_v<LevelsT, slot<D>>, N>::template self_tv_t<Z>>{};
+      else if constexpr (has_node_tag_v<StagedTag, PN> &&
+                         !is_default_tv_v<lg_cute_slot_tv_t<LevelsT, slot<D>>>)
+        return std::type_identity<
+            cute_point_tv_of_t<lg_cute_slot_tv_t<LevelsT, slot<D>>, CModes,
+                               canon_t<D>, tile_shape>>{};
+      else
+        return std::type_identity<void>{};
+    } else {
+      return std::type_identity<void>{};
+    }
+  }
+  template <int Z = 0>
+  using self_tv_t = typename decltype(self_tv_impl<Z>())::type;
+
   __device__ static part make(const LevelsT& levels) {
     return picked::make(levels);
   }
@@ -491,6 +612,22 @@ template <typename LevelsT, int N, std::size_t S>
 inline constexpr std::size_t lg_cute_slot_pool_v =
     lg_cute_pool_of_slot<LevelsT, N>()[S];
 
+// A CuTe slot's span in the arena, rounded to 16 bytes. cute::copy on a static
+// layout ASSUMES 128-bit aligned pointers (cute/algorithm/copy.hpp) and will
+// emit LDS.128 / STS.128 for any 4-element contiguous run, so every slot base
+// must really be 16-byte aligned -- Kokkos' scratch ALIGN (8) is not enough.
+inline constexpr std::size_t lg_cute_slot_align = 16;
+
+template <typename V>
+constexpr std::size_t lg_cute_slot_step(std::size_t elems) {
+  static_assert(lg_cute_slot_align % sizeof(V) == 0,
+                "level graph (CuTe): the slot alignment must be a whole number "
+                "of elements");
+  const std::size_t b = elems * sizeof(V);
+  return (b + lg_cute_slot_align - 1) / lg_cute_slot_align *
+         lg_cute_slot_align / sizeof(V);
+}
+
 template <typename V, typename ES, typename LevelsT, int N, std::size_t... Ss>
 constexpr std::array<std::size_t, sizeof...(Ss)> lg_cute_smem_steps(
     std::index_sequence<Ss...>) {
@@ -499,10 +636,10 @@ constexpr std::array<std::size_t, sizeof...(Ss)> lg_cute_smem_steps(
         std::is_same_v<lg_slot_elem_t<LevelsT, Ss, V>, V>) &&
        ...),
       "level graph (CuTe): an index slot never lives in shared memory");
-  return {(lg_cute_smem_slot_v<LevelsT, N, Ss>
-               ? slot_arena_step<V, ES>(
-                     slot_tile_elems<lg_slot_tile_t<LevelsT, Ss>>())
-               : std::size_t{0})...};
+  return {(
+      lg_cute_smem_slot_v<LevelsT, N, Ss>
+          ? lg_cute_slot_step<V>(slot_tile_elems<lg_slot_tile_t<LevelsT, Ss>>())
+          : std::size_t{0})...};
 }
 
 template <typename V, typename ES, typename LevelsT, int N>
@@ -581,25 +718,60 @@ template <typename V, typename ES, int NumThreads, typename LevelsT,
           std::size_t S>
 __device__ auto lg_cute_slot_smem(V* base) {
   using P = lg_cute_slot_producer<LevelsT, S, NumThreads>;
+  static_assert(lg_cute_smem_offset_v<V, ES, LevelsT, NumThreads, S> *
+                        sizeof(V) % lg_cute_slot_align ==
+                    0,
+                "level graph (CuTe): a slot base must be 16-byte aligned; "
+                "cute::copy assumes it");
   return cute::make_tensor(
       cute::make_smem_ptr(base +
                           lg_cute_smem_offset_v<V, ES, LevelsT, NumThreads, S>),
       cute::make_layout(typename P::tile_shape{}, cute::LayoutRight{}));
 }
 
+template <typename Outs, std::size_t... Os>
+__device__ auto lg_cute_outputs_tuple(const Outs& outs,
+                                      std::index_sequence<Os...>) {
+  return DeviceTuple<std::decay_t<decltype(outs[Os])>...>{outs[Os]...};
+}
+
 template <typename ES, int NumThreads, typename LevelsT, typename GridModes,
-          std::size_t RootR, std::size_t L, std::size_t M>
-__device__ auto lg_cute_stage_member(
-    const LevelsT& levels, const Kokkos::Array<int, RootR>& grid_idx) {
-  using Node     = tuple_element_t<M, tuple_element_t<L, LevelsT>>;
-  using S        = lg_cute_stage<Node, NumThreads>;
-  using Gather   = gather_seq_t<typename Node::modes_seq, GridModes>;
-  const auto idx = node_index<Node::Rank, RootR>(grid_idx, Gather{});
-  auto       ev  = make_evaluator<CutePolicyTag<ES>>(
-      levels.template get<L>().template get<M>(),
-      CuteStagedTag<typename S::tile_shape, typename S::part>{S::make()});
-  using R = DeviceTuple<decltype(ev(idx))>;
-  return R{ev(idx)};
+          std::size_t RootR, std::size_t L, std::size_t M, typename Acc>
+__device__ auto lg_cute_stage_member(const LevelsT&                   levels,
+                                     const Kokkos::Array<int, RootR>& grid_idx,
+                                     const Acc&                       acc) {
+  using Node = tuple_element_t<M, tuple_element_t<L, LevelsT>>;
+  if constexpr (has_node_tag_v<GatherTag, typename Node::operand_type>) {
+    using P = lg_cute_slot_producer<LevelsT, lg_member_base_v<LevelsT, L, M>,
+                                    NumThreads>;
+    const auto& f =
+        acc.template get<Node::operand_type::idx_type::SlotIdx>().node().frag_;
+    const auto ev = make_evaluator<CutePolicyTag<ES>>(
+        levels.template get<L>().template get<M>(),
+        CuteGatherTag<typename P::tile_shape, typename P::part,
+                      std::decay_t<decltype(f)>>{P::make(levels), f});
+    using R = DeviceTuple<decltype(ev())>;
+    return R{ev()};
+  } else {
+    using S      = lg_cute_stage<Node, NumThreads>;
+    using Gather = gather_seq_t<typename Node::modes_seq, GridModes>;
+    using Ext = std::conditional_t<lg_cute_global_input_v<Node>,
+                                   lg_cute_input_ext_t<Node, GridModes>, void>;
+    const auto idx = node_index<Node::Rank, RootR>(grid_idx, Gather{});
+    auto       ev  = make_evaluator<CutePolicyTag<ES>>(
+        levels.template get<L>().template get<M>(),
+        CuteStagedTag<typename S::tile_shape, typename S::part, Ext>{
+            S::make()});
+    if constexpr (Node::NumOut == 1) {
+      using R = DeviceTuple<decltype(ev(idx))>;
+      return R{ev(idx)};
+    } else {
+      const auto outs = ev(idx);
+      return lg_cute_outputs_tuple(
+          outs,
+          std::make_index_sequence<static_cast<std::size_t>(Node::NumOut)>{});
+    }
+  }
 }
 
 template <typename V, typename ES, int NumThreads, typename LevelsT,
@@ -676,6 +848,21 @@ __device__ auto lg_cute_combine_operand(const LevelsT& levels, const Acc& acc,
                            typename Plan::template op_t<K>>(base);
 }
 
+template <typename IdxTV, typename SelfTV, typename CModes, typename IdxModes,
+          typename TileShape>
+constexpr bool lg_cute_scatter_aligned() {
+  if constexpr (std::is_void_v<SelfTV> || is_default_tv_v<IdxTV>)
+    return false;
+  else
+    return cute_points_aligned_v<
+        cute_point_tv_of_t<IdxTV, CModes, IdxModes, TileShape>, SelfTV>;
+}
+
+template <typename IdxTV, typename SelfTV, typename CModes, typename IdxModes,
+          typename TileShape>
+inline constexpr bool lg_cute_scatter_aligned_v =
+    lg_cute_scatter_aligned<IdxTV, SelfTV, CModes, IdxModes, TileShape>();
+
 template <typename V, typename ES, int NumThreads, typename LevelsT,
           typename GridModes, std::size_t RootR, std::size_t L, std::size_t M,
           typename Acc, std::size_t... Ks, std::size_t... Os>
@@ -697,15 +884,48 @@ __device__ auto lg_cute_combine_member(
   const Ops   ops{lg_cute_combine_operand<V, ES, NumThreads, LevelsT, L, M, Ks>(
       levels, acc, base)...};
   const auto& node = levels.template get<L>().template get<M>();
-  const auto  ev   = make_evaluator<CutePolicyTag<ES>>(
-      node, make_cute_combine_tag<typename Plan::tile_shape>(
-                Plan::make(levels), origin, ops.template get<Ks>()...));
-  if constexpr (Node::NumOut == 0) {
-    ev();
+  if constexpr (is_scatter_slot_fn_v<typename Node::combine_type>) {
+    using Fn                = typename Node::combine_type;
+    using IdxSlot           = typename Fn::idx_type;
+    constexpr std::size_t I = IdxSlot::SlotIdx;
+    using TileShape         = typename Plan::tile_shape;
+    using IdxTV             = lg_cute_slot_tv_t<LevelsT, I>;
+    using SelfTV            = typename Plan::template self_tv_t<>;
+    static_assert(
+        lg_cute_scatter_aligned_v<IdxTV, SelfTV, typename Node::modes_seq,
+                                  typename IdxSlot::modes_seq, TileShape>,
+        "scatter node: the index's thread-value layout must match "
+        "the scatter's thread map; give make_index_node the layout "
+        "of the scatter's driving MMA");
+    using IdxPT   = cute_point_tv_of_t<IdxTV, typename Node::modes_seq,
+                                       typename IdxSlot::modes_seq, TileShape>;
+    using Remap   = cute_value_remap_t<IdxPT, SelfTV>;
+    const auto& f = acc.template get<I>().node().frag_;
+    const auto  coords =
+        Plan::make(levels)(cute::make_identity_tensor(TileShape{}));
+    auto frag =
+        cute::make_tensor<typename std::decay_t<decltype(f)>::value_type>(
+            cute::shape(coords));
+    CUTE_UNROLL
+    for (int v = 0; v < static_cast<int>(cute::size(frag)); ++v)
+      frag(v) = f(Remap{}(v));
+    const auto bound = rebind_combine_fn(
+        node, ScatterAddFragFn<decltype(frag), typename Fn::dst_type>{
+                  frag, node.fn.dst});
+    make_evaluator<CutePolicyTag<ES>>(
+        bound, make_cute_combine_tag<TileShape>(Plan::make(levels), origin,
+                                                ops.template get<Ks>()...))();
     return DeviceTuple<>{};
   } else {
-    const auto outs = ev();
-    return DeviceTuple<std::decay_t<decltype(outs[Os])>...>{outs[Os]...};
+    const auto ev = make_evaluator<CutePolicyTag<ES>>(
+        node, make_cute_combine_tag<typename Plan::tile_shape>(
+                  Plan::make(levels), origin, ops.template get<Ks>()...));
+    if constexpr (Node::NumOut == 0) {
+      ev();
+      return DeviceTuple<>{};
+    } else {
+      return lg_cute_outputs_tuple(ev(), std::index_sequence<Os...>{});
+    }
   }
 }
 
@@ -742,7 +962,7 @@ __device__ auto lg_cute_run_level(const LevelsT&                   levels,
     return lg_cute_cat(
         DeviceTuple<>{},
         lg_cute_stage_member<ES, NumThreads, LevelsT, GridModes, RootR, L, Ms>(
-            levels, grid_idx)...);
+            levels, grid_idx, acc)...);
   } else {
     if constexpr (lg_cute_reuses_at_v<LevelsT, NumThreads, L,
                                       std::index_sequence<Ss...>>)
@@ -806,11 +1026,13 @@ __device__ void lg_cute_store_root(const LevelsT& levels, const Slots& slots,
   const auto  node =
       make_cute_fragment_node<ES, Node::Rank, typename P::tile_shape>(
           f.frag_, f.coords_);
-  const auto out =
-      make_handle_seq(view, typename lg_member_decl_modes<Node>::type{});
+  using DeclModes = typename lg_member_decl_modes<Node>::type;
+  using Ext       = lg_cute_static_ext_t<DeclModes, typename Node::modes_seq,
+                                         typename P::tile_shape, GridModes>;
+  const auto out  = make_handle_seq(view, DeclModes{});
   make_evaluator<CutePolicyTag<ES>>(
       node, CuteFragmentStoreTag<typename P::part>{P::make(levels)})(
-      idx, out, output_perm_seq<Node>());
+      idx, out, output_perm_seq<Node>(), Ext{});
 }
 
 template <typename ES, int NumThreads, typename LevelsT, typename GridModes,
@@ -826,11 +1048,35 @@ __device__ void lg_cute_store_roots(const LevelsT& levels, const Slots& slots,
    ...);
 }
 
+// Device-side check that the kernel really was launched as a (NumThreads, 1, 1)
+// block -- the shape lg_cute_kernel ASSUMES. A debug-build check: on when
+// NDEBUG is absent or Kokkos' bounds checking is on (the switch
+// TileLayout.hpp's TENSOR_OPS_VERIFY_RESHAPE uses), off in a release build.
+// Define it to 0 or 1 on the command line to override either way.
+#if !defined(TENSOR_OPS_CHECK_CUTE_LAUNCH)
+#if defined(KOKKOS_ENABLE_DEBUG_BOUNDS_CHECK) || !defined(NDEBUG)
+#define TENSOR_OPS_CHECK_CUTE_LAUNCH 1
+#else
+#define TENSOR_OPS_CHECK_CUTE_LAUNCH 0
+#endif
+#endif
+
 template <typename V, typename ES, int NumThreads, typename LevelsT,
           typename GridModes, typename GridTile, typename Scheduler,
           typename RootsSeq, std::size_t RootR, typename ViewArr>
 __global__ void lg_cute_kernel(LevelsT levels, Kokkos::Array<int, RootR> shape,
                                ViewArr views) {
+#if TENSOR_OPS_CHECK_CUTE_LAUNCH
+  if (blockDim.x != NumThreads || blockDim.y != 1 || blockDim.z != 1) __trap();
+#endif
+  // lg_execute_cute launches this kernel with exactly a (NumThreads, 1, 1)
+  // block, and it is the only launch site. Saying so lets every partitioner's
+  // `thr_idx < size(...)` guard fold away whenever that size is at least
+  // NumThreads, instead of costing a branch and reconvergence per member; on
+  // sfpp_min that halved the wait stalls. If the shape were ever different
+  // this is undefined behaviour, which is why the launch builds the block from
+  // the same constant and the debug check above traps on any other shape.
+  __builtin_assume(threadIdx.x < static_cast<unsigned>(NumThreads));
   extern __shared__ __align__(16) unsigned char lg_cute_smem[];
   V* const   base     = reinterpret_cast<V*>(lg_cute_smem);
   const auto grid_idx = Scheduler::template tile_coord<RootR, GridTile>(shape);
@@ -873,6 +1119,52 @@ void lg_cute_check_wholes(const LevelsT& levels, std::index_sequence<Ls...>) {
       ...);
 }
 
+template <typename GridModes, typename Node>
+void lg_cute_check_global_input(const Node& n) {
+  if constexpr (lg_cute_global_input_v<Node>)
+    if (!cute_global_layout_holds<lg_cute_input_ext_t<Node, GridModes>>(
+            n.operand_.handle))
+      Kokkos::abort(
+          "level graph (CuTe): an input view is padded, or a LabelWhole "
+          "label's extent differs from its tile; the CuTe backend reads "
+          "LayoutRight and LayoutLeft views as contiguous");
+}
+
+template <typename GridModes, typename LevelsT, std::size_t... Ls>
+void lg_cute_check_global_inputs(const LevelsT& levels,
+                                 std::index_sequence<Ls...>) {
+  (
+      [&]<std::size_t... Ms>(const auto& lv, std::index_sequence<Ms...>) {
+        (lg_cute_check_global_input<GridModes>(lv.template get<Ms>()), ...);
+      }(levels.template get<Ls>(),
+        std::make_index_sequence<tuple_size_v<tuple_element_t<Ls, LevelsT>>>{}),
+      ...);
+}
+
+template <typename GridModes, int NumThreads, typename LevelsT,
+          typename ViewArr, std::size_t... Rts>
+void lg_cute_check_global_outputs(const ViewArr& views,
+                                  std::index_sequence<Rts...>) {
+  int  i  = 0;
+  bool ok = true;
+  (
+      [&] {
+        using Node      = lg_cute_slot_node_t<LevelsT, Rts>;
+        using P         = lg_cute_slot_producer<LevelsT, Rts, NumThreads>;
+        using DeclModes = typename lg_member_decl_modes<Node>::type;
+        using Ext = lg_cute_static_ext_t<DeclModes, typename Node::modes_seq,
+                                         typename P::tile_shape, GridModes>;
+        ok        = ok && cute_global_layout_holds<Ext>(
+                              make_handle_seq(views[i++], DeclModes{}));
+      }(),
+      ...);
+  if (!ok)
+    Kokkos::abort(
+        "level graph (CuTe): an output view is padded, or a LabelWhole "
+        "label's extent differs from its tile; the CuTe backend writes "
+        "LayoutRight and LayoutLeft views as contiguous");
+}
+
 template <typename V, typename ES, typename LevelsT>
 std::size_t lg_cute_smem_bytes() {
   return lg_cute_smem_elems_v<V, ES, LevelsT, lg_cute_num_threads_v<LevelsT>> *
@@ -892,11 +1184,17 @@ int lg_execute_cute(const LevelsT& levels, RootsSeq, const ViewTs&... views) {
   static_assert(lg_cute_supported<LevelsT>(
                     std::make_index_sequence<tuple_size_v<LevelsT>>{}),
                 "level graph (CuTe): every level must be all stage, all "
-                "contraction or all combine members");
+                "contraction or all combine members; a general contraction "
+                "(make_contraction_node with more than two operands, a shared "
+                "batch label or a structured operand) runs on the team "
+                "backend only");
+  // The block size. It is both the kernel's template argument and the launch's
+  // block, and the kernel ASSUMES threadIdx.x < NumThreads -- so this one
+  // constant must feed both, and nothing else may launch lg_cute_kernel.
   constexpr int NumThreads = lg_cute_num_threads_v<LevelsT>;
-  static_assert(NumThreads <= 1024,
-                "level graph (CuTe): the largest contraction TiledMMA needs "
-                "more than 1024 threads");
+  static_assert(NumThreads >= 1 && NumThreads <= 1024,
+                "level graph (CuTe): the block needs between 1 and 1024 "
+                "threads; the largest contraction TiledMMA asks for more");
   using GridModes      = lg_grid_modes_t<LT, LevelsT>;
   using GridTile       = lg_grid_tile_t<LT, LevelsT>;
   using Scheduler      = LinearTileScheduler;
@@ -907,8 +1205,12 @@ int lg_execute_cute(const LevelsT& levels, RootsSeq, const ViewTs&... views) {
   lg_cute_check_divisible<LT, GridModes>(grid_shape);
   lg_cute_check_wholes<LT>(levels,
                            std::make_index_sequence<tuple_size_v<LevelsT>>{});
-  const int         wk    = lg_league_size<GridTile>(grid_shape);
-  const auto        varr  = lg_view_array(views...);
+  lg_cute_check_global_inputs<GridModes>(
+      levels, std::make_index_sequence<tuple_size_v<LevelsT>>{});
+  const int  wk   = lg_league_size<GridTile>(grid_shape);
+  const auto varr = lg_view_array(views...);
+  lg_cute_check_global_outputs<GridModes, NumThreads, LevelsT>(varr,
+                                                               RootsSeq{});
   const std::size_t bytes = lg_cute_smem_bytes<V, ES, LevelsT>();
 
   const auto kernel =
@@ -921,7 +1223,19 @@ int lg_execute_cute(const LevelsT& levels, RootsSeq, const ViewTs&... views) {
         "level graph (CuTe): the graph's scratch exceeds the device's "
         "shared memory per block");
 
-  kernel<<<Scheduler::grid(wk), NumThreads, bytes, ES{}.cuda_stream()>>>(
+  // The kernel's own thread limit (registers included, not just the device's
+  // 1024). A launch above it would fail anyway; this says why.
+  cudaFuncAttributes attr{};
+  if (cudaFuncGetAttributes(&attr, kernel) != cudaSuccess)
+    Kokkos::abort("level graph (CuTe): cannot query the kernel's attributes");
+  if (NumThreads > attr.maxThreadsPerBlock)
+    Kokkos::abort(
+        "level graph (CuTe): the kernel's register use allows fewer threads "
+        "per block than the graph's contractions need; use a smaller tile");
+
+  // Exactly (NumThreads, 1, 1): the shape lg_cute_kernel assumes.
+  const dim3 block(static_cast<unsigned>(NumThreads), 1u, 1u);
+  kernel<<<Scheduler::grid(wk), block, bytes, ES{}.cuda_stream()>>>(
       levels, grid_shape, varr);
   if (cudaGetLastError() != cudaSuccess)
     Kokkos::abort("level graph (CuTe): kernel launch failed");
