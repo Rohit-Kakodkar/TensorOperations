@@ -62,16 +62,20 @@ namespace sfpp_min {
 
 using KernelES = Kokkos::DefaultExecutionSpace;
 
-// The gather the library never looks inside: a displacement value at a grid
+// The gather the library never looks inside: the displacement at a grid
 // coordinate comes from the mesh index map. The coordinate is GLOBAL (the
 // functional input folds the tile origin in), so iglob is indexed directly.
+// All three components come from one iglob load, so the stage is a single
+// three-output node rather than three nodes that each re-read the map.
 template <typename IglobView>
 struct GatherDisplacement {
-  Fields::view_type             u;
-  IglobView                     iglob;
-  int                           comp;
-  KOKKOS_INLINE_FUNCTION real_t operator()(int e, int k, int j, int i) const {
-    return u(iglob(e, k, j, i), comp);
+  Fields::view_type      u;
+  IglobView              iglob;
+  KOKKOS_INLINE_FUNCTION Kokkos::Array<real_t, 3> operator()(int e, int k,
+                                                             int j,
+                                                             int i) const {
+    const int ig = iglob(e, k, j, i);
+    return {u(ig, 0), u(ig, 1), u(ig, 2)};
   }
 };
 
@@ -329,16 +333,9 @@ auto build_new_graph(
   auto [g1, h, hwn] = g0.add(
       make_stage_node(make_input_node(make_handle<'r', 'p'>(args.hprime))),
       make_stage_node(make_input_node(make_handle<'p', 'r'>(hw))));
-  auto [g2, u0, u1, u2] = g1.add(
-      make_stage_node(make_functional_input_node<'e', 'k', 'j', 'i'>(
-          ext,
-          GatherDisplacement<IglobView>{args.displacement, args.iglob, 0})),
-      make_stage_node(make_functional_input_node<'e', 'k', 'j', 'i'>(
-          ext,
-          GatherDisplacement<IglobView>{args.displacement, args.iglob, 1})),
-      make_stage_node(make_functional_input_node<'e', 'k', 'j', 'i'>(
-          ext,
-          GatherDisplacement<IglobView>{args.displacement, args.iglob, 2})));
+  auto [g2, u0, u1, u2] =
+      g1.add(make_stage_node(make_functional_input_node<'e', 'k', 'j', 'i'>(
+          ext, GatherDisplacement<IglobView>{args.displacement, args.iglob})));
 
   auto gx = [&](auto uu) {
     return make_contraction_node<'e', 'k', 'j', 'i'>(

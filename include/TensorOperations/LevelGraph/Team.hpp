@@ -379,12 +379,31 @@ KOKKOS_FUNCTION auto lg_stage_src(const LevelsT&                   levels,
       .storage_;
 }
 
-template <typename SrcsT, typename Store, typename Coord, std::size_t... Bs,
-          std::size_t... Ms>
+template <std::size_t B, typename Src, typename Store, typename Coord,
+          std::size_t... Os>
+KOKKOS_FUNCTION void lg_copy_outputs(const Src& src, const Store& store,
+                                     Coord coord, std::index_sequence<Os...>) {
+  const auto r = src[coord];
+  ((store.template get<B + Os>()[coord] = r[Os]), ...);
+}
+
+template <int A, std::size_t B, typename Src, typename Store, typename Coord>
+KOKKOS_FUNCTION void lg_copy_member(const Src& src, const Store& store,
+                                    Coord coord) {
+  if constexpr (A == 1)
+    store.template get<B>()[coord] = src[coord];
+  else
+    lg_copy_outputs<B>(src, store, coord, std::make_index_sequence<A>{});
+}
+
+template <typename LevelT, typename SrcsT, typename Store, typename Coord,
+          std::size_t... Bs, std::size_t... Ms>
 KOKKOS_FUNCTION void lg_copy_coord(const SrcsT& srcs, const Store& store,
                                    Coord coord, std::index_sequence<Ms...>,
                                    std::index_sequence<Bs...>) {
-  ((store.template get<Bs>()[coord] = srcs.template get<Ms>()[coord]), ...);
+  (lg_copy_member<tuple_element_t<Ms, LevelT>::NumOut, Bs>(
+       srcs.template get<Ms>(), store, coord),
+   ...);
 }
 
 // A STAGE level: every member's global -> scratch copy, in ONE TeamVectorRange.
@@ -415,7 +434,8 @@ KOKKOS_FUNCTION void lg_run_staged_level(
   using bases     = std::index_sequence<lg_member_base_v<LevelsT, L, Ms>...>;
   const auto src0 = srcs.template get<0>();
   team_for_each_coord(team, src0, [=](auto coord) {
-    lg_copy_coord(srcs, store, coord, std::index_sequence<Ms...>{}, bases{});
+    lg_copy_coord<tuple_element_t<L, LevelsT>>(
+        srcs, store, coord, std::index_sequence<Ms...>{}, bases{});
   });
   team.team_barrier();
 }

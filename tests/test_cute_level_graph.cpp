@@ -5,7 +5,10 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <string>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -1039,6 +1042,122 @@ ViewR sink_view(const char* name) {
 }
 
 }  // namespace
+
+namespace {
+
+struct GatherAllU {
+  ViewGlob        glob;
+  ViewMap         iglob;
+  KOKKOS_FUNCTION Kokkos::Array<float, 3> operator()(int e, int a, int b,
+                                                     int c) const {
+    const int n = iglob(e, a, b, c);
+    return {glob(n, 0), glob(n, 1), glob(n, 2)};
+  }
+};
+
+struct Mix3At {
+  KOKKOS_FUNCTION float operator()(int e, int, int, int c, float x, float y,
+                                   float z) const {
+    return x - 2.0f * y + 4.0f * z + 0.5f * static_cast<float>(e) -
+           0.25f * static_cast<float>(c);
+  }
+};
+
+}  // namespace
+
+TEST(CuteLevelGraph, MultiOutputFunctionalStageIsBitwiseThreeStages) {
+  const GatherFixture f;
+  const auto          contract_three = [&](auto stages, ViewR* cute_out,
+                                           ViewR* team_out) {
+    for (int k = 0; k < 3; ++k) Kokkos::deep_copy(cute_out[k], -999.0f);
+    auto g0 = make_level_graph<float, ES>(MapQ<kFN, kFTE>{});
+    auto [g1, sh] =
+        g0.add(make_stage_node(make_input_node(make_handle<'q', 'a'>(f.h))));
+    auto [g2, s0, s1, s2] =
+        std::apply([&](auto... st) { return g1.add(st...); }, stages);
+    auto [g3, c0, c1, c2] =
+        g2.add(make_contraction_node<'q', 'e', 'b', 'c'>(sh, s0),
+               make_contraction_node<'q', 'e', 'b', 'c'>(sh, s1),
+               make_contraction_node<'q', 'e', 'b', 'c'>(sh, s2));
+    const auto out = g3.outputs(c0, c1, c2);
+    EXPECT_EQ(
+        out.execute(CutePolicyTag<>{}, cute_out[0], cute_out[1], cute_out[2]),
+        kFE / kFTE);
+    EXPECT_TRUE(synced());
+    out.execute(TeamPolicyTag<ES>{}, team_out[0], team_out[1], team_out[2]);
+    EXPECT_TRUE(synced());
+    return g3;
+  };
+  const auto make3 = [](const char* p) {
+    return std::array<ViewR, 3>{
+        ViewR(std::string(p) + "0", kFN, kFE, kFN, kFN),
+        ViewR(std::string(p) + "1", kFN, kFE, kFN, kFN),
+        ViewR(std::string(p) + "2", kFN, kFE, kFN, kFN)};
+  };
+  auto mc = make3("mc"), mt = make3("mt"), sc = make3("sc"), st = make3("st");
+  const auto gather = [&](int comp) {
+    return make_stage_node(make_functional_input_node<ES, 'e', 'a', 'b', 'c'>(
+        kFExt, GatherU{f.glob, f.iglob, comp}));
+  };
+
+  const auto gm = contract_three(
+      std::make_tuple(
+          make_stage_node(make_functional_input_node<ES, 'e', 'a', 'b', 'c'>(
+              kFExt, GatherAllU{f.glob, f.iglob}))),
+      mc.data(), mt.data());
+  static_assert(Impl::lg_level_slots_v<LevelsOf<decltype(gm)>, 1> == 3);
+  contract_three(std::make_tuple(gather(0), gather(1), gather(2)), sc.data(),
+                 st.data());
+
+  for (int comp = 0; comp < 3; ++comp) {
+    EXPECT_EQ(mismatches(mc[comp], sc[comp]), 0) << "component " << comp;
+    EXPECT_EQ(mismatches(mt[comp], st[comp]), 0) << "component " << comp;
+    EXPECT_LT(
+        max_rel_err(mc[comp], gradient_ref(f.h, gathered_u(f.glob, comp), 0)),
+        1e-5f)
+        << "component " << comp;
+    EXPECT_LT(max_rel_err(mc[comp], mt[comp]), 1e-5f) << "component " << comp;
+  }
+}
+
+TEST(CuteLevelGraph, MultiOutputFunctionalStageFeedsACombineInRegisters) {
+  const GatherFixture f;
+  ViewR cp("cp", kFE, kFN, kFN, kFN), tp("tp", kFE, kFN, kFN, kFN);
+  Kokkos::deep_copy(cp, -999.0f);
+
+  auto g0 = make_level_graph<float, ES>(MapQ<kFN, kFTE>{});
+  auto [g1, s0, s1, s2] =
+      g0.add(make_stage_node(make_functional_input_node<ES, 'e', 'a', 'b', 'c'>(
+          kFExt, GatherAllU{f.glob, f.iglob})));
+  auto [g2, pv] =
+      g1.add(make_combine_node<'e', 'a', 'b', 'c'>(s0, s1, s2, Mix3At{}));
+  using Plan = Impl::lg_cute_combine_plan<LevelsOf<decltype(g2)>, 1, 0, 128>;
+  static_assert(Plan::register_driven && Plan::template in_register<0>() &&
+                Plan::template in_register<1>() &&
+                Plan::template in_register<2>());
+
+  const auto out = g2.outputs(pv);
+  EXPECT_EQ(out.cute_smem_bytes(), 0u);
+  out.execute(CutePolicyTag<>{}, cp);
+  ASSERT_TRUE(synced());
+  out.execute(TeamPolicyTag<ES>{}, tp);
+  ASSERT_TRUE(synced());
+
+  const ViewR u[3] = {gathered_u(f.glob, 0), gathered_u(f.glob, 1),
+                      gathered_u(f.glob, 2)};
+  auto   h0 = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, u[0]);
+  auto   h1 = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, u[1]);
+  auto   h2 = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, u[2]);
+  HostV4 r("r", kFE, kFN, kFN, kFN);
+  for (int e = 0; e < kFE; ++e)
+    for (int a = 0; a < kFN; ++a)
+      for (int b = 0; b < kFN; ++b)
+        for (int c = 0; c < kFN; ++c)
+          r(e, a, b, c) = Mix3At{}(e, a, b, c, h0(e, a, b, c), h1(e, a, b, c),
+                                   h2(e, a, b, c));
+  EXPECT_LT(max_rel_err(cp, r), 1e-5f);
+  EXPECT_LT(max_rel_err(cp, tp), 1e-5f);
+}
 
 TEST(CuteLevelGraph, PlainSinkIsBitwiseTheRootedGraph) {
   const SinkInputs in;

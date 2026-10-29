@@ -106,7 +106,8 @@ class Evaluator<
 
   using layout_t =
       decltype(make_tile_layout(std::declval<Tile_>(), order_tag{}));
-  using view_t = FunctionalView<Fn, layout_t, ValueType, ES>;
+  using view_t =
+      FunctionalView<Fn, layout_t, typename node_type::result_type, ES>;
 
   KOKKOS_FUNCTION Evaluator(node_type n, Tile_ t, const team_member_t& team)
       : fn_(n.fn_), hook_(n.hook_op), tile_(t), team_(team) {}
@@ -324,6 +325,9 @@ class Evaluator<TeamPolicyTag<ES>,
 
   static_assert(static_cast<int>(Tile_::rank) == node_type::Rank,
                 "staged tile rank must equal the operand's rank");
+  static_assert(node_type::NumOut == 1,
+                "a multi-output stage writes one slot per output, so it runs "
+                "only as a LevelGraph stage member");
 
   KOKKOS_FUNCTION Evaluator(node_type n, Tile_ t, const team_member_t& team)
       : node_(n),

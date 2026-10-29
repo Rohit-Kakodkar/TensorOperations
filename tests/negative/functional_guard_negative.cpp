@@ -18,7 +18,10 @@
 // Selected by -DFUNCTIONAL_NEG_CASE=<n>; exactly one case per target.
 //   1  a functional input straight into make_contraction_node
 //   2  a functional input straight into make_combine_node
-//   0  the control: the same functional input, STAGED, which must COMPILE.
+//   3  a multi-output functional input given a hook
+//   4  a functional input whose source returns void
+//   0  the control: the same functional input, STAGED, which must COMPILE,
+//      beside a STAGED multi-output functional input.
 // ===========================================================================
 #include <TensorOperations/LevelGraph.hpp>
 #include <TensorOperations/NodeHandle.hpp>
@@ -47,6 +50,23 @@ struct Source {
   }
 };
 
+struct Source2 {
+  KOKKOS_INLINE_FUNCTION Kokkos::Array<float, 2> operator()(int e, int a,
+                                                            int b) const {
+    return {1.0f * e + 0.5f * a, 0.25f * b};
+  }
+};
+
+struct VoidSource {
+  KOKKOS_INLINE_FUNCTION void operator()(int, int, int) const {}
+};
+
+struct Bump {
+  KOKKOS_INLINE_FUNCTION void operator()(int, int, int, float& v) const {
+    v += 1.0f;
+  }
+};
+
 struct Passthrough {
   KOKKOS_INLINE_FUNCTION float operator()(int, int, int, float v) const {
     return v;
@@ -68,8 +88,13 @@ int main() {
   auto g0 = make_level_graph<float, ES>(Map{});
   auto [g1, h] =
       g0.add(make_stage_node(make_input_node(make_handle<'q', 'a'>(Hd))));
-  auto [g2, u] = g1.add(make_stage_node(source_node()));
-  auto [g3, c] = g2.add(make_contraction_node<'q', 'e', 'b'>(h, u));
+  auto [g2, u, v0, v1] =
+      g1.add(make_stage_node(source_node()),
+             make_stage_node(make_functional_input_node<'e', 'a', 'b'>(
+                 Kokkos::Array<int, 3>{kE, kA, kB}, Source2{})));
+  auto [g3, c, d0, d1] = g2.add(make_contraction_node<'q', 'e', 'b'>(h, u),
+                                make_contraction_node<'q', 'e', 'b'>(h, v0),
+                                make_contraction_node<'q', 'e', 'b'>(h, v1));
   (void)g3;
   return 0;
 
@@ -84,6 +109,20 @@ int main() {
 #elif FUNCTIONAL_NEG_CASE == 2
   // Same for a combine operand.
   auto node = make_combine_node<'e', 'a', 'b'>(source_node(), Passthrough{});
+  (void)node;
+  return 0;
+
+#elif FUNCTIONAL_NEG_CASE == 3
+  // A hook mutates one value; a multi-output source has M of them.
+  auto node = make_functional_input_node<'e', 'a', 'b'>(
+      Kokkos::Array<int, 3>{kE, kA, kB}, Source2{}, Bump{});
+  (void)node;
+  return 0;
+
+#elif FUNCTIONAL_NEG_CASE == 4
+  // A void source produces nothing to stage.
+  auto node = make_functional_input_node<'e', 'a', 'b'>(
+      Kokkos::Array<int, 3>{kE, kA, kB}, VoidSource{});
   (void)node;
   return 0;
 
