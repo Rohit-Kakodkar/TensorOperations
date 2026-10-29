@@ -106,7 +106,8 @@ class Evaluator<
 
   using layout_t =
       decltype(make_tile_layout(std::declval<Tile_>(), order_tag{}));
-  using view_t = FunctionalView<Fn, layout_t, ValueType, ES>;
+  using view_t =
+      FunctionalView<Fn, layout_t, typename node_type::result_type, ES>;
 
   KOKKOS_FUNCTION Evaluator(node_type n, Tile_ t, const team_member_t& team)
       : fn_(n.fn_), hook_(n.hook_op), tile_(t), team_(team) {}
@@ -311,9 +312,14 @@ template <typename ES, typename Operand, typename ModesSeq, typename NodeTile,
 class Evaluator<TeamPolicyTag<ES>,
                 NodeHandle<StagedTag, Operand, ModesSeq, NodeTile, TV>, Tile_> {
  public:
-  using node_type     = NodeHandle<StagedTag, Operand, ModesSeq, NodeTile, TV>;
-  using policy_tag    = TeamPolicyTag<ES>;
-  using tiling_type   = Tile_;
+  using node_type   = NodeHandle<StagedTag, Operand, ModesSeq, NodeTile, TV>;
+  using policy_tag  = TeamPolicyTag<ES>;
+  using tiling_type = Tile_;
+
+  static_assert(!node_type::is_register,
+                "register node: it runs only on the CuTe backend, which keeps "
+                "its values in registers across levels; use make_stage_node "
+                "for a team graph");
   using value_type    = typename node_type::value_type;
   using exec_space    = ES;
   using modes_seq     = typename node_type::modes_seq;
@@ -324,6 +330,9 @@ class Evaluator<TeamPolicyTag<ES>,
 
   static_assert(static_cast<int>(Tile_::rank) == node_type::Rank,
                 "staged tile rank must equal the operand's rank");
+  static_assert(node_type::NumOut == 1,
+                "a multi-output stage writes one slot per output, so it runs "
+                "only as a LevelGraph stage member");
 
   KOKKOS_FUNCTION Evaluator(node_type n, Tile_ t, const team_member_t& team)
       : node_(n),
@@ -572,9 +581,11 @@ KOKKOS_FUNCTION auto combine_operands_from(const Tup& t,
 // (NumOut == 1) or a Kokkos::Array of them.
 template <typename... Args>
 KOKKOS_FUNCTION auto make_combine_operands(Args... args) {
-  static_assert(sizeof...(Args) >= 2,
-                "make_combine_operands needs at least one operand and a "
-                "destination");
+  // Zero operands is legal here: a team level graph binds register-node
+  // operands into the fn (LevelGraph/Team.hpp) and may leave none in memory.
+  // make_combine_node itself still requires at least one.
+  static_assert(sizeof...(Args) >= 1,
+                "make_combine_operands needs a destination");
   return Impl::combine_operands_from(
       DeviceTuple<Args...>(args...),
       std::make_index_sequence<sizeof...(Args) - 1>{});
@@ -758,10 +769,10 @@ struct CombineSinkOperands {
 
 // make_combine_sink_operands<Rank>(a, b, ...) -- operands only, no destination.
 // The mirror of make_combine_operands for the NumOut == 0 case.
+// Zero operands is legal, as for make_combine_operands; the caller then drives
+// the sink's loop from its output tile, since there is no iter_view().
 template <int SinkRank, typename... OpEvals>
 KOKKOS_FUNCTION auto make_combine_sink_operands(OpEvals... ops) {
-  static_assert(sizeof...(OpEvals) >= 1,
-                "a sink combine still needs at least one operand to read");
   return CombineSinkOperands<SinkRank, OpEvals...>{
       DeviceTuple<OpEvals...>(ops...), {}};
 }
@@ -795,7 +806,19 @@ class Evaluator<TeamPolicyTag<ES>,
 
  private:
   using ops_seq = std::make_index_sequence<NumOps>;
-  using op0_t   = std::tuple_element_t<0, std::tuple<OpEvals...>>;
+
+  // Every operand against operand 0's extents; vacuous with no operand, which
+  // a team register binding can leave (the caller then drives the loop).
+  static constexpr bool ops_aligned() {
+    if constexpr (sizeof...(OpEvals) == 0) {
+      return true;
+    } else {
+      using op0_t = std::tuple_element_t<0, std::tuple<OpEvals...>>;
+      return (Impl::combine_op_aligned_v<
+                  Rank, typename op0_t::storage_type::layout_t, OpEvals> &&
+              ...);
+    }
+  }
 
  public:
   static_assert(sizeof...(OpEvals) == NumOps,
@@ -804,9 +827,7 @@ class Evaluator<TeamPolicyTag<ES>,
   static_assert(SinkRank == Rank,
                 "sink tiling rank must match the combine node's output rank");
   static_assert(
-      (Impl::combine_op_aligned_v<Rank, typename op0_t::storage_type::layout_t,
-                                  OpEvals> &&
-       ...),
+      ops_aligned(),
       "sink combine: every operand must already present the same extents "
       "on every mode -- a permuted operand must be relabeled and staged first");
 
