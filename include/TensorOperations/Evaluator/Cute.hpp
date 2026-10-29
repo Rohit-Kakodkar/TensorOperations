@@ -43,6 +43,111 @@ KOKKOS_FUNCTION CuteHandle<T, ModesSeq> make_cute_handle(
       h, std::make_index_sequence<TensorHandle<T, ModesSeq>::Rank>{})};
 }
 
+template <typename T, typename ArrayLayout, bool = Kokkos::is_view_v<T>>
+inline constexpr bool cute_view_layout_is = false;
+template <typename T, typename ArrayLayout>
+inline constexpr bool cute_view_layout_is<T, ArrayLayout, true> =
+    std::is_same_v<typename T::array_layout, ArrayLayout>;
+
+template <typename T>
+inline constexpr bool cute_compact_view_v =
+    cute_view_layout_is<T, Kokkos::LayoutRight> ||
+    cute_view_layout_is<T, Kokkos::LayoutLeft>;
+
+template <int E, typename H>
+KOKKOS_FUNCTION auto cute_global_extent(const H& h, std::size_t d) {
+  if constexpr (E > 0)
+    return cute::Int<E>{};
+  else
+    return static_cast<int>(h.extent(d));
+}
+
+template <typename T, typename ModesSeq, int... Ext, std::size_t... Is>
+KOKKOS_FUNCTION auto make_cute_global_tensor(const TensorHandle<T, ModesSeq>& h,
+                                             std::integer_sequence<int, Ext...>,
+                                             std::index_sequence<Is...>) {
+  const auto shape = cute::make_shape(cute_global_extent<Ext>(h, Is)...);
+  const auto ptr   = cute::make_gmem_ptr(h.data());
+  if constexpr (cute_view_layout_is<T, Kokkos::LayoutRight>)
+    return cute::make_tensor(ptr,
+                             cute::make_layout(shape, cute::LayoutRight{}));
+  else if constexpr (cute_view_layout_is<T, Kokkos::LayoutLeft>)
+    return cute::make_tensor(ptr, cute::make_layout(shape, cute::LayoutLeft{}));
+  else
+    return cute::make_tensor(
+        ptr, cute::make_layout(
+                 shape, cute::make_stride(static_cast<int>(h.stride(Is))...)));
+}
+
+template <typename StaticExt, typename T, typename ModesSeq>
+KOKKOS_FUNCTION auto make_cute_global_tensor(
+    const TensorHandle<T, ModesSeq>& h) {
+  return make_cute_global_tensor(
+      h, StaticExt{},
+      std::make_index_sequence<TensorHandle<T, ModesSeq>::Rank>{});
+}
+
+template <typename T, typename ModesSeq, int... Ext, std::size_t... Is>
+bool cute_global_layout_holds(const TensorHandle<T, ModesSeq>& h,
+                              std::integer_sequence<int, Ext...>,
+                              std::index_sequence<Is...>) {
+  const bool extents =
+      ((Ext <= 0 || static_cast<int>(h.extent(Is)) == Ext) && ...);
+  if constexpr (cute_compact_view_v<T>)
+    return extents && h.span_is_contiguous();
+  else
+    return extents;
+}
+
+template <typename StaticExt, typename T, typename ModesSeq>
+bool cute_global_layout_holds(const TensorHandle<T, ModesSeq>& h) {
+  return cute_global_layout_holds(
+      h, StaticExt{},
+      std::make_index_sequence<TensorHandle<T, ModesSeq>::Rank>{});
+}
+
+template <typename TileShape, typename StaticExt>
+struct CuteGlobalTiler {};
+
+template <typename Tiler>
+struct cute_tiler_traits {
+  using shape                  = Tiler;
+  static constexpr bool global = false;
+};
+template <typename TileShape, typename StaticExt>
+struct cute_tiler_traits<CuteGlobalTiler<TileShape, StaticExt>> {
+  using shape                  = TileShape;
+  using static_ext             = StaticExt;
+  static constexpr bool global = true;
+};
+
+template <typename Tiler>
+KOKKOS_FUNCTION auto cute_tiler_shape(const Tiler& t) {
+  if constexpr (cute_tiler_traits<Tiler>::global)
+    return typename cute_tiler_traits<Tiler>::shape{};
+  else
+    return t;
+}
+
+template <typename Tiler, typename T, typename ModesSeq>
+KOKKOS_FUNCTION auto make_cute_input_tensor(
+    const TensorHandle<T, ModesSeq>& h) {
+  if constexpr (cute_tiler_traits<Tiler>::global)
+    return make_cute_global_tensor<
+        typename cute_tiler_traits<Tiler>::static_ext>(h);
+  else
+    return make_cute_handle(h).tensor;
+}
+
+template <typename TileShape, typename StaticExt>
+struct cute_staged_tiler {
+  using type = CuteGlobalTiler<TileShape, StaticExt>;
+};
+template <typename TileShape>
+struct cute_staged_tiler<TileShape, void> {
+  using type = TileShape;
+};
+
 template <typename Fn, typename CoordIter, typename V>
 struct CuteFunctionalIterator {
   using value_type   = V;
@@ -215,6 +320,18 @@ KOKKOS_FUNCTION auto make_cute_fragment_value_evaluator(Frag   frag,
   return Evaluator<CutePolicyTag<ES>, decltype(node), void>(node);
 }
 
+template <typename ES, int R, typename TileShape, typename Frags,
+          typename Coords, std::size_t... Ms>
+KOKKOS_FUNCTION auto make_cute_fragment_value_evaluators(
+    const Frags& frags, const Coords& coords, std::index_sequence<Ms...>) {
+  using result_t =
+      decltype(make_cute_fragment_value_evaluator<ES, R, TileShape>(
+          frags[0], coords, NoHook{}));
+  return Kokkos::Array<result_t, sizeof...(Ms)>{
+      make_cute_fragment_value_evaluator<ES, R, TileShape>(frags[Ms], coords,
+                                                           NoHook{})...};
+}
+
 }  // namespace Impl
 
 template <typename ES, TensorLike T, typename ModesSeq, typename HookOp,
@@ -228,24 +345,30 @@ class Evaluator<CutePolicyTag<ES>, NodeHandle<InputTag, T, ModesSeq, HookOp>,
   using exec_space          = ES;
   static constexpr int Rank = node_type::Rank;
 
-  static_assert(cute::rank_v<Tiler> == Rank,
+ private:
+  using tile_shape  = typename Impl::cute_tiler_traits<Tiler>::shape;
+  using tensor_type = decltype(Impl::make_cute_input_tensor<Tiler>(
+      std::declval<const TensorHandle<T, ModesSeq>&>()));
+
+ public:
+  static_assert(cute::rank_v<tile_shape> == Rank,
                 "CuTe input: tiler rank must equal the node's rank");
 
   KOKKOS_FUNCTION Evaluator(node_type n, Tiler t)
-      : handle_(Impl::make_cute_handle(n.handle)),
-        tiler_(t),
+      : tensor_(Impl::make_cute_input_tensor<Tiler>(n.handle)),
+        tiler_(Impl::cute_tiler_shape(t)),
         hook_(n.hook_op) {}
 
   template <typename Coord>
   KOKKOS_FUNCTION auto operator()(const Coord& coord) const {
     return Impl::make_cute_value_evaluator<ES>(
-        cute::local_tile(handle_.tensor, tiler_, coord), hook_);
+        cute::local_tile(tensor_, tiler_, coord), hook_);
   }
 
  private:
-  Impl::CuteHandle<T, ModesSeq> handle_;
-  Tiler                         tiler_;
-  [[no_unique_address]] HookOp  hook_;
+  tensor_type                  tensor_;
+  tile_shape                   tiler_;
+  [[no_unique_address]] HookOp hook_;
 };
 
 template <typename ES, typename Fn, typename ModesSeq, typename ValueType,
@@ -269,8 +392,9 @@ class Evaluator<
                 "CuTe functional input: tiler rank must equal the node's rank");
 
   KOKKOS_FUNCTION Evaluator(node_type n, Tiler t)
-      : tensor_(Impl::make_cute_functional_tensor<ValueType>(
-            n.fn_, n.shape(), std::make_index_sequence<Rank>{})),
+      : tensor_(
+            Impl::make_cute_functional_tensor<typename node_type::result_type>(
+                n.fn_, n.shape(), std::make_index_sequence<Rank>{})),
         tiler_(t),
         hook_(n.hook_op) {}
 
@@ -281,9 +405,10 @@ class Evaluator<
   }
 
  private:
-  Impl::cute_functional_tensor_t<ValueType, Fn, Rank> tensor_;
-  Tiler                                               tiler_;
-  [[no_unique_address]] HookOp                        hook_;
+  Impl::cute_functional_tensor_t<typename node_type::result_type, Fn, Rank>
+                               tensor_;
+  Tiler                        tiler_;
+  [[no_unique_address]] HookOp hook_;
 };
 
 template <typename ThrLayout>
@@ -298,8 +423,16 @@ struct CuteSmemLoadTag : CuteThreadTag<ThrLayout> {};
 template <typename ThrLayout>
 struct CuteStoreTag : CuteThreadTag<ThrLayout> {};
 
-template <typename TileShape, typename ThrLayout>
-struct CuteStagedTag : CuteThreadTag<ThrLayout> {};
+template <typename TileShape, typename Part, typename StaticExt = void>
+struct CuteStagedTag {
+  Part part;
+};
+
+template <typename TileShape, typename Part, typename IdxFrag>
+struct CuteGatherTag {
+  Part    part;
+  IdxFrag idx;
+};
 
 template <typename AEval, typename BEval, typename TiledMma>
 struct CuteContractTag {
@@ -341,6 +474,21 @@ struct CuteThreadPartitioner {
   template <typename Tensor>
   KOKKOS_FUNCTION auto operator()(const Tensor& t) const {
     return cute::local_partition(t, thr_layout, thr_idx);
+  }
+};
+
+template <typename TV>
+struct CuteTVPartitioner {
+  TV  tv;
+  int thr_idx;
+
+  KOKKOS_FUNCTION bool active() const {
+    return thr_idx < static_cast<int>(cute::size<0>(tv));
+  }
+
+  template <typename Tensor>
+  KOKKOS_FUNCTION auto operator()(const Tensor& t) const {
+    return cute::composition(t, tv)(thr_idx, cute::_);
   }
 };
 
@@ -518,8 +666,9 @@ inline constexpr bool partitions_like_v =
                        std::declval<const Tensor&>()))),
                    decltype(cute::shape(std::declval<Frag>()))>;
 
-template <int R, typename Src, typename Part, typename Tiler, typename Coord,
-          typename T, typename ModesSeq, typename HookOp, int... Perm>
+template <int R, typename StaticExt = void, typename Src, typename Part,
+          typename Tiler, typename Coord, typename T, typename ModesSeq,
+          typename HookOp, int... Perm>
 KOKKOS_FUNCTION void cute_store_global(const Src& src, const Part& part,
                                        const Tiler& tiler, const Coord& coord,
                                        const TensorHandle<T, ModesSeq>& out,
@@ -530,7 +679,12 @@ KOKKOS_FUNCTION void cute_store_global(const Src& src, const Part& part,
   static_assert(TensorHandle<T, ModesSeq>::Rank == R,
                 "CuTe store: output rank must equal the tile's rank");
 
-  const auto g = make_cute_handle(out).tensor;
+  const auto g = [&] {
+    if constexpr (std::is_void_v<StaticExt>)
+      return make_cute_handle(out).tensor;
+    else
+      return make_cute_global_tensor<StaticExt>(out);
+  }();
   const auto gc =
       cute::make_tensor(g.data(), cute::select<Perm...>(g.layout()));
   if (!part.active()) return;
@@ -579,14 +733,14 @@ class Evaluator<
 };
 
 template <typename ES, typename Operand, typename ModesSeq, typename NodeTile,
-          typename TileShape, typename ThrLayout>
+          typename TV, typename TileShape, typename Part, typename StaticExt>
 class Evaluator<CutePolicyTag<ES>,
-                NodeHandle<StagedTag, Operand, ModesSeq, NodeTile>,
-                CuteStagedTag<TileShape, ThrLayout>> {
+                NodeHandle<StagedTag, Operand, ModesSeq, NodeTile, TV>,
+                CuteStagedTag<TileShape, Part, StaticExt>> {
  public:
-  using node_type   = NodeHandle<StagedTag, Operand, ModesSeq, NodeTile>;
+  using node_type   = NodeHandle<StagedTag, Operand, ModesSeq, NodeTile, TV>;
   using policy_tag  = CutePolicyTag<ES>;
-  using tiling_type = CuteStagedTag<TileShape, ThrLayout>;
+  using tiling_type = CuteStagedTag<TileShape, Part, StaticExt>;
   using value_type  = typename node_type::value_type;
   using exec_space  = ES;
   using modes_seq   = typename node_type::modes_seq;
@@ -596,24 +750,84 @@ class Evaluator<CutePolicyTag<ES>,
                     cute::rank_v<TileShape> == Rank,
                 "CuTe staged: the tile shape must be static with one mode per "
                 "operand mode");
-  static_assert(cute::is_static<ThrLayout>::value &&
-                    cute::rank_v<ThrLayout> == Rank,
-                "CuTe staged: the thread layout must be static with one mode "
-                "per operand mode");
 
   KOKKOS_FUNCTION Evaluator(node_type n, tiling_type tag)
       : node_(n), tag_(tag) {}
 
+  static constexpr int NumOut = node_type::NumOut;
+
   template <typename Coord>
   KOKKOS_FUNCTION auto operator()(const Coord& coord) const {
-    const auto src =
-        make_evaluator<CutePolicyTag<ES>>(node_.operand_, TileShape{})(coord);
-    const CuteThreadPartitioner<ThrLayout> part{tag_.thr_layout, tag_.thr_idx};
+    const auto src = make_evaluator<CutePolicyTag<ES>>(
+        node_.operand_,
+        typename Impl::cute_staged_tiler<TileShape, StaticExt>::type{})(coord);
+    const Part part   = tag_.part;
     const auto coords = part(cute::make_identity_tensor(TileShape{}));
+    if constexpr (NumOut == 1) {
+      auto frag = cute::make_tensor<value_type>(cute::shape(coords));
+      if (part.active()) cute::copy(part(src.node().storage_), frag);
+      return Impl::make_cute_fragment_value_evaluator<ES, Rank, TileShape>(
+          frag, coords, src.node().hook_op);
+    } else {
+      using frag_t =
+          decltype(cute::make_tensor<value_type>(cute::shape(coords)));
+      Kokkos::Array<frag_t, NumOut> frags;
+      if (part.active()) {
+        const auto sp = part(src.node().storage_);
+        CUTE_UNROLL
+        for (int v = 0; v < static_cast<int>(cute::size(coords)); ++v) {
+          const auto r = sp(v);
+          CUTE_UNROLL
+          for (int o = 0; o < NumOut; ++o) frags[o](v) = r[o];
+        }
+      }
+      return Impl::make_cute_fragment_value_evaluators<ES, Rank, TileShape>(
+          frags, coords, std::make_index_sequence<NumOut>{});
+    }
+  }
+
+ private:
+  node_type   node_;
+  tiling_type tag_;
+};
+
+template <typename ES, typename IdxSlot, typename Source, typename OpModes,
+          typename ModesSeq, typename NodeTile, typename TV, typename TileShape,
+          typename Part, typename IdxFrag>
+class Evaluator<
+    CutePolicyTag<ES>,
+    NodeHandle<StagedTag, NodeHandle<GatherTag, IdxSlot, Source, OpModes>,
+               ModesSeq, NodeTile, TV>,
+    CuteGatherTag<TileShape, Part, IdxFrag>> {
+ public:
+  using node_type =
+      NodeHandle<StagedTag, NodeHandle<GatherTag, IdxSlot, Source, OpModes>,
+                 ModesSeq, NodeTile, TV>;
+  using policy_tag          = CutePolicyTag<ES>;
+  using tiling_type         = CuteGatherTag<TileShape, Part, IdxFrag>;
+  using value_type          = typename node_type::value_type;
+  using exec_space          = ES;
+  using modes_seq           = typename node_type::modes_seq;
+  static constexpr int Rank = node_type::Rank;
+
+  KOKKOS_FUNCTION Evaluator(node_type n, tiling_type tag)
+      : node_(n), tag_(tag) {}
+
+  KOKKOS_FUNCTION auto operator()() const {
+    const auto coords = tag_.part(cute::make_identity_tensor(TileShape{}));
     auto       frag   = cute::make_tensor<value_type>(cute::shape(coords));
-    if (part.active()) cute::copy(part(src.node().storage_), frag);
+    static_assert(decltype(cute::size(frag))::value ==
+                      decltype(cute::size(std::declval<IdxFrag>()))::value,
+                  "CuTe gather: the index fragment must hold one index per "
+                  "gathered value");
+    if (tag_.part.active()) {
+      CUTE_UNROLL
+      for (int v = 0; v < static_cast<int>(cute::size(frag)); ++v)
+        frag(v) = static_cast<value_type>(
+            node_.operand_.source_(static_cast<int>(tag_.idx(v))));
+    }
     return Impl::make_cute_fragment_value_evaluator<ES, Rank, TileShape>(
-        frag, coords, src.node().hook_op);
+        frag, coords, NoHook{});
   }
 
  private:
@@ -649,8 +863,8 @@ class Evaluator<
 namespace Impl {
 
 template <typename Layout, typename T, T... P>
-KOKKOS_FUNCTION auto select_seq(const Layout& l,
-                                std::integer_sequence<T, P...>) {
+KOKKOS_FUNCTION constexpr auto select_seq(const Layout& l,
+                                          std::integer_sequence<T, P...>) {
   return cute::select<static_cast<int>(P)...>(l);
 }
 
@@ -668,6 +882,19 @@ KOKKOS_FUNCTION auto group_free_contracted(const Tensor& t) {
 }
 
 }  // namespace Impl
+
+template <typename Part, typename PermSeq>
+struct CutePermutedPartitioner {
+  Part part;
+
+  KOKKOS_FUNCTION bool active() const { return part.active(); }
+
+  template <typename Tensor>
+  KOKKOS_FUNCTION auto operator()(const Tensor& t) const {
+    return part(
+        cute::make_tensor(t.data(), Impl::select_seq(t.layout(), PermSeq{})));
+  }
+};
 
 template <typename ES, typename NA, typename NB, typename IntCRank, typename S,
           typename HookOp, typename CModesSeq, typename PermCSeq, typename Mma,
@@ -749,8 +976,19 @@ class Evaluator<CutePolicyTag<ES>,
     const auto cC   = thr.partition_C(idC);
     auto       frag = thr.partition_fragment_C(idC);
     cute::clear(frag);
-    if (tag_.thr_idx < static_cast<int>(cute::size(tag_.mma)))
-      cute::gemm(tag_.mma, thr.partition_A(sA), thr.partition_B(sB), frag);
+    if (tag_.thr_idx < static_cast<int>(cute::size(tag_.mma))) {
+      const auto tA = thr.partition_A(sA);
+      const auto tB = thr.partition_B(sB);
+      auto       rA = thr.partition_fragment_A(sA);
+      auto       rB = thr.partition_fragment_B(sB);
+      cute::copy(tA, rA);
+      CUTE_UNROLL
+      for (int k = 0; k < static_cast<int>(cute::size<2>(rA)); ++k) {
+        cute::copy(tB(cute::_, cute::_, k), rB(cute::_, cute::_, k));
+        cute::gemm(tag_.mma, frag, rA(cute::_, cute::_, k),
+                   rB(cute::_, cute::_, k), frag);
+      }
+    }
 
     return Impl::make_cute_fragment_value_evaluator<
         ES, RankC, decltype(cute::flatten(cute::shape(idC)))>(frag, cC,
@@ -772,14 +1010,6 @@ template <typename... OpEvals>
 inline constexpr int combine_rank_v =
     std::tuple_element_t<0, std::tuple<OpEvals...>>::Rank;
 
-template <typename... OpEvals>
-constexpr std::size_t first_fragment_index() {
-  const bool frag[] = {is_cute_fragment_eval_v<OpEvals>...};
-  for (std::size_t k = 0; k < sizeof...(OpEvals); ++k)
-    if (frag[k]) return k;
-  return sizeof...(OpEvals);
-}
-
 template <typename Eval>
 constexpr bool cute_combine_operand_ok() {
   if constexpr (is_cute_fragment_eval_v<Eval>)
@@ -792,126 +1022,139 @@ constexpr bool cute_combine_operand_ok() {
 
 }  // namespace Impl
 
-template <typename... OpEvals>
+template <typename Coords, typename TileShape, typename... OpEvals>
 struct CuteCombineTag {
   DeviceTuple<OpEvals...>                              ops;
   Kokkos::Array<int, Impl::combine_rank_v<OpEvals...>> origin{};
   bool                                                 active = true;
+  Coords                                               coords;
 };
 
-template <typename ThrLayout, typename... OpEvals>
-struct CuteCombineThreadTag : CuteThreadTag<ThrLayout> {
-  DeviceTuple<OpEvals...>                              ops;
-  Kokkos::Array<int, Impl::combine_rank_v<OpEvals...>> origin{};
-  bool                                                 active = true;
-};
-
-namespace Impl {
-
-template <typename ES, typename Node, typename... OpEvals>
-class CuteCombineEvaluator;
+template <typename TileShape, typename Part, typename Origin,
+          typename... OpEvals>
+KOKKOS_FUNCTION auto make_cute_combine_tag(const Part&   part,
+                                           const Origin& origin,
+                                           const OpEvals&... ops) {
+  const auto coords = part(cute::make_identity_tensor(TileShape{}));
+  return CuteCombineTag<std::decay_t<decltype(coords)>, TileShape, OpEvals...>{
+      DeviceTuple<OpEvals...>(ops...), origin, part.active(), coords};
+}
 
 template <typename ES, typename CombineFn, typename IntCRank, typename S,
           typename CModesSeq, typename IntNumOut, typename... Ops,
-          typename... OpEvals>
-class CuteCombineEvaluator<ES,
-                           NodeHandle<CombineTag, CombineFn, IntCRank, S, ES,
-                                      CModesSeq, IntNumOut, Ops...>,
-                           OpEvals...> {
+          typename Coords, typename TileShape, typename... OpEvals>
+class Evaluator<CutePolicyTag<ES>,
+                NodeHandle<CombineTag, CombineFn, IntCRank, S, ES, CModesSeq,
+                           IntNumOut, Ops...>,
+                CuteCombineTag<Coords, TileShape, OpEvals...>> {
  public:
-  using node_type  = NodeHandle<CombineTag, CombineFn, IntCRank, S, ES,
-                                CModesSeq, IntNumOut, Ops...>;
-  using policy_tag = CutePolicyTag<ES>;
-  using value_type = S;
-  using exec_space = ES;
+  using node_type   = NodeHandle<CombineTag, CombineFn, IntCRank, S, ES,
+                                 CModesSeq, IntNumOut, Ops...>;
+  using policy_tag  = CutePolicyTag<ES>;
+  using tiling_type = CuteCombineTag<Coords, TileShape, OpEvals...>;
+  using value_type  = S;
+  using exec_space  = ES;
 
   static constexpr int Rank   = node_type::Rank;
   static constexpr int NumOps = node_type::NumOps;
   static constexpr int NumOut = node_type::NumOut;
 
-  static_assert(sizeof...(OpEvals) == NumOps,
-                "CuTe combine: one operand evaluator per node operand");
-  static_assert(((OpEvals::Rank == Rank) && ...),
-                "CuTe combine: every operand must have the output's rank");
-  static_assert((cute_combine_operand_ok<OpEvals>() && ...),
-                "CuTe combine: an operand must be a fragment node or a "
-                "shared-memory cute::Tensor with a static layout");
-
-  template <std::size_t K>
-  using view_shape_t = decltype(cute::shape(select_seq(
-      std::declval<typename std::tuple_element_t<
-          K, std::tuple<OpEvals...>>::storage_type::layout_type>(),
-      label_perm_seq_t<CModesSeq, typename std::tuple_element_t<
-                                      K, std::tuple<Ops...>>::modes_seq>{})));
-
-  template <std::size_t K>
-  using flat_view_shape_t =
-      decltype(cute::flatten(std::declval<view_shape_t<K>>()));
-
-  KOKKOS_FUNCTION CuteCombineEvaluator(node_type n, DeviceTuple<OpEvals...> ops,
-                                       Kokkos::Array<int, Rank> origin,
-                                       bool                     active)
-      : fn_(n.fn), ops_(ops), origin_(origin), active_(active) {}
-
- protected:
+ private:
   template <std::size_t K>
   using op_eval_t = std::tuple_element_t<K, std::tuple<OpEvals...>>;
   template <std::size_t K>
   using op_node_t = std::tuple_element_t<K, std::tuple<Ops...>>;
   template <std::size_t K>
   using op_perm_t =
-      label_perm_seq_t<CModesSeq, typename op_node_t<K>::modes_seq>;
+      Impl::label_perm_seq_t<CModesSeq, typename op_node_t<K>::modes_seq>;
 
   template <std::size_t K>
-  KOKKOS_FUNCTION auto view() const {
-    const auto& s = ops_.template get<K>().node().storage_;
-    return cute::make_tensor(s.data(), select_seq(s.layout(), op_perm_t<K>{}));
+  static constexpr bool operand_fits() {
+    using E = op_eval_t<K>;
+    if constexpr (Impl::is_cute_fragment_eval_v<E>)
+      return std::is_same_v<typename op_node_t<K>::modes_seq, CModesSeq> &&
+             std::is_same_v<typename E::tile_shape_type, TileShape> &&
+             decltype(cute::size(
+                 std::declval<typename E::storage_type>()))::value ==
+                 decltype(cute::size(std::declval<Coords>()))::value;
+    else
+      return std::is_same_v<
+          decltype(cute::flatten(cute::shape(Impl::select_seq(
+              std::declval<typename E::storage_type::layout_type>(),
+              op_perm_t<K>{})))),
+          TileShape>;
   }
 
-  template <typename TileShape, typename Coords, typename Proto>
-  KOKKOS_FUNCTION auto evaluate(const Coords& coords,
-                                const Proto&  proto) const {
+  template <std::size_t... Ks>
+  static constexpr bool operands_fit(std::index_sequence<Ks...>) {
+    return (operand_fits<Ks>() && ...);
+  }
+
+  static_assert(sizeof...(OpEvals) == NumOps,
+                "CuTe combine: one operand evaluator per node operand");
+  static_assert(((OpEvals::Rank == Rank) && ...),
+                "CuTe combine: every operand must have the output's rank");
+  static_assert((Impl::cute_combine_operand_ok<OpEvals>() && ...),
+                "CuTe combine: an operand must be a fragment node or a "
+                "shared-memory cute::Tensor with a static layout");
+  static_assert(operands_fit(std::make_index_sequence<NumOps>{}),
+                "CuTe combine: a fragment operand must be labelled in the "
+                "output's order and hold one value per assigned coordinate; a "
+                "shared-memory operand must present the tile's extents in the "
+                "output's order");
+
+ public:
+  KOKKOS_FUNCTION Evaluator(node_type n, tiling_type t)
+      : fn_(n.fn),
+        ops_(t.ops),
+        origin_(t.origin),
+        active_(t.active),
+        coords_(t.coords) {}
+
+  KOKKOS_FUNCTION auto operator()() const {
+    constexpr int nv = decltype(cute::size(std::declval<Coords>()))::value;
     if constexpr (NumOut == 0) {
-      const int nv = active_ ? static_cast<int>(cute::size(coords)) : 0;
-      for (int v = 0; v < nv; ++v) {
-        const auto oc = cute::flatten(coords(v));
-        apply_combine(fn_, global_index(oc, std::make_index_sequence<Rank>{}),
-                      gather(v, oc, std::make_index_sequence<NumOps>{}));
+      if (active_) {
+        CUTE_UNROLL
+        for (int v = 0; v < nv; ++v) {
+          const auto oc = cute::flatten(coords_(v));
+          if constexpr (Impl::is_scatter_frag_fn_v<CombineFn>)
+            fn_.add(v, read<0>(v, oc));
+          else
+            Impl::apply_combine(
+                fn_, global_index(oc, std::make_index_sequence<Rank>{}),
+                gather(v, oc, std::make_index_sequence<NumOps>{}));
+        }
       }
     } else {
-      return evaluate_outputs<TileShape>(coords, proto);
+      using frag_t = decltype(cute::make_tensor<S>(cute::shape(coords_)));
+      Kokkos::Array<frag_t, NumOut> outs;
+      if (active_) {
+        CUTE_UNROLL
+        for (int v = 0; v < nv; ++v) {
+          const auto oc = cute::flatten(coords_(v));
+          const auto r  = Impl::as_output_array<S>(Impl::apply_combine(
+              fn_, global_index(oc, std::make_index_sequence<Rank>{}),
+              gather(v, oc, std::make_index_sequence<NumOps>{})));
+          CUTE_UNROLL
+          for (int m = 0; m < NumOut; ++m) outs[m](v) = r[m];
+        }
+      }
+      return Impl::make_cute_fragment_value_evaluators<ES, Rank, TileShape>(
+          outs, coords_, std::make_index_sequence<NumOut>{});
     }
   }
-
-  [[no_unique_address]] CombineFn fn_;
-  DeviceTuple<OpEvals...>         ops_;
-  Kokkos::Array<int, Rank>        origin_;
-  bool                            active_;
 
  private:
-  template <typename TileShape, typename Coords, typename Proto>
-  KOKKOS_FUNCTION auto evaluate_outputs(const Coords& coords,
-                                        const Proto&  proto) const {
-    using frag_t = decltype(cute::make_tensor<S>(cute::shape(proto)));
-    Kokkos::Array<frag_t, NumOut> outs;
-    const int nv = active_ ? static_cast<int>(cute::size(coords)) : 0;
-    for (int v = 0; v < nv; ++v) {
-      const auto oc = cute::flatten(coords(v));
-      const auto r  = as_output_array<S>(
-          apply_combine(fn_, global_index(oc, std::make_index_sequence<Rank>{}),
-                        gather(v, oc, std::make_index_sequence<NumOps>{})));
-      for (int m = 0; m < NumOut; ++m) outs[m](v) = r[m];
-    }
-    return make_results<TileShape>(outs, coords,
-                                   std::make_index_sequence<NumOut>{});
-  }
-
   template <std::size_t K, typename Coord>
   KOKKOS_FUNCTION S read(int v, const Coord& oc) const {
-    if constexpr (is_cute_fragment_eval_v<op_eval_t<K>>)
-      return static_cast<S>(ops_.template get<K>().node().frag_(v));
+    const auto& n = ops_.template get<K>().node();
+    if constexpr (Impl::is_cute_fragment_eval_v<op_eval_t<K>>)
+      return static_cast<S>(n.frag_(v));
     else
-      return static_cast<S>(view<K>()(oc));
+      return static_cast<S>(cute::make_tensor(
+          n.storage_.data(),
+          Impl::select_seq(n.storage_.layout(), op_perm_t<K>{}))(oc));
   }
 
   template <typename Coord, std::size_t... Ks>
@@ -926,187 +1169,11 @@ class CuteCombineEvaluator<ES,
     return {origin_[Ds] + static_cast<int>(cute::get<Ds>(oc))...};
   }
 
-  template <typename TileShape, typename Frags, typename Coords,
-            std::size_t... Ms>
-  KOKKOS_FUNCTION auto make_results(const Frags& outs, const Coords& coords,
-                                    std::index_sequence<Ms...>) const {
-    using result_t =
-        decltype(make_cute_fragment_value_evaluator<ES, Rank, TileShape>(
-            outs[0], coords, NoHook{}));
-    return Kokkos::Array<result_t, NumOut>{
-        make_cute_fragment_value_evaluator<ES, Rank, TileShape>(
-            outs[Ms], coords, NoHook{})...};
-  }
-};
-
-template <std::size_t D, typename CModesSeq, typename OpEvals, typename Ops,
-          typename Is>
-struct fragments_share_driver;
-
-template <std::size_t D, typename CModesSeq, typename... OpEvals,
-          typename... Ops, std::size_t... Ks>
-struct fragments_share_driver<D, CModesSeq, std::tuple<OpEvals...>,
-                              std::tuple<Ops...>, std::index_sequence<Ks...>> {
-  using driver_t = std::tuple_element_t<D, std::tuple<OpEvals...>>;
-
-  template <typename Eval, typename OpNode>
-  static constexpr bool one() {
-    if constexpr (!is_cute_fragment_eval_v<Eval>)
-      return true;
-    else
-      return std::is_same_v<typename Eval::coords_type,
-                            typename driver_t::coords_type> &&
-             std::is_same_v<typename Eval::tile_shape_type,
-                            typename driver_t::tile_shape_type> &&
-             std::is_same_v<
-                 decltype(cute::shape(
-                     std::declval<typename Eval::storage_type>())),
-                 decltype(cute::shape(
-                     std::declval<typename driver_t::storage_type>()))> &&
-             std::is_same_v<typename OpNode::modes_seq, CModesSeq>;
-  }
-
-  static constexpr bool value = (one<OpEvals, Ops>() && ...);
-};
-
-template <typename Base, typename TileShape, typename OpEvals, typename Is>
-struct smem_operands_match_tile;
-
-template <typename Base, typename TileShape, typename... OpEvals,
-          std::size_t... Ks>
-struct smem_operands_match_tile<Base, TileShape, std::tuple<OpEvals...>,
-                                std::index_sequence<Ks...>> {
-  template <typename Eval, std::size_t K>
-  static constexpr bool one() {
-    if constexpr (is_cute_fragment_eval_v<Eval>)
-      return true;
-    else
-      return std::is_same_v<typename Base::template flat_view_shape_t<K>,
-                            TileShape>;
-  }
-
-  static constexpr bool value = (one<OpEvals, Ks>() && ...);
-};
-
-template <typename Base, typename Is>
-struct view_shapes_agree;
-
-template <typename Base, std::size_t... Ks>
-struct view_shapes_agree<Base, std::index_sequence<Ks...>> {
-  static constexpr bool value =
-      (std::is_same_v<typename Base::template view_shape_t<Ks>,
-                      typename Base::template view_shape_t<0>> &&
-       ...);
-};
-
-}  // namespace Impl
-
-template <typename ES, typename CombineFn, typename IntCRank, typename S,
-          typename CModesSeq, typename IntNumOut, typename... Ops,
-          typename... OpEvals>
-class Evaluator<CutePolicyTag<ES>,
-                NodeHandle<CombineTag, CombineFn, IntCRank, S, ES, CModesSeq,
-                           IntNumOut, Ops...>,
-                CuteCombineTag<OpEvals...>>
-    : public Impl::CuteCombineEvaluator<
-          ES,
-          NodeHandle<CombineTag, CombineFn, IntCRank, S, ES, CModesSeq,
-                     IntNumOut, Ops...>,
-          OpEvals...> {
-  using base =
-      Impl::CuteCombineEvaluator<ES,
-                                 NodeHandle<CombineTag, CombineFn, IntCRank, S,
-                                            ES, CModesSeq, IntNumOut, Ops...>,
-                                 OpEvals...>;
-  static constexpr std::size_t D = Impl::first_fragment_index<OpEvals...>();
-
-  static_assert(D < sizeof...(OpEvals),
-                "CuTe combine: CuteCombineTag needs a fragment operand to "
-                "decide which elements each thread owns; with only "
-                "shared-memory operands use CuteCombineThreadTag");
-  static_assert(
-      Impl::fragments_share_driver<D, CModesSeq, std::tuple<OpEvals...>,
-                                   std::tuple<Ops...>,
-                                   std::index_sequence_for<OpEvals...>>::value,
-      "CuTe combine: every fragment operand must share the driving "
-      "fragment's partition and be labelled in the combine's output order");
-  static_assert(
-      Impl::smem_operands_match_tile<
-          base,
-          typename std::tuple_element_t<
-              D, std::tuple<OpEvals...>>::tile_shape_type,
-          std::tuple<OpEvals...>, std::index_sequence_for<OpEvals...>>::value,
-      "CuTe combine: every shared-memory operand must present the driving "
-      "fragment's tile extents in the output's mode order");
-
- public:
-  using typename base::node_type;
-  using tiling_type = CuteCombineTag<OpEvals...>;
-
-  KOKKOS_FUNCTION Evaluator(node_type n, tiling_type t)
-      : base(n, t.ops, t.origin, t.active) {}
-
-  KOKKOS_FUNCTION auto operator()() const {
-    const auto& d = this->ops_.template get<D>().node();
-    return this->template evaluate<
-        typename std::decay_t<decltype(d)>::tile_shape_type>(d.coords_,
-                                                             d.frag_);
-  }
-};
-
-template <typename ES, typename CombineFn, typename IntCRank, typename S,
-          typename CModesSeq, typename IntNumOut, typename... Ops,
-          typename ThrLayout, typename... OpEvals>
-class Evaluator<CutePolicyTag<ES>,
-                NodeHandle<CombineTag, CombineFn, IntCRank, S, ES, CModesSeq,
-                           IntNumOut, Ops...>,
-                CuteCombineThreadTag<ThrLayout, OpEvals...>>
-    : public Impl::CuteCombineEvaluator<
-          ES,
-          NodeHandle<CombineTag, CombineFn, IntCRank, S, ES, CModesSeq,
-                     IntNumOut, Ops...>,
-          OpEvals...> {
-  using base =
-      Impl::CuteCombineEvaluator<ES,
-                                 NodeHandle<CombineTag, CombineFn, IntCRank, S,
-                                            ES, CModesSeq, IntNumOut, Ops...>,
-                                 OpEvals...>;
-
-  static_assert((!Impl::is_cute_fragment_eval_v<OpEvals> && ...),
-                "CuTe combine: CuteCombineThreadTag takes shared-memory "
-                "operands only; a fragment operand decides thread ownership "
-                "itself, so use CuteCombineTag");
-  static_assert(cute::is_static<ThrLayout>::value &&
-                    cute::rank_v<ThrLayout> == base::Rank,
-                "CuTe combine: the thread layout must be static with one mode "
-                "per output mode");
-
-  static_assert(
-      Impl::view_shapes_agree<base, std::index_sequence_for<OpEvals...>>::value,
-      "CuTe combine: every operand must present the same extents in the "
-      "output's mode order");
-
- public:
-  using typename base::node_type;
-  using tiling_type = CuteCombineThreadTag<ThrLayout, OpEvals...>;
-
-  KOKKOS_FUNCTION Evaluator(node_type n, tiling_type t)
-      : base(n, t.ops, t.origin, t.active),
-        thr_layout_(t.thr_layout),
-        thr_idx_(t.thr_idx) {}
-
-  KOKKOS_FUNCTION auto operator()() const {
-    const auto cC = cute::local_partition(
-        cute::make_identity_tensor(cute::shape(this->template view<0>())),
-        thr_layout_, thr_idx_);
-    return this
-        ->template evaluate<typename base::template flat_view_shape_t<0>>(cC,
-                                                                          cC);
-  }
-
- private:
-  ThrLayout thr_layout_;
-  int       thr_idx_;
+  [[no_unique_address]] CombineFn fn_;
+  DeviceTuple<OpEvals...>         ops_;
+  Kokkos::Array<int, Rank>        origin_;
+  bool                            active_;
+  Coords                          coords_;
 };
 
 template <typename ES, typename Storage, int R, typename HookOp,
@@ -1196,6 +1263,16 @@ class Evaluator<CutePolicyTag<ES>,
                                   PermSeq                          perm) const {
     Impl::cute_store_global<R>(node_.frag_, tag_.part, TileShape{}, coord, out,
                                perm, node_.hook_op);
+  }
+
+  template <typename Coord, typename T, typename ModesSeq, typename PermSeq,
+            int... Ext>
+  KOKKOS_FUNCTION void operator()(const Coord&                     coord,
+                                  const TensorHandle<T, ModesSeq>& out,
+                                  PermSeq                          perm,
+                                  std::integer_sequence<int, Ext...>) const {
+    Impl::cute_store_global<R, std::integer_sequence<int, Ext...>>(
+        node_.frag_, tag_.part, TileShape{}, coord, out, perm, node_.hook_op);
   }
 
  private:

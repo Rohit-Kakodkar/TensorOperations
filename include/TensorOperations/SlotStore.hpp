@@ -118,15 +118,38 @@ KOKKOS_FUNCTION constexpr std::size_t slot_tile_elems() {
   return static_cast<std::size_t>(layout_t::num_elements);
 }
 
-template <typename ValueType, typename ExecSpace>
-KOKKOS_FUNCTION constexpr std::size_t slot_arena_step(std::size_t elems) {
+template <typename ValueType, typename ElemType, typename ExecSpace>
+KOKKOS_FUNCTION constexpr std::size_t slot_arena_step_of(std::size_t elems) {
   constexpr std::size_t a = slot_arena_align<ValueType, ExecSpace>();
   static_assert(a % sizeof(ValueType) == 0,
                 "arena slot store: the scratch alignment must be a whole "
                 "number of elements for offsets to be expressible in elements");
-  const std::size_t b = elems * sizeof(ValueType);
+  static_assert(alignof(ElemType) <= a,
+                "arena slot store: a slot's element type must not need more "
+                "alignment than the arena gives every slot base");
+  const std::size_t b = elems * sizeof(ElemType);
   return ((b + a - 1) / a * a) / sizeof(ValueType);
 }
+
+template <typename ValueType, typename ExecSpace>
+KOKKOS_FUNCTION constexpr std::size_t slot_arena_step(std::size_t elems) {
+  return slot_arena_step_of<ValueType, ValueType, ExecSpace>(elems);
+}
+
+template <typename... Elems>
+struct SlotElems {};
+
+template <typename ValueType, typename ElemsList, typename... Tiles>
+struct slot_elems_resolve {
+  using type = ElemsList;
+};
+template <typename ValueType, typename... Tiles>
+struct slot_elems_resolve<ValueType, void, Tiles...> {
+  using type = SlotElems<std::conditional_t<true, ValueType, Tiles>...>;
+};
+template <typename ValueType, typename ElemsList, typename... Tiles>
+using slot_elems_t =
+    typename slot_elems_resolve<ValueType, ElemsList, Tiles...>::type;
 
 template <typename ValueType, typename ExecSpace, typename... Tiles>
 KOKKOS_FUNCTION constexpr std::size_t slot_arena_prefix(std::size_t n) {
@@ -145,6 +168,12 @@ struct SlotTiles {};
 template <std::size_t... Pools>
 struct SlotPools {};
 
+// The pool of a slot that occupies NO storage: a streamed root, whose producer
+// writes the designated output directly (LevelPlan.hpp). It contributes
+// nothing to the arena, and its view -- still typed by its tile, so nothing
+// else changes -- is placed at the arena base and never touched.
+inline constexpr std::size_t slot_pool_none = ~std::size_t{0};
+
 // The arena laid out by POOL rather than by slot: pool P is as big as its
 // largest occupant, pools sit end to end, and every slot assigned to P starts
 // at P's base. Slots sharing a pool therefore ALIAS, which is the point -- the
@@ -157,30 +186,36 @@ struct SlotPools {};
 // pelems is sized N rather than the pool count because the pool count is not a
 // constant expression here and cannot exceed the number of slots.
 template <typename ValueType, typename ExecSpace, typename PoolsList,
-          typename TilesList>
+          typename TilesList, typename ElemsList>
 struct slot_pool_arena;
 
 template <typename ValueType, typename ExecSpace, std::size_t... Pools,
-          typename... Tiles>
+          typename... Tiles, typename... Elems>
 struct slot_pool_arena<ValueType, ExecSpace, SlotPools<Pools...>,
-                       SlotTiles<Tiles...>> {
+                       SlotTiles<Tiles...>, SlotElems<Elems...>> {
   static constexpr std::size_t N = sizeof...(Tiles);
   static_assert(sizeof...(Pools) == N,
                 "pooled slot store: the plan must assign exactly one pool per "
                 "slot");
+  static_assert(sizeof...(Elems) == N,
+                "pooled slot store: one element type per slot");
 
   static constexpr std::size_t prefix(std::size_t i) {
     const std::size_t steps[] = {
-        slot_arena_step<ValueType, ExecSpace>(slot_tile_elems<Tiles>())..., 0};
+        slot_arena_step_of<ValueType, Elems, ExecSpace>(
+            slot_tile_elems<Tiles>())...,
+        0};
     const std::size_t pools[] = {Pools..., 0};
 
     std::size_t pelems[N > 0 ? N : 1] = {};
     std::size_t np                    = 0;
     for (std::size_t k = 0; k < N; ++k) {
+      if (pools[k] == slot_pool_none) continue;  // no storage
       if (steps[k] > pelems[pools[k]]) pelems[pools[k]] = steps[k];
       if (pools[k] + 1 > np) np = pools[k] + 1;
     }
 
+    if (i < N && pools[i] == slot_pool_none) return 0;
     const std::size_t upto = (i >= N) ? np : pools[i];
     std::size_t       off  = 0;
     for (std::size_t p = 0; p < upto; ++p) off += pelems[p];
@@ -191,10 +226,11 @@ struct slot_pool_arena<ValueType, ExecSpace, SlotPools<Pools...>,
 };
 
 template <typename ValueType, typename ExecSpace, typename PoolsList,
-          typename TilesList, std::size_t I>
+          typename TilesList, typename ElemsList, std::size_t I>
 struct slot_pool_offset {
   static constexpr std::size_t value =
-      slot_pool_arena<ValueType, ExecSpace, PoolsList, TilesList>::prefix(I);
+      slot_pool_arena<ValueType, ExecSpace, PoolsList, TilesList,
+                      ElemsList>::prefix(I);
 };
 
 template <typename ValueType, typename ExecSpace, typename TilesList,
@@ -277,40 +313,44 @@ KOKKOS_FUNCTION auto carve_arena_slot_store(const Team& team,
 // directly (tests/test_level_liveness.cpp) rather than trusted.
 // ---------------------------------------------------------------------------
 template <typename ValueType, typename ExecSpace, typename PoolsList,
-          typename... Tiles>
+          typename ElemsList = void, typename... Tiles>
 std::size_t pooled_arena_slot_store_bytes(const Tiles&...) {
-  constexpr std::size_t elems =
-      Impl::slot_pool_arena<ValueType, ExecSpace, PoolsList,
-                            Impl::SlotTiles<Tiles...>>::total();
+  constexpr std::size_t elems = Impl::slot_pool_arena<
+      ValueType, ExecSpace, PoolsList, Impl::SlotTiles<Tiles...>,
+      Impl::slot_elems_t<ValueType, ElemsList, Tiles...>>::total();
   return Impl::scratch_backing_t<ValueType, ExecSpace>::shmem_size(elems);
 }
 
 template <typename ValueType, typename ExecSpace, typename PoolsList,
-          typename Team, typename... Tiles, std::size_t... Is>
-KOKKOS_FUNCTION auto place_pooled_arena_slot_store(const Team& team,
+          typename Scratch, typename... Elems, typename... Tiles,
+          std::size_t... Is>
+KOKKOS_FUNCTION auto place_pooled_arena_slot_store(const Scratch& scratch,
+                                                   Impl::SlotElems<Elems...>,
                                                    std::index_sequence<Is...>,
                                                    const Tiles&... tiles)
-    -> SlotStore<SlotView<ValueType, ExecSpace, Tiles>...> {
+    -> SlotStore<SlotView<Elems, ExecSpace, Tiles>...> {
+  using ElemsList = Impl::SlotElems<Elems...>;
   constexpr std::size_t elems =
       Impl::slot_pool_arena<ValueType, ExecSpace, PoolsList,
-                            Impl::SlotTiles<Tiles...>>::total();
-  Impl::scratch_backing_t<ValueType, ExecSpace> arena(team.team_scratch(0),
-                                                      elems);
+                            Impl::SlotTiles<Tiles...>, ElemsList>::total();
+  Impl::scratch_backing_t<ValueType, ExecSpace> arena(scratch, elems);
   ValueType*                                    base = arena.data();
-  return {DeviceTuple<SlotView<ValueType, ExecSpace, Tiles>...>{
-      Impl::alloc_scratch_tile_at<ValueType, ExecSpace>(
-          base + Impl::slot_pool_offset<ValueType, ExecSpace, PoolsList,
-                                        Impl::SlotTiles<Tiles...>, Is>::value,
+  return {DeviceTuple<SlotView<Elems, ExecSpace, Tiles>...>{
+      Impl::alloc_scratch_tile_at<Elems, ExecSpace>(
+          reinterpret_cast<Elems*>(
+              base + Impl::slot_pool_offset<ValueType, ExecSpace, PoolsList,
+                                            Impl::SlotTiles<Tiles...>,
+                                            ElemsList, Is>::value),
           tiles)...}};
 }
 
 template <typename ValueType, typename ExecSpace, typename PoolsList,
-          typename Team, typename... Tiles>
-KOKKOS_FUNCTION auto carve_pooled_arena_slot_store(const Team& team,
-                                                   const Tiles&... tiles)
-    -> SlotStore<SlotView<ValueType, ExecSpace, Tiles>...> {
+          typename ElemsList = void, typename Scratch, typename... Tiles>
+KOKKOS_FUNCTION auto carve_pooled_arena_slot_store(const Scratch& scratch,
+                                                   const Tiles&... tiles) {
   return place_pooled_arena_slot_store<ValueType, ExecSpace, PoolsList>(
-      team, std::index_sequence_for<Tiles...>{}, tiles...);
+      scratch, Impl::slot_elems_t<ValueType, ElemsList, Tiles...>{},
+      std::index_sequence_for<Tiles...>{}, tiles...);
 }
 
 }  // namespace TensorOperations

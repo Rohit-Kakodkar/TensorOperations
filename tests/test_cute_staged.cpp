@@ -29,7 +29,8 @@ __global__ void stage_node_tiles(StageNode sn, OutHandle out) {
   const int thr = static_cast<int>(threadIdx.x);
 
   auto ev = make_evaluator<CutePolicyTag<>>(
-      sn, CuteStagedTag<Tiler, ThrLayout>{{ThrLayout{}, thr}});
+      sn, CuteStagedTag<Tiler, CuteThreadPartitioner<ThrLayout>>{
+              {ThrLayout{}, thr}});
   const auto coord = cute::make_coord(tp, tq, tr);
   auto       frag  = ev(coord);
   static_assert(
@@ -73,7 +74,63 @@ int count_staged_mismatches(int threads, Hook hook, float shift) {
   return bad;
 }
 
+using TransposedTV =
+    cute::Layout<cute::Shape<cute::Shape<cute::_4, cute::_4>, cute::_3>,
+                 cute::Stride<cute::Stride<cute::_12, cute::_3>, cute::_1>>;
+
+template <typename StageNode>
+__global__ void stage_tv_tiles(StageNode sn, View out) {
+  const int t  = blockIdx.x;
+  const int tp = t / (NQ * NR), tq = (t / NR) % NQ, tr = t % NR;
+  const int thr = static_cast<int>(threadIdx.x);
+
+  using Part = CuteTVPartitioner<TransposedTV>;
+  auto ev    = make_evaluator<CutePolicyTag<>>(
+      sn, CuteStagedTag<Tiler, Part>{Part{TransposedTV{}, thr}});
+  auto frag = ev(cute::make_coord(tp, tq, tr));
+  if (thr >= 16) return;
+  for (int v = 0; v < 3; ++v) {
+    const int idx                  = static_cast<int>(TransposedTV{}(thr, v));
+    out(tp * TP + idx % TP, tq * TQ + (idx / TP) % TQ,
+        tr * TR + idx / (TP * TQ)) = frag.node().frag_(v);
+  }
+}
+
+int count_tv_mismatches(int threads) {
+  View v("v", P, Q, R), out("out", P, Q, R);
+  auto hv = Kokkos::create_mirror_view(v);
+  for (int p = 0; p < P; ++p)
+    for (int q = 0; q < Q; ++q)
+      for (int r = 0; r < R; ++r)
+        hv(p, q, r) = 100.0f * p + 10.0f * q + r + 0.5f * p * r;
+  Kokkos::deep_copy(v, hv);
+  Kokkos::deep_copy(out, -999.0f);
+
+  auto sn = make_stage_node(make_input_node(make_handle<'p', 'q', 'r'>(v)),
+                            TransposedTV{});
+  stage_tv_tiles<<<(P / TP) * NQ * NR, threads>>>(sn, out);
+  if (cudaGetLastError() != cudaSuccess ||
+      cudaDeviceSynchronize() != cudaSuccess)
+    return -1;
+
+  auto ho  = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, out);
+  int  bad = 0;
+  for (int p = 0; p < P; ++p)
+    for (int q = 0; q < Q; ++q)
+      for (int r = 0; r < R; ++r)
+        if (ho(p, q, r) != hv(p, q, r)) ++bad;
+  return bad;
+}
+
 }  // namespace
+
+TEST(CuteStaged, ThreadValueLayoutPicksEachThreadsCoordinates) {
+  EXPECT_EQ(count_tv_mismatches(16), 0);
+}
+
+TEST(CuteStaged, ThreadValueLayoutLeavesExtraThreadsIdle) {
+  EXPECT_EQ(count_tv_mismatches(32), 0);
+}
 
 TEST(CuteStaged, StagedTileRoundTripsThroughRegisters) {
   EXPECT_EQ(count_staged_mismatches(24, NoHook{}, 0.0f), 0);

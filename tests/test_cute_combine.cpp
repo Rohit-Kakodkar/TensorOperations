@@ -99,8 +99,8 @@ __global__ void epilogue_kernel(SH sh, SU su, SW sw, CN cn, GN gn, Mma mma,
   auto x = make_evaluator<CutePolicyTag<>>(
       cn, CuteContractTag<decltype(eh), decltype(eu), Mma>{eh, eu, mma, thr})();
   auto outs = make_evaluator<CutePolicyTag<>>(
-      gn, CuteCombineTag<decltype(x), decltype(ew)>{
-              DeviceTuple<decltype(x), decltype(ew)>(x, ew), origin})();
+      gn, make_cute_combine_tag<USh>(CuteMmaPartitioner<Mma, 1>{mma, thr},
+                                     origin, x, ew))();
 
   const auto& c = outs[0].node().coords_;
   for (int v = 0; v < static_cast<int>(cute::size(c)); ++v) {
@@ -130,8 +130,8 @@ __global__ void epilogue_sink_kernel(SH sh, SU su, SW sw, CN cn, GN gn, Mma mma,
   auto x = make_evaluator<CutePolicyTag<>>(
       cn, CuteContractTag<decltype(eh), decltype(eu), Mma>{eh, eu, mma, thr})();
   auto ev = make_evaluator<CutePolicyTag<>>(
-      gn, CuteCombineTag<decltype(x), decltype(ew)>{
-              DeviceTuple<decltype(x), decltype(ew)>(x, ew), origin});
+      gn, make_cute_combine_tag<USh>(CuteMmaPartitioner<Mma, 1>{mma, thr},
+                                     origin, x, ew));
   static_assert(std::is_void_v<decltype(ev())>,
                 "a sink combine evaluates to nothing");
   ev();
@@ -157,10 +157,8 @@ __global__ void pointwise_kernel(SA sa, SB sb, GN gn, V3 out, int* writes) {
 
   const Kokkos::Array<int, 3> origin{TP * tp, TQ * tq, TR * tr};
   auto                        outs = make_evaluator<CutePolicyTag<>>(
-      gn, CuteCombineThreadTag<ThrC, decltype(ea), decltype(eb)>{
-              {ThrC{}, thr},
-              DeviceTuple<decltype(ea), decltype(eb)>(ea, eb),
-              origin})();
+      gn, make_cute_combine_tag<ATile>(CuteThreadPartitioner<ThrC>{ThrC{}, thr},
+                                       origin, ea, eb))();
 
   const auto& c = outs[0].node().coords_;
   for (int v = 0; v < static_cast<int>(cute::size(c)); ++v) {
@@ -189,11 +187,8 @@ __global__ void pointwise_sink_kernel(SA sa, SB sb, GN gn) {
 
   const Kokkos::Array<int, 3> origin{TP * tp, TQ * tq, TR * tr};
   make_evaluator<CutePolicyTag<>>(
-      gn, CuteCombineThreadTag<ThrC, decltype(ea), decltype(eb)>{
-              {ThrC{}, thr},
-              DeviceTuple<decltype(ea), decltype(eb)>(ea, eb),
-              origin,
-              thr < static_cast<int>(cute::size(ThrC{}))})();
+      gn, make_cute_combine_tag<ATile>(CuteThreadPartitioner<ThrC>{ThrC{}, thr},
+                                       origin, ea, eb))();
 }
 
 template <typename V>
