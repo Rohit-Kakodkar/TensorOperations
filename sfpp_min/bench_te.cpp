@@ -69,35 +69,6 @@ double best_ms(Fn&& fn, int warmup, int reps) {
   return best * 1e3;
 }
 
-// The backend is fixed per BINARY, not per run: sfpp_min_bench_te is the team
-// policy, sfpp_min_bench_te_cute (SFPP_MIN_BENCH_TE_CUTE) the CuTe policy.
-// Instantiating both launches of the same graph in one translation unit makes
-// nvcc stop inlining the team kernel's helpers (255 registers, ~15 KB stack,
-// ~40x slower), so the team number is only trustworthy from a team-only TU.
-struct TeamBackend {
-  static constexpr const char* name = "team";
-
-  template <int TE, class Args>
-  static NewFootprint footprint(const Args& args, const GlobalHPrime& hw) {
-    return new_footprint<TE>(args, TensorOperations::TeamPolicyTag<KernelES>{},
-                             hw);
-  }
-  template <int TE, class Args>
-  static int launch(const Args& args, int team_arg, const GlobalHPrime& hw) {
-    return new_stiffness<TE>(args, TensorOperations::TeamPolicyTag<KernelES>{},
-                             team_arg, hw);
-  }
-};
-
-#if defined(SFPP_MIN_BENCH_TE_CUTE)
-#if defined(SFPP_MIN_BENCH_ROW_OF_E)
-template <int TE>
-using BenchMmas = RowOfEMmas<TE>;
-#else
-template <int TE>
-using BenchMmas = RowOfIMmas<TE>;
-#endif
-
 #if !defined(SFPP_MIN_GATHER_MODE) || SFPP_MIN_GATHER_MODE == 0
 inline constexpr GatherMode BenchGather = GatherMode::Functional;
 #define SFPP_MIN_GATHER_NAME ""
@@ -120,10 +91,65 @@ inline constexpr ScatterMode BenchScatter = ScatterMode::IndexSlot;
 #define SFPP_MIN_SCATTER_NAME ", scatter from index slot"
 #endif
 
+#if defined(SFPP_MIN_METRICS_MODE) && SFPP_MIN_METRICS_MODE == 1
+inline constexpr MetricsMode BenchMetrics = MetricsMode::Register;
+#define SFPP_MIN_METRICS_NAME ", metrics in registers"
+#elif defined(SFPP_MIN_METRICS_MODE) && SFPP_MIN_METRICS_MODE == 3
+inline constexpr MetricsMode BenchMetrics = MetricsMode::Partial;
+#define SFPP_MIN_METRICS_NAME ", partial metric preload"
+#elif defined(SFPP_MIN_METRICS_MODE) && SFPP_MIN_METRICS_MODE == 2
+inline constexpr MetricsMode BenchMetrics = MetricsMode::Bundle;
+#define SFPP_MIN_METRICS_NAME ", metrics in registers (one bundle node)"
+#else
+inline constexpr MetricsMode BenchMetrics = MetricsMode::Captured;
+#define SFPP_MIN_METRICS_NAME ""
+#endif
+
+#if SFPP_MIN_PRELOAD_SET == 3
+using BenchPreSel = std::integer_sequence<int, 0, 3, 6>;
+#elif SFPP_MIN_PRELOAD_SET == 6
+using BenchPreSel = std::integer_sequence<int, 0, 3, 6, 1, 4, 7>;
+#elif SFPP_MIN_PRELOAD_SET == 9
+using BenchPreSel = std::integer_sequence<int, 0, 3, 6, 1, 4, 7, 2, 5, 8>;
+#else
+using BenchPreSel = std::integer_sequence<int>;
+#endif
+
+// The backend is fixed per BINARY, not per run: sfpp_min_bench_te is the team
+// policy, sfpp_min_bench_te_cute (SFPP_MIN_BENCH_TE_CUTE) the CuTe policy.
+// Instantiating both launches of the same graph in one translation unit makes
+// nvcc stop inlining the team kernel's helpers (255 registers, ~15 KB stack,
+// ~40x slower), so the team number is only trustworthy from a team-only TU.
+struct TeamBackend {
+  static constexpr const char* name = "team (" SFPP_MIN_METRICS_NAME ")";
+
+  template <int TE, class Args>
+  static NewFootprint footprint(const Args& args, const GlobalHPrime& hw) {
+    return new_footprint<TE, BenchGather, BenchScatter, BenchMetrics,
+                         BenchPreSel>(
+        args, TensorOperations::TeamPolicyTag<KernelES>{}, hw);
+  }
+  template <int TE, class Args>
+  static int launch(const Args& args, int team_arg, const GlobalHPrime& hw) {
+    return new_stiffness<TE, BenchGather, BenchScatter, BenchMetrics,
+                         BenchPreSel>(
+        args, TensorOperations::TeamPolicyTag<KernelES>{}, team_arg, hw);
+  }
+};
+
+#if defined(SFPP_MIN_BENCH_TE_CUTE)
+#if defined(SFPP_MIN_BENCH_ROW_OF_E)
+template <int TE>
+using BenchMmas = RowOfEMmas<TE>;
+#else
+template <int TE>
+using BenchMmas = RowOfIMmas<TE>;
+#endif
+
 struct CuteBackend {
 #if defined(SFPP_MIN_BENCH_ROW_OF_E)
-  static constexpr const char* name =
-      "cute (row of e" SFPP_MIN_GATHER_NAME SFPP_MIN_SCATTER_NAME ")";
+  static constexpr const char* name = "cute (row of e" SFPP_MIN_GATHER_NAME
+                               SFPP_MIN_SCATTER_NAME SFPP_MIN_METRICS_NAME ")";
 #else
   static constexpr const char* name =
       "cute (row of i" SFPP_MIN_GATHER_NAME SFPP_MIN_SCATTER_NAME ")";
@@ -131,12 +157,14 @@ struct CuteBackend {
 
   template <int TE, class Args>
   static NewFootprint footprint(const Args& args, const GlobalHPrime& hw) {
-    return new_footprint<TE, BenchMmas<TE>, BenchGather, BenchScatter>(
+    return new_footprint<TE, BenchMmas<TE>, BenchGather, BenchScatter,
+                         BenchMetrics, BenchPreSel>(
         args, TensorOperations::CutePolicyTag<KernelES>{}, hw);
   }
   template <int TE, class Args>
   static int launch(const Args& args, int, const GlobalHPrime& hw) {
-    return new_stiffness<TE, BenchMmas<TE>, BenchGather, BenchScatter>(
+    return new_stiffness<TE, BenchMmas<TE>, BenchGather, BenchScatter,
+                         BenchMetrics, BenchPreSel>(
         args, TensorOperations::CutePolicyTag<KernelES>{}, hw);
   }
 };
@@ -294,8 +322,11 @@ int dispatch_te(int argc, char** argv, int te) {
       return run_te<Backend, 5>(argc, argv);
     case 8:
       return run_te<Backend, 8>(argc, argv);
+#if !(defined(SFPP_MIN_BENCH_ROW_OF_E) && defined(SFPP_MIN_NGLL) && \
+      SFPP_MIN_NGLL > 5)
     case 16:
       return run_te<Backend, 16>(argc, argv);
+#endif
     case 32:
       return run_te<Backend, 32>(argc, argv);
     default:

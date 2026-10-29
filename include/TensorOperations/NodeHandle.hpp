@@ -18,6 +18,7 @@ struct FunctionalTag {};
 struct IntermTag {};
 struct ContractionTag {};
 struct CombineTag {};
+struct GeneralContractionTag {};
 struct SlotTag {};
 struct StagedTag {};
 struct GatherTag {};
@@ -113,6 +114,29 @@ struct is_node_handle<NodeHandle<Tag, Args...>> : std::true_type {};
 template <typename T>
 inline constexpr bool is_node_handle_v =
     is_node_handle<std::remove_cv_t<std::remove_reference_t<T>>>::value;
+
+template <typename T, typename = void>
+struct has_modes_seq : std::false_type {};
+template <typename T>
+struct has_modes_seq<T, std::void_t<typename T::modes_seq>> : std::true_type {};
+
+// A STRUCTURED operand of make_contraction_node -- the result of
+// make_delta_node, make_outer_product_node or make_stack_node, or a relabel of
+// one (Structured.hpp). Not a node, and it carries no data: the
+// general contraction lowers it to terms. Recognised by a nested
+// `structured_operand_tag`, so this header need not include Structured.hpp.
+template <typename T>
+inline constexpr bool is_structured_operand_v = requires {
+  typename std::remove_cv_t<std::remove_reference_t<T>>::structured_operand_tag;
+};
+
+// Anything make_contraction_node takes as an operand: a labelled node, or a
+// structured operand.
+template <typename T>
+inline constexpr bool is_contraction_operand_v =
+    (is_node_handle_v<T> &&
+     has_modes_seq<std::remove_cv_t<std::remove_reference_t<T>>>::value) ||
+    is_structured_operand_v<T>;
 
 // Safely extracts T::value_type when it exists; falls back to void.
 template <typename T, typename = void>
@@ -651,10 +675,49 @@ KOKKOS_FUNCTION auto make_stage_node(Operand op, TV tv = {}) {
 
 template <typename Operand, typename TV>
 KOKKOS_FUNCTION auto make_register_node(Operand op, TV tv) {
+  static_assert(
+      requires { typename Operand::node_tag; },
+      "register node: label a view or handle source, as in "
+      "make_register_node<'e', ...>(view, tv)");
   static_assert(!Impl::is_default_tv_v<TV>,
                 "register node: give the thread-value layout of the combine "
                 "that reads it, so its fragments stay in registers");
   return make_stage_node(std::move(op), Impl::RegisterTV<TV>{std::move(tv)});
+}
+
+namespace Impl {
+template <typename Src, typename ModesSeq>
+struct register_source {
+  static_assert(TensorLike<Src>,
+                "register node: the source must be a view, a handle or a node");
+  static_assert(static_cast<int>(Src::rank) ==
+                    static_cast<int>(ModesSeq::size()),
+                "register node: one label per view axis");
+
+  static auto make(Src src) {
+    return make_input_node(make_handle_seq(std::move(src), ModesSeq{}));
+  }
+};
+
+template <typename T, typename HandleSeq, typename ModesSeq>
+struct register_source<TensorHandle<T, HandleSeq>, ModesSeq> {
+  static_assert(std::is_same_v<HandleSeq, ModesSeq>,
+                "register node: a handle's labels must equal the labels "
+                "given to make_register_node");
+
+  static auto make(TensorHandle<T, HandleSeq> h) {
+    return make_input_node(std::move(h));
+  }
+};
+}  // namespace Impl
+
+template <int32_t... Modes, typename Src, typename TV>
+  requires(sizeof...(Modes) > 0)
+auto make_register_node(Src src, TV tv) {
+  return make_register_node(
+      Impl::register_source<
+          Src, std::integer_sequence<int32_t, Modes...>>::make(std::move(src)),
+      std::move(tv));
 }
 
 template <int32_t... Modes, TensorLike T, typename TV = DefaultTV>
@@ -902,12 +965,41 @@ auto make_contraction_node_impl(NodeA a, NodeB b, HookOp hook, Mma mma) {
       std::move(a), std::move(b), c_shape, std::move(hook), std::move(mma)};
 }
 
+// Whether make_contraction_node<Out...>(a, b[, hook[, mma]]) is this binary
+// GEMM: two node operands whose labels make a valid A x B -> C{Out} (each
+// output label on exactly one side, every other label on both), and trailing
+// arguments, if any, that are a hook and an MMA rather than more operands.
+// Every other call is a general contraction -- GeneralContraction.hpp, whose
+// overloads of make_contraction_node carry the complementary constraint (it
+// cannot be included here: it includes this header).
+template <typename OutSeq, typename A, typename B, typename... Rest>
+constexpr bool gemm_call() {
+  if constexpr (sizeof...(Rest) > 2 || !is_node_handle_v<A> ||
+                !is_node_handle_v<B> || (is_contraction_operand_v<Rest> || ...))
+    return false;
+  else if constexpr (!has_modes_seq<A>::value || !has_modes_seq<B>::value)
+    return false;
+  else
+    return valid_contraction_v<static_cast<int>(OutSeq::size()),
+                               typename A::modes_seq, typename B::modes_seq,
+                               OutSeq>;
+}
+template <typename OutSeq, typename... Args>
+inline constexpr bool gemm_call_v = gemm_call<OutSeq, Args...>();
+
 }  // namespace Impl
 
+// These two overloads are taken only when the call IS a binary GEMM
+// (Impl::gemm_call_v); any other make_contraction_node call -- more operands,
+// a structured operand, a label shared with the output -- is the general
+// contraction in GeneralContraction.hpp.
+//
 // Primary form: infer the output scalar from NodeA, default execution space.
 //   make_contraction_node<'l','i'>(a, b)
 template <int32_t... OutModes, typename NodeA, typename NodeB,
           typename HookOp = NoHook, typename Mma = DefaultMma<>>
+  requires(Impl::gemm_call_v<std::integer_sequence<int32_t, OutModes...>, NodeA,
+                             NodeB, HookOp, Mma>)
 auto make_contraction_node(NodeA a, NodeB b, HookOp hook = {}, Mma mma = {}) {
   return Impl::make_contraction_node_impl<
       typename NodeA::value_type, Kokkos::DefaultExecutionSpace, OutModes...>(
@@ -919,6 +1011,8 @@ auto make_contraction_node(NodeA a, NodeB b, HookOp hook = {}, Mma mma = {}) {
 template <typename Scalar, typename ExecSpace = Kokkos::DefaultExecutionSpace,
           int32_t... OutModes, typename NodeA, typename NodeB,
           typename HookOp = NoHook, typename Mma = DefaultMma<>>
+  requires(Impl::gemm_call_v<std::integer_sequence<int32_t, OutModes...>, NodeA,
+                             NodeB, HookOp, Mma>)
 auto make_contraction_node(NodeA a, NodeB b, HookOp hook = {}, Mma mma = {}) {
   return Impl::make_contraction_node_impl<Scalar, ExecSpace, OutModes...>(
       std::move(a), std::move(b), std::move(hook), std::move(mma));
@@ -1230,6 +1324,25 @@ KOKKOS_FUNCTION auto rebind_combine_fn(
     NewFn                     fn) {
   return NodeHandle<CombineTag, NewFn, IntRank, S, ES, ModesSeq, IntNumOut,
                     Ops...>{std::move(fn), n.operands, n.shape_};
+}
+
+// rebind_combine_fn that also keeps only operands Ks. The new fn takes over
+// the dropped operands itself (a team register node read at the coordinate),
+// so the evaluator gathers -- and counts -- just the ones still in memory.
+template <typename NewFn, typename Fn, typename IntRank, typename S,
+          typename ES, typename ModesSeq, typename IntNumOut, typename... Ops,
+          std::size_t... Ks>
+KOKKOS_FUNCTION auto rebind_combine_fn_ops(
+    const NodeHandle<CombineTag, Fn, IntRank, S, ES, ModesSeq, IntNumOut,
+                     Ops...>& n,
+    NewFn                     fn, std::index_sequence<Ks...>) {
+  using OpsT = DeviceTuple<Ops...>;
+  return NodeHandle<CombineTag, NewFn, IntRank, S, ES, ModesSeq, IntNumOut,
+                    tuple_element_t<Ks, OpsT>...>{
+      std::move(fn),
+      DeviceTuple<tuple_element_t<Ks, OpsT>...>(
+          n.operands.template get<Ks>()...),
+      n.shape_};
 }
 
 }  // namespace Impl

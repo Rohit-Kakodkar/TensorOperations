@@ -1,0 +1,616 @@
+#pragma once
+// ---------------------------------------------------------------------------
+// Structured operands -- tensors built from dense ones by tensor algebra and
+// never materialised. Each is an operand of make_contraction_node
+// (GeneralContraction.hpp), as are dense nodes (slots, functional inputs), and
+// they nest:
+//
+//   make_delta_node<'a','b'>()        identity delta_ab, zero storage
+//   make_delta_node<'r'>(idx<t>)      unit vector e_t(r): 1 where r == t
+//   make_outer_product_node<l...>(x, y, ...)
+//                                     outer product; the operands' label sets
+//                                     must be disjoint
+//   make_stack_node<'r', l...>(b_0, ..., b_{n-1})
+//                                     lazy np.stack: the value is b_t where
+//                                     r == t; every b_t carries the same label
+//                                     SET (any order)
+//   x.as<New...>()                    positional relabel over x's label order,
+//                                     zero-copy (like a slot's .as<>)
+//
+// Every axis of an outer product or a stack is declared, so the order a later
+// .as<>() renames over is on the page. The labels are POSITIONAL over the
+// natural order -- the operands' labels concatenated for an outer product, and
+// for a stack its label 'r' followed by b_0's labels in b_0's order:
+//
+//   * repeating a natural label states it (it must keep its position; a
+//     swapped order is a compile error, never a silent transpose);
+//   * a new name relabels that axis at construction, as .as<>() would.
+//
+// None of them is a graph node on its own: the make_*_node names match the
+// rest of the builder API, and each result only enters a graph as an operand
+// of make_contraction_node.
+//
+// Lowering. Every operand lowers at compile time to a TERM SET, a sum of
+// terms, each a product of dense leaves, label equalities (a == b) and
+// constant bindings (l == t):
+//
+//   dense leaf                    { leaf }
+//   make_delta_node<a,b>()        { a == b }
+//   make_delta_node<r>(idx<t>)    { r == t }
+//   make_outer_product_node       cartesian product of the operands' term sets
+//   make_stack_node<r, l...>      union over t of b_t's terms, each with r == t
+//                                 added
+//   .as<>, or a renaming label    the same terms, every label renamed
+//
+// make_contraction_node multiplies its operands' term sets (first operand
+// outermost) and expands each term against the graph's label map: labels a
+// delta joins are merged, a constant binds its class, the rest is summed.
+//
+// The SEM gradient, with hx{x,i}, hy{y,j}, hz{z,k}:
+//
+//   B = make_stack_node<'r', 'x','i', 'y','j', 'z','k'>(
+//       make_outer_product_node<'x','i', 'y','j', 'z','k'>(
+//           hx, make_delta_node<'y','j'>(), make_delta_node<'z','k'>()),
+//       make_outer_product_node<'x','i', 'y','j', 'z','k'>(
+//           make_delta_node<'x','i'>(), hy, make_delta_node<'z','k'>()),
+//       make_outer_product_node<'x','i', 'y','j', 'z','k'>(
+//           make_delta_node<'x','i'>(), make_delta_node<'y','j'>(), hz));
+//
+// B.as<'s','x','l','y','m','z','n'>() is the same operator with r->s, i->l,
+// j->m, k->n -- as is the same make_stack_node call declared
+// <'s', 'x','l', 'y','m', 'z','n'>, relabelled at construction. Then
+//
+//   K = make_contraction_node<'e','a','k','j','i','b','n','m','l'>(
+//           B, M, B.as<'s','x','l','y','m','z','n'>());
+//
+// is K_e = B^T M B as nine sum-factored terms, never the O(N^9) sum.
+// ---------------------------------------------------------------------------
+#include <TensorOperations/DeviceTuple.hpp>
+#include <TensorOperations/NodeHandle.hpp>
+#include <TensorOperations/Permute.hpp>
+
+#include <cstdint>
+#include <tuple>
+#include <type_traits>
+#include <utility>
+
+namespace TensorOperations {
+
+// --- the operand types -----------------------------------------------------
+
+/// A constant index t, as a type: the argument of make_delta_node<'r'>(idx<t>).
+template <int T>
+struct ConstIndex {
+  static_assert(T >= 0, "idx<t>: the index must be non-negative");
+  static constexpr int value = T;
+};
+template <int T>
+inline constexpr ConstIndex<T> idx{};
+
+template <typename Op, typename ModesSeq>
+struct Relabeled;
+
+/// delta_ab: the identity between two labels. No storage.
+template <int32_t A, int32_t B>
+struct Delta {
+  static_assert(A != B, "make_delta_node<a, b>(): the two labels must differ");
+  using structured_operand_tag = void;
+  using modes_seq              = std::integer_sequence<int32_t, A, B>;
+  static constexpr int Rank    = 2;
+
+  template <int32_t... New>
+  constexpr auto as() const {
+    static_assert(sizeof...(New) == 2, "delta as(): one label per axis");
+    constexpr int32_t l[] = {New...};
+    return Delta<l[0], l[1]>{};
+  }
+};
+
+/// e_T(R): 1 where R == T, else 0. No storage.
+template <int32_t R, int T>
+struct UnitVector {
+  using structured_operand_tag = void;
+  using modes_seq              = std::integer_sequence<int32_t, R>;
+  static constexpr int Rank    = 1;
+  static constexpr int index   = T;
+
+  template <int32_t... New>
+  constexpr auto as() const {
+    static_assert(sizeof...(New) == 1,
+                  "make_delta_node<r>(idx<t>) as(): one label");
+    constexpr int32_t l[] = {New...};
+    return UnitVector<l[0], T>{};
+  }
+};
+
+namespace Impl {
+
+template <typename... Seqs>
+struct gc_cat_seq;
+template <typename T>
+struct gc_cat_seq<std::integer_sequence<T>> {
+  using type = std::integer_sequence<T>;
+};
+template <typename T, T... As>
+struct gc_cat_seq<std::integer_sequence<T, As...>> {
+  using type = std::integer_sequence<T, As...>;
+};
+template <typename T, T... As, T... Bs, typename... Rest>
+struct gc_cat_seq<std::integer_sequence<T, As...>,
+                  std::integer_sequence<T, Bs...>, Rest...> {
+  using type = typename gc_cat_seq<std::integer_sequence<T, As..., Bs...>,
+                                   Rest...>::type;
+};
+template <typename... Seqs>
+using gc_cat_seq_t = typename gc_cat_seq<Seqs...>::type;
+
+template <typename... Ts>
+using gc_first_t = std::tuple_element_t<0, std::tuple<Ts...>>;
+
+template <typename Op, typename New>
+constexpr void check_relabel() {
+  static_assert(Op::modes_seq::size() == New::size(),
+                "as(): one label per axis");
+  static_assert(labels_distinct_v<New>, "as(): labels must be distinct");
+}
+
+// Declared labels read positionally over a natural order: a declared label
+// that also names a natural axis must sit at that axis's position, so a
+// swapped order cannot pass for a relabel.
+template <typename Natural, typename Declared>
+constexpr bool positional_relabel_ok() {
+  constexpr auto n = seq_to_array(Natural{});
+  constexpr auto d = seq_to_array(Declared{});
+  for (std::size_t p = 0; p < d.size(); ++p)
+    for (std::size_t q = 0; q < n.size(); ++q)
+      if (d[p] == n[q] && p != q) return false;
+  return true;
+}
+
+}  // namespace Impl
+
+/// make_outer_product_node<l...>(ops...): the product of operands with
+/// pairwise-disjoint label sets.
+template <typename... Ops>
+struct Outer {
+  using structured_operand_tag = void;
+  using modes_seq           = Impl::gc_cat_seq_t<std::integer_sequence<int32_t>,
+                                                 typename Ops::modes_seq...>;
+  static constexpr int Rank = static_cast<int>(modes_seq::size());
+
+  std::tuple<Ops...> ops;
+
+  template <int32_t... New>
+  auto as() const {
+    using NewSeq = std::integer_sequence<int32_t, New...>;
+    Impl::check_relabel<Outer, NewSeq>();
+    return Relabeled<Outer, NewSeq>{*this};
+  }
+};
+
+/// make_stack_node<R, l...>(branches...): the value is branch t where R == t.
+template <int32_t R, typename... Branches>
+struct Stack {
+  using structured_operand_tag = void;
+  using modes_seq =
+      Impl::gc_cat_seq_t<std::integer_sequence<int32_t, R>,
+                         typename Impl::gc_first_t<Branches...>::modes_seq>;
+  static constexpr int     Rank = static_cast<int>(modes_seq::size());
+  static constexpr int     size = static_cast<int>(sizeof...(Branches));
+  static constexpr int32_t axis = R;
+
+  std::tuple<Branches...> branches;
+
+  template <int32_t... New>
+  auto as() const {
+    using NewSeq = std::integer_sequence<int32_t, New...>;
+    Impl::check_relabel<Stack, NewSeq>();
+    return Relabeled<Stack, NewSeq>{*this};
+  }
+};
+
+/// An outer or stack read under other labels: Op's labels, positionally
+/// renamed to ModesSeq. Relabelling again renames from Op's labels directly.
+template <typename Op, typename ModesSeq>
+struct Relabeled {
+  using structured_operand_tag = void;
+  using modes_seq              = ModesSeq;
+  using operand_type           = Op;
+  static constexpr int Rank    = static_cast<int>(ModesSeq::size());
+
+  Op op;
+
+  template <int32_t... New>
+  auto as() const {
+    using NewSeq = std::integer_sequence<int32_t, New...>;
+    Impl::check_relabel<Relabeled, NewSeq>();
+    return Relabeled<Op, NewSeq>{op};
+  }
+};
+
+// --- the factories ---------------------------------------------------------
+
+/// make_delta_node<'a','b'>(): the identity delta_ab.
+template <int32_t A, int32_t B>
+constexpr Delta<A, B> make_delta_node() {
+  return {};
+}
+
+/// make_delta_node<'r'>(idx<t>): the unit vector e_t(r).
+template <int32_t R, int T>
+constexpr UnitVector<R, T> make_delta_node(ConstIndex<T>) {
+  return {};
+}
+
+/// make_outer_product_node<l...>(ops...): operands with pairwise-disjoint
+/// label sets, multiplied. One label per axis, positional over the operands'
+/// labels concatenated: a repeated label states that axis, a new one renames
+/// it.
+template <int32_t... L, typename... Ops>
+auto make_outer_product_node(Ops... ops) {
+  static_assert(sizeof...(Ops) >= 1,
+                "make_outer_product_node<l...>(): needs at least one operand");
+  static_assert((Impl::is_contraction_operand_v<Ops> && ...),
+                "make_outer_product_node<l...>(): every operand must be a "
+                "slot, a functional input, or a structured operand "
+                "(make_delta_node, make_outer_product_node, make_stack_node, "
+                ".as<>)");
+  using Natural  = Impl::gc_cat_seq_t<std::integer_sequence<int32_t>,
+                                      typename Ops::modes_seq...>;
+  using Declared = std::integer_sequence<int32_t, L...>;
+  static_assert(
+      Impl::labels_distinct_v<Natural>,
+      "make_outer_product_node<l...>(): the operands' label sets must be "
+      "pairwise disjoint -- a shared label is a contraction or a Hadamard "
+      "product, which is make_contraction_node's job");
+  static_assert(sizeof...(L) == Natural::size(),
+                "make_outer_product_node<l...>(): declare one label per axis "
+                "-- the operands' labels, concatenated");
+  static_assert(Impl::labels_distinct_v<Declared>,
+                "make_outer_product_node<l...>(): the labels must be distinct");
+  static_assert(Impl::positional_relabel_ok<Natural, Declared>(),
+                "make_outer_product_node<l...>(): a label kept from the "
+                "operands must keep its position -- the labels are "
+                "positional; to reorder, contract");
+  Outer<Ops...> o{std::tuple<Ops...>(std::move(ops)...)};
+  if constexpr (std::is_same_v<Natural, Declared>)
+    return o;
+  else
+    return Relabeled<Outer<Ops...>, Declared>{o};
+}
+
+/// make_stack_node<'r', l...>(b_0, ..., b_{n-1}): the value is b_t where
+/// r == t. 'r' is the stacking label; l... are positional over b_0's labels:
+/// a repeated label states that axis, a new one renames it.
+template <int32_t R, int32_t... L, typename... Bs>
+auto make_stack_node(Bs... bs) {
+  static_assert(sizeof...(Bs) >= 1,
+                "make_stack_node<r, l...>(): needs at least one branch");
+  static_assert((Impl::is_contraction_operand_v<Bs> && ...),
+                "make_stack_node<r, l...>(): every branch must be a slot, a "
+                "functional input, or a structured operand (make_delta_node, "
+                "make_outer_product_node, make_stack_node, .as<>)");
+  using B0       = Impl::gc_first_t<Bs...>;
+  using Natural  = typename B0::modes_seq;
+  using Declared = std::integer_sequence<int32_t, L...>;
+  static_assert(
+      (Impl::same_label_set_v<typename Bs::modes_seq, Natural> && ...),
+      "make_stack_node<r, l...>(): every branch must carry the same label "
+      "set (in any order)");
+  static_assert(!Impl::arr_contains(Impl::seq_to_array(Natural{}), R),
+                "make_stack_node<r, l...>(): the stacking label must not be "
+                "one of the branches' labels");
+  static_assert(sizeof...(L) == Natural::size(),
+                "make_stack_node<r, l...>(): declare the stacking label, then "
+                "one label per branch axis -- branch 0's labels, in order");
+  static_assert(
+      Impl::labels_distinct_v<std::integer_sequence<int32_t, R, L...>>,
+      "make_stack_node<r, l...>(): the labels must be distinct");
+  static_assert(Impl::positional_relabel_ok<Natural, Declared>(),
+                "make_stack_node<r, l...>(): a label kept from the branches "
+                "must keep its position -- the labels are positional; to "
+                "reorder, contract");
+  Stack<R, Bs...> st{std::tuple<Bs...>(std::move(bs)...)};
+  if constexpr (std::is_same_v<Natural, Declared>)
+    return st;
+  else
+    return Relabeled<Stack<R, Bs...>,
+                     std::integer_sequence<int32_t, R, L...>>{st};
+}
+
+// --- lowering: every operand as a set of terms -----------------------------
+
+namespace Impl {
+
+template <typename... Ts>
+struct GcList {};
+
+template <typename... Ls>
+struct gc_cat_list;
+template <>
+struct gc_cat_list<> {
+  using type = GcList<>;
+};
+template <typename... As>
+struct gc_cat_list<GcList<As...>> {
+  using type = GcList<As...>;
+};
+template <typename... As, typename... Bs, typename... Rest>
+struct gc_cat_list<GcList<As...>, GcList<Bs...>, Rest...> {
+  using type = typename gc_cat_list<GcList<As..., Bs...>, Rest...>::type;
+};
+template <typename... Ls>
+using gc_cat_list_t = typename gc_cat_list<Ls...>::type;
+
+template <typename List>
+struct gc_list_size;
+template <typename... Ts>
+struct gc_list_size<GcList<Ts...>>
+    : std::integral_constant<int, static_cast<int>(sizeof...(Ts))> {};
+
+template <std::size_t K, typename List>
+struct gc_list_at;
+template <std::size_t K, typename T, typename... Ts>
+struct gc_list_at<K, GcList<T, Ts...>> : gc_list_at<K - 1, GcList<Ts...>> {};
+template <typename T, typename... Ts>
+struct gc_list_at<0, GcList<T, Ts...>> {
+  using type = T;
+};
+template <std::size_t K, typename List>
+using gc_list_at_t = typename gc_list_at<K, List>::type;
+
+// Positional renaming: label l of From becomes the label at the same position
+// of To; a label not in From is kept.
+template <typename From, typename To>
+constexpr int32_t map_label(int32_t l) {
+  constexpr auto f = seq_to_array(From{});
+  constexpr auto t = seq_to_array(To{});
+  for (std::size_t i = 0; i < f.size(); ++i)
+    if (f[i] == l) return t[i];
+  return l;
+}
+template <typename Seq, typename From, typename To>
+struct map_labels;
+template <int32_t... Ls, typename From, typename To>
+struct map_labels<std::integer_sequence<int32_t, Ls...>, From, To> {
+  using type = std::integer_sequence<int32_t, map_label<From, To>(Ls)...>;
+};
+template <typename Seq, typename From, typename To>
+using map_labels_t = typename map_labels<Seq, From, To>::type;
+
+using gc_iseq0 = std::integer_sequence<int>;
+using gc_lseq0 = std::integer_sequence<int32_t>;
+
+/// One term: the leaves it multiplies (indices into its operand's flat leaf
+/// list), the label pairs its deltas equate (a0, b0, a1, b1, ...), and its
+/// constant bindings (label ConstLabs[c] == ConstVals[c]).
+template <typename LeafSeq, typename PairSeq, typename ConstLabSeq,
+          typename ConstValSeq>
+struct GcTerm {};
+
+/// An operand lowered: its flat dense leaves' labels (one sequence per leaf,
+/// in the leaf's axis order), its terms, and every stack label inside it
+/// with its number of branches.
+template <typename LeafLabels, typename Terms, typename StackLabSeq,
+          typename StackLenSeq>
+struct GcLowered {};
+
+/// The identity of the product: one empty term.
+using GcUnit =
+    GcLowered<GcList<>, GcList<GcTerm<gc_iseq0, gc_lseq0, gc_lseq0, gc_iseq0>>,
+              gc_lseq0, gc_iseq0>;
+
+// The product of two terms, the second's leaves shifted by Shift.
+template <int Shift, typename TA, typename TB>
+struct gc_term_join;
+template <int Shift, int... La, int32_t... Pa, int32_t... Ca, int... Va,
+          int... Lb, int32_t... Pb, int32_t... Cb, int... Vb>
+struct gc_term_join<Shift,
+                    GcTerm<std::integer_sequence<int, La...>,
+                           std::integer_sequence<int32_t, Pa...>,
+                           std::integer_sequence<int32_t, Ca...>,
+                           std::integer_sequence<int, Va...>>,
+                    GcTerm<std::integer_sequence<int, Lb...>,
+                           std::integer_sequence<int32_t, Pb...>,
+                           std::integer_sequence<int32_t, Cb...>,
+                           std::integer_sequence<int, Vb...>>> {
+  using type = GcTerm<std::integer_sequence<int, La..., (Lb + Shift)...>,
+                      std::integer_sequence<int32_t, Pa..., Pb...>,
+                      std::integer_sequence<int32_t, Ca..., Cb...>,
+                      std::integer_sequence<int, Va..., Vb...>>;
+};
+
+template <int Shift, typename TA, typename TBs>
+struct gc_row;
+template <int Shift, typename TA, typename... TBs>
+struct gc_row<Shift, TA, GcList<TBs...>> {
+  using type = GcList<typename gc_term_join<Shift, TA, TBs>::type...>;
+};
+
+// Cartesian product of two term sets, A's terms outermost.
+template <typename A, typename B>
+struct gc_product;
+template <typename... LA, typename... TA, int32_t... SA, int... NA,
+          typename... LB, typename TB, int32_t... SB, int... NB>
+struct gc_product<
+    GcLowered<GcList<LA...>, GcList<TA...>,
+              std::integer_sequence<int32_t, SA...>,
+              std::integer_sequence<int, NA...>>,
+    GcLowered<GcList<LB...>, TB, std::integer_sequence<int32_t, SB...>,
+              std::integer_sequence<int, NB...>>> {
+  using type =
+      GcLowered<GcList<LA..., LB...>,
+                gc_cat_list_t<typename gc_row<static_cast<int>(sizeof...(LA)),
+                                              TA, TB>::type...>,
+                std::integer_sequence<int32_t, SA..., SB...>,
+                std::integer_sequence<int, NA..., NB...>>;
+};
+
+template <typename... Ls>
+struct gc_product_all;
+template <>
+struct gc_product_all<> {
+  using type = GcUnit;
+};
+template <typename L0, typename... Ls>
+struct gc_product_all<L0, Ls...> {
+  using type =
+      typename gc_product<L0, typename gc_product_all<Ls...>::type>::type;
+};
+
+// Union of two term sets (leaves concatenated, B's already shifted).
+template <typename A, typename B>
+struct gc_union;
+template <typename... LA, typename... TA, int32_t... SA, int... NA,
+          typename... LB, typename... TB, int32_t... SB, int... NB>
+struct gc_union<GcLowered<GcList<LA...>, GcList<TA...>,
+                          std::integer_sequence<int32_t, SA...>,
+                          std::integer_sequence<int, NA...>>,
+                GcLowered<GcList<LB...>, GcList<TB...>,
+                          std::integer_sequence<int32_t, SB...>,
+                          std::integer_sequence<int, NB...>>> {
+  using type = GcLowered<GcList<LA..., LB...>, GcList<TA..., TB...>,
+                         std::integer_sequence<int32_t, SA..., SB...>,
+                         std::integer_sequence<int, NA..., NB...>>;
+};
+
+// Branches T, T+1, ... of a stack on R, their leaves starting at Shift.
+template <int32_t R, int T, int Shift, typename... Ls>
+struct gc_stack_acc;
+template <int32_t R, int T, int Shift>
+struct gc_stack_acc<R, T, Shift> {
+  using type = GcLowered<GcList<>, GcList<>, gc_lseq0, gc_iseq0>;
+};
+template <int32_t R, int T, int Shift, typename... LL, typename... TT,
+          int32_t... SS, int... NN, typename... Rest>
+struct gc_stack_acc<R, T, Shift,
+                    GcLowered<GcList<LL...>, GcList<TT...>,
+                              std::integer_sequence<int32_t, SS...>,
+                              std::integer_sequence<int, NN...>>,
+                    Rest...> {
+  using at_t = GcTerm<gc_iseq0, gc_lseq0, std::integer_sequence<int32_t, R>,
+                      std::integer_sequence<int, T>>;
+  using here = GcLowered<
+      GcList<LL...>, GcList<typename gc_term_join<Shift, at_t, TT>::type...>,
+      std::integer_sequence<int32_t, SS...>, std::integer_sequence<int, NN...>>;
+  using rest =
+      typename gc_stack_acc<R, T + 1, Shift + static_cast<int>(sizeof...(LL)),
+                            Rest...>::type;
+  using type = typename gc_union<here, rest>::type;
+};
+
+template <int32_t R, int N, typename Lowered>
+struct gc_add_stack;
+template <int32_t R, int N, typename Ls, typename Ts, int32_t... S, int... Ns>
+struct gc_add_stack<R, N,
+                    GcLowered<Ls, Ts, std::integer_sequence<int32_t, S...>,
+                              std::integer_sequence<int, Ns...>>> {
+  using type = GcLowered<Ls, Ts, std::integer_sequence<int32_t, R, S...>,
+                         std::integer_sequence<int, N, Ns...>>;
+};
+
+// Every label of a term set renamed positionally From -> To.
+template <typename Term, typename From, typename To>
+struct gc_relabel_term;
+template <typename Ls, int32_t... P, int32_t... C, typename Vs, typename From,
+          typename To>
+struct gc_relabel_term<GcTerm<Ls, std::integer_sequence<int32_t, P...>,
+                              std::integer_sequence<int32_t, C...>, Vs>,
+                       From, To> {
+  using type =
+      GcTerm<Ls, std::integer_sequence<int32_t, map_label<From, To>(P)...>,
+             std::integer_sequence<int32_t, map_label<From, To>(C)...>, Vs>;
+};
+template <typename Lowered, typename From, typename To>
+struct gc_relabel;
+template <typename... Ls, typename... Ts, int32_t... S, typename Ns,
+          typename From, typename To>
+struct gc_relabel<GcLowered<GcList<Ls...>, GcList<Ts...>,
+                            std::integer_sequence<int32_t, S...>, Ns>,
+                  From, To> {
+  using type =
+      GcLowered<GcList<map_labels_t<Ls, From, To>...>,
+                GcList<typename gc_relabel_term<Ts, From, To>::type...>,
+                std::integer_sequence<int32_t, map_label<From, To>(S)...>, Ns>;
+};
+
+/// An operand's term set. The primary is a dense leaf: one term, itself.
+template <typename Op>
+struct gc_lower {
+  using type = GcLowered<GcList<typename Op::modes_seq>,
+                         GcList<GcTerm<std::integer_sequence<int, 0>, gc_lseq0,
+                                       gc_lseq0, gc_iseq0>>,
+                         gc_lseq0, gc_iseq0>;
+};
+template <int32_t A, int32_t B>
+struct gc_lower<Delta<A, B>> {
+  using type =
+      GcLowered<GcList<>,
+                GcList<GcTerm<gc_iseq0, std::integer_sequence<int32_t, A, B>,
+                              gc_lseq0, gc_iseq0>>,
+                gc_lseq0, gc_iseq0>;
+};
+template <int32_t R, int T>
+struct gc_lower<UnitVector<R, T>> {
+  using type = GcLowered<
+      GcList<>,
+      GcList<GcTerm<gc_iseq0, gc_lseq0, std::integer_sequence<int32_t, R>,
+                    std::integer_sequence<int, T>>>,
+      gc_lseq0, gc_iseq0>;
+};
+template <typename... Ops>
+struct gc_lower<Outer<Ops...>> {
+  using type = typename gc_product_all<typename gc_lower<Ops>::type...>::type;
+};
+template <int32_t R, typename... Bs>
+struct gc_lower<Stack<R, Bs...>> {
+  using type = typename gc_add_stack<
+      R, static_cast<int>(sizeof...(Bs)),
+      typename gc_stack_acc<R, 0, 0,
+                            typename gc_lower<Bs>::type...>::type>::type;
+};
+template <typename Op, typename M>
+struct gc_lower<Relabeled<Op, M>> {
+  using type = typename gc_relabel<typename gc_lower<Op>::type,
+                                   typename Op::modes_seq, M>::type;
+};
+template <typename Op>
+using gc_lower_t = typename gc_lower<Op>::type;
+
+template <typename T>
+struct is_outer : std::false_type {};
+template <typename... Ops>
+struct is_outer<Outer<Ops...>> : std::true_type {};
+template <typename T>
+struct is_stack : std::false_type {};
+template <int32_t R, typename... Bs>
+struct is_stack<Stack<R, Bs...>> : std::true_type {};
+template <typename T>
+struct is_relabeled : std::false_type {};
+template <typename Op, typename M>
+struct is_relabeled<Relabeled<Op, M>> : std::true_type {};
+
+/// An operand's dense leaves, flattened in the order its lowering numbers
+/// them (depth first, left to right). Deltas contribute none.
+template <typename Op>
+auto gc_leaves(const Op& op) {
+  if constexpr (is_node_handle_v<Op>) {
+    return std::tuple<Op>(op);
+  } else if constexpr (is_outer<Op>::value) {
+    return std::apply(
+        [](const auto&... o) { return std::tuple_cat(gc_leaves(o)...); },
+        op.ops);
+  } else if constexpr (is_stack<Op>::value) {
+    return std::apply(
+        [](const auto&... b) { return std::tuple_cat(gc_leaves(b)...); },
+        op.branches);
+  } else if constexpr (is_relabeled<Op>::value) {
+    return gc_leaves(op.op);
+  } else {
+    return std::tuple<>{};
+  }
+}
+
+}  // namespace Impl
+
+}  // namespace TensorOperations
