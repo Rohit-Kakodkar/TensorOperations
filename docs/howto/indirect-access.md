@@ -144,7 +144,10 @@ To write a combine with several operands or results, see
 - **Labels name existing axes.** For `local_to_global(e, p)`, use `<'e', 'p'>`. Labels never
   transpose storage.
 - **One level per dependency.** Put the index and each producer in an earlier
-  `add(...)` than its consumers; members of one level run concurrently.
+  `add(...)` than its consumers; members of one level run concurrently. This
+  ordering holds within one tile only: a level cannot read what a scatter or sink
+  in the same graph wrote, because other tiles may not have written it yet. Run
+  a second graph for that; see {doc}`../explanation/level-graphs`.
 - **Scatter adds, it never clears.** Zero the destination first for a fresh sum.
 - **Nothing checks your indices.** Every connectivity entry must be a valid,
   `int`-representable index for both source and destination.
