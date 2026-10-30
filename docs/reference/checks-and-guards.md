@@ -62,9 +62,10 @@ checking, when enabled, is not a substitute for the caller obligations above.
 
 ### Local computation between gather and scatter
 
-A combine function receives the local coordinates first, one `int` per label in
-the node's label order, followed by the values of its operands. `TwicePlusOne`
-in the how-to ignores the coordinates `(e, q)` and uses only the gathered value `u`.
+A combine function receives the global coordinates first, one `int` per label in
+the node's label order, followed by the values of its operands. `DoublePlusOne`
+in the how-to ignores the coordinates `(e, p)` and uses only the gathered value.
+See {doc}`../howto/write-device-callables` for several operands and results.
 
 ### Accumulate and complete
 

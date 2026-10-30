@@ -133,6 +133,9 @@ updates do not fix the summation order.
 | 3 | `make_combine_node` | `doubled` | `DoublePlusOne` applied at each `(e, p)` |
 | 4 | `make_scatter_add_node` | none | Atomic add into `node_sums` |
 
+To write a combine with several operands or results, see
+{doc}`write-device-callables`.
+
 ## Rules to remember
 
 - **Labels name existing axes.** For `local_to_global(e, p)`, use `<'e', 'p'>`. Labels never
