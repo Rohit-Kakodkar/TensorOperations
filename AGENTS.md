@@ -62,6 +62,13 @@ Google C++ style guide.
 - Put library APIs in `TensorOperations` and private machinery in
   `TensorOperations::Impl`. Keep test-only helpers in unnamed namespaces in `.cpp`
   files. Do not add namespace-wide `using namespace` directives to public headers.
+- Refer to the library from outside it through the alias
+  `namespace TOps = TensorOperations;`, and write `TOps::make_handle`. Put the
+  alias at file scope in `.cpp` files, benchmarks, `sfpp_min` sources, and
+  documentation examples. In a header, declare it inside the function that
+  uses it, or write `TensorOperations::` in full; a header-level alias or
+  `using namespace` leaks into every includer. Tests and negative tests under
+  `tests/` may keep `using namespace TensorOperations;` to keep assertions short.
 - Keep header definitions safe across translation units: templates, class-defined
   functions, `constexpr` functions, or explicitly `inline` free functions as
   appropriate. Use `inline constexpr` for shared header constants. Avoid mutable

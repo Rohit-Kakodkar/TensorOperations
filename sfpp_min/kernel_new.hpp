@@ -541,11 +541,13 @@ template <int TE,
 auto build_new_graph(
     const DummyKernelArgs<MetricsAcc, PropertiesAcc, IglobView>& args,
     GlobalHPrime                                                 hw) {
-  using namespace TensorOperations;
-  using ES   = KernelES;
-  using GMap = LabelTiles<LabelTile<'e', TE>, LabelWhole<'k', NGLL>,
-                          LabelWhole<'j', NGLL>, LabelWhole<'i', NGLL>,
-                          LabelWhole<'p', NGLL>, LabelWhole<'r', NGLL>>;
+  namespace TOps = TensorOperations;
+  using ES       = KernelES;
+  using GMap =
+      TOps::LabelTiles<TOps::LabelTile<'e', TE>, TOps::LabelWhole<'k', NGLL>,
+                       TOps::LabelWhole<'j', NGLL>, TOps::LabelWhole<'i', NGLL>,
+                       TOps::LabelWhole<'p', NGLL>,
+                       TOps::LabelWhole<'r', NGLL>>;
 
   const Kokkos::Array<int, 4> ext{args.nspec, NGLL, NGLL, NGLL};
 
@@ -558,20 +560,22 @@ auto build_new_graph(
   const typename Mmas::eta   me{};
   const typename Mmas::gamma mg{};
 
-  auto           g0 = make_level_graph<real_t, ES>(GMap{});
+  auto           g0 = TOps::make_level_graph<real_t, ES>(GMap{});
   constexpr bool UseIndex =
       Gather == GatherMode::IndexSlot || Scatter == ScatterMode::IndexSlot;
   auto start = [&] {
     if constexpr (UseIndex)
-      return g0.add(make_index_node<'e', 'k', 'j', 'i'>(
+      return g0.add(TOps::make_index_node<'e', 'k', 'j', 'i'>(
           args.iglob, index_tv<TE, Scatter>()));
     else
       return std::make_tuple(g0, args.iglob);
   }();
   const auto idx     = std::get<1>(start);
   auto [g1a, h, hwn] = std::get<0>(start).add(
-      make_stage_node(make_input_node(make_handle<'r', 'p'>(args.hprime))),
-      make_stage_node(make_input_node(make_handle<'p', 'r'>(hw))));
+      TOps::make_stage_node(
+          TOps::make_input_node(TOps::make_handle<'r', 'p'>(args.hprime))),
+      TOps::make_stage_node(
+          TOps::make_input_node(TOps::make_handle<'p', 'r'>(hw))));
   constexpr bool RegisterMetrics = Metrics != MetricsMode::Captured;
   auto           mstart          = [&] {
     if constexpr (RegisterMetrics) {
@@ -582,11 +586,11 @@ auto build_new_graph(
         using Field = Kokkos::View<real_t****, Kokkos::LayoutRight,
                                    typename decltype(v)::device_type,
                                    Kokkos::MemoryUnmanaged>;
-        return make_register_node<'e', 'k', 'j', 'i'>(
+        return TOps::make_register_node<'e', 'k', 'j', 'i'>(
             Field(v.data(), ext[0], ext[1], ext[2], ext[3]), MetricTV<TE>{});
 #else
-        return make_register_node(
-            make_functional_input_node<'e', 'k', 'j', 'i'>(
+        return TOps::make_register_node(
+            TOps::make_functional_input_node<'e', 'k', 'j', 'i'>(
                 ext, SoAComponent<decltype(v), decltype(off)>{v, off}),
             MetricTV<TE>{});
 #endif
@@ -600,15 +604,15 @@ auto build_new_graph(
       const StaticStrideOffset so{};
       if constexpr (Metrics == MetricsMode::Partial)
         return [&]<int... Sel>(std::integer_sequence<int, Sel...>) {
-          return g1a.add(make_register_node(
-              make_functional_input_node<'e', 'k', 'j', 'i'>(
+          return g1a.add(TOps::make_register_node(
+              TOps::make_functional_input_node<'e', 'k', 'j', 'i'>(
                   ext,
                   MetricBundleSel<MetricsAcc, PropertiesAcc, Sel...>{m, pr}),
               MetricTV<TE>{}));
         }(PreSel{});
       else if constexpr (Metrics == MetricsMode::Bundle)
-        return g1a.add(make_register_node(
-            make_functional_input_node<'e', 'k', 'j', 'i'>(
+        return g1a.add(TOps::make_register_node(
+            TOps::make_functional_input_node<'e', 'k', 'j', 'i'>(
                 ext, MetricBundle<MetricsAcc, PropertiesAcc>{m, pr}),
             MetricTV<TE>{}));
       else
@@ -623,32 +627,33 @@ auto build_new_graph(
   auto g1     = std::get<0>(mstart);
   auto gather = [&](int c) {
     if constexpr (Gather == GatherMode::Functional)
-      return make_stage_node(make_functional_input_node<'e', 'k', 'j', 'i'>(
-          ext,
-          GatherDisplacement<IglobView>{args.displacement, args.iglob, c}));
+      return TOps::make_stage_node(
+          TOps::make_functional_input_node<'e', 'k', 'j', 'i'>(
+              ext,
+              GatherDisplacement<IglobView>{args.displacement, args.iglob, c}));
     else if constexpr (Gather == GatherMode::IndexView)
-      return make_gather_node<'e', 'k', 'j', 'i'>(
+      return TOps::make_gather_node<'e', 'k', 'j', 'i'>(
           args.iglob, Kokkos::subview(args.displacement, Kokkos::ALL, c));
     else
-      return make_gather_node<'e', 'k', 'j', 'i'>(
+      return TOps::make_gather_node<'e', 'k', 'j', 'i'>(
           idx, Kokkos::subview(args.displacement, Kokkos::ALL, c));
   };
   auto [g2, u0, u1, u2] = g1.add(gather(0), gather(1), gather(2));
 
   auto gx = [&](auto uu) {
-    return make_contraction_node<'e', 'k', 'j', 'i'>(
+    return TOps::make_contraction_node<'e', 'k', 'j', 'i'>(
         h.template as<'i', 'p'>(), uu.template as<'e', 'k', 'j', 'p'>(),
-        NoHook{}, mx);
+        TOps::NoHook{}, mx);
   };
   auto ge = [&](auto uu) {
-    return make_contraction_node<'e', 'k', 'j', 'i'>(
+    return TOps::make_contraction_node<'e', 'k', 'j', 'i'>(
         h.template as<'j', 'p'>(), uu.template as<'e', 'k', 'p', 'i'>(),
-        NoHook{}, me);
+        TOps::NoHook{}, me);
   };
   auto gg = [&](auto uu) {
-    return make_contraction_node<'e', 'k', 'j', 'i'>(
+    return TOps::make_contraction_node<'e', 'k', 'j', 'i'>(
         h.template as<'k', 'p'>(), uu.template as<'e', 'p', 'j', 'i'>(),
-        NoHook{}, mg);
+        TOps::NoHook{}, mg);
   };
   auto [g3, gx0, gx1, gx2, ge0, ge1, ge2, gg0, gg1, gg2] = g2.add(
       gx(u0), gx(u1), gx(u2), ge(u0), ge(u1), ge(u2), gg(u0), gg(u1), gg(u2));
@@ -658,7 +663,7 @@ auto build_new_graph(
       return std::apply(
           [&](auto, auto... mh) {
             return [&]<int... Sel>(std::integer_sequence<int, Sel...>) {
-              return g3.add(make_combine_node<'e', 'k', 'j', 'i'>(
+              return g3.add(TOps::make_combine_node<'e', 'k', 'j', 'i'>(
                   gx0, gx1, gx2, ge0, ge1, ge2, gg0, gg1, gg2, mh...,
                   IntegrandSel<MetricsAcc, PropertiesAcc, Sel...>{
                       args.metrics, args.properties}));
@@ -668,56 +673,58 @@ auto build_new_graph(
     else if constexpr (RegisterMetrics)
       return std::apply(
           [&](auto, auto... mh) {
-            return g3.add(make_combine_node<'e', 'k', 'j', 'i'>(
+            return g3.add(TOps::make_combine_node<'e', 'k', 'j', 'i'>(
                 gx0, gx1, gx2, ge0, ge1, ge2, gg0, gg1, gg2, mh...,
                 IntegrandRegister{}));
           },
           mstart);
     else
-      return g3.add(make_combine_node<'e', 'k', 'j', 'i'>(
+      return g3.add(TOps::make_combine_node<'e', 'k', 'j', 'i'>(
           gx0, gx1, gx2, ge0, ge1, ge2, gg0, gg1, gg2, integrand));
   }();
 
   auto dvx = [&](auto f) {
-    return make_contraction_node<'e', 'k', 'j', 'i'>(
+    return TOps::make_contraction_node<'e', 'k', 'j', 'i'>(
         hwn.template as<'p', 'i'>(), f.template as<'e', 'k', 'j', 'p'>(),
-        NoHook{}, mx);
+        TOps::NoHook{}, mx);
   };
   auto dve = [&](auto f) {
-    return make_contraction_node<'e', 'k', 'j', 'i'>(
+    return TOps::make_contraction_node<'e', 'k', 'j', 'i'>(
         hwn.template as<'p', 'j'>(), f.template as<'e', 'k', 'p', 'i'>(),
-        NoHook{}, me);
+        TOps::NoHook{}, me);
   };
   auto dvg = [&](auto f) {
-    return make_contraction_node<'e', 'k', 'j', 'i'>(
+    return TOps::make_contraction_node<'e', 'k', 'j', 'i'>(
         hwn.template as<'p', 'k'>(), f.template as<'e', 'p', 'j', 'i'>(),
-        NoHook{}, mg);
+        TOps::NoHook{}, mg);
   };
   auto [g5, tx0, tx1, tx2, te0, te1, te2, tg0, tg1, tg2] =
       g4.add(dvx(fx0), dvx(fx1), dvx(fx2), dve(fe0), dve(fe1), dve(fe2),
              dvg(fg0), dvg(fg1), dvg(fg2));
 
-  auto [g6, r0, r1, r2] = g5.add(make_combine_node<'e', 'k', 'j', 'i'>(
+  auto [g6, r0, r1, r2] = g5.add(TOps::make_combine_node<'e', 'k', 'j', 'i'>(
       tx0, tx1, tx2, te0, te1, te2, tg0, tg1, tg2, to_accel));
 
   auto scatter = [&](auto dst, auto rc) {
     if constexpr (Scatter == ScatterMode::IndexView)
-      return make_scatter_add_node<'e', 'k', 'j', 'i'>(args.iglob, dst, rc);
+      return TOps::make_scatter_add_node<'e', 'k', 'j', 'i'>(args.iglob, dst,
+                                                             rc);
     else
-      return make_scatter_add_node<'e', 'k', 'j', 'i'>(idx, dst, rc);
+      return TOps::make_scatter_add_node<'e', 'k', 'j', 'i'>(idx, dst, rc);
   };
   auto accel = [&](int c) {
     return Kokkos::subview(args.acceleration, Kokkos::ALL, c);
   };
   auto g7 = [&] {
     if constexpr (Scatter == ScatterMode::Functional)
-      return g6.add(make_combine_node<'e', 'k', 'j', 'i'>(r0, r1, r2, sink));
+      return g6.add(
+          TOps::make_combine_node<'e', 'k', 'j', 'i'>(r0, r1, r2, sink));
     else
       return g6.add(scatter(accel(0), r0), scatter(accel(1), r1),
                     scatter(accel(2), r2));
   }();
 
-  using Plan = LevelPlan<std::decay_t<decltype(g7.levels)>>;
+  using Plan = TOps::LevelPlan<std::decay_t<decltype(g7.levels)>>;
   constexpr std::size_t IndexLevels =
       (UseIndex ? 1 : 0) + (RegisterMetrics ? 1 : 0);
   static_assert(Plan::num_levels == 7 + IndexLevels,

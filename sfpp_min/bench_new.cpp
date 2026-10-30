@@ -67,6 +67,7 @@
 #include <type_traits>
 
 using namespace sfpp_min;
+namespace TOps = TensorOperations;
 
 namespace {
 
@@ -98,7 +99,7 @@ double best_ms(Fn&& fn, int warmup, int reps) {
   return best * 1e3;
 }
 
-using TeamPolicy = TensorOperations::TeamPolicyTag<KernelES>;
+using TeamPolicy = TOps::TeamPolicyTag<KernelES>;
 
 template <class Args>
 int launch(TeamPolicy policy, const Args& args, int team_arg,
@@ -107,7 +108,7 @@ int launch(TeamPolicy policy, const Args& args, int team_arg,
 }
 
 #if defined(TENSOR_OPS_ENABLE_CUTE)
-using CutePolicy = TensorOperations::CutePolicyTag<KernelES>;
+using CutePolicy = TOps::CutePolicyTag<KernelES>;
 
 template <class Args>
 int launch(CutePolicy policy, const Args& args, int, const GlobalHPrime& hw) {
