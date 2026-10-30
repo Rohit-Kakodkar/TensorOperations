@@ -5,6 +5,7 @@ Task-focused guides for readers who already know the basic concepts.
 ```{toctree}
 :maxdepth: 1
 
+use-in-your-project
 indirect-access
 choose-a-tile-map
 reorder-and-permute
