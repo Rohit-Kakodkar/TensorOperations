@@ -27,7 +27,9 @@ Labels `'e'` (element) and `'p'` (point) name the two axes of
 
 ## The code
 
-The program needs the `tensor` CMake target. Each numbered comment is one step.
+The program needs the `tensor` CMake target; see
+{doc}`use-in-your-project` for getting it into your own project. Each numbered
+comment is one step.
 
 ```cpp
 #include <TensorOperations/Evaluator.hpp>
