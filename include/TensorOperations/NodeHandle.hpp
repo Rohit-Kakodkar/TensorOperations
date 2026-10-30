@@ -1237,9 +1237,28 @@ auto combine_from_args(Tuple args, std::index_sequence<Is...>) {
 
 }  // namespace Impl
 
-// Primary form: infer the output scalar from the first operand, default exec
-// space.  make_combine_node<'i','j'>(a, b, ..., fn)   // operands first, fn
-// last
+/**
+ * @brief Applies your function at every point of the output, reading one value
+ * from each operand.
+ *
+ * `fn` is called as `fn(i_0, ..., i_{Rank-1}, v_0, ..., v_{N-1})`: the global
+ * coordinates in the order of `OutModes`, then one value per operand in the
+ * order you passed them. Operands may store their labels in any order. See the
+ * how-to guide `howto/write-device-callables` for what `fn` may return and for
+ * the operand rules.
+ *
+ * @tparam OutModes Output labels, in output axis order.
+ * @param[in] args The operand node handles, then `fn` last.
+ * @return A node whose scalar is the first operand's `value_type`. Use the
+ * overload with an explicit `Scalar` to choose another.
+ * @pre Operand extents agree on every label. This is an `assert`, so it is not
+ * checked under `NDEBUG`.
+ * @par Constraints
+ * Static assertions reject: a functional-input operand (wrap it in
+ * make_stage_node() first), an integer index slot, an operand whose label set
+ * differs from `OutModes`, and an `fn` that is not callable on a `const` object
+ * with this argument list.
+ */
 template <int32_t... OutModes, typename... Args>
 auto make_combine_node(Args... args) {
   constexpr std::size_t N = sizeof...(Args);
