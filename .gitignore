@@ -6,3 +6,7 @@ output.log
 .venv
 issues
 profiles
+.agents/
+.codex/
+b/
+.DS_Store
