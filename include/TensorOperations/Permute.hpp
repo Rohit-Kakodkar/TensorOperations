@@ -1,8 +1,7 @@
 #pragma once
 /**
  * @file Permute.hpp
- * @brief Compile-time einsum-mode planning plus a zero-copy permuted tensor
- * view.
+ * @brief Compile-time einsum-mode planning.
  *
  * A binary contraction is specified by einsum-style *labels* on each operand
  * and the output (e.g. `A[j,i,k] * B[j,k,l] -> C[l,i]`). The team GEMM kernel,
@@ -13,9 +12,7 @@
  * @endcode
  * with A's and B's contracted axes in the same order. This header derives, at
  * compile time from the labels, the per-operand gather permutations that map an
- * operand's user axis order into that canonical order, and provides a zero-copy
- * strided view (@ref TensorOperations::Impl::PermutedView) that presents an
- * operand's data already permuted.
+ * operand's user axis order into that canonical order.
  *
  * @par Gather convention
  * Matches `reorder_layout` / `reorder_view` in `TiledLayout.hpp`:
@@ -342,7 +339,7 @@ using gather_modes_seq_t =
  * `SourceSeq[perm[i]] == TargetSeq[i]`. Following the header's gather
  * convention, this is the permutation that presents a source operand in the
  * target's axis order (`canonical.extent(i) == source.extent(perm[i])`), so it
- * drives `canonicalize_input` / `reorder_tile_value` for combine operands whose
+ * drives `reorder_tile_value` for combine operands whose
  * labels match the output but may be permuted. Both sequences must be a
  * permutation of one another (checked by @ref same_label_set at the call site).
  */
@@ -418,103 +415,6 @@ KOKKOS_FUNCTION constexpr Kokkos::Array<int, sizeof...(P)> scatter_index(
   int                              i = 0;
   ((n[P] = c[i++]), ...);
   return n;
-}
-
-// --- PermutedView: a zero-copy, strided relabel of a tensor's axes ---------
-
-/**
- * @brief Zero-copy, strided view that relabels a tensor's axes by a
- * permutation.
- *
- * Presents the wrapped view @ref v with its axes gathered by @p Perm, so that
- * `extent(d) == v.extent(Perm[d])` and `stride(d) == v.stride(Perm[d])`, while
- * sharing the same underlying data pointer. It reports `Kokkos::LayoutStride`,
- * which routes callers through the generic (runtime) `subview_tile` path. The
- * type satisfies the project's `TensorLike` interface.
- *
- * @tparam V The wrapped Kokkos-view-like tensor type.
- * @tparam Perm The gather permutation: source axis for each presented axis.
- */
-template <typename V, int... Perm>
-struct PermutedView {
-  V v;  ///< The wrapped tensor whose axes are relabeled (data is shared, not
-        ///< copied).
-
-  using value_type      = typename V::value_type;
-  using array_layout    = Kokkos::LayoutStride;
-  using execution_space = typename V::execution_space;
-  using memory_space    = typename V::memory_space;
-
-  /// The wrapped native view type (before permutation). Consumers that want the
-  /// ordered (register-resident) subview path tile @ref v directly and reorder
-  /// the resulting subview by @ref perm_seq instead of tiling this strided
-  /// view.
-  using inner_view_t = V;
-  /// The gather permutation as a sequence: presented axis d <- native axis
-  /// Perm[d].
-  using perm_seq = std::integer_sequence<int, Perm...>;
-
-  static constexpr int rank = sizeof...(Perm);  ///< Rank of the permuted view.
-
-  /// Extent along presented axis @p d: `v.extent(src(d))`.
-  KOKKOS_FUNCTION int extent(int d) const noexcept {
-    return static_cast<int>(v.extent(src(d)));
-  }
-  /// Stride along presented axis @p d: `v.stride(src(d))`.
-  KOKKOS_FUNCTION std::ptrdiff_t stride(int d) const noexcept {
-    return static_cast<std::ptrdiff_t>(v.stride(src(d)));
-  }
-  /// @return Pointer to the shared underlying data (identical to `v.data()`).
-  KOKKOS_FUNCTION value_type* data() const noexcept { return v.data(); }
-
-  /**
-   * @brief Element access in the permuted axis order.
-   *
-   * Applies the wrapped view's strides through the permutation so that
-   * `(*this)(i0, i1, ...)` addresses `v` at the corresponding permuted axes.
-   */
-  template <typename... Idx>
-    requires(sizeof...(Idx) == rank)
-  KOKKOS_FUNCTION value_type& operator()(Idx... idx) const {
-    const int      c[rank] = {static_cast<int>(idx)...};
-    std::ptrdiff_t off     = 0;
-    for (int d = 0; d < rank; ++d)
-      off += static_cast<std::ptrdiff_t>(c[d]) * v.stride(src(d));
-    return v.data()[off];
-  }
-
- private:
-  /// Source (native) axis of presented axis @p d.
-  KOKKOS_FUNCTION static constexpr int src(int d) noexcept {
-    constexpr int p[rank] = {Perm...};
-    return p[d];
-  }
-};
-
-/// Trait: detect a @ref PermutedView (and recover its native view +
-/// permutation).
-template <typename>
-struct is_permuted_view : std::false_type {};
-template <typename V, int... Perm>
-struct is_permuted_view<PermutedView<V, Perm...>> : std::true_type {};
-template <typename T>
-inline constexpr bool is_permuted_view_v =
-    is_permuted_view<std::decay_t<T>>::value;
-
-/**
- * @brief Return @p v relabeled by @p perm, avoiding a wrapper when possible.
- *
- * If @p perm is the identity the original view is returned unchanged —
- * preserving its native layout and the fast compile-time `subview_tile` path.
- * Any other permutation yields a zero-copy @ref PermutedView.
- */
-template <typename V, int... Perm>
-KOKKOS_FUNCTION auto permuted_alias(const V&                            v,
-                                    std::integer_sequence<int, Perm...> perm) {
-  if constexpr (is_identity_seq(perm))
-    return v;
-  else
-    return PermutedView<V, Perm...>{v};
 }
 
 }  // namespace Impl

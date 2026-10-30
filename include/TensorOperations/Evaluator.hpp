@@ -241,33 +241,6 @@ KOKKOS_FORCEINLINE_FUNCTION Kokkos::Array<T, M> as_result_array(
   return r;
 }
 
-// The inverse of as_result_array, for the one context that needs a SINGLE value
-// rather than a normalized pack: an operand's evaluated result, which a
-// consumer stages into one scratch slot. A single-output evaluator's interm
-// handle passes through; a combine's Kokkos::Array is unwrapped.
-//
-// This is where the phase-1 restriction on fused combine operands lives, and
-// the one place a phase-2 output selector would take an index instead of
-// asserting M == 1. Stated here rather than at each consumer's call site so
-// the restriction is one declaration, not a condition duplicated per
-// consumer.
-//
-// Returns BY VALUE for the same reason as_result_array does: the argument is
-// the temporary returned by eval(), so a const& pass-through would dangle.
-template <typename T>
-KOKKOS_FORCEINLINE_FUNCTION T single_result(const T& r) {
-  return r;
-}
-template <typename T, std::size_t M>
-KOKKOS_FORCEINLINE_FUNCTION T single_result(const Kokkos::Array<T, M>& r) {
-  static_assert(M == 1,
-                "a multi-output combine node cannot yet be consumed as an "
-                "operand: selecting one output of several is phase 2 (a bound "
-                "output handle as an operand). Register the multi-output "
-                "combine as its own graph output instead");
-  return r[0];
-}
-
 // --- node output order ------------------------------------------------------
 //
 // A contraction node's modes_seq, shape() and C scratch are all CANONICAL

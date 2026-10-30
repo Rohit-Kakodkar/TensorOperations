@@ -418,7 +418,7 @@ KOKKOS_FUNCTION Kokkos::Array<int, 2 * N> interleave_tile_extents(
 // reorder_static_tile — gather-permute a StaticTile's extents.
 //
 // new tile axis i has extent E[Perm[i]] (gather convention, matching
-// reorder_layout / permuted_alias). Compile-time only; used to reorder an
+// reorder_layout). Compile-time only; used to reorder an
 // operand's (or the output's) tile from user axis order into the canonical
 // [free.., contracted..] order the team GEMM expects.
 //
@@ -445,55 +445,6 @@ KOKKOS_FUNCTION auto reorder_tile_value(
   else
     return reorder_static_tile(tile, perm);
 }
-
-// ---------------------------------------------------------------------------
-// OperandAxes<PermSeq> — relates one operand's native axis order to the
-// canonical order the evaluators work in.
-//
-// PermSeq is the gather permutation: canonical axis i comes from native axis
-// PermSeq[i], so canon.extent(i) == native.extent(PermSeq[i]). Both directions
-// are needed across the evaluators and each was previously open-coded:
-//   • the contraction evaluator stores each operand's NATIVE tile and derives
-//     the canonical one (permA/permB/permC),
-//   • the combine evaluator receives each operand's tile already in CANONICAL
-//     (output) order and derives the native one (inverse of the label gather).
-// Both then scatter a canonical tile index into the operand's native order to
-// drive that operand's own natively-tiled evaluator — the identical operation
-// in each case.
-//
-// Everything here is compile-time or a trivially-inlined value transform; the
-// identity permutation short-circuits via reorder_tile_value.
-// ---------------------------------------------------------------------------
-template <typename PermSeq>
-struct OperandAxes {
-  using perm_seq         = PermSeq;
-  using inverse_perm_seq = Impl::inverse_perm_seq_t<PermSeq>;
-
-  static constexpr bool is_identity = Impl::is_identity_seq(PermSeq{});
-
-  // native tile -> canonical tile, and back.
-  template <typename Tile>
-  using canon_tile_t =
-      decltype(reorder_tile_value(std::declval<Tile>(), PermSeq{}));
-  template <typename Tile>
-  using native_tile_t =
-      decltype(reorder_tile_value(std::declval<Tile>(), inverse_perm_seq{}));
-
-  template <typename Tile>
-  KOKKOS_FUNCTION static canon_tile_t<Tile> to_canon_tile(const Tile& t) {
-    return reorder_tile_value(t, PermSeq{});
-  }
-  template <typename Tile>
-  KOKKOS_FUNCTION static native_tile_t<Tile> to_native_tile(const Tile& t) {
-    return reorder_tile_value(t, inverse_perm_seq{});
-  }
-
-  // Canonical tile index -> the operand's own native tile index.
-  template <std::size_t R>
-  KOKKOS_FUNCTION static auto to_native_idx(const Kokkos::Array<int, R>& idx) {
-    return Impl::scatter_index(idx, PermSeq{});
-  }
-};
 
 template <int... Extents, int... TileE>
 KOKKOS_FUNCTION constexpr auto tile_layout(StaticTileLayoutRight<Extents...>,
@@ -1011,86 +962,5 @@ template <int R>
 KOKKOS_FUNCTION DynamicTile<R> output_tile(DynamicTile<R> t) noexcept {
   return t;
 }
-
-// ---------------------------------------------------------------------------
-// CombineTile — per-operand tile bundle for a combine node.
-//
-// A combine node's output tile fixes both its own output and every operand's
-// tile IF every operand is a leaf (input) node: operand K stages its input
-// slab with the same output tile. To support a contraction node as a combine
-// operand, operand K needs a `Tile<A,B,C>` bundle instead — the inner
-// contraction's A/B/C tile spec — whose C tile equals the combine's output
-// tile. CombineTile carries the output tile plus one per-operand tile spec:
-//
-//   OpTile == OutTile        for input operands (staged in output order)
-//   OpTile == Tile<A,B,C>    for contraction operands. C is in that operand's
-//                             own USER order and need not match OutTile
-//                             directly: the combine evaluator reads it through
-//                             the operand's permC and gathers it into the
-//                             combine's output order, which is what must equal
-//                             OutTile. Both collapse to C == OutTile when the
-//                             operand is canonical and in the output's order.
-//
-// `output_tile(CombineTile)` returns the shared output tile so the graph
-// driver keeps sizing work items / decoding tile indices uniformly. For a
-// plain combine (all input operands), callers can keep passing the plain
-// output tile directly; the combine evaluator accepts either form.
-// ---------------------------------------------------------------------------
-template <typename OutTile, typename... OpTiles>
-struct CombineTile {
-  static constexpr int    rank      = OutTile::rank;
-  static constexpr bool   is_static = OutTile::is_static;
-  static constexpr int    num_ops   = static_cast<int>(sizeof...(OpTiles));
-  OutTile                 out{};
-  DeviceTuple<OpTiles...> ops{};
-
-  KOKKOS_FUNCTION constexpr int extent(int i) const noexcept {
-    return out.extent(i);
-  }
-};
-
-namespace Impl {
-template <typename T>
-struct is_combine_tile : std::false_type {};
-template <typename OutTile, typename... OpTiles>
-struct is_combine_tile<CombineTile<OutTile, OpTiles...>> : std::true_type {};
-template <typename T>
-inline constexpr bool is_combine_tile_v = is_combine_tile<T>::value;
-}  // namespace Impl
-
-template <typename OutTile, typename... OpTiles>
-KOKKOS_FUNCTION OutTile
-output_tile(const CombineTile<OutTile, OpTiles...>& t) noexcept {
-  return t.out;
-}
-
-// Host-side factory: assemble a CombineTile from an output tile and one tile
-// spec per operand. For input operands pass the output tile again (or its
-// equivalent); for contraction operands pass the corresponding Tile<A,B,C>.
-template <typename OutTile, typename... OpTiles>
-CombineTile<OutTile, OpTiles...> make_combine_tile(const OutTile& out,
-                                                   const OpTiles&... ops) {
-  return CombineTile<OutTile, OpTiles...>{out, DeviceTuple<OpTiles...>(ops...)};
-}
-
-// ---------------------------------------------------------------------------
-// StageTile<SourceTile, PermSeq> — target spec for staging a global-view
-// interm node into scratch.
-//
-// Bundles the operand's own (native-order) tile shape with the gather
-// permutation (native -> canonical) needed to bring it into the order the
-// destination scratch tile expects. The scratch tile's actual shape is
-// derived on demand via reorder_tile_value(source_tile, PermSeq{}) — the same
-// helper the contraction evaluator already uses to build its canonical
-// per-operand tiles. PermSeq carries no runtime data; it's a template
-// parameter only.
-// ---------------------------------------------------------------------------
-template <typename SourceTile, typename PermSeq>
-struct StageTile {
-  using source_tile_t = SourceTile;
-  using perm_seq      = PermSeq;
-
-  SourceTile source_tile{};
-};
 
 }  // namespace TensorOperations

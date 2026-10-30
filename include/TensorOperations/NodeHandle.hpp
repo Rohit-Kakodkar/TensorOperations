@@ -484,8 +484,8 @@ struct NodeHandle<StagedTag, Operand, ModesSeq, Tile, TV> {
 // get wrong.
 //
 // Two slot nodes may share an index and differ in their labels. That is the
-// relabel mechanism (see make_slot_node), and it is why the index alone does
-// not determine the type.
+// relabel mechanism (see make_slot_node_seq), and it is why the index alone
+// does not determine the type.
 template <typename IntSlotIdx, typename Storage, typename IntRank,
           typename ExecSpace, typename ModesSeq>
 struct NodeHandle<SlotTag, IntSlotIdx, Storage, IntRank, ExecSpace, ModesSeq> {
@@ -848,13 +848,6 @@ KOKKOS_FUNCTION auto make_slot_node_seq(
                     ModesSeq>{std::move(storage), shape};
 }
 
-template <std::size_t SlotIdx, int32_t... Modes, typename Storage>
-KOKKOS_FUNCTION auto make_slot_node(
-    Storage storage, Kokkos::Array<int, sizeof...(Modes)> shape) {
-  return make_slot_node_seq<SlotIdx, std::integer_sequence<int32_t, Modes...>>(
-      std::move(storage), shape);
-}
-
 // ---------------------------------------------------------------------------
 // Contraction specialization — C{free modes} = sum{contracted} A × B
 // ---------------------------------------------------------------------------
@@ -1180,33 +1173,6 @@ auto make_combine_node(Args... args) {
       std::tuple<Args...>(std::move(args)...),
       std::make_index_sequence<N - 1>{});
 }
-
-// ---------------------------------------------------------------------------
-// canonicalize_input — present an operand in the GEMM's canonical axis order.
-//
-// Identity permutation returns the node unchanged (native layout, fast staging
-// path); otherwise the operand's data is wrapped in a zero-copy PermutedView
-// carrying canonical labels. Only input operands may be permuted (permuted
-// nested/intermediate operands are a follow-up).
-// ---------------------------------------------------------------------------
-namespace Impl {
-
-template <typename Node, int... Perm>
-KOKKOS_FUNCTION auto canonicalize_input(
-    const Node& node, std::integer_sequence<int, Perm...> perm) {
-  if constexpr (is_identity_seq(perm)) {
-    return node;
-  } else {
-    static_assert(has_node_tag_v<InputTag, Node>,
-                  "permuted non-input operands are not supported yet");
-    using PermSeq    = std::integer_sequence<int, Perm...>;
-    using CanonModes = gather_modes_seq_t<typename Node::modes_seq, PermSeq>;
-    auto pv          = permuted_alias(node.handle, perm);
-    return make_input_node(make_handle_seq(pv, CanonModes{}), node.hook_op);
-  }
-}
-
-}  // namespace Impl
 
 namespace Impl {
 
