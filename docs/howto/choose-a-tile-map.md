@@ -10,8 +10,8 @@ the example here is the one from {doc}`indirect-access`.
 ## What the two entries mean
 
 ```cpp
-using TileMap = to::LabelTiles<to::LabelTile<'e', 4>,
-                               to::LabelWhole<'p', 3>>;
+using TileMap = TOps::LabelTiles<TOps::LabelTile<'e', 4>,
+                                 TOps::LabelWhole<'p', 3>>;
 ```
 
 - `LabelTile<'e', 4>` cuts the `'e'` axis into tiles of 4. Each tile is one
@@ -112,7 +112,7 @@ int main(int argc, char* argv[]) {
   Kokkos::initialize(argc, argv);
   int exit_code = 0;
   {
-    namespace to = TensorOperations;
+    namespace TOps = TensorOperations;
     using Space  = Kokkos::DefaultExecutionSpace;
 
     constexpr int tile_elements      = 4;   // elements per team
@@ -127,8 +127,8 @@ int main(int argc, char* argv[]) {
     constexpr int spare_node = num_nodes;
 
     using TileMap =
-        to::LabelTiles<to::LabelTile<'e', tile_elements>,
-                       to::LabelWhole<'p', points_per_element>>;
+        TOps::LabelTiles<TOps::LabelTile<'e', tile_elements>,
+                         TOps::LabelWhole<'p', points_per_element>>;
 
     Kokkos::View<int**, Kokkos::LayoutRight, Space> local_to_global(
         "local_to_global", padded_elements, points_per_element);
@@ -148,20 +148,20 @@ int main(int argc, char* argv[]) {
     Kokkos::deep_copy(node_values, host_values);
     Kokkos::deep_copy(node_sums, 0.0f);
 
-    auto empty = to::make_level_graph<float, Space>(TileMap{});
+    auto empty = TOps::make_level_graph<float, Space>(TileMap{});
     auto [with_map, map_slot] =
-        empty.add(to::make_index_node<'e', 'p'>(local_to_global));
+        empty.add(TOps::make_index_node<'e', 'p'>(local_to_global));
     auto [with_gather, gathered] =
-        with_map.add(to::make_gather_node<'e', 'p'>(map_slot, node_values));
+        with_map.add(TOps::make_gather_node<'e', 'p'>(map_slot, node_values));
     auto [with_math, doubled] = with_gather.add(
-        to::make_combine_node<'e', 'p'>(gathered, DoublePlusOne{}));
+        TOps::make_combine_node<'e', 'p'>(gathered, DoublePlusOne{}));
     auto graph = with_math.add(
-        to::make_scatter_add_node<'e', 'p'>(map_slot, node_sums, doubled));
+        TOps::make_scatter_add_node<'e', 'p'>(map_slot, node_sums, doubled));
 
     auto launch = graph.outputs();
     std::printf("scratch: %zu bytes at level %d\n", launch.scratch_bytes(),
                 launch.scratch_level());
-    launch.execute(to::TeamPolicyTag<Space>{});
+    launch.execute(TOps::TeamPolicyTag<Space>{});
     Kokkos::fence();
 
     auto host_sums =
