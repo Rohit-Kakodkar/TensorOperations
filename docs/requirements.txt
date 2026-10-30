@@ -1,0 +1,4 @@
+sphinx>=8,<9
+furo
+myst-parser
+breathe

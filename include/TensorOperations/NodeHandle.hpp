@@ -720,6 +720,44 @@ auto make_register_node(Src src, TV tv) {
       std::move(tv));
 }
 
+/**
+ * @brief Stages a table of integer indices so gathers and scatters can share
+ * it.
+ *
+ * Use this when one connectivity table, such as `local_to_global(e, p)`, feeds
+ * more than one gather or scatter. The table is staged into graph storage once
+ * and the returned handle is passed to each consumer.
+ *
+ * Labels name the table's existing axes, in order; they never transpose it.
+ * Every consumer must be added in a later level and must use exactly the same
+ * labels in the same order. You can also pass the integer view straight to a
+ * gather or scatter and skip this node. Neither form is known to be faster.
+ *
+ * @tparam Modes Distinct labels, one per axis of `view`, in axis order.
+ * @tparam T Tensor type satisfying TensorLike whose elements are integral.
+ * @tparam TV Thread-value layout type; leave as DefaultTV for Team staging.
+ * @param[in] view Integer connectivity tensor, copied by value.
+ * @param[in] tv Optional staging layout. Slot-fed gathers use this layout too.
+ * @return A staged input holding `view`. Ownership follows T: a managed Kokkos
+ * view shares its storage, while unmanaged storage remains borrowed.
+ * @pre The storage behind `view` stays valid and accessible from the graph's
+ * execution space until execution has completed.
+ * @par Constraints
+ * Static assertions reject non-integral elements, duplicate labels, and a label
+ * count that differs from the tensor rank. An integer slot cannot be an operand
+ * of a combine or contraction. On the Team path the slot must live in memory,
+ * not in registers.
+ * @note Index values are not validated; see the how-to guide
+ * `howto/indirect-access` for the caller's obligations.
+ * @par Example
+ * @code{.cpp}
+ * // local_to_global is an int** view with axes (element, point).
+ * auto [with_map, map_slot] =
+ *     graph.add(make_index_node<'e', 'p'>(local_to_global));
+ * // Later levels pass map_slot to make_gather_node / make_scatter_add_node.
+ * @endcode
+ * @see make_gather_node(), make_scatter_add_node()
+ */
 template <int32_t... Modes, TensorLike T, typename TV = DefaultTV>
 auto make_index_node(T view, TV tv = {}) {
   static_assert(std::is_integral_v<typename Impl::value_type_of<T>::type>,
@@ -784,6 +822,52 @@ struct NodeHandle<GatherTag, IdxSlot, Source, ModesSeq> {
   }
 };
 
+/**
+ * @brief Reads global values through an index table, one value per table entry.
+ *
+ * For every local coordinate `(i...)` of the index table, the result is
+ * `source(idx(i...))`. The result has the index table's shape and axis order,
+ * so it is a local array of values pulled from a global field.
+ *
+ * `idx` is either an integer Kokkos view or the slot returned by
+ * make_index_node(). With a slot, the labels must match the slot's labels
+ * exactly. The gathered values may feed combines and contractions as long as
+ * the source's element type is not integral.
+ *
+ * @tparam Modes Distinct labels for the index table's axes, in axis order.
+ * @tparam Idx Integer Kokkos view, or an integer slot from make_index_node().
+ * @tparam Source Rank-one Kokkos view, or an object whose `const` call operator
+ * accepts one integer and returns a value.
+ * @tparam TV Thread-value layout type. Must stay DefaultTV for a slot-fed
+ * gather.
+ * @param[in] idx Index view or slot handle, copied by value.
+ * @param[in] source Global values or an accessor, copied by value. To read a
+ * column of a rank-two field, pass a rank-one subview; a rank-two view is not
+ * accepted.
+ * @param[in] tv Optional staging layout for the direct-view form. For a
+ * slot-fed gather, give the layout to make_index_node() instead.
+ * @return A staged value node. Ownership follows the copy semantics of `idx`
+ * and `source`: managed Kokkos views share storage, unmanaged state is
+ * borrowed.
+ * @pre Every index is valid for `source`, including any conversion its call
+ * operator performs. Extents agree per label across the workflow.
+ * @par Constraints
+ * Static assertions check integral indices, label count and order, that
+ * `source` is callable with one integer on a `const` object and returns a
+ * value, and the slot-fed layout rule. Slot producers must be in earlier levels
+ * than their consumers.
+ * @note The read happens in the kernel, so accessors must be device-callable
+ * for the chosen backend. No index range check is added.
+ * @par Example
+ * @code{.cpp}
+ * // gathered(e, p) == node_values(local_to_global(e, p))
+ * auto [with_gather, gathered] =
+ *     with_map.add(make_gather_node<'e', 'p'>(map_slot, node_values));
+ * @endcode
+ * Here `with_map` and `map_slot` come from make_index_node() and `node_values`
+ * is a rank-one `float` view.
+ * @see make_index_node(), make_scatter_add_node()
+ */
 template <int32_t... Modes, typename Idx, typename Source,
           typename TV = DefaultTV>
 auto make_gather_node(Idx idx, Source source, TV tv = {}) {
@@ -1347,6 +1431,62 @@ KOKKOS_FUNCTION auto rebind_combine_fn_ops(
 
 }  // namespace Impl
 
+/**
+ * @brief Adds local values into a global array at positions given by an index
+ * table.
+ *
+ * For every local coordinate `(i...)`, the contribution `val(i...)` is added to
+ * `dst(idx(i...))`. Several contributions with the same index accumulate, even
+ * across teams. Each addition is an atomic add on the destination element
+ * type, after converting the contribution to that type.
+ *
+ * The destination is never cleared. Existing values are kept and added to, and
+ * running the graph again adds again, so zero the destination before a fresh
+ * sum. Atomic updates do not fix the order of floating-point additions, so
+ * results may differ in the last bits between runs.
+ *
+ * A scatter produces no value. A level containing only scatters makes
+ * `add(...)` return just the new graph, and you run it with no output views.
+ *
+ * @tparam Modes Distinct labels for the index table's axes, in axis order.
+ * @tparam Idx Integer Kokkos view, or an integer slot from make_index_node().
+ * @tparam Dst Writable rank-one Kokkos view, or an object whose `const` call
+ * operator takes one integer and returns a non-`const` lvalue reference
+ * suitable for `Kokkos::atomic_add`.
+ * @tparam Val Node of non-integral values carrying the same label set as the
+ * scatter. Its axis order may differ from `Modes`.
+ * @param[in] idx Index view or slot handle, copied by value.
+ * @param[in,out] dst Global destination or accessor, copied by value. Its
+ * elements are updated. To target a column of a rank-two field, pass a rank-one
+ * subview or an accessor.
+ * @param[in] val Local contributions to add.
+ * @return A sink node with no outputs, holding its inputs by value. Ownership
+ * follows their copy semantics; unmanaged storage remains borrowed.
+ * @pre Indices fit in `int` and are valid for `dst`. Index and value extents
+ * agree per label. All storage is accessible from the execution space and stays
+ * valid until execution completes.
+ * @par Constraints
+ * Static assertions check integral indices, index rank or exact slot labels,
+ * the value's label set and non-integral type, and destination writability.
+ * Slot producers must be in earlier levels. On the Team path the slot must live
+ * in memory, not in registers.
+ * @note Accessors must be `const`-callable and device-callable. No index range
+ * check and no index/value extent comparison is performed. Execution does not
+ * fence: call `Kokkos::fence()` before reading `dst` on the host, clearing it
+ * or releasing its storage.
+ * @par Example
+ * @code{.cpp}
+ * // node_sums(local_to_global(e, p)) += doubled(e, p)
+ * Kokkos::deep_copy(node_sums, 0.0f);  // scatter never clears
+ * auto done = with_math.add(
+ *     make_scatter_add_node<'e', 'p'>(map_slot, node_sums, doubled));
+ * done.outputs().execute(TeamPolicyTag<Space>{});
+ * Kokkos::fence();
+ * @endcode
+ * Here `doubled` is a floating-point value node with labels `'e'` and `'p'`.
+ * See the how-to guide `howto/indirect-access` for a complete program.
+ * @see make_index_node(), make_gather_node()
+ */
 template <int32_t... Modes, typename Idx, typename Dst, typename Val>
 auto make_scatter_add_node(Idx idx, Dst dst, Val val) {
   using ModesSeq     = std::integer_sequence<int32_t, Modes...>;
