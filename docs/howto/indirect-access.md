@@ -23,7 +23,8 @@ node_sums (result): node 0 = 3 + 3 = 6,  node 1 = 5 + 5 = 10,  node 2 = 7 + 7 = 
 ```
 
 Labels `'e'` (element) and `'p'` (point) name the two axes of
-`local_to_global`, in that order.
+`local_to_global`, in that order. For your own mesh size, including an element
+count that is not a multiple of the tile, see {doc}`choose-a-tile-map`.
 
 ## The code
 
