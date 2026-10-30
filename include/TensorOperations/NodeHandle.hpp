@@ -438,6 +438,9 @@ struct NodeHandle<StagedTag, Operand, ModesSeq, Tile, TV> {
   // Relabelling keeps the tile UNRESOLVED even if it was resolved, because the
   // tile follows the labels: a different label order is a different tile, and
   // re-deriving it is the graph's job, not this node's.
+  /// @brief Renames this node's labels by position; see
+  /// docs/howto/reuse-a-tensor-under-new-labels.md. In generic code call it as
+  /// `h.template as<...>()`.
   template <int32_t... Modes>
   KOKKOS_FUNCTION auto as() const {
     return NodeHandle<StagedTag, Operand,
@@ -503,6 +506,10 @@ struct NodeHandle<SlotTag, IntSlotIdx, Storage, IntRank, ExecSpace, ModesSeq> {
 
   KOKKOS_FUNCTION Kokkos::Array<int, Rank> shape() const { return shape_; }
 
+  /// @brief Reads the same buffer under new labels, assigned to the axes in
+  /// order and copying nothing; see
+  /// docs/howto/reuse-a-tensor-under-new-labels.md. In generic code call it as
+  /// `h.template as<...>()`.
   template <int32_t... Modes>
   KOKKOS_FUNCTION auto as() const {
     static_assert(static_cast<int>(sizeof...(Modes)) == Rank,
