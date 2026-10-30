@@ -67,14 +67,14 @@ int main(int argc, char* argv[]) {
   Kokkos::initialize(argc, argv);
   int exit_code = 0;
   {
-    namespace to = TensorOperations;
+    namespace TOps = TensorOperations;
     using Space  = Kokkos::DefaultExecutionSpace;
 
     constexpr int E = 4;  // elements
     constexpr int P = 3;  // points per element
 
     using TileMap =
-        to::LabelTiles<to::LabelTile<'e', 2>, to::LabelWhole<'p', P>>;
+        TOps::LabelTiles<TOps::LabelTile<'e', 2>, TOps::LabelWhole<'p', P>>;
 
     // lambda is stored (e, p); strain is stored (p, e).
     Kokkos::View<float**, Kokkos::LayoutRight, Space> lambda("lambda", E, P);
@@ -96,22 +96,22 @@ int main(int argc, char* argv[]) {
     Kokkos::deep_copy(total, 0.0f);  // the sink adds; it never clears
 
     // Stage both inputs, then combine.
-    auto g0 = to::make_level_graph<float, Space>(TileMap{});
-    auto [g1, l] = g0.add(to::make_stage_node(
-        to::make_input_node(to::make_handle<'e', 'p'>(lambda))));
-    auto [g2, s] = g1.add(to::make_stage_node(
-        to::make_input_node(to::make_handle<'p', 'e'>(strain))));
+    auto g0 = TOps::make_level_graph<float, Space>(TileMap{});
+    auto [g1, l] = g0.add(TOps::make_stage_node(
+        TOps::make_input_node(TOps::make_handle<'e', 'p'>(lambda))));
+    auto [g2, s] = g1.add(TOps::make_stage_node(
+        TOps::make_input_node(TOps::make_handle<'p', 'e'>(strain))));
 
     // Two results: add() returns the graph, then one handle per result.
     auto [g3, out_stress, out_tagged] =
-        g2.add(to::make_combine_node<'e', 'p'>(l, s, Stress{}));
+        g2.add(TOps::make_combine_node<'e', 'p'>(l, s, Stress{}));
     g3.outputs(out_stress, out_tagged)
-        .execute(to::TeamPolicyTag<Space>{}, stress, tagged);
+        .execute(TOps::TeamPolicyTag<Space>{}, stress, tagged);
 
     // No results: add() returns only the graph, and outputs() takes no views.
     auto g4 =
-        g2.add(to::make_combine_node<'e', 'p'>(l, s, SumPerElement{total}));
-    g4.outputs().execute(to::TeamPolicyTag<Space>{});
+        g2.add(TOps::make_combine_node<'e', 'p'>(l, s, SumPerElement{total}));
+    g4.outputs().execute(TOps::TeamPolicyTag<Space>{});
     Kokkos::fence();  // execute() does not wait; fence before reading.
 
     auto h_stress =
