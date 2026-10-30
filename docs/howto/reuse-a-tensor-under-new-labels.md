@@ -188,10 +188,10 @@ and defaulting one would silently change the iteration space
 
 A renamed label that is summed needs its extent from the map unless the call
 is a plain two-operand product: two operands, each output label on exactly one
-operand, and every summed label on both. Every other call (more than two operands, structured operands such
-as `make_outer_product_node`, or a label shared by both operands and the
-output) needs every summed label in the map, and reports
-`make_contraction_node: a summed label is not in the graph's label map, so its
+operand, and every summed label on both. Every other call (more than two
+operands, structured operands such as `make_outer_product_node`, or a label
+shared by both operands and the output) needs every summed label in the map,
+and reports `make_contraction_node: a summed label is not in the graph's label map, so its
 extent is unknown`. For example, summing over `w` here fails unless `w` is in
 the map, because `q` and `e` are shared by both operands and the output:
 
@@ -204,10 +204,19 @@ For a call like this, add `to::LabelWhole<'w', N>`.
 
 Be careful with a summed label that is on one operand only. The library sums
 it by itself, so a rename that fails to match the other operand does not
-stop compilation as a mismatch. Without the label in the map you get the
-"summed label is not in the graph's label map" error; with it in the map the
-call compiles and silently returns the wrong numbers. Fix the rename, not the
-map.
+stop compilation as a mismatch. What you see depends on the label map and on
+where the call sits:
+
+- Label not in the map: the "summed label is not in the graph's label map"
+  error.
+- Label in the map, call alone in its `add(...)` level: the call compiles and
+  silently returns the wrong numbers.
+- Label in the map, call sharing an `add(...)` with a plain two-operand
+  product: compilation fails in `LevelGraph/Team.hpp` with `no member named
+  'NumOps'`. A contraction that is not a plain two-operand product does not
+  compile beside a plain one, so give it an `add(...)` of its own.
+
+In every case, fix the rename, not the map.
 
 Map extents must match the tensors. When you rename an axis, give the new label
 the same extent as the label it replaces:
