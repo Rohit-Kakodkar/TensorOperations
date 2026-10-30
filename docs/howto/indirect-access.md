@@ -177,7 +177,7 @@ the kernel: make them `KOKKOS_FUNCTION` and `const`.
 
 | Compiler message or symptom | Cause |
 | --- | --- |
-| `an index handle must be read with the gather's labels, in the same order` | Consumer's labels differ from the index handle's; `as<...>()` does not fix this (scatter says "scatter's labels") |
+| `an index handle must be read with the gather's labels, in the same order` | Consumer's labels differ from the index handle's; `as<...>()` does not fix this, see {doc}`reuse-a-tensor-under-new-labels` (scatter says "scatter's labels") |
 | `an index slot is read only by gather` | An integer slot was used as a numerical operand; gather from a floating-point source instead |
 | `may not read a slot ITS OWN LEVEL` | A slot producer is in the same `add(...)` level as its consumer |
 | Destination holds old values plus new sums | Destination was not zeroed; running again adds again |
