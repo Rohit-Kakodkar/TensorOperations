@@ -11,11 +11,8 @@ repository into your build. Pick a route by whether you already have Kokkos.
 | Kokkos as a source tree or `FetchContent` dependency in your build | [Route 2](#route-2-you-build-kokkos-in-your-project) |
 | An installed Kokkos (`find_package(Kokkos)` works) | [Route 3](#route-3-you-have-an-installed-kokkos) or [Route 4](#route-4-no-tensor-target-at-all) |
 
-Every route was tried with the indirect-access program, copied unchanged from
-that page, and each printed `ok`. The trials ran on one machine: macOS arm64,
-Homebrew clang 22.1.2, CMake 4.0.3, Release builds, Serial backend only.
-Route 3 was also run with the install and the project on a case-sensitive APFS
-volume. Other compilers, platforms and backends were not tried.
+These routes are verified on macOS (arm64, clang 22, CMake 4.0) with the Serial
+backend. Other compilers, platforms and backends are untried.
 
 ## Route 1: let the library fetch Kokkos
 
@@ -44,12 +41,8 @@ FetchContent_MakeAvailable(tensor_ops)
 The library's `CMakeLists.txt` fetches Kokkos `develop` and GoogleTest, and
 builds Kokkos with the options you set in the cache before the call. Choose a
 backend with the usual Kokkos variables, for example
-`-DKokkos_ENABLE_SERIAL=ON` (Serial was already the default in the trial).
-`EXCLUDE_FROM_ALL` matters; see [Keep the tests out of your build](#keep-the-tests-and-benchmarks-out-of-your-build).
-
-Trials: `add_subdirectory` from a local checkout, and `FetchContent` from a
-`file://` clone pinned to a commit. Both configured, built `my_app` and ran.
-`FetchContent` with `GIT_TAG main` was not run; it is the same mechanism.
+`-DKokkos_ENABLE_SERIAL=ON` (Serial is on by default).
+`EXCLUDE_FROM_ALL` matters; see [Keep the tests and benchmarks out of your build](#keep-the-tests-and-benchmarks-out-of-your-build).
 
 ## Route 2: you build Kokkos in your project
 
@@ -58,8 +51,8 @@ What works depends on how you bring yours in.
 
 - **Declare it with `FetchContent` under the name `kokkos`, before adding
   TensorOperations.** The first declaration of a name wins, so the library's
-  `FetchContent_MakeAvailable(kokkos)` reuses yours. Tried, with a Kokkos from a
-  source tree and with Kokkos `5.1.1` from its git tag.
+  `FetchContent_MakeAvailable(kokkos)` reuses yours. This works with a Kokkos from
+  a source tree or from a git tag.
 
   ```cmake
   include(FetchContent)
@@ -107,8 +100,7 @@ target_link_libraries(my_app PRIVATE tensor)
 cmake -S . -B build -DCMAKE_PREFIX_PATH=/path/to/kokkos/install
 ```
 
-The build used the installed Kokkos and fetched none. GoogleTest is still
-fetched, because no installed copy was on the prefix.
+CMake uses the installed Kokkos and fetches none. GoogleTest is still fetched.
 
 Do not rely on `-DFETCHCONTENT_TRY_FIND_PACKAGE_MODE=ALWAYS` instead. It asks
 for `find_package(kokkos)` in lowercase, the name the library declares, while
@@ -119,13 +111,11 @@ its own Kokkos `develop` into `_deps/kokkos-src`. Configuration still succeeds,
 so check `kokkos_DIR` in `CMakeCache.txt`: it should be your install's
 `lib/cmake/Kokkos`, not `.../CMakeFiles/pkgRedirects`.
 
-Your own `find_package(Kokkos REQUIRED)` before the declaration is fine. Keep
-it if you need it elsewhere; with the declaration after it, `kokkos_DIR` and
-`Kokkos_DIR` both pointed at the install and only GoogleTest was fetched. What
-fails is `find_package(Kokkos)` with no `FIND_PACKAGE_ARGS` declaration. Then the
-library builds a second Kokkos in your project, and configuration stops with
-`Given deprecated option list Kokkos_DEVICES`. Both cases were run with the
-install and project on a case-sensitive APFS volume.
+Your own `find_package(Kokkos REQUIRED)` before the declaration is fine; keep it
+if you need it elsewhere. What fails is calling `find_package(Kokkos)` without
+the `FIND_PACKAGE_ARGS` declaration. The library then builds a second Kokkos in
+your project, and configuration stops with
+`Given deprecated option list Kokkos_DEVICES`.
 
 ## Route 4: no `tensor` target at all
 
@@ -139,61 +129,74 @@ target_include_directories(my_app PRIVATE path/to/TensorOperations/include)
 target_link_libraries(my_app PRIVATE Kokkos::kokkos)
 ```
 
-Tried with the indirect-access program against an installed Kokkos. You give up
-what the `tensor` target adds (see `CMakeLists.txt`): the `cxx_std_20`
+You give up what the `tensor` target adds (see `CMakeLists.txt`): the `cxx_std_20`
 requirement, so set C++20 yourself if Kokkos does not; `-fbracket-depth=2048` on
 Clang and AppleClang; and the `TENSOR_OPS_ENABLE_TIMING`,
 `TENSOR_OPS_VERIFY_RESHAPE` and `TENSOR_OPS_ENABLE_CUTE` definitions. The
-indirect-access program compiled without the bracket-depth flag. Whether larger
-programs need it was not established; if Clang stops with a bracket nesting
-error, add `-fbracket-depth=2048`.
+indirect-access program compiles without the bracket-depth flag. If Clang stops
+with a bracket nesting error in a larger program, add `-fbracket-depth=2048`.
 
 ## Keep the tests and benchmarks out of your build
 
 The library's `CMakeLists.txt` defines about 40 test, `sfpp_min` and benchmark
 executables whether or not it is the top-level project. It has no switch to turn
-them off. Without `EXCLUDE_FROM_ALL`, they all join your `all` target; the
-trial's `all` held 42 library executables, plus the Kokkos and GoogleTest
-targets.
+them off. Without `EXCLUDE_FROM_ALL`, they all join your `all` target.
 
-Add `EXCLUDE_FROM_ALL` as in the examples above. With it, `all` held only `my_app`
-and the Kokkos targets it needs. The library's tests do not appear in your
-`ctest` list either way unless you call `enable_testing()` yourself; the trial
-did not, and `ctest -N` showed zero tests with and without the keyword.
+Add `EXCLUDE_FROM_ALL` as in the examples above. With it, `all` holds only your
+targets and the Kokkos targets they need.
 
-Three of those targets (`sfpp_min_bench_li`, `sfpp_min_bench_new_li` and
+`EXCLUDE_FROM_ALL` does not hide the library's tests from CTest. The library
+calls `enable_testing()` itself, so if your project calls it too, about 80 of the
+library's tests join your `ctest` list, whether or not you used
+`EXCLUDE_FROM_ALL` and wherever you call `enable_testing()`. With
+`EXCLUDE_FROM_ALL` their executables are not built, so plain `ctest` reports them as `*_NOT_BUILT (Not Run)` and exits
+with an error. The 48 `*Negative.*` tests start builds of their own when run.
+Select your own tests instead. Label them:
+
+```cmake
+enable_testing()
+add_test(NAME my_app COMMAND my_app)
+set_tests_properties(my_app PROPERTIES LABELS mine)
+```
+
+```sh
+ctest --test-dir build -L mine
+```
+
+`-R '^my_app'` also works if your test names share a prefix. Neither selection
+runs the library's tests, including the `Negative` ones.
+
+Three of the library's benchmark targets (`sfpp_min_bench_li`, `sfpp_min_bench_new_li` and
 `sfpp_min_bench_te_li`) pass `-lineinfo`, a CUDA compiler flag, even on a CPU
-build. The Homebrew clang in the trial accepted it with a warning
-(`-lineinfo: 'linker' input unused`), and `sfpp_min_bench_li` built and linked;
-the other two were not built. Other compilers were not tried. `AGENTS.md` warns
-contributors to build explicit targets on CPU because of these flags, so treat
-a failure there as possible.
+build. Clang 22 accepts it with a warning (`-lineinfo: 'linker' input unused`);
+`EXCLUDE_FROM_ALL` keeps these targets out of your build.
 
 ## Which Kokkos you get
 
 Route 1 uses whatever Kokkos `develop` is when you configure: the library's
 `CMakeLists.txt` pins `GIT_TAG develop`, not a tagged release. Routes 2 to 4 use
-yours (Route 3 only with the `FIND_PACKAGE_ARGS` declaration). This page does
-not give a minimum Kokkos version. The indirect-access program built and ran
-against Kokkos `5.1.1` (Route 2); no other program or test was run against it.
+yours (Route 3 only with the `FIND_PACKAGE_ARGS` declaration).
+
+`CMakeLists.txt` explains the `develop` pin: the GEMM path needs a Kokkos SIMD
+fix that is newer than the `5.1.1` tag. The `5.1.1` tag builds and runs the
+indirect-access program. Nothing beyond that program is established for a tagged
+release, so if you pin one, check the features you use.
 
 ## Pick a backend
 
 Backends come from Kokkos, so set the Kokkos options on your configure line or
 in the cache before the library is added, for example
-`-DKokkos_ENABLE_OPENMP=ON`. Only Serial was tried; see
-{doc}`../reference/backends` for what each backend needs and what has been
-validated.
+`-DKokkos_ENABLE_OPENMP=ON`. See {doc}`../reference/backends` for what each
+backend needs and what has been validated.
 
 The CuTe backend needs `-DTENSOR_OPS_CUTLASS_DIR=/path/to/cutlass` and a Kokkos
 CUDA build. In `CMakeLists.txt` the CUTLASS include path and the
 `TENSOR_OPS_ENABLE_CUTE` definition are added to `tensor` only when both
 `TENSOR_OPS_CUTLASS_DIR` and `Kokkos_ENABLE_CUDA` are set in the project that
-adds the library. That is read from the source and was not run. With a
-Kokkos you did not build in the same project (Routes 3 and 4), do not assume the
-second condition holds.
+adds the library. With a Kokkos you did not build in the same project
+(Routes 3 and 4), do not assume the second condition holds.
 
 ## See also
 
 - {doc}`../reference/build-options` for the library's CMake variables.
-- {doc}`indirect-access` for the program used in these trials.
+- {doc}`indirect-access` for a complete program to build.

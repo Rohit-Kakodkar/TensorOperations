@@ -25,8 +25,8 @@ it may need network access.
 
 The commands above build this repository's tests. To link your own program to
 `tensor`, see {doc}`howto/use-in-your-project`. It covers the routes that work
-with or without a Kokkos of your own, and how to keep this repository's tests
-out of your build.
+with or without a Kokkos of your own, keeping this repository's tests and
+benchmarks out of your build, and running only your own tests.
 
 ## Backends
 
