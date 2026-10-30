@@ -51,7 +51,7 @@ int main(int argc, char* argv[]) {
   Kokkos::initialize(argc, argv);
   int exit_code = 0;
   {
-    namespace to = TensorOperations;
+    namespace TOps = TensorOperations;
     using Space  = Kokkos::DefaultExecutionSpace;
 
     constexpr int num_elements       = 2;
@@ -59,8 +59,8 @@ int main(int argc, char* argv[]) {
     constexpr int num_nodes          = 3;
 
     // One team per element; the point axis is kept whole inside each team.
-    using TileMap = to::LabelTiles<to::LabelTile<'e', 1>,
-                                   to::LabelWhole<'p', points_per_element>>;
+    using TileMap = TOps::LabelTiles<TOps::LabelTile<'e', 1>,
+                                     TOps::LabelWhole<'p', points_per_element>>;
 
     // 1. Data. Everything lives in the graph's execution space.
     Kokkos::View<int**, Kokkos::LayoutRight, Space> local_to_global(
@@ -83,27 +83,27 @@ int main(int argc, char* argv[]) {
     Kokkos::deep_copy(node_sums, 0.0f);
 
     // 2. Graph. Each add() is one level; a level may only read earlier ones.
-    auto empty = to::make_level_graph<float, Space>(TileMap{});
+    auto empty = TOps::make_level_graph<float, Space>(TileMap{});
 
     // Level 1: stage the connectivity table.
     auto [with_map, map_slot] =
-        empty.add(to::make_index_node<'e', 'p'>(local_to_global));
+        empty.add(TOps::make_index_node<'e', 'p'>(local_to_global));
 
     // Level 2: gathered(e, p) = node_values(local_to_global(e, p)).
     auto [with_gather, gathered] =
-        with_map.add(to::make_gather_node<'e', 'p'>(map_slot, node_values));
+        with_map.add(TOps::make_gather_node<'e', 'p'>(map_slot, node_values));
 
     // Level 3: doubled(e, p) = 2 * gathered(e, p) + 1.
     auto [with_math, doubled] = with_gather.add(
-        to::make_combine_node<'e', 'p'>(gathered, DoublePlusOne{}));
+        TOps::make_combine_node<'e', 'p'>(gathered, DoublePlusOne{}));
 
     // Level 4: node_sums(local_to_global(e, p)) += doubled(e, p).
     // A level of only scatters returns just the graph (no value handle).
     auto graph = with_math.add(
-        to::make_scatter_add_node<'e', 'p'>(map_slot, node_sums, doubled));
+        TOps::make_scatter_add_node<'e', 'p'>(map_slot, node_sums, doubled));
 
     // 3. Run. No output views: the result is the mutation of node_sums.
-    graph.outputs().execute(to::TeamPolicyTag<Space>{});
+    graph.outputs().execute(TOps::TeamPolicyTag<Space>{});
     Kokkos::fence();  // execute() does not wait; fence before reading.
 
     // 4. Check on the host. Expected node_sums: 6, 10, 14.

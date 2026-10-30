@@ -30,7 +30,7 @@ on its own. For the second, `d.as<'q', 'b'>()` calls the same matrix `(q, b)`.
 #include <cmath>
 #include <cstdio>
 
-namespace to = TensorOperations;
+namespace TOps = TensorOperations;
 using Space  = Kokkos::DefaultExecutionSpace;
 using Mat    = Kokkos::View<float**, Kokkos::LayoutRight, Space>;
 using Field  = Kokkos::View<float****, Kokkos::LayoutRight, Space>;
@@ -40,9 +40,9 @@ constexpr int Q = 3, N = 5, C = 4, E = 6, TE = 2;
 // One extent per label. 'e' is blocked into tiles of TE, so the graph runs one
 // team per tile; every other label is taken whole. The contracted labels
 // 'a' and 'b' must be LabelWhole.
-using Map = to::LabelTiles<to::LabelWhole<'q', Q>, to::LabelWhole<'a', N>,
-                           to::LabelWhole<'b', N>, to::LabelWhole<'c', C>,
-                           to::LabelTile<'e', TE>>;
+using Map = TOps::LabelTiles<TOps::LabelWhole<'q', Q>, TOps::LabelWhole<'a', N>,
+                             TOps::LabelWhole<'b', N>, TOps::LabelWhole<'c', C>,
+                           TOps::LabelTile<'e', TE>>;
 
 float dval(int q, int k) { return 0.1f + 0.3f * q - 0.2f * k + 0.05f * q * k; }
 float uval(int e, int a, int b, int c) {
@@ -70,18 +70,18 @@ int main(int argc, char* argv[]) {
     Kokkos::deep_copy(D, Dh);
     Kokkos::deep_copy(U, Uh);
 
-    auto g0      = to::make_level_graph<float, Space>(Map{});
+    auto g0      = TOps::make_level_graph<float, Space>(Map{});
     auto [g1, d] = g0.add(
-        to::make_stage_node(to::make_input_node(to::make_handle<'q', 'a'>(D))));
-    auto [g2, u] = g1.add(to::make_stage_node(
-        to::make_input_node(to::make_handle<'e', 'a', 'b', 'c'>(U))));
+        TOps::make_stage_node(TOps::make_input_node(TOps::make_handle<'q', 'a'>(D))));
+    auto [g2, u] = g1.add(TOps::make_stage_node(
+        TOps::make_input_node(TOps::make_handle<'e', 'a', 'b', 'c'>(U))));
 
-    auto along_a = to::make_contraction_node<'q', 'e', 'b', 'c'>(d, u);
+    auto along_a = TOps::make_contraction_node<'q', 'e', 'b', 'c'>(d, u);
     auto along_b =
-        to::make_contraction_node<'q', 'e', 'a', 'c'>(d.as<'q', 'b'>(), u);
+        TOps::make_contraction_node<'q', 'e', 'a', 'c'>(d.as<'q', 'b'>(), u);
     auto [g3, ra, rb] = g2.add(along_a, along_b);
 
-    g3.outputs(ra, rb).execute(to::TeamPolicyTag<Space>{}, Ga, Gb);
+    g3.outputs(ra, rb).execute(TOps::TeamPolicyTag<Space>{}, Ga, Gb);
     Kokkos::fence();
 
     auto Gah = Kokkos::create_mirror_view(Ga);
@@ -129,8 +129,8 @@ chosen so that a wrong axis pairing changes the answer.
 
   ```cpp
   // x, y, z mapped to 4, 4 and 3 (z is LabelTile<'z', 3>); M is 4 x 4, N is 4 x 3.
-  auto plain   = to::make_contraction_node<'y', 'z'>(m, n);
-  auto swapped = to::make_contraction_node<'y', 'z'>(m.as<'y', 'x'>(), n);
+  auto plain   = TOps::make_contraction_node<'y', 'z'>(m, n);
+  auto swapped = TOps::make_contraction_node<'y', 'z'>(m.as<'y', 'x'>(), n);
   ```
 
   `plain` sums `m`'s first axis and gives `M^T N`. In `swapped`, `m`'s first
@@ -160,19 +160,19 @@ it, so the second contraction goes in a later `add`.
 
 ```cpp
 // i=4 (tile 2), k=4, l=5, j=5, m=6: A is 4x4, B is 4x5, F is 5x6.
-using Map = to::LabelTiles<to::LabelTile<'i', 2>, to::LabelWhole<'k', 4>,
-                           to::LabelWhole<'l', 5>, to::LabelWhole<'j', 5>,
-                           to::LabelWhole<'m', 6>>;
+using Map = TOps::LabelTiles<TOps::LabelTile<'i', 2>, TOps::LabelWhole<'k', 4>,
+                             TOps::LabelWhole<'l', 5>, TOps::LabelWhole<'j', 5>,
+                           TOps::LabelWhole<'m', 6>>;
 
-auto g0    = to::make_level_graph<float, Space>(Map{});
+auto g0    = TOps::make_level_graph<float, Space>(Map{});
 auto stage = [](auto handle) {
-  return to::make_stage_node(to::make_input_node(handle));
+  return TOps::make_stage_node(TOps::make_input_node(handle));
 };
-auto [g1, a]  = g0.add(stage(to::make_handle<'i', 'k'>(A)));
-auto [g2, b]  = g1.add(stage(to::make_handle<'k', 'l'>(B)));
-auto [g3, f]  = g2.add(stage(to::make_handle<'j', 'm'>(F)));
-auto [g4, ab] = g3.add(to::make_contraction_node<'i', 'l'>(a, b));
-auto [g5, r]  = g4.add(to::make_contraction_node<'i', 'm'>(ab.as<'i', 'j'>(), f));
+auto [g1, a]  = g0.add(stage(TOps::make_handle<'i', 'k'>(A)));
+auto [g2, b]  = g1.add(stage(TOps::make_handle<'k', 'l'>(B)));
+auto [g3, f]  = g2.add(stage(TOps::make_handle<'j', 'm'>(F)));
+auto [g4, ab] = g3.add(TOps::make_contraction_node<'i', 'l'>(a, b));
+auto [g5, r]  = g4.add(TOps::make_contraction_node<'i', 'm'>(ab.as<'i', 'j'>(), f));
 ```
 
 ## Which labels the tile map must list
@@ -196,11 +196,11 @@ extent is unknown`. For example, summing over `w` here fails unless `w` is in
 the map, because `q` and `e` are shared by both operands and the output:
 
 ```cpp
-auto z = to::make_contraction_node<'q', 'e', 'c'>(ra.as<'q', 'e', 'w', 'c'>(),
-                                                  rb.as<'q', 'e', 'w', 'c'>());
+auto z = TOps::make_contraction_node<'q', 'e', 'c'>(ra.as<'q', 'e', 'w', 'c'>(),
+                                                    rb.as<'q', 'e', 'w', 'c'>());
 ```
 
-For a call like this, add `to::LabelWhole<'w', N>`.
+For a call like this, add `TOps::LabelWhole<'w', N>`.
 
 Be careful with a summed label that is on one operand only. The library sums
 it by itself, so a rename that fails to match the other operand does not
