@@ -91,3 +91,19 @@ execution follow from the atomic-add implementation; they are not covered by
 dedicated tests.
 
 Worked example: {doc}`../howto/indirect-access`.
+
+## Staged contraction and output views
+
+Worked example: {doc}`../howto/contract-with-a-level-graph`. Team path only.
+
+| Check | Mechanism | Present in release builds |
+| --- | --- | --- |
+| A contracted label declared `LabelTile` | `static_assert` in `add` | Compile time only |
+| A label missing from the tile map, or listed twice | `static_assert` | Compile time only |
+| View count differs from output count; output views of different types; policy tag for another execution space; no blocked label | `static_assert` in `execute` | Compile time only |
+| Level rules (one kind and one iteration space per level) | Only when you instantiate `LevelPlan` for the graph; `add` does not check them | Compile time, on request |
+| A `LabelWhole` axis longer than its tile | `Kokkos::abort` | Yes |
+| Contracted extents differ between operands | `assert` | No: removed by `NDEBUG` |
+| A partial tile in a staged input | None | Not checked: wrong values |
+| A `LabelWhole` axis shorter than its tile | `assert` when a tile is staged or stored | No: removed by `NDEBUG` |
+| Output view axis order and extents matching the declared labels | None | Not checked: wrong values |

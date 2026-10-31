@@ -524,7 +524,18 @@ struct NodeHandle<SlotTag, IntSlotIdx, Storage, IntRank, ExecSpace, ModesSeq> {
 // Factory functions
 // ---------------------------------------------------------------------------
 
-// Input node — wraps an existing TensorHandle
+/**
+ * @brief Wraps a labelled tensor as a graph input.
+ *
+ * Pass the result to `make_stage_node` to copy it into team scratch. The node
+ * keeps `h`, which holds the view handle; the elements stay in your storage.
+ *
+ * @param[in] h A labelled tensor from `make_handle<Labels...>(view)`. Labels
+ * name the view's axes in order.
+ * @param[in] hook Optional function callable as `op(i_0, ..., i_{Rank-1},
+ * value&)`; the default does nothing.
+ * @see make_stage_node(), LevelGraph::add()
+ */
 template <TensorLike T, typename ModesSeq, typename HookOp = NoHook>
 KOKKOS_FUNCTION NodeHandle<InputTag, T, ModesSeq, HookOp> make_input_node(
     TensorHandle<T, ModesSeq> h, HookOp hook = {}) {
@@ -674,6 +685,22 @@ KOKKOS_FUNCTION auto make_interm_node(Storage storage, HookOp hook = {}) {
                     ExecSpace, HookOp>{std::move(storage), std::move(hook)};
 }
 
+/**
+ * @brief Copies an input into team scratch once per team, so later levels read
+ * it from fast memory.
+ *
+ * Add the staged node in an earlier level than the nodes that read it; stages
+ * whose tiles have different shapes also need separate levels.
+ * `LevelGraph::add` returns a handle to the scratch tile; pass that handle, not
+ * the original view, to `make_contraction_node` or `make_combine_node`. The
+ * tile extents come from the graph's tile map.
+ *
+ * @param[in] op The node to stage, usually from `make_input_node`.
+ * @param[in] tv Thread-value layout; leave the default unless you stage for a
+ * register-resident combine (see `make_register_node`).
+ * @return A staged node to pass to `LevelGraph::add()`.
+ * @see make_input_node(), make_contraction_node()
+ */
 template <typename Operand, typename TV = DefaultTV>
 KOKKOS_FUNCTION auto make_stage_node(Operand op, TV tv = {}) {
   return NodeHandle<StagedTag, Operand, typename Operand::modes_seq, void, TV>{
@@ -1073,13 +1100,39 @@ inline constexpr bool gemm_call_v = gemm_call<OutSeq, Args...>();
 
 }  // namespace Impl
 
-// These two overloads are taken only when the call IS a binary GEMM
-// (Impl::gemm_call_v); any other make_contraction_node call -- more operands,
-// a structured operand, a label shared with the output -- is the general
-// contraction in GeneralContraction.hpp.
-//
-// Primary form: infer the output scalar from NodeA, default execution space.
-//   make_contraction_node<'l','i'>(a, b)
+/**
+ * @brief Contracts two operands over the labels they share:
+ * `C[Out...] = sum over shared labels of A * B`.
+ *
+ * The output labels you list are the output's axis order, in the order you
+ * write them; the output view you pass to `execute` has its axes in that
+ * order. Labels on both operands are summed; a label on one operand must
+ * appear in the output. Operands need not list their labels in the same order:
+ *
+ * @code{.cpp}
+ * // a_tile has labels (i, k), b_tile has (k, j): C has axes (j, i).
+ * auto product = make_contraction_node<'j', 'i'>(a_tile, b_tile);
+ * @endcode
+ *
+ * @tparam OutModes The output labels, in output axis order.
+ * @param[in] a First operand: a staged handle from `LevelGraph::add`.
+ * @param[in] b Second operand, same requirement.
+ * @param[in] hook Optional function callable as `op(i_0, ..., i_{Rank-1},
+ * value&)`; the default does nothing.
+ * @param[in] mma Matrix-multiply configuration; leave the default.
+ * @return A contraction node to pass to `LevelGraph::add()`. Its output scalar
+ * is the value type of `a`, and it runs in `Kokkos::DefaultExecutionSpace`;
+ * use the explicit form below to change either.
+ * @pre Contracted labels have equal extents on both operands. This is an
+ * `assert`, so it is not checked under `NDEBUG`.
+ * @par Constraints
+ * Every output label appears on exactly one operand, output labels are
+ * distinct, and the output rank equals the number of free labels. A call that
+ * does not fit (more operands, a structured operand, a label shared with the
+ * output) selects the general contraction overloads instead, so the compile
+ * error then comes from there. An integer index slot is not an operand.
+ * @see make_stage_node(), LevelGraph::add()
+ */
 template <int32_t... OutModes, typename NodeA, typename NodeB,
           typename HookOp = NoHook, typename Mma = DefaultMma<>>
   requires(Impl::gemm_call_v<std::integer_sequence<int32_t, OutModes...>, NodeA,
@@ -1090,8 +1143,8 @@ auto make_contraction_node(NodeA a, NodeB b, HookOp hook = {}, Mma mma = {}) {
       std::move(a), std::move(b), std::move(hook), std::move(mma));
 }
 
-// Explicit scalar (and execution-space) override:
-//   make_contraction_node<double, Kokkos::DefaultExecutionSpace, 'i','k'>(a, b)
+/// @brief Like the form above, with the output scalar and execution space
+/// given explicitly: `make_contraction_node<double, Space, 'i', 'k'>(a, b)`.
 template <typename Scalar, typename ExecSpace = Kokkos::DefaultExecutionSpace,
           int32_t... OutModes, typename NodeA, typename NodeB,
           typename HookOp = NoHook, typename Mma = DefaultMma<>>
