@@ -16,8 +16,6 @@
 
 namespace sfpp_min::simple {
 
-using namespace TensorOperations;
-
 inline constexpr int N = NGLL;
 using ES               = Kokkos::DefaultExecutionSpace;
 using N_               = cute::Int<N>;
@@ -113,9 +111,11 @@ struct Divergence {
 template <int TE, typename Args, typename Policy>
 int stiffness(const Args& a, GlobalHPrime hprimewgll, Policy policy,
               int team_size = -1) {
+  namespace TOps = TensorOperations;
   using Tiles =
-      LabelTiles<LabelTile<'e', TE>, LabelWhole<'k', N>, LabelWhole<'j', N>,
-                 LabelWhole<'i', N>, LabelWhole<'p', N>, LabelWhole<'r', N>>;
+      TOps::LabelTiles<TOps::LabelTile<'e', TE>, TOps::LabelWhole<'k', N>,
+                       TOps::LabelWhole<'j', N>, TOps::LabelWhole<'i', N>,
+                       TOps::LabelWhole<'p', N>, TOps::LabelWhole<'r', N>>;
   const Kokkos::Array<int, 4> extents{a.nspec, N, N, N};
   using Mma     = RowOfEMmas<TE>;
   const auto& m = a.metrics;
@@ -125,24 +125,25 @@ int stiffness(const Args& a, GlobalHPrime hprimewgll, Policy policy,
     using Field = Kokkos::View<real_t****, Kokkos::LayoutRight,
                                typename decltype(view)::device_type,
                                Kokkos::MemoryUnmanaged>;
-    return make_register_node<'e', 'k', 'j', 'i'>(
+    return TOps::make_register_node<'e', 'k', 'j', 'i'>(
         Field(view.data(), extents[0], extents[1], extents[2], extents[3]),
         PointTV<TE>{});
   };
   auto gather = [&](int c) {
-    return make_gather_node<'e', 'k', 'j', 'i'>(
+    return TOps::make_gather_node<'e', 'k', 'j', 'i'>(
         a.iglob, Kokkos::subview(a.displacement, Kokkos::ALL, c));
   };
   auto scatter = [&](int c, auto r) {
-    return make_scatter_add_node<'e', 'k', 'j', 'i'>(
+    return TOps::make_scatter_add_node<'e', 'k', 'j', 'i'>(
         a.iglob, Kokkos::subview(a.acceleration, Kokkos::ALL, c), r);
   };
 
-  auto g0 = make_level_graph<real_t, ES>(Tiles{});
+  auto g0 = TOps::make_level_graph<real_t, ES>(Tiles{});
 
-  auto [g1, H, HW] = g0.add(
-      make_stage_node(make_input_node(make_handle<'r', 'p'>(a.hprime))),
-      make_stage_node(make_input_node(make_handle<'p', 'r'>(hprimewgll))));
+  auto [g1, H, HW] = g0.add(TOps::make_stage_node(TOps::make_input_node(
+                                TOps::make_handle<'r', 'p'>(a.hprime))),
+                            TOps::make_stage_node(TOps::make_input_node(
+                                TOps::make_handle<'p', 'r'>(hprimewgll))));
 
   auto [g2, xix, xiy, xiz, etax, etay, etaz, gamx, gamy, gamz, jac, kappa, mu] =
       g1.add(in_registers(m.xix), in_registers(m.xiy), in_registers(m.xiz),
@@ -154,18 +155,18 @@ int stiffness(const Args& a, GlobalHPrime hprimewgll, Policy policy,
   auto [g3, u0, u1, u2] = g2.add(gather(0), gather(1), gather(2));
 
   auto d_dxi = [&](auto u) {
-    return make_contraction_node<'e', 'k', 'j', 'i'>(
-        as<'i', 'p'>(H), as<'e', 'k', 'j', 'p'>(u), NoHook{},
+    return TOps::make_contraction_node<'e', 'k', 'j', 'i'>(
+        as<'i', 'p'>(H), as<'e', 'k', 'j', 'p'>(u), TOps::NoHook{},
         typename Mma::xi{});
   };
   auto d_deta = [&](auto u) {
-    return make_contraction_node<'e', 'k', 'j', 'i'>(
-        as<'j', 'p'>(H), as<'e', 'k', 'p', 'i'>(u), NoHook{},
+    return TOps::make_contraction_node<'e', 'k', 'j', 'i'>(
+        as<'j', 'p'>(H), as<'e', 'k', 'p', 'i'>(u), TOps::NoHook{},
         typename Mma::eta{});
   };
   auto d_dgam = [&](auto u) {
-    return make_contraction_node<'e', 'k', 'j', 'i'>(
-        as<'k', 'p'>(H), as<'e', 'p', 'j', 'i'>(u), NoHook{},
+    return TOps::make_contraction_node<'e', 'k', 'j', 'i'>(
+        as<'k', 'p'>(H), as<'e', 'p', 'j', 'i'>(u), TOps::NoHook{},
         typename Mma::gamma{});
   };
   auto [g4, dxi0, dxi1, dxi2, deta0, deta1, deta2, dgam0, dgam1, dgam2] =
@@ -173,23 +174,23 @@ int stiffness(const Args& a, GlobalHPrime hprimewgll, Policy policy,
              d_deta(u2), d_dgam(u0), d_dgam(u1), d_dgam(u2));
 
   auto [g5, Fxi0, Fxi1, Fxi2, Feta0, Feta1, Feta2, Fgam0, Fgam1, Fgam2] =
-      g4.add(make_combine_node<'e', 'k', 'j', 'i'>(
+      g4.add(TOps::make_combine_node<'e', 'k', 'j', 'i'>(
           dxi0, dxi1, dxi2, deta0, deta1, deta2, dgam0, dgam1, dgam2, xix, xiy,
           xiz, etax, etay, etaz, gamx, gamy, gamz, jac, kappa, mu, Stress{}));
 
   auto div_xi = [&](auto F) {
-    return make_contraction_node<'e', 'k', 'j', 'i'>(
-        as<'p', 'i'>(HW), as<'e', 'k', 'j', 'p'>(F), NoHook{},
+    return TOps::make_contraction_node<'e', 'k', 'j', 'i'>(
+        as<'p', 'i'>(HW), as<'e', 'k', 'j', 'p'>(F), TOps::NoHook{},
         typename Mma::xi{});
   };
   auto div_eta = [&](auto F) {
-    return make_contraction_node<'e', 'k', 'j', 'i'>(
-        as<'p', 'j'>(HW), as<'e', 'k', 'p', 'i'>(F), NoHook{},
+    return TOps::make_contraction_node<'e', 'k', 'j', 'i'>(
+        as<'p', 'j'>(HW), as<'e', 'k', 'p', 'i'>(F), TOps::NoHook{},
         typename Mma::eta{});
   };
   auto div_gam = [&](auto F) {
-    return make_contraction_node<'e', 'k', 'j', 'i'>(
-        as<'p', 'k'>(HW), as<'e', 'p', 'j', 'i'>(F), NoHook{},
+    return TOps::make_contraction_node<'e', 'k', 'j', 'i'>(
+        as<'p', 'k'>(HW), as<'e', 'p', 'j', 'i'>(F), TOps::NoHook{},
         typename Mma::gamma{});
   };
   auto [g6, sxi0, sxi1, sxi2, seta0, seta1, seta2, sgam0, sgam1, sgam2] =
@@ -197,7 +198,7 @@ int stiffness(const Args& a, GlobalHPrime hprimewgll, Policy policy,
              div_eta(Feta1), div_eta(Feta2), div_gam(Fgam0), div_gam(Fgam1),
              div_gam(Fgam2));
 
-  auto [g7, r0, r1, r2] = g6.add(make_combine_node<'e', 'k', 'j', 'i'>(
+  auto [g7, r0, r1, r2] = g6.add(TOps::make_combine_node<'e', 'k', 'j', 'i'>(
       sxi0, sxi1, sxi2, seta0, seta1, seta2, sgam0, sgam1, sgam2,
       Divergence<GlobalWeights>{a.weights}));
 

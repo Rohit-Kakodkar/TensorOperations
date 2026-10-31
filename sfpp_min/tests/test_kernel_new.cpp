@@ -32,6 +32,7 @@
 #include <vector>
 
 using namespace sfpp_min;
+namespace TOps = TensorOperations;
 
 namespace {
 
@@ -48,9 +49,9 @@ constexpr int kTestTE =
 
 // Every test runs once per backend the build has: the team policy always, and
 // the CuTe policy when the build is configured with TENSOR_OPS_CUTLASS_DIR.
-using TeamPolicy = TensorOperations::TeamPolicyTag<KernelES>;
+using TeamPolicy = TOps::TeamPolicyTag<KernelES>;
 #if defined(TENSOR_OPS_ENABLE_CUTE)
-using CutePolicy = TensorOperations::CutePolicyTag<KernelES>;
+using CutePolicy = TOps::CutePolicyTag<KernelES>;
 #endif
 
 constexpr MeshDims kD{4, 3, 2};
@@ -725,10 +726,9 @@ TEST(SfppMinKernelNewCute, RowOfECombinesReadEveryContractionInRegisters) {
   const auto     hw   = make_hprimewgll(args.hprime, args.weights);
   using G = decltype(build_new_graph<kTestTE, RowOfEMmas<kTestTE>>(args, hw));
   using Levels    = typename G::levels_type;
-  constexpr int N = TensorOperations::Impl::lg_cute_num_threads_v<Levels>;
-  using Integrand =
-      TensorOperations::Impl::lg_cute_combine_plan<Levels, 3, 0, N>;
-  using ToAccel = TensorOperations::Impl::lg_cute_combine_plan<Levels, 5, 0, N>;
+  constexpr int N = TOps::Impl::lg_cute_num_threads_v<Levels>;
+  using Integrand = TOps::Impl::lg_cute_combine_plan<Levels, 3, 0, N>;
+  using ToAccel   = TOps::Impl::lg_cute_combine_plan<Levels, 5, 0, N>;
   static_assert(N == NGLL * NGLL * NGLL);
   static_assert(Integrand::aligned_driven &&
                 all_in_register<Integrand>(std::make_index_sequence<9>{}));

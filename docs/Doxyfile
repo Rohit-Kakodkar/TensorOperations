@@ -1,0 +1,23 @@
+# Doxygen feeds Breathe; it emits XML only. Run from the docs/ directory.
+PROJECT_NAME           = "TensorOperations"
+OUTPUT_DIRECTORY       = _build/doxygen
+INPUT                  = ../include/TensorOperations
+FILE_PATTERNS          = *.hpp
+INCLUDE_PATH           = ../include
+RECURSIVE              = YES
+EXCLUDE_SYMBOLS        = TensorOperations::Impl* *::Impl::*
+EXTRACT_ALL            = NO
+EXTRACT_PRIVATE        = NO
+GENERATE_XML           = YES
+GENERATE_HTML          = NO
+GENERATE_LATEX         = NO
+QUIET                  = YES
+WARN_IF_UNDOCUMENTED   = NO
+MARKDOWN_SUPPORT       = YES
+ENABLE_PREPROCESSING   = YES
+MACRO_EXPANSION        = YES
+EXPAND_ONLY_PREDEF     = YES
+PREDEFINED             = KOKKOS_FUNCTION= \
+                         KOKKOS_INLINE_FUNCTION= \
+                         KOKKOS_FORCEINLINE_FUNCTION= \
+                         KOKKOS_DEFAULTED_FUNCTION=

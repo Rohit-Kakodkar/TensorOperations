@@ -12,7 +12,9 @@
  * @endcode
  * with A's and B's contracted axes in the same order. This header derives, at
  * compile time from the labels, the per-operand gather permutations that map an
- * operand's user axis order into that canonical order.
+ * operand's user axis order into that canonical order, and provides a zero-copy
+ * strided view (`TensorOperations::Impl::PermutedView`) that presents an
+ * operand's data already permuted.
  *
  * @par Gather convention
  * Matches `reorder_layout` / `reorder_view` in `TiledLayout.hpp`:
