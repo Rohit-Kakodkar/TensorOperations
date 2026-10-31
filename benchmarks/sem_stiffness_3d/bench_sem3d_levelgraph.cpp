@@ -70,7 +70,7 @@
 #include <cstddef>
 #include <vector>
 
-using namespace TensorOperations;
+namespace TOps = TensorOperations;
 
 using ES = Kokkos::DefaultExecutionSpace;
 
@@ -199,9 +199,10 @@ struct Fields {
 // the league is its tile count; every spatial and summed axis is a whole NGLL
 // and stays out of the grid entirely.
 template <int TE>
-using GMap = LabelTiles<LabelTile<'e', TE>, LabelWhole<'k', cfg::N>,
-                        LabelWhole<'j', cfg::N>, LabelWhole<'i', cfg::N>,
-                        LabelWhole<'p', cfg::N>, LabelWhole<'r', cfg::N>>;
+using GMap = TOps::LabelTiles<
+    TOps::LabelTile<'e', TE>, TOps::LabelWhole<'k', cfg::N>,
+    TOps::LabelWhole<'j', cfg::N>, TOps::LabelWhole<'i', cfg::N>,
+    TOps::LabelWhole<'p', cfg::N>, TOps::LabelWhole<'r', cfg::N>>;
 
 inline constexpr int kFnBegin = __LINE__;
 // F^r_c for ALL NINE (r,c) from one chain rule and one stress evaluation.
@@ -266,28 +267,33 @@ void levelgraph_sem3d(Fields d, int team) {
   // iteration space, and 25 != 125*TE. What the grouping buys is that the three
   // frame copies run in ONE TeamVectorRange, so their global loads are all in
   // flight together instead of five serialized load-store round trips.
-  auto g0 = make_level_graph<float, ES>(GMap<TE>{});
+  auto g0 = TOps::make_level_graph<float, ES>(GMap<TE>{});
   auto [g1, h, hw] =
-      g0.add(make_stage_node(make_input_node(make_handle<'r', 'p'>(d.H))),
-             make_stage_node(make_input_node(make_handle<'p', 'r'>(d.Hw))));
+      g0.add(TOps::make_stage_node(
+                 TOps::make_input_node(TOps::make_handle<'r', 'p'>(d.H))),
+             TOps::make_stage_node(
+                 TOps::make_input_node(TOps::make_handle<'p', 'r'>(d.Hw))));
   auto [g2, u0, u1, u2] = g1.add(
-      make_stage_node(make_input_node(make_handle<'e', 'k', 'j', 'i'>(d.u0))),
-      make_stage_node(make_input_node(make_handle<'e', 'k', 'j', 'i'>(d.u1))),
-      make_stage_node(make_input_node(make_handle<'e', 'k', 'j', 'i'>(d.u2))));
+      TOps::make_stage_node(
+          TOps::make_input_node(TOps::make_handle<'e', 'k', 'j', 'i'>(d.u0))),
+      TOps::make_stage_node(
+          TOps::make_input_node(TOps::make_handle<'e', 'k', 'j', 'i'>(d.u1))),
+      TOps::make_stage_node(
+          TOps::make_input_node(TOps::make_handle<'e', 'k', 'j', 'i'>(d.u2))));
 
   // LEVEL 1 -- nine gradients, one fused range. The direction is which axis of
   // the one staged u is summed ('p' in slot 3 = d/d(xi), slot 2 = d/d(eta),
   // slot 1 = d/d(gamma)) and which row of the one staged H pairs with it.
   auto gx = [&](auto uu) {
-    return make_contraction_node<'e', 'k', 'j', 'i'>(
+    return TOps::make_contraction_node<'e', 'k', 'j', 'i'>(
         h.template as<'i', 'p'>(), uu.template as<'e', 'k', 'j', 'p'>());
   };
   auto ge = [&](auto uu) {
-    return make_contraction_node<'e', 'k', 'j', 'i'>(
+    return TOps::make_contraction_node<'e', 'k', 'j', 'i'>(
         h.template as<'j', 'p'>(), uu.template as<'e', 'k', 'p', 'i'>());
   };
   auto gg = [&](auto uu) {
-    return make_contraction_node<'e', 'k', 'j', 'i'>(
+    return TOps::make_contraction_node<'e', 'k', 'j', 'i'>(
         h.template as<'k', 'p'>(), uu.template as<'e', 'p', 'j', 'i'>());
   };
   auto [g3, gx0, gx1, gx2, ge0, ge1, ge2, gg0, gg1, gg2] = g2.add(
@@ -301,20 +307,20 @@ void levelgraph_sem3d(Fields d, int team) {
   // extents-only, blind to axis order, so a MISTYPED "identity" relabel
   // compiles clean and silently returns garbage. Bare cannot be mistyped.
   auto [g4, fx0, fx1, fx2, fe0, fe1, fe2, fg0, fg1, fg2] =
-      g3.add(make_combine_node<'e', 'k', 'j', 'i'>(gx0, gx1, gx2, ge0, ge1, ge2,
-                                                   gg0, gg1, gg2, integrand));
+      g3.add(TOps::make_combine_node<'e', 'k', 'j', 'i'>(
+          gx0, gx1, gx2, ge0, ge1, ge2, gg0, gg1, gg2, integrand));
 
   // LEVEL 3 -- nine divergences. Structurally level 1 with H -> Hw, u -> F.
   auto dvx = [&](auto f) {
-    return make_contraction_node<'e', 'k', 'j', 'i'>(
+    return TOps::make_contraction_node<'e', 'k', 'j', 'i'>(
         hw.template as<'p', 'i'>(), f.template as<'e', 'k', 'j', 'p'>());
   };
   auto dve = [&](auto f) {
-    return make_contraction_node<'e', 'k', 'j', 'i'>(
+    return TOps::make_contraction_node<'e', 'k', 'j', 'i'>(
         hw.template as<'p', 'j'>(), f.template as<'e', 'k', 'p', 'i'>());
   };
   auto dvg = [&](auto f) {
-    return make_contraction_node<'e', 'k', 'j', 'i'>(
+    return TOps::make_contraction_node<'e', 'k', 'j', 'i'>(
         hw.template as<'p', 'k'>(), f.template as<'e', 'p', 'j', 'i'>());
   };
   auto [g5, tx0, tx1, tx2, te0, te1, te2, tg0, tg1, tg2] =
@@ -323,7 +329,7 @@ void levelgraph_sem3d(Fields d, int team) {
 
   // LEVEL 4 -- the three weighted sums.
   auto ws = [&](auto a, auto b, auto c) {
-    return make_combine_node<'e', 'k', 'j', 'i'>(a, b, c, wsum);
+    return TOps::make_combine_node<'e', 'k', 'j', 'i'>(a, b, c, wsum);
   };
   auto [g6, r0, r1, r2] =
       g5.add(ws(tx0, te0, tg0), ws(tx1, te1, tg1), ws(tx2, te2, tg2));
@@ -333,7 +339,7 @@ void levelgraph_sem3d(Fields d, int team) {
   // level's output -- do not fire on their own. Naming the plan here is what
   // runs them. Without this an SA/SB disagreement between members would
   // silently index a sibling's output out of bounds.
-  using Plan = LevelPlan<std::decay_t<decltype(g6.levels)>>;
+  using Plan = TOps::LevelPlan<std::decay_t<decltype(g6.levels)>>;
   static_assert(Plan::num_levels == 6,
                 "two stage levels (the 5x5 operators, then the three frames) "
                 "and four compute levels");
@@ -351,7 +357,7 @@ void levelgraph_sem3d(Fields d, int team) {
 
   g6.outputs(r0, r1, r2)
       .team_size(team)
-      .execute(TeamPolicyTag<ES>{}, d.f0, d.f1, d.f2);
+      .execute(TOps::TeamPolicyTag<ES>{}, d.f0, d.f1, d.f2);
 }
 inline constexpr int kGraphEnd = __LINE__;
 
@@ -365,59 +371,66 @@ std::size_t levelgraph_scratch(Fields d) {
   // iteration space, and 25 != 125*TE. What the grouping buys is that the three
   // frame copies run in ONE TeamVectorRange, so their global loads are all in
   // flight together instead of five serialized load-store round trips.
-  auto g0 = make_level_graph<float, ES>(GMap<TE>{});
+  auto g0 = TOps::make_level_graph<float, ES>(GMap<TE>{});
   auto [g1, h, hw] =
-      g0.add(make_stage_node(make_input_node(make_handle<'r', 'p'>(d.H))),
-             make_stage_node(make_input_node(make_handle<'p', 'r'>(d.Hw))));
+      g0.add(TOps::make_stage_node(
+                 TOps::make_input_node(TOps::make_handle<'r', 'p'>(d.H))),
+             TOps::make_stage_node(
+                 TOps::make_input_node(TOps::make_handle<'p', 'r'>(d.Hw))));
   auto [g2, u0, u1, u2] = g1.add(
-      make_stage_node(make_input_node(make_handle<'e', 'k', 'j', 'i'>(d.u0))),
-      make_stage_node(make_input_node(make_handle<'e', 'k', 'j', 'i'>(d.u1))),
-      make_stage_node(make_input_node(make_handle<'e', 'k', 'j', 'i'>(d.u2))));
+      TOps::make_stage_node(
+          TOps::make_input_node(TOps::make_handle<'e', 'k', 'j', 'i'>(d.u0))),
+      TOps::make_stage_node(
+          TOps::make_input_node(TOps::make_handle<'e', 'k', 'j', 'i'>(d.u1))),
+      TOps::make_stage_node(
+          TOps::make_input_node(TOps::make_handle<'e', 'k', 'j', 'i'>(d.u2))));
   auto [g3, gx0, gx1, gx2, ge0, ge1, ge2, gg0, gg1, gg2] = g2.add(
-      make_contraction_node<'e', 'k', 'j', 'i'>(
+      TOps::make_contraction_node<'e', 'k', 'j', 'i'>(
           h.template as<'i', 'p'>(), u0.template as<'e', 'k', 'j', 'p'>()),
-      make_contraction_node<'e', 'k', 'j', 'i'>(
+      TOps::make_contraction_node<'e', 'k', 'j', 'i'>(
           h.template as<'i', 'p'>(), u1.template as<'e', 'k', 'j', 'p'>()),
-      make_contraction_node<'e', 'k', 'j', 'i'>(
+      TOps::make_contraction_node<'e', 'k', 'j', 'i'>(
           h.template as<'i', 'p'>(), u2.template as<'e', 'k', 'j', 'p'>()),
-      make_contraction_node<'e', 'k', 'j', 'i'>(
+      TOps::make_contraction_node<'e', 'k', 'j', 'i'>(
           h.template as<'j', 'p'>(), u0.template as<'e', 'k', 'p', 'i'>()),
-      make_contraction_node<'e', 'k', 'j', 'i'>(
+      TOps::make_contraction_node<'e', 'k', 'j', 'i'>(
           h.template as<'j', 'p'>(), u1.template as<'e', 'k', 'p', 'i'>()),
-      make_contraction_node<'e', 'k', 'j', 'i'>(
+      TOps::make_contraction_node<'e', 'k', 'j', 'i'>(
           h.template as<'j', 'p'>(), u2.template as<'e', 'k', 'p', 'i'>()),
-      make_contraction_node<'e', 'k', 'j', 'i'>(
+      TOps::make_contraction_node<'e', 'k', 'j', 'i'>(
           h.template as<'k', 'p'>(), u0.template as<'e', 'p', 'j', 'i'>()),
-      make_contraction_node<'e', 'k', 'j', 'i'>(
+      TOps::make_contraction_node<'e', 'k', 'j', 'i'>(
           h.template as<'k', 'p'>(), u1.template as<'e', 'p', 'j', 'i'>()),
-      make_contraction_node<'e', 'k', 'j', 'i'>(
+      TOps::make_contraction_node<'e', 'k', 'j', 'i'>(
           h.template as<'k', 'p'>(), u2.template as<'e', 'p', 'j', 'i'>()));
   auto [g4, fx0, fx1, fx2, fe0, fe1, fe2, fg0, fg1, fg2] =
-      g3.add(make_combine_node<'e', 'k', 'j', 'i'>(
+      g3.add(TOps::make_combine_node<'e', 'k', 'j', 'i'>(
           gx0, gx1, gx2, ge0, ge1, ge2, gg0, gg1, gg2, Integrand9{d}));
   auto [g5, tx0, tx1, tx2, te0, te1, te2, tg0, tg1, tg2] = g4.add(
-      make_contraction_node<'e', 'k', 'j', 'i'>(
+      TOps::make_contraction_node<'e', 'k', 'j', 'i'>(
           hw.template as<'p', 'i'>(), fx0.template as<'e', 'k', 'j', 'p'>()),
-      make_contraction_node<'e', 'k', 'j', 'i'>(
+      TOps::make_contraction_node<'e', 'k', 'j', 'i'>(
           hw.template as<'p', 'i'>(), fx1.template as<'e', 'k', 'j', 'p'>()),
-      make_contraction_node<'e', 'k', 'j', 'i'>(
+      TOps::make_contraction_node<'e', 'k', 'j', 'i'>(
           hw.template as<'p', 'i'>(), fx2.template as<'e', 'k', 'j', 'p'>()),
-      make_contraction_node<'e', 'k', 'j', 'i'>(
+      TOps::make_contraction_node<'e', 'k', 'j', 'i'>(
           hw.template as<'p', 'j'>(), fe0.template as<'e', 'k', 'p', 'i'>()),
-      make_contraction_node<'e', 'k', 'j', 'i'>(
+      TOps::make_contraction_node<'e', 'k', 'j', 'i'>(
           hw.template as<'p', 'j'>(), fe1.template as<'e', 'k', 'p', 'i'>()),
-      make_contraction_node<'e', 'k', 'j', 'i'>(
+      TOps::make_contraction_node<'e', 'k', 'j', 'i'>(
           hw.template as<'p', 'j'>(), fe2.template as<'e', 'k', 'p', 'i'>()),
-      make_contraction_node<'e', 'k', 'j', 'i'>(
+      TOps::make_contraction_node<'e', 'k', 'j', 'i'>(
           hw.template as<'p', 'k'>(), fg0.template as<'e', 'p', 'j', 'i'>()),
-      make_contraction_node<'e', 'k', 'j', 'i'>(
+      TOps::make_contraction_node<'e', 'k', 'j', 'i'>(
           hw.template as<'p', 'k'>(), fg1.template as<'e', 'p', 'j', 'i'>()),
-      make_contraction_node<'e', 'k', 'j', 'i'>(
+      TOps::make_contraction_node<'e', 'k', 'j', 'i'>(
           hw.template as<'p', 'k'>(), fg2.template as<'e', 'p', 'j', 'i'>()));
-  auto [g6, r0, r1, r2] = g5.add(
-      make_combine_node<'e', 'k', 'j', 'i'>(tx0, te0, tg0, WeightedSum{d}),
-      make_combine_node<'e', 'k', 'j', 'i'>(tx1, te1, tg1, WeightedSum{d}),
-      make_combine_node<'e', 'k', 'j', 'i'>(tx2, te2, tg2, WeightedSum{d}));
+  auto [g6, r0, r1, r2] = g5.add(TOps::make_combine_node<'e', 'k', 'j', 'i'>(
+                                     tx0, te0, tg0, WeightedSum{d}),
+                                 TOps::make_combine_node<'e', 'k', 'j', 'i'>(
+                                     tx1, te1, tg1, WeightedSum{d}),
+                                 TOps::make_combine_node<'e', 'k', 'j', 'i'>(
+                                     tx2, te2, tg2, WeightedSum{d}));
   return g6.outputs(r0, r1, r2).scratch_bytes();
 }
 
@@ -426,14 +439,16 @@ std::size_t levelgraph_scratch(Fields d) {
 //
 // The reference gradient of SPECFEM++'s direct kernel,
 //
-//   B = make_stack_node<'r', ...>(make_outer_product_node<...>(h, delta,
+//   B = TOps::make_stack_node<'r', ...>(TOps::make_outer_product_node<...>(h,
+//   delta,
 //                                                            delta), ...)
 //
 // replaces the nine hand-relabelled gradient contractions, and its divergence
 // twin D replaces the nine divergences AND the three weighted sums:
 //
-//   grad_r u_c = make_contraction_node(make_delta_node<'r'>(idx<r>), B, u_c)
-//   f_c        = make_contraction_node(D, make_stack_node<'r', ...>(
+//   grad_r u_c =
+//   TOps::make_contraction_node(TOps::make_delta_node<'r'>(idx<r>), B, u_c) f_c
+//   = TOps::make_contraction_node(D, TOps::make_stack_node<'r', ...>(
 //                                             F^0_c, F^1_c, F^2_c))
 //
 // The deltas are eliminated at compile time, so each gradient is one
@@ -468,79 +483,84 @@ inline constexpr int kStructFnEnd = __LINE__;
 // z y x the quadrature point, n m l the input node, k j i the output node,
 // r the reference direction, u f the two axes of H and Hw.
 template <int TE>
-using SMap =
-    LabelTiles<LabelTile<'e', TE>, LabelWhole<'z', cfg::N>,
-               LabelWhole<'y', cfg::N>, LabelWhole<'x', cfg::N>,
-               LabelWhole<'n', cfg::N>, LabelWhole<'m', cfg::N>,
-               LabelWhole<'l', cfg::N>, LabelWhole<'k', cfg::N>,
-               LabelWhole<'j', cfg::N>, LabelWhole<'i', cfg::N>,
-               LabelWhole<'u', cfg::N>, LabelWhole<'f', cfg::N>,
-               LabelWhole<'r', 3>>;
+using SMap = TOps::LabelTiles<
+    TOps::LabelTile<'e', TE>, TOps::LabelWhole<'z', cfg::N>,
+    TOps::LabelWhole<'y', cfg::N>, TOps::LabelWhole<'x', cfg::N>,
+    TOps::LabelWhole<'n', cfg::N>, TOps::LabelWhole<'m', cfg::N>,
+    TOps::LabelWhole<'l', cfg::N>, TOps::LabelWhole<'k', cfg::N>,
+    TOps::LabelWhole<'j', cfg::N>, TOps::LabelWhole<'i', cfg::N>,
+    TOps::LabelWhole<'u', cfg::N>, TOps::LabelWhole<'f', cfg::N>,
+    TOps::LabelWhole<'r', 3>>;
 
 // One builder for both the launch and the scratch query.
 inline constexpr int kStructBegin = __LINE__;
 template <int TE>
 auto structured_outputs(Fields d) {
-  auto g0 = make_level_graph<float, ES>(SMap<TE>{});
+  auto g0 = TOps::make_level_graph<float, ES>(SMap<TE>{});
   auto [g1, h, hw] =
-      g0.add(make_stage_node(make_input_node(make_handle<'u', 'f'>(d.H))),
-             make_stage_node(make_input_node(make_handle<'u', 'f'>(d.Hw))));
+      g0.add(TOps::make_stage_node(
+                 TOps::make_input_node(TOps::make_handle<'u', 'f'>(d.H))),
+             TOps::make_stage_node(
+                 TOps::make_input_node(TOps::make_handle<'u', 'f'>(d.Hw))));
   // u staged on the input node's labels, so B reads it without a relabel.
   auto [g2, u0, u1, u2] = g1.add(
-      make_stage_node(make_input_node(make_handle<'e', 'n', 'm', 'l'>(d.u0))),
-      make_stage_node(make_input_node(make_handle<'e', 'n', 'm', 'l'>(d.u1))),
-      make_stage_node(make_input_node(make_handle<'e', 'n', 'm', 'l'>(d.u2))));
+      TOps::make_stage_node(
+          TOps::make_input_node(TOps::make_handle<'e', 'n', 'm', 'l'>(d.u0))),
+      TOps::make_stage_node(
+          TOps::make_input_node(TOps::make_handle<'e', 'n', 'm', 'l'>(d.u1))),
+      TOps::make_stage_node(
+          TOps::make_input_node(TOps::make_handle<'e', 'n', 'm', 'l'>(d.u2))));
 
   // B(r; x,l, y,m, z,n): the derivative of basis function (n, m, l) along r
   // at point (z, y, x) -- H(point, function) along r, the identity along the
   // other two.
-  const auto B = make_stack_node<'r', 'x', 'l', 'y', 'm', 'z', 'n'>(
-      make_outer_product_node<'x', 'l', 'y', 'm', 'z', 'n'>(
-          h.template as<'x', 'l'>(), make_delta_node<'y', 'm'>(),
-          make_delta_node<'z', 'n'>()),
-      make_outer_product_node<'x', 'l', 'y', 'm', 'z', 'n'>(
-          make_delta_node<'x', 'l'>(), h.template as<'y', 'm'>(),
-          make_delta_node<'z', 'n'>()),
-      make_outer_product_node<'x', 'l', 'y', 'm', 'z', 'n'>(
-          make_delta_node<'x', 'l'>(), make_delta_node<'y', 'm'>(),
+  const auto B = TOps::make_stack_node<'r', 'x', 'l', 'y', 'm', 'z', 'n'>(
+      TOps::make_outer_product_node<'x', 'l', 'y', 'm', 'z', 'n'>(
+          h.template as<'x', 'l'>(), TOps::make_delta_node<'y', 'm'>(),
+          TOps::make_delta_node<'z', 'n'>()),
+      TOps::make_outer_product_node<'x', 'l', 'y', 'm', 'z', 'n'>(
+          TOps::make_delta_node<'x', 'l'>(), h.template as<'y', 'm'>(),
+          TOps::make_delta_node<'z', 'n'>()),
+      TOps::make_outer_product_node<'x', 'l', 'y', 'm', 'z', 'n'>(
+          TOps::make_delta_node<'x', 'l'>(), TOps::make_delta_node<'y', 'm'>(),
           h.template as<'z', 'n'>()));
   // Branch r of B against one component: the unit vector binds r, so the
   // other two branches vanish at compile time.
   auto grad = [&](auto r, auto uu) {
-    return make_contraction_node<'e', 'z', 'y', 'x'>(make_delta_node<'r'>(r),
-                                                     B, uu);
+    return TOps::make_contraction_node<'e', 'z', 'y', 'x'>(
+        TOps::make_delta_node<'r'>(r), B, uu);
   };
-  auto [g3, gx0, gx1, gx2, ge0, ge1, ge2, gg0, gg1, gg2] =
-      g2.add(grad(idx<0>, u0), grad(idx<0>, u1), grad(idx<0>, u2),
-             grad(idx<1>, u0), grad(idx<1>, u1), grad(idx<1>, u2),
-             grad(idx<2>, u0), grad(idx<2>, u1), grad(idx<2>, u2));
+  auto [g3, gx0, gx1, gx2, ge0, ge1, ge2, gg0, gg1, gg2] = g2.add(
+      grad(TOps::idx<0>, u0), grad(TOps::idx<0>, u1), grad(TOps::idx<0>, u2),
+      grad(TOps::idx<1>, u0), grad(TOps::idx<1>, u1), grad(TOps::idx<1>, u2),
+      grad(TOps::idx<2>, u0), grad(TOps::idx<2>, u1), grad(TOps::idx<2>, u2));
 
   auto [g4, fx0, fx1, fx2, fe0, fe1, fe2, fg0, fg1, fg2] =
-      g3.add(make_combine_node<'e', 'z', 'y', 'x'>(gx0, gx1, gx2, ge0, ge1,
-                                                   ge2, gg0, gg1, gg2,
-                                                   WeightedIntegrand9{{d}}));
+      g3.add(TOps::make_combine_node<'e', 'z', 'y', 'x'>(
+          gx0, gx1, gx2, ge0, ge1, ge2, gg0, gg1, gg2,
+          WeightedIntegrand9{{d}}));
 
   // D(r; x,i, y,j, z,k): Hw(summed point, output) along r, the identity
   // along the other two.
-  const auto D = make_stack_node<'r', 'x', 'i', 'y', 'j', 'z', 'k'>(
-      make_outer_product_node<'x', 'i', 'y', 'j', 'z', 'k'>(
-          hw.template as<'x', 'i'>(), make_delta_node<'y', 'j'>(),
-          make_delta_node<'z', 'k'>()),
-      make_outer_product_node<'x', 'i', 'y', 'j', 'z', 'k'>(
-          make_delta_node<'x', 'i'>(), hw.template as<'y', 'j'>(),
-          make_delta_node<'z', 'k'>()),
-      make_outer_product_node<'x', 'i', 'y', 'j', 'z', 'k'>(
-          make_delta_node<'x', 'i'>(), make_delta_node<'y', 'j'>(),
+  const auto D = TOps::make_stack_node<'r', 'x', 'i', 'y', 'j', 'z', 'k'>(
+      TOps::make_outer_product_node<'x', 'i', 'y', 'j', 'z', 'k'>(
+          hw.template as<'x', 'i'>(), TOps::make_delta_node<'y', 'j'>(),
+          TOps::make_delta_node<'z', 'k'>()),
+      TOps::make_outer_product_node<'x', 'i', 'y', 'j', 'z', 'k'>(
+          TOps::make_delta_node<'x', 'i'>(), hw.template as<'y', 'j'>(),
+          TOps::make_delta_node<'z', 'k'>()),
+      TOps::make_outer_product_node<'x', 'i', 'y', 'j', 'z', 'k'>(
+          TOps::make_delta_node<'x', 'i'>(), TOps::make_delta_node<'y', 'j'>(),
           hw.template as<'z', 'k'>()));
   // f_c = sum_r D_r F^r_c, the three directions stacked on r.
   auto div = [&](auto fx, auto fe, auto fg) {
-    return make_contraction_node<'e', 'k', 'j', 'i'>(
-        D, make_stack_node<'r', 'e', 'z', 'y', 'x'>(fx, fe, fg));
+    return TOps::make_contraction_node<'e', 'k', 'j', 'i'>(
+        D, TOps::make_stack_node<'r', 'e', 'z', 'y', 'x'>(fx, fe, fg));
   };
   auto [g5, r0, r1, r2] =
       g4.add(div(fx0, fe0, fg0), div(fx1, fe1, fg1), div(fx2, fe2, fg2));
 
-  using Plan = LevelPlan<std::decay_t<decltype(g5.levels)>>;
+  using Plan = TOps::LevelPlan<std::decay_t<decltype(g5.levels)>>;
   static_assert(Plan::num_levels == 5,
                 "two stage levels and three compute levels: gradient, "
                 "integrand, divergence");
@@ -549,8 +569,8 @@ auto structured_outputs(Fields d) {
 
 template <int TE>
 void structured_sem3d(Fields d, int team) {
-  structured_outputs<TE>(d).team_size(team).execute(TeamPolicyTag<ES>{}, d.f0,
-                                                    d.f1, d.f2);
+  structured_outputs<TE>(d).team_size(team).execute(TOps::TeamPolicyTag<ES>{},
+                                                    d.f0, d.f1, d.f2);
 }
 inline constexpr int kStructEnd = __LINE__;
 
@@ -1023,13 +1043,11 @@ int run(int argc, char* argv[]) {
         const double sms =
             best_ms([&] { structured_sem3d<TE>(d, team); }, warmup, reps);
         const double serr = check(d, Echk, r0, r1, r2);
-        std::printf("%4d %6d %10.3f %10.3f %10.3f %11zu %7zu %11zu\n", TE,
-                    team, gms, hms, sms, gsc, gsc ? (227u * 1024u) / gsc : 0u,
-                    ssc);
+        std::printf("%4d %6d %10.3f %10.3f %10.3f %11zu %7zu %11zu\n", TE, team,
+                    gms, hms, sms, gsc, gsc ? (227u * 1024u) / gsc : 0u, ssc);
         if (gms < graph.ms) graph = Best{gms, TE, team, gerr, gsc};
         if (hms < hand.ms) hand = Best{hms, TE, team, herr, hsc};
-        if (sms < structured.ms)
-          structured = Best{sms, TE, team, serr, ssc};
+        if (sms < structured.ms) structured = Best{sms, TE, team, serr, ssc};
       }
     };
     for_each_TE(sweep);

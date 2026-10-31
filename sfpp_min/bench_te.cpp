@@ -50,6 +50,7 @@
 #include <type_traits>
 
 using namespace sfpp_min;
+namespace TOps = TensorOperations;
 
 namespace {
 
@@ -126,14 +127,14 @@ struct TeamBackend {
   template <int TE, class Args>
   static NewFootprint footprint(const Args& args, const GlobalHPrime& hw) {
     return new_footprint<TE, BenchGather, BenchScatter, BenchMetrics,
-                         BenchPreSel>(
-        args, TensorOperations::TeamPolicyTag<KernelES>{}, hw);
+                         BenchPreSel>(args, TOps::TeamPolicyTag<KernelES>{},
+                                      hw);
   }
   template <int TE, class Args>
   static int launch(const Args& args, int team_arg, const GlobalHPrime& hw) {
     return new_stiffness<TE, BenchGather, BenchScatter, BenchMetrics,
-                         BenchPreSel>(
-        args, TensorOperations::TeamPolicyTag<KernelES>{}, team_arg, hw);
+                         BenchPreSel>(args, TOps::TeamPolicyTag<KernelES>{},
+                                      team_arg, hw);
   }
 };
 
@@ -159,13 +160,13 @@ struct CuteBackend {
   static NewFootprint footprint(const Args& args, const GlobalHPrime& hw) {
     return new_footprint<TE, BenchMmas<TE>, BenchGather, BenchScatter,
                          BenchMetrics, BenchPreSel>(
-        args, TensorOperations::CutePolicyTag<KernelES>{}, hw);
+        args, TOps::CutePolicyTag<KernelES>{}, hw);
   }
   template <int TE, class Args>
   static int launch(const Args& args, int, const GlobalHPrime& hw) {
     return new_stiffness<TE, BenchMmas<TE>, BenchGather, BenchScatter,
                          BenchMetrics, BenchPreSel>(
-        args, TensorOperations::CutePolicyTag<KernelES>{}, hw);
+        args, TOps::CutePolicyTag<KernelES>{}, hw);
   }
 };
 #endif
