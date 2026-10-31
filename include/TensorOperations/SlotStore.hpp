@@ -25,10 +25,10 @@ namespace TensorOperations {
 // driver of stage 5 would be a substantially harder piece of work.
 //
 // It is also what a caller needs to spell a slot node HOST-side, before any
-// buffer exists: `make_slot_node<'i','k'>(SlotView<float, ES, Tile>{}, shape)`
-// declares the node with a placeholder, and the driver assigns the real buffer
-// on device (node factories are host-only, so the graph cannot be assembled
-// where team scratch lives).
+// buffer exists: `make_slot_node_seq<I, Modes>(SlotView<float, ES, Tile>{},
+// shape)` declares the node with a placeholder, and the driver assigns the real
+// buffer on device (node factories are host-only, so the graph cannot be
+// assembled where team scratch lives).
 // ---------------------------------------------------------------------------
 template <typename ValueType, typename ExecSpace, typename Tile>
 using SlotView = decltype(Impl::alloc_scratch_tile<ValueType, ExecSpace>(
@@ -66,35 +66,6 @@ struct SlotStore {
     return views.template get<K>();
   }
 };
-
-// ---------------------------------------------------------------------------
-// place_slot_store<V, ES>(base, seq, tiles...) — the same store, over buffers
-// the CALLER chose.
-//
-// The store with NO allocator at all: slot I is built at base[I], and NOTHING
-// requires those pointers to be distinct -- a liveness plan (Liveness.hpp,
-// LevelPlan.hpp) may point two slots at one buffer when their live ranges do
-// not overlap.
-//
-// THE INVARIANT IS THEREFORE WEAKER THAN carve_arena_slot_store's, and
-// deliberately. The arena lays slots end to end and so guarantees them pairwise
-// disjoint; this guarantees only what its caller's plan guarantees, which is
-// that slots whose live ranges OVERLAP are disjoint. A plan that got that wrong
-// would not crash -- it would silently feed one node another node's data -- so
-// the plan is checked directly in tests/test_level_liveness.cpp rather than
-// trusted.
-//
-// The returned type is identical to the arena's for the same tiles: a slot's
-// view type is a function of its tile alone, never of where it lives.
-template <typename ValueType, typename ExecSpace, typename... Tiles,
-          std::size_t... Is>
-KOKKOS_FUNCTION auto place_slot_store(
-    const Kokkos::Array<ValueType*, sizeof...(Tiles)>& base,
-    std::index_sequence<Is...>, const Tiles&... tiles)
-    -> SlotStore<SlotView<ValueType, ExecSpace, Tiles>...> {
-  return {DeviceTuple<SlotView<ValueType, ExecSpace, Tiles>...>{
-      Impl::alloc_scratch_tile_at<ValueType, ExecSpace>(base[Is], tiles)...}};
-}
 
 namespace Impl {
 
