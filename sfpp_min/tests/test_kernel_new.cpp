@@ -12,26 +12,15 @@
 //     accumulate is the reason acceleration is zeroed before each launch and
 //     compared against reference_stiffness, which sums the same contributions.
 // ===========================================================================
-#include <access_model.hpp>
-#include <config.hpp>
-#include <data.hpp>
-#include <geometry.hpp>
-#include <gll.hpp>
+#include "kernel_case.hpp"
+
 #include <kernel_new.hpp>
-#include <layout.hpp>
-#include <mesh.hpp>
-#include <reference.hpp>
 
-#include <Kokkos_Core.hpp>
-#include <gtest/gtest.h>
-
-#include <cmath>
-#include <cstdio>
 #include <string>
 #include <type_traits>
-#include <vector>
 
 using namespace sfpp_min;
+using namespace sfpp_min::test;
 namespace TOps = TensorOperations;
 
 namespace {
@@ -54,117 +43,6 @@ using TeamPolicy = TOps::TeamPolicyTag<KernelES>;
 using CutePolicy = TOps::CutePolicyTag<KernelES>;
 #endif
 
-constexpr MeshDims kD{4, 3, 2};
-
-constexpr double kB[3][3] = {{3.0e-4, -1.7e-4, 0.9e-4},
-                             {2.1e-4, 1.3e-4, -2.6e-4},
-                             {-0.8e-4, 2.9e-4, 1.1e-4}};
-
-template <typename Off>
-struct Case {
-  ElementSet       set;
-  IglobMap         g;
-  int              nglob = 0;
-  Metrics<Off>     m;
-  Properties<Off>  p;
-  Coordinates<Off> c;
-  Fields           f;
-};
-
-// ix_fastest selects the level graph's own mesh numbering (renumber_ix_fastest)
-// instead of the dummy's. It changes iglob's VALUES, so the oracle -- which
-// reads the same map -- must still agree exactly.
-template <typename Off>
-Case<Off> make_case(bool ix_fastest = false) {
-  Case<Off> k;
-  k.set              = all_elements(kD);
-  k.g                = IglobMap(k.set.nspec());
-  k.nglob            = ix_fastest ? renumber_ix_fastest(kD, k.set, k.g)
-                                  : renumber_access_order(kD, k.set, k.g);
-  k.m                = Metrics<Off>(k.set.nspec());
-  k.p                = Properties<Off>(k.set.nspec());
-  k.c                = Coordinates<Off>(k.set.nspec());
-  k.f                = Fields(k.nglob);
-  const Geometry geo = make_geometry(kD);
-  fill_affine(kD, k.set, geo, k.m, k.c);
-  fill_properties(kD, k.set, k.p);
-  return k;
-}
-
-template <typename Off>
-void set_linear_field(Case<Off>& k) {
-  for (int ispec = 0; ispec < k.set.nspec(); ++ispec)
-    for (int iz = 0; iz < NGLL; ++iz)
-      for (int iy = 0; iy < NGLL; ++iy)
-        for (int ix = 0; ix < NGLL; ++ix) {
-          const int    ig   = k.g.h_map(ispec, iz, iy, ix);
-          const double x[3] = {k.c.x.host(ispec, iz, iy, ix),
-                               k.c.y.host(ispec, iz, iy, ix),
-                               k.c.z.host(ispec, iz, iy, ix)};
-          for (int comp = 0; comp < 3; ++comp) {
-            double v = 0.0;
-            for (int j = 0; j < 3; ++j) v += kB[comp][j] * x[j];
-            k.f.h_displacement(ig, comp) = static_cast<real_t>(v);
-          }
-        }
-}
-
-template <typename Off>
-void set_constant_field(Case<Off>& k, const double c[3]) {
-  for (int ig = 0; ig < k.nglob; ++ig)
-    for (int comp = 0; comp < 3; ++comp)
-      k.f.h_displacement(ig, comp) = static_cast<real_t>(c[comp]);
-}
-
-template <typename Off>
-void set_velocity(Case<Off>& k) {
-  for (int ig = 0; ig < k.nglob; ++ig)
-    for (int comp = 0; comp < 3; ++comp)
-      k.f.h_velocity(ig, comp) =
-          static_cast<real_t>(0.37 * std::sin(0.011 * ig + 1.7 * comp) + 0.13);
-}
-
-struct GllViews {
-  GlobalHPrime  hprime;
-  GlobalWeights weights;
-};
-
-GllViews make_gll_views() {
-  GllViews v{GlobalHPrime("hprime", NGLL, NGLL),
-             GlobalWeights("weights", NGLL)};
-  auto     hh = Kokkos::create_mirror_view(v.hprime);
-  auto     hw = Kokkos::create_mirror_view(v.weights);
-  for (int a = 0; a < NGLL; ++a) {
-    hw(a) = static_cast<real_t>(gll::weight(a));
-    for (int b = 0; b < NGLL; ++b)
-      hh(a, b) = static_cast<real_t>(gll::hprime(a, b));
-  }
-  Kokkos::deep_copy(v.hprime, hh);
-  Kokkos::deep_copy(v.weights, hw);
-  return v;
-}
-
-template <typename Off>
-auto make_args(Case<Off>& k, const GllViews& q) {
-  k.m.to_device();
-  k.p.to_device();
-  k.g.to_device();
-  k.f.to_device();
-  Kokkos::deep_copy(k.f.acceleration, static_cast<real_t>(0));
-  return DummyKernelArgs{
-      make_accessor(k.m), make_accessor(k.p), k.g.map,
-      k.f.displacement,   k.f.velocity,       k.f.acceleration,
-      q.hprime,           q.weights,          k.set.nspec()};
-}
-
-struct ErrorReport {
-  double worst_abs = 0.0;
-  double scale     = 0.0;
-  double relative() const {
-    return scale > 0.0 ? worst_abs / scale : worst_abs;
-  }
-};
-
 template <int TE, GatherMode G, ScatterMode Sc, typename Args>
 void launch_modes(const Args& args, TeamPolicy policy) {
   new_stiffness<TE, G, Sc>(args, policy);
@@ -182,24 +60,8 @@ template <typename Policy, int TE = kTestTE,
           GatherMode  G  = GatherMode::Functional,
           ScatterMode Sc = ScatterMode::Functional, typename Off>
 ErrorReport run_and_compare(Case<Off>& k) {
-  const GllViews q    = make_gll_views();
-  auto           args = make_args(k, q);
-  launch_modes<TE, G, Sc>(args, Policy{});
-  Kokkos::fence();
-  k.f.to_host();
-
-  const ReferenceOutput want =
-      reference_stiffness(k.set, k.m, k.p, k.g, k.f, k.nglob);
-
-  ErrorReport e;
-  for (int ig = 0; ig < k.nglob; ++ig)
-    for (int c = 0; c < 3; ++c) {
-      const double got = k.f.h_acceleration(ig, c);
-      const double ref = want.a(c, ig);
-      e.worst_abs      = std::max(e.worst_abs, std::abs(got - ref));
-      e.scale          = std::max(e.scale, std::abs(ref));
-    }
-  return e;
+  launch_modes<TE, G, Sc>(make_args(k, make_gll_views()), Policy{});
+  return compare_to_oracle(k);
 }
 
 // The same run over a LayoutRight index map. iglob holds the SAME integers in
@@ -217,95 +79,17 @@ ErrorReport run_and_compare_iglob_right(Case<Off>& k) {
         for (int ix = 0; ix < NGLL; ++ix)
           gr.h_map(ispec, iz, iy, ix) = k.g.h_map(ispec, iz, iy, ix);
   gr.to_device();
-
-  const GllViews q = make_gll_views();
   k.m.to_device();
   k.p.to_device();
-  k.f.to_device();
-  Kokkos::deep_copy(k.f.acceleration, static_cast<real_t>(0));
-  DummyKernelArgs args{make_accessor(k.m), make_accessor(k.p), gr.map,
-                       k.f.displacement,   k.f.velocity,       k.f.acceleration,
-                       q.hprime,           q.weights,          k.set.nspec()};
-  launch_modes<kTestTE, G, Sc>(args, Policy{});
-  Kokkos::fence();
-  k.f.to_host();
-
-  const ReferenceOutput want =
-      reference_stiffness(k.set, k.m, k.p, k.g, k.f, k.nglob);
-
-  ErrorReport e;
-  for (int ig = 0; ig < k.nglob; ++ig)
-    for (int c = 0; c < 3; ++c) {
-      const double got = k.f.h_acceleration(ig, c);
-      const double ref = want.a(c, ig);
-      e.worst_abs      = std::max(e.worst_abs, std::abs(got - ref));
-      e.scale          = std::max(e.scale, std::abs(ref));
-    }
-  return e;
-}
-
-template <typename Policy, typename Off>
-ErrorReport run_and_compare_aos(Case<Off>& k) {
-  MetricsAoS<Off>    m(k.set.nspec());
-  PropertiesAoS<Off> p(k.set.nspec());
-  for (int ispec = 0; ispec < k.set.nspec(); ++ispec)
-    for (int iz = 0; iz < NGLL; ++iz)
-      for (int iy = 0; iy < NGLL; ++iy)
-        for (int ix = 0; ix < NGLL; ++ix) {
-          m.xix.host(ispec, iz, iy, ix)    = k.m.xix.host(ispec, iz, iy, ix);
-          m.xiy.host(ispec, iz, iy, ix)    = k.m.xiy.host(ispec, iz, iy, ix);
-          m.xiz.host(ispec, iz, iy, ix)    = k.m.xiz.host(ispec, iz, iy, ix);
-          m.etax.host(ispec, iz, iy, ix)   = k.m.etax.host(ispec, iz, iy, ix);
-          m.etay.host(ispec, iz, iy, ix)   = k.m.etay.host(ispec, iz, iy, ix);
-          m.etaz.host(ispec, iz, iy, ix)   = k.m.etaz.host(ispec, iz, iy, ix);
-          m.gammax.host(ispec, iz, iy, ix) = k.m.gammax.host(ispec, iz, iy, ix);
-          m.gammay.host(ispec, iz, iy, ix) = k.m.gammay.host(ispec, iz, iy, ix);
-          m.gammaz.host(ispec, iz, iy, ix) = k.m.gammaz.host(ispec, iz, iy, ix);
-          m.jacobian.host(ispec, iz, iy, ix) =
-              k.m.jacobian.host(ispec, iz, iy, ix);
-          p.kappa.host(ispec, iz, iy, ix) = k.p.kappa.host(ispec, iz, iy, ix);
-          p.mu.host(ispec, iz, iy, ix)    = k.p.mu.host(ispec, iz, iy, ix);
-          p.rho.host(ispec, iz, iy, ix)   = k.p.rho.host(ispec, iz, iy, ix);
-        }
-  m.to_device();
-  p.to_device();
-
-  const GllViews q = make_gll_views();
-  k.g.to_device();
-  k.f.to_device();
-  Kokkos::deep_copy(k.f.acceleration, static_cast<real_t>(0));
-  DummyKernelArgs args{make_accessor(m), make_accessor(p), k.g.map,
-                       k.f.displacement, k.f.velocity,     k.f.acceleration,
-                       q.hprime,         q.weights,        k.set.nspec()};
-  new_stiffness<kTestTE>(args, Policy{});
-  Kokkos::fence();
-  k.f.to_host();
-
-  const ReferenceOutput want =
-      reference_stiffness(k.set, k.m, k.p, k.g, k.f, k.nglob);
-
-  ErrorReport e;
-  for (int ig = 0; ig < k.nglob; ++ig)
-    for (int c = 0; c < 3; ++c) {
-      const double got = k.f.h_acceleration(ig, c);
-      const double ref = want.a(c, ig);
-      e.worst_abs      = std::max(e.worst_abs, std::abs(got - ref));
-      e.scale          = std::max(e.scale, std::abs(ref));
-    }
-  return e;
+  launch_modes<kTestTE, G, Sc>(make_args(k, make_gll_views(), k.m, k.p, gr.map),
+                               Policy{});
+  return compare_to_oracle(k);
 }
 
 template <typename Policy, typename Off>
 void expect_layout_invariant(const char* name) {
-  auto k = make_case<Off>();
-  set_linear_field(k);
-  set_velocity(k);
-  const ErrorReport e = run_and_compare<Policy>(k);
-  std::printf(
-      "[ INFO     ] %s: max|diff| = %.3e, scale = %.3e, relative = %.3e\n",
-      name, e.worst_abs, e.scale, e.relative());
-  EXPECT_GT(e.scale, 0.0) << name << ": oracle produced an all-zero field";
-  EXPECT_LT(e.relative(), 1e-4) << name;
+  auto k = make_linear_case<Off>();
+  expect_matches_oracle(run_and_compare<Policy>(k), name);
 }
 
 template <typename Policy>
@@ -356,15 +140,14 @@ TYPED_TEST(SfppMinKernelNew, MatchesSerialOracleLayoutLeftDynamic) {
 
 template <typename Policy, typename Off>
 void expect_aos_invariant(const char* name) {
-  auto k = make_case<Off>();
-  set_linear_field(k);
-  set_velocity(k);
-  const ErrorReport e = run_and_compare_aos<Policy>(k);
-  std::printf(
-      "[ INFO     ] %s: max|diff| = %.3e, scale = %.3e, relative = %.3e\n",
-      name, e.worst_abs, e.scale, e.relative());
-  EXPECT_GT(e.scale, 0.0) << name << ": oracle produced an all-zero field";
-  EXPECT_LT(e.relative(), 1e-4) << name;
+  auto               k = make_linear_case<Off>();
+  MetricsAoS<Off>    m(k.set.nspec());
+  PropertiesAoS<Off> p(k.set.nspec());
+  fill_aos(k, m, p);
+  k.g.to_device();
+  new_stiffness<kTestTE>(make_args(k, make_gll_views(), m, p, k.g.map),
+                         Policy{});
+  expect_matches_oracle(compare_to_oracle(k), name);
 }
 
 TYPED_TEST(SfppMinKernelNew, MatchesSerialOracleAoSStaticExtents) {
@@ -376,36 +159,21 @@ TYPED_TEST(SfppMinKernelNew, MatchesSerialOracleAoSDynamicExtents) {
       "AoS dynamic extents");
 }
 
-// A rigid-body translation is in the operator's null space exactly, because
-// hprime's row sums vanish. On device the residual is float roundoff, not the
-// double floor. A transposed hprime -- or a transposed hprimewgll, which the
-// graph builds itself -- puts the residual at the order of the output, ratio
-// near 1. This is the one test that catches either transpose.
 TYPED_TEST(SfppMinKernelNew, MatchesSerialOracleWithLayoutRightIglob) {
-  auto k = make_case<ChunkTiledDynamicOffset>();
-  set_linear_field(k);
-  set_velocity(k);
-  const ErrorReport e = run_and_compare_iglob_right<TypeParam>(k);
-  std::printf(
-      "[ INFO     ] LayoutRight iglob: max|diff| = %.3e, scale = %.3e, "
-      "relative = %.3e\n",
-      e.worst_abs, e.scale, e.relative());
-  EXPECT_GT(e.scale, 0.0) << "LayoutRight iglob: oracle produced zero field";
-  EXPECT_LT(e.relative(), 1e-4) << "LayoutRight iglob";
+  auto k = make_linear_case<ChunkTiledDynamicOffset>();
+  expect_matches_oracle(run_and_compare_iglob_right<TypeParam>(k),
+                        "LayoutRight iglob");
 }
 
 template <typename Policy, GatherMode G, ScatterMode Sc>
 void expect_mode_oracle(const char* name) {
   for (int right = 0; right < 2; ++right) {
-    auto k = make_case<ChunkTiledDynamicOffset>(/*ix_fastest=*/true);
-    set_linear_field(k);
-    set_velocity(k);
+    auto k = make_linear_case<ChunkTiledDynamicOffset>(/*ix_fastest=*/true);
     const ErrorReport e = right ? run_and_compare_iglob_right<Policy, G, Sc>(k)
                                 : run_and_compare<Policy, kTestTE, G, Sc>(k);
-    std::printf("[ INFO     ] %s (iglob %s): relative = %.3e\n", name,
-                right ? "LayoutRight" : "LayoutLeft", e.relative());
-    EXPECT_GT(e.scale, 0.0) << name << ": oracle produced a zero field";
-    EXPECT_LT(e.relative(), 1e-4) << name << " right=" << right;
+    expect_matches_oracle(
+        e, std::string(name) +
+               (right ? " (iglob LayoutRight)" : " (iglob LayoutLeft)"));
   }
 }
 
@@ -441,30 +209,11 @@ TYPED_TEST(SfppMinKernelNew, ScatterFromTheIndexSlotMatchesTheOracle) {
 // modes assume layout_right_dynamic metric storage.
 template <MetricsMode Mt, typename PreSel = std::integer_sequence<int>>
 void expect_team_metrics_oracle(const char* name) {
-  auto k = make_case<LayoutRightDynamicOffset>(/*ix_fastest=*/true);
-  set_linear_field(k);
-  set_velocity(k);
-  const GllViews q    = make_gll_views();
-  auto           args = make_args(k, q);
+  auto k = make_linear_case<LayoutRightDynamicOffset>(/*ix_fastest=*/true);
   new_stiffness<kTestTE, GatherMode::Functional, ScatterMode::Functional, Mt,
-                PreSel>(args, TeamPolicy{});
-  Kokkos::fence();
-  k.f.to_host();
-
-  const ReferenceOutput want =
-      reference_stiffness(k.set, k.m, k.p, k.g, k.f, k.nglob);
-  ErrorReport e;
-  for (int ig = 0; ig < k.nglob; ++ig)
-    for (int c = 0; c < 3; ++c) {
-      const double got = k.f.h_acceleration(ig, c);
-      const double ref = want.a(c, ig);
-      e.worst_abs      = std::max(e.worst_abs, std::abs(got - ref));
-      e.scale          = std::max(e.scale, std::abs(ref));
-    }
-  std::printf("[ INFO     ] team metrics %s: relative = %.3e\n", name,
-              e.relative());
-  EXPECT_GT(e.scale, 0.0) << name << ": oracle produced a zero field";
-  EXPECT_LT(e.relative(), 1e-4) << name;
+                PreSel>(make_args(k, make_gll_views()), TeamPolicy{});
+  expect_matches_oracle(compare_to_oracle(k),
+                        std::string("team metrics ") + name);
 }
 
 TEST(SfppMinKernelNewTeam, MetricsModesMatchTheOracle) {
@@ -504,30 +253,15 @@ TEST(SfppMinKernelNewTeam, RegisterMetricsCostNoScratch) {
 }
 
 TYPED_TEST(SfppMinKernelNew, MatchesSerialOracleWithIxFastestNumbering) {
-  auto k = make_case<ChunkTiledDynamicOffset>(/*ix_fastest=*/true);
-  set_linear_field(k);
-  set_velocity(k);
-  const ErrorReport e = run_and_compare<TypeParam>(k);
-  std::printf(
-      "[ INFO     ] ix-fastest numbering: max|diff| = %.3e, scale = %.3e, "
-      "relative = %.3e\n",
-      e.worst_abs, e.scale, e.relative());
-  EXPECT_GT(e.scale, 0.0) << "ix-fastest: oracle produced an all-zero field";
-  EXPECT_LT(e.relative(), 1e-4) << "ix-fastest numbering";
+  auto k = make_linear_case<ChunkTiledDynamicOffset>(/*ix_fastest=*/true);
+  expect_matches_oracle(run_and_compare<TypeParam>(k), "ix-fastest numbering");
 }
 
 // The two axes together: the graph's numbering AND a LayoutRight index map.
 TYPED_TEST(SfppMinKernelNew, MatchesSerialOracleIxFastestWithLayoutRightIglob) {
-  auto k = make_case<ChunkTiledDynamicOffset>(/*ix_fastest=*/true);
-  set_linear_field(k);
-  set_velocity(k);
-  const ErrorReport e = run_and_compare_iglob_right<TypeParam>(k);
-  std::printf(
-      "[ INFO     ] ix-fastest + LayoutRight iglob: max|diff| = %.3e, "
-      "scale = %.3e, relative = %.3e\n",
-      e.worst_abs, e.scale, e.relative());
-  EXPECT_GT(e.scale, 0.0) << "ix-fastest + LR iglob: all-zero field";
-  EXPECT_LT(e.relative(), 1e-4) << "ix-fastest + LayoutRight iglob";
+  auto k = make_linear_case<ChunkTiledDynamicOffset>(/*ix_fastest=*/true);
+  expect_matches_oracle(run_and_compare_iglob_right<TypeParam>(k),
+                        "ix-fastest + LayoutRight iglob");
 }
 
 // TE-INVARIANCE, asserted rather than assumed. The graph's tile width changes
@@ -537,16 +271,9 @@ TYPED_TEST(SfppMinKernelNew, MatchesSerialOracleIxFastestWithLayoutRightIglob) {
 // existed nothing had checked TE=1 against the oracle at all.
 template <typename Policy, int TE>
 void expect_te_invariant() {
-  auto k = make_case<ChunkTiledDynamicOffset>(/*ix_fastest=*/true);
-  set_linear_field(k);
-  set_velocity(k);
-  const ErrorReport e = run_and_compare<Policy, TE>(k);
-  std::printf(
-      "[ INFO     ] TE=%d: max|diff| = %.3e, scale = %.3e, relative = %.3e\n",
-      TE, e.worst_abs, e.scale, e.relative());
-  EXPECT_GT(e.scale, 0.0) << "TE=" << TE
-                          << ": oracle produced an all-zero field";
-  EXPECT_LT(e.relative(), 1e-4) << "TE=" << TE;
+  auto k = make_linear_case<ChunkTiledDynamicOffset>(/*ix_fastest=*/true);
+  expect_matches_oracle(run_and_compare<Policy, TE>(k),
+                        "TE=" + std::to_string(TE));
 }
 
 TYPED_TEST(SfppMinKernelNew, MatchesSerialOracleAtTileWidthOne) {
@@ -557,37 +284,11 @@ TYPED_TEST(SfppMinKernelNew, MatchesSerialOracleAtTileWidthTwo) {
   expect_te_invariant<TypeParam, 2>();
 }
 
+// The rigid-body null test is the one that catches a transposed hprime -- or a
+// transposed hprimewgll, which the graph builds itself.
 TYPED_TEST(SfppMinKernelNew, RigidBodyTranslationIsAtTheFloatRoundoffFloor) {
-  auto         k    = make_case<ChunkTiledOffset>();
-  const double c[3] = {1.3e-3, -0.7e-3, 2.1e-3};
-  set_constant_field(k, c);
-  set_velocity(k);
-
-  const GllViews q    = make_gll_views();
-  auto           args = make_args(k, q);
-  new_stiffness<kTestTE>(args, TypeParam{});
-  Kokkos::fence();
-  k.f.to_host();
-
-  double residual = 0.0;
-  for (int ig = 0; ig < k.nglob; ++ig)
-    for (int comp = 0; comp < 3; ++comp)
-      residual =
-          std::max(residual,
-                   std::abs(static_cast<double>(k.f.h_acceleration(ig, comp))));
-
-  auto k2 = make_case<ChunkTiledOffset>();
-  set_linear_field(k2);
-  set_velocity(k2);
-  const ErrorReport ref          = run_and_compare<TypeParam>(k2);
-  const double      output_scale = ref.scale;
-
-  const double ratio = residual / output_scale;
-  std::printf(
-      "[ INFO     ] rigid body: residual = %.3e, operator output "
-      "scale = %.3e, ratio = %.3e\n",
-      residual, output_scale, ratio);
-  EXPECT_GT(output_scale, 0.0) << "no output to compare against; test is void";
+  const double ratio = rigid_body_ratio(
+      [](const auto& a) { new_stiffness<kTestTE>(a, TypeParam{}); });
   // Float roundoff in the derivative sums grows with the order (hprime's
   // corner entries are DEG(DEG+1)/4: 5 at NGLL = 5, 14 at NGLL = 8 -- measured
   // ratio 1.7e-5 there). A transposed operator puts the ratio near 1, so a
@@ -600,21 +301,13 @@ TYPED_TEST(SfppMinKernelNew, RigidBodyTranslationIsAtTheFloatRoundoffFloor) {
 // either agrees with the double-precision oracle. Only the atomic scatter's
 // accumulation order differs, which puts the floor at float roundoff.
 TEST(SfppMinKernelNewCute, MatchesTheTeamBackend) {
-  auto kt = make_case<ChunkTiledDynamicOffset>(/*ix_fastest=*/true);
-  set_linear_field(kt);
-  set_velocity(kt);
-  const GllViews qt = make_gll_views();
-  new_stiffness<kTestTE>(make_args(kt, qt), TeamPolicy{});
-  Kokkos::fence();
-  kt.f.to_host();
+  auto kt = make_linear_case<ChunkTiledDynamicOffset>(/*ix_fastest=*/true);
+  new_stiffness<kTestTE>(make_args(kt, make_gll_views()), TeamPolicy{});
+  fetch(kt);
 
-  auto kc = make_case<ChunkTiledDynamicOffset>(/*ix_fastest=*/true);
-  set_linear_field(kc);
-  set_velocity(kc);
-  const GllViews qc = make_gll_views();
-  new_stiffness<kTestTE>(make_args(kc, qc), CutePolicy{});
-  Kokkos::fence();
-  kc.f.to_host();
+  auto kc = make_linear_case<ChunkTiledDynamicOffset>(/*ix_fastest=*/true);
+  new_stiffness<kTestTE>(make_args(kc, make_gll_views()), CutePolicy{});
+  fetch(kc);
 
   double worst = 0.0, scale = 0.0;
   for (int ig = 0; ig < kt.nglob; ++ig)
@@ -639,28 +332,10 @@ template <int         TE, typename Off, typename Mmas = RowOfIMmas<TE>,
           GatherMode  G  = GatherMode::Functional,
           ScatterMode Sc = ScatterMode::Functional>
 void expect_cute_oracle(const char* name) {
-  auto k = make_case<Off>(/*ix_fastest=*/true);
-  set_linear_field(k);
-  set_velocity(k);
-  const GllViews q = make_gll_views();
-  new_stiffness<TE, Mmas, G, Sc>(make_args(k, q), CutePolicy{});
-  Kokkos::fence();
-  k.f.to_host();
-
-  const ReferenceOutput want =
-      reference_stiffness(k.set, k.m, k.p, k.g, k.f, k.nglob);
-  ErrorReport e;
-  for (int ig = 0; ig < k.nglob; ++ig)
-    for (int c = 0; c < 3; ++c) {
-      const double got = k.f.h_acceleration(ig, c);
-      const double ref = want.a(c, ig);
-      e.worst_abs      = std::max(e.worst_abs, std::abs(got - ref));
-      e.scale          = std::max(e.scale, std::abs(ref));
-    }
-  std::printf("[ INFO     ] %s TE=%d: relative = %.3e\n", name, TE,
-              e.relative());
-  EXPECT_GT(e.scale, 0.0) << name << ": oracle produced an all-zero field";
-  EXPECT_LT(e.relative(), 1e-4) << name << " TE=" << TE;
+  auto k = make_linear_case<Off>(/*ix_fastest=*/true);
+  new_stiffness<TE, Mmas, G, Sc>(make_args(k, make_gll_views()), CutePolicy{});
+  expect_matches_oracle(compare_to_oracle(k),
+                        std::string(name) + " TE=" + std::to_string(TE));
 }
 
 TEST(SfppMinKernelNewCute, MatchesTheOracleAtEveryTE) {
