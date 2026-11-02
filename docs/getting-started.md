@@ -1,11 +1,5 @@
 # Getting started
 
-```{admonition} Draft
-:class: note
-This page is a skeleton. Commands below come from the repository's build
-guidance; only the Serial build has been exercised while writing this page.
-```
-
 TensorOperations is header-only and is consumed through the CMake interface
 target `tensor`. It requires CMake 3.22 or newer, a C++20 compiler and Kokkos.
 
@@ -36,5 +30,5 @@ validated.
 ## Next steps
 
 - Link your own program: {doc}`howto/use-in-your-project`.
-- Learn the basics with the {doc}`tutorials <tutorials/index>`.
+- Write your first program: {doc}`tutorials/first-level-graph`.
 - Solve a specific task with the {doc}`how-to guides <howto/index>`.

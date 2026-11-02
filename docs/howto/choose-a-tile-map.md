@@ -4,8 +4,8 @@ The tile map is the first argument to `make_level_graph`. It lists every label
 your nodes use and gives each one an extent. This page is for when you move from
 a toy size to your own: which labels to block, how big a tile to use, and what
 to do when your element count is not a multiple of the tile. It covers the Team
-policy only. The basic graph is built in {doc}`../tutorials/first-level-graph`;
-the example here is the one from {doc}`indirect-access`.
+policy only. Read {doc}`../tutorials/first-level-graph` first for the basic
+graph; the example here is the one from {doc}`indirect-access`.
 
 ## What the two entries mean
 
