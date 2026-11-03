@@ -7,6 +7,5 @@ against the `tensor` target; see
 ```{toctree}
 :maxdepth: 1
 
-first-contraction
 first-level-graph
 ```

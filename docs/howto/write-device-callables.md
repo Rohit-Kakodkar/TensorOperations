@@ -2,10 +2,10 @@
 
 Apply your own per-point function in a graph: read one value from each of
 several operands at the same point, and return one result, several, or none.
-This page assumes you have read {doc}`indirect-access`, which shows a
-single-operand combine. It covers the Team policy; the CuTe backend is not
-covered. The factory is `make_combine_node`; see the
-{doc}`API reference <../reference/api/graph-and-nodes>`.
+This page assumes you have read {doc}`../tutorials/first-level-graph`, which
+shows a single-operand combine, and {doc}`indirect-access`. It covers the Team
+policy; the CuTe backend is not covered. The factory is `make_combine_node`;
+see the {doc}`API reference <../reference/api/graph-and-nodes>`.
 
 ## What the function receives
 
