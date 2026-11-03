@@ -28,11 +28,25 @@ constexpr bool lg_contracted_labels_whole() {
 
 }  // namespace Impl
 
+/**
+ * @brief A graph plus the slots chosen as outputs, ready to launch.
+ *
+ * Get one from LevelGraph::outputs(). `execute` runs the graph on the Team
+ * policy; see the how-to guide `howto/contract-with-a-level-graph` for a
+ * complete program.
+ */
 template <typename Graph, std::size_t... Roots>
 struct LevelOutputs {
   Graph graph;
   int   team = -1;
 
+  /**
+   * @brief Fixes the number of threads per team.
+   *
+   * Without this call, or with `n <= 0`, the launch passes `Kokkos::AUTO`.
+   * @return A new `LevelOutputs`; this one is unchanged, so chain the call
+   * before `execute`.
+   */
   LevelOutputs team_size(int n) const { return {graph, n}; }
 
   using roots_seq = std::index_sequence<Roots...>;
@@ -52,6 +66,36 @@ struct LevelOutputs {
   static constexpr std::size_t num_pools =
       Impl::lg_pool_count_v<typename Graph::levels_type, roots_seq>;
 
+  /**
+   * @brief Runs the graph on the Team policy and writes each output slot into
+   * its view.
+   *
+   * @param[in] tag `TeamPolicyTag<ES>{}`; `ES` must be the execution space the
+   * graph was made with.
+   * @param[out] views One view per output slot, in the order the slots were
+   * passed to `outputs`. A view's axes follow the labels that were passed to
+   * `make_contraction_node` (or the stage's own labels), in that order, with
+   * the extents of the full tensor. All views must have the same type.
+   * @return The league size: the number of teams launched, one per tile of the
+   * blocked labels.
+   * @pre Every extent of a `LabelTile` label is a multiple of its tile, and
+   * every `LabelWhole` extent equals its tile. The Team path has no remainder
+   * path, so a partial tile gives wrong values. Only a `LabelWhole` axis longer
+   * than its tile is always caught (the launch aborts); other violations are
+   * caught at most by a Debug-build assertion.
+   * @pre The inputs and the output views are accessible from `ES` and stay
+   * alive until the kernel has finished. The graph and the launch hold view
+   * handles, not copies of the elements.
+   * @par Constraints
+   * `static_assert` rejects a view count different from the output count,
+   * output views of different types, a tag for a different execution space,
+   * and a map with no `LabelTile` label that a node carries.
+   * @note One team runs every level for its own tile; teams are not
+   * synchronized between levels. See `explanation/level-graphs`.
+   * @warning The launch is asynchronous. Call `Kokkos::fence()` before the host
+   * reads a view or releases storage the kernel uses.
+   * @see LevelGraph::add(), make_level_graph()
+   */
   template <typename ES, TensorLike... Ts>
   int execute(const TeamPolicyTag<ES>& tag, const Ts&... views) const {
     return graph.template launch<Roots...>(tag, team, views...);
@@ -82,11 +126,51 @@ struct LevelGraph {
 
   LevelsT levels;
 
-  // A staged member arrives with its tile unresolved -- make_stage_node cannot
-  // know it -- so this is where the map fills it in. Every other member kind
-  // passes through untouched.
+  /**
+   * @brief Appends one level of nodes and returns the new graph with a handle
+   * for each value the nodes produce.
+   *
+   * The graph is immutable: `add` leaves `*this` unchanged, so keep the
+   * returned graph and name each step.
+   * @code{.cpp}
+   * auto [g1, a_tile] = g0.add(make_stage_node(make_input_node(a_handle)));
+   * @endcode
+   * The result is `std::tuple<LevelGraph, Handle...>`, one handle per output
+   * of every member in the order given. A level whose members are all sinks
+   * (scatter, or a combine whose function returns `void`) produces no handles
+   * and `add` returns the graph alone.
+   *
+   * A level is the set of nodes that run together. The rule for choosing: put
+   * nodes in one `add` only when they do not read each other, and put a node
+   * in a later `add` than every node whose handle it uses. A handle exists
+   * only after the `add` that produced it returns, so a node cannot read a
+   * sibling by construction.
+   *
+   * @tparam Members Nodes from the `make_*_node` factories.
+   * @param[in] members The nodes of this level: all stages, or all
+   * contractions, or all combines, with one iteration space (stages with the
+   * same tile shape). A staged input needs its own level before any node can
+   * read it.
+   * @return The new graph and the handles of the values the members produce.
+   * @par Constraints
+   * `static_assert` rejects a contracted label that the tile map declares
+   * `LabelTile` (`a contracted label must be LabelWhole`) and a label missing
+   * from the map.
+   * @warning `add` does not check the level rules above. Stages of different
+   * tile shapes in one level compile and compute wrong values, and mixed kinds
+   * fail with an unrelated error from the Team code. Including
+   * `LevelPlan.hpp` and instantiating `LevelPlan` on the finished graph's
+   * `levels_type` applies the rules:
+   * @code{.cpp}
+   * static_assert(sizeof(LevelPlan<decltype(g)::levels_type>) > 0);
+   * @endcode
+   * @see make_level_graph(), LevelOutputs::execute()
+   */
   template <typename... Members>
   auto add(const Members&... members) const {
+    // A staged member arrives with its tile unresolved -- make_stage_node
+    // cannot know it -- so this is where the map fills it in. Every other
+    // member kind passes through untouched.
     static_assert(
         (Impl::lg_contracted_labels_whole<LabelTilesT, Members>() && ...),
         "level graph: a contracted label must be LabelWhole -- gridding it "
@@ -98,6 +182,15 @@ struct LevelGraph {
     return add_impl(level, std::make_index_sequence<sizeof...(Members)>{});
   }
 
+  /**
+   * @brief Chooses which slots become output views at launch.
+   *
+   * Pass the handles returned by `add`, in the order you will pass the views to
+   * `LevelOutputs::execute`. Pass none for a graph that only writes through
+   * sinks. A chosen slot is kept for the whole launch, so it never shares
+   * scratch with other slots.
+   * @return A `LevelOutputs` to configure and launch.
+   */
   template <typename... Handles>
   auto outputs(const Handles&...) const {
     return LevelOutputs<LevelGraph, Handles::SlotIdx...>{*this};
@@ -243,17 +336,28 @@ struct LevelGraph {
   }
 };
 
-// The tile map is the graph's single source of truth for tile extents: one per
-// label, supplied once here instead of once per stage() call.
-//
-// Taken as an ARGUMENT rather than a template parameter so it is deduced, which
-// keeps ExecSpace's default reachable and puts the map where a reader looks for
-// the graph's configuration. LabelTiles is stateless, so the value is discarded
-// once its type has been read -- the same convention stage() used for its tile.
+/**
+ * @brief Starts an empty graph for a given tile map.
+ *
+ * The tile map names every label your nodes use and gives each an extent: a
+ * `LabelTile` label is cut into tiles and each tile is one team, a `LabelWhole`
+ * label stays whole inside every team. See `howto/choose-a-tile-map` for how to
+ * choose. The map is the only place tile extents are written.
+ *
+ * @tparam ValueType Scalar type of the graph's scratch slots, for example
+ * `float`.
+ * @tparam ExecSpace Execution space the graph launches on; it must equal the
+ * `ES` of the `TeamPolicyTag` you pass to `execute`.
+ * @tparam LabelTilesT A `LabelTiles<...>` type, deduced from the argument.
+ * @return An empty graph. Grow it with `LevelGraph::add()`.
+ */
 template <typename ValueType,
           typename ExecSpace = Kokkos::DefaultExecutionSpace,
           typename LabelTilesT>
 auto make_level_graph(LabelTilesT) {
+  // The map is an argument, not a template parameter, so it is deduced and
+  // ExecSpace keeps its default. LabelTiles is stateless: only its type is
+  // used.
   return LevelGraph<ValueType, ExecSpace, LabelTilesT, DeviceTuple<>>{{}};
 }
 
