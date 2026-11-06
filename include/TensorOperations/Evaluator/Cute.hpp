@@ -3,6 +3,7 @@
 #include <TensorOperations/Evaluator.hpp>
 #include <TensorOperations/NodeHandle.hpp>
 #include <TensorOperations/TensorHandle.hpp>
+#include <TensorOperations/TileExtent.hpp>
 
 #include <cute/tensor.hpp>
 
@@ -127,6 +128,29 @@ KOKKOS_FUNCTION auto cute_tiler_shape(const Tiler& t) {
     return typename cute_tiler_traits<Tiler>::shape{};
   else
     return t;
+}
+
+template <typename Frag>
+KOKKOS_FUNCTION void clear_missing(Frag&, const WholeTile&) {}
+
+template <typename Frag, std::size_t Rank>
+KOKKOS_FUNCTION void clear_missing(Frag& frag, const ClippedTile<Rank>&) {
+  cute::clear(frag);
+}
+
+template <typename Src, typename Dst, typename Coords>
+KOKKOS_FUNCTION void copy_existing(const Src& src, Dst&& dst, const Coords&,
+                                   const WholeTile&) {
+  cute::copy(src, dst);
+}
+
+template <typename Src, typename Dst, typename Coords, std::size_t Rank>
+KOKKOS_FUNCTION void copy_existing(const Src& src, Dst&& dst,
+                                   const Coords&            coords,
+                                   const ClippedTile<Rank>& tile) {
+  CUTE_UNROLL
+  for (int v = 0; v < static_cast<int>(cute::size(coords)); ++v)
+    if (tile.contains(cute::flatten(coords(v)))) dst(v) = src(v);
 }
 
 template <typename Tiler, typename T, typename ModesSeq>
@@ -668,12 +692,13 @@ inline constexpr bool partitions_like_v =
 
 template <int R, typename StaticExt = void, typename Src, typename Part,
           typename Tiler, typename Coord, typename T, typename ModesSeq,
-          typename HookOp, int... Perm>
+          typename HookOp, int... Perm, typename Extent = WholeTile>
 KOKKOS_FUNCTION void cute_store_global(const Src& src, const Part& part,
                                        const Tiler& tiler, const Coord& coord,
                                        const TensorHandle<T, ModesSeq>& out,
                                        std::integer_sequence<int, Perm...>,
-                                       const HookOp& hook) {
+                                       const HookOp& hook,
+                                       const Extent& tile = {}) {
   static_assert(sizeof...(Perm) == R,
                 "store permutation must have one entry per output mode");
   static_assert(TensorHandle<T, ModesSeq>::Rank == R,
@@ -690,12 +715,14 @@ KOKKOS_FUNCTION void cute_store_global(const Src& src, const Part& part,
   if (!part.active()) return;
   auto gp = part(cute::local_tile(gc, tiler, coord));
 
+  const auto lc = part(cute::make_identity_tensor(tiler));
   if constexpr (std::is_same_v<HookOp, NoHook>) {
-    cute::copy(src, gp);
+    copy_existing(src, gp, lc, tile);
   } else {
     const auto cp = part(cute::local_tile(
         cute::make_identity_tensor(cute::shape(gc)), tiler, coord));
     for (int i = 0; i < static_cast<int>(cute::size(src)); ++i) {
+      if (!tile.contains(cute::flatten(lc(i)))) continue;
       auto v = src(i);
       apply_cute_hook(hook, cp(i), v, std::make_index_sequence<R>{});
       gp(i) = v;
@@ -756,8 +783,9 @@ class Evaluator<CutePolicyTag<ES>,
 
   static constexpr int NumOut = node_type::NumOut;
 
-  template <typename Coord>
-  KOKKOS_FUNCTION auto operator()(const Coord& coord) const {
+  template <typename Coord, typename Extent = Impl::WholeTile>
+  KOKKOS_FUNCTION auto operator()(const Coord&  coord,
+                                  const Extent& tile = {}) const {
     const auto src = make_evaluator<CutePolicyTag<ES>>(
         node_.operand_,
         typename Impl::cute_staged_tiler<TileShape, StaticExt>::type{})(coord);
@@ -765,17 +793,22 @@ class Evaluator<CutePolicyTag<ES>,
     const auto coords = part(cute::make_identity_tensor(TileShape{}));
     if constexpr (NumOut == 1) {
       auto frag = cute::make_tensor<value_type>(cute::shape(coords));
-      if (part.active()) cute::copy(part(src.node().storage_), frag);
+      Impl::clear_missing(frag, tile);
+      if (part.active())
+        Impl::copy_existing(part(src.node().storage_), frag, coords, tile);
       return Impl::make_cute_fragment_value_evaluator<ES, Rank, TileShape>(
           frag, coords, src.node().hook_op);
     } else {
       using frag_t =
           decltype(cute::make_tensor<value_type>(cute::shape(coords)));
       Kokkos::Array<frag_t, NumOut> frags;
+      CUTE_UNROLL
+      for (int o = 0; o < NumOut; ++o) Impl::clear_missing(frags[o], tile);
       if (part.active()) {
         const auto sp = part(src.node().storage_);
         CUTE_UNROLL
         for (int v = 0; v < static_cast<int>(cute::size(coords)); ++v) {
+          if (!tile.contains(cute::flatten(coords(v)))) continue;
           const auto r = sp(v);
           CUTE_UNROLL
           for (int o = 0; o < NumOut; ++o) frags[o](v) = r[o];
@@ -1111,13 +1144,15 @@ class Evaluator<CutePolicyTag<ES>,
         active_(t.active),
         coords_(t.coords) {}
 
-  KOKKOS_FUNCTION auto operator()() const {
+  template <typename Extent = Impl::WholeTile>
+  KOKKOS_FUNCTION auto operator()(const Extent& tile = {}) const {
     constexpr int nv = decltype(cute::size(std::declval<Coords>()))::value;
     if constexpr (NumOut == 0) {
       if (active_) {
         CUTE_UNROLL
         for (int v = 0; v < nv; ++v) {
           const auto oc = cute::flatten(coords_(v));
+          if (!tile.contains(oc)) continue;
           if constexpr (Impl::is_scatter_frag_fn_v<CombineFn>)
             fn_.add(v, read<0>(v, oc));
           else
@@ -1129,11 +1164,14 @@ class Evaluator<CutePolicyTag<ES>,
     } else {
       using frag_t = decltype(cute::make_tensor<S>(cute::shape(coords_)));
       Kokkos::Array<frag_t, NumOut> outs;
+      CUTE_UNROLL
+      for (int m = 0; m < NumOut; ++m) Impl::clear_missing(outs[m], tile);
       if (active_) {
         CUTE_UNROLL
         for (int v = 0; v < nv; ++v) {
           const auto oc = cute::flatten(coords_(v));
-          const auto r  = Impl::as_output_array<S>(Impl::apply_combine(
+          if (!tile.contains(oc)) continue;
+          const auto r = Impl::as_output_array<S>(Impl::apply_combine(
               fn_, global_index(oc, std::make_index_sequence<Rank>{}),
               gather(v, oc, std::make_index_sequence<NumOps>{})));
           CUTE_UNROLL
@@ -1266,13 +1304,15 @@ class Evaluator<CutePolicyTag<ES>,
   }
 
   template <typename Coord, typename T, typename ModesSeq, typename PermSeq,
-            int... Ext>
+            int... Ext, typename Extent = Impl::WholeTile>
   KOKKOS_FUNCTION void operator()(const Coord&                     coord,
                                   const TensorHandle<T, ModesSeq>& out,
                                   PermSeq                          perm,
-                                  std::integer_sequence<int, Ext...>) const {
+                                  std::integer_sequence<int, Ext...>,
+                                  const Extent& tile = {}) const {
     Impl::cute_store_global<R, std::integer_sequence<int, Ext...>>(
-        node_.frag_, tag_.part, TileShape{}, coord, out, perm, node_.hook_op);
+        node_.frag_, tag_.part, TileShape{}, coord, out, perm, node_.hook_op,
+        tile);
   }
 
  private:

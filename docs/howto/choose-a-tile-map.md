@@ -27,7 +27,7 @@ using TileMap = TOps::LabelTiles<TOps::LabelTile<'e', 4>,
 | A label that is summed over (contracted) is `LabelWhole`. Blocking it would split the sum across teams, and nothing adds the partial sums. | Compile error: `a contracted label must be LabelWhole`. |
 | At least one label is `LabelTile` and carried by some node; a `LabelTile` entry for an unused label does not count. | Compile error at `execute`: `at least one label must be blocked (LabelTile)`. |
 | A `LabelWhole` extent is not smaller than the axis. | Runtime abort, in every build: `a label declared LabelWhole is longer than its tile ... declare it LabelTile instead`. |
-| Every blocked extent is a multiple of its tile (next section). | Nothing checks a staged input (a tensor the graph copies into team scratch, such as `local_to_global`) in any build. Behavior is undefined. |
+| On the Team path, every blocked extent is a multiple of its tile (see below). The CuTe path has no such rule. | Runtime abort on the Team path, in every build: `a gridded label's extent is not a multiple of its tile`. |
 
 The compile-time cases are exercised in
 [`labeltiles_guard_negative.cpp`](https://github.com/Rohit-Kakodkar/TensorOperations/blob/main/tests/negative/labeltiles_guard_negative.cpp).
@@ -76,6 +76,11 @@ The limit comes from the backend, so the same tile can fit on Serial and fail on
 a GPU. Check on the device you will run on.
 
 ## When the extent is not a multiple of the tile
+
+The CuTe path handles this for you. The last tile is clipped to the tensor, and
+points past the end are never read, written, or passed to your functions.
+Divisible sizes run the same code as before, and only the clipped tile pays for
+the checks.
 
 The Team path has no remainder tile. Round the blocked axis up to a multiple of
 the tile, and make the padded entries harmless:
@@ -186,11 +191,7 @@ On Serial it prints the scratch line (152 bytes at level 0 for this graph),
 then `ok (spare node holds 102, ignored)`. The spare node's sum is whatever the
 padded entries add; read only real nodes.
 
-If you skip the padding, nothing tells you, in any build: a staged input whose
-blocked extent is not a multiple of the tile is not checked on the Team path.
-Padding is the only protection. The last tile reads past the end of the
-connectivity table, which can crash or silently produce wrong sums; do not rely
-on a particular failure.
+If you skip the padding on the Team path, `execute` aborts in every build.
 
 Two checks that do exist, both `assert` only (removed by `NDEBUG`):
 

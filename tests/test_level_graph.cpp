@@ -1211,6 +1211,18 @@ TEST(LevelGraphScratchLevelDeathTest, AStoreAboveEveryLevelAbortsClearly) {
   EXPECT_DEATH(out.execute(TeamPolicyTag<ES>{}, out_view), "every level");
 }
 
+TEST(LevelGraphPartialTileDeathTest, TeamAbortsOnAPartialTile) {
+  if (!kOnHost) GTEST_SKIP() << "death tests fork; run them on host only";
+  using View = Kokkos::View<float**, Kokkos::LayoutRight, ES>;
+  using Map  = LabelTiles<LabelTile<'e', 2>, LabelWhole<'a', 4>>;
+  View in("in", 5, 4), out_view("out", 5, 4);
+  auto g0 = make_level_graph<float, ES>(Map{});
+  auto [g1, s] =
+      g0.add(make_stage_node(make_input_node(make_handle<'e', 'a'>(in))));
+  const auto out = g1.outputs(s);
+  EXPECT_DEATH(out.execute(TeamPolicyTag<ES>{}, out_view), "not a multiple");
+}
+
 }  // namespace lvl
 
 int main(int argc, char* argv[]) {

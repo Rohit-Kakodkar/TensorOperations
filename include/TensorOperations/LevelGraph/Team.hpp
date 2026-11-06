@@ -1300,7 +1300,8 @@ void lg_note_level_extents(std::array<int, N>& ext, std::array<bool, N>& seen,
      else if constexpr (has_node_tag_v<GeneralContractionTag, Member>)
        lg_note_gc_extents<LT, GridModes, N, Member>(
            ext, seen, lv.template get<Ms>(),
-           std::make_index_sequence<static_cast<std::size_t>(Member::NumOps)>{});
+           std::make_index_sequence<static_cast<std::size_t>(
+               Member::NumOps)>{});
    }()),
    ...);
 }
@@ -1327,6 +1328,14 @@ Kokkos::Array<int, lg_grid_rank<LT, LevelsT>()> lg_grid_shape(
 // League size: the product of every label's tile count. A label whose extent
 // equals its tile contributes exactly 1, which is how a mode that is not really
 // gridded costs nothing but a factor of one.
+template <typename LT, typename GridModes, std::size_t N>
+bool lg_every_tile_whole(const Kokkos::Array<int, N>& shape) {
+  constexpr auto grid = seq_to_array(GridModes{});
+  for (std::size_t d = 0; d < N; ++d)
+    if (shape[d] % label_tile_of<LT>(grid[d]) != 0) return false;
+  return true;
+}
+
 template <typename GridTile, std::size_t N>
 int lg_league_size(const Kokkos::Array<int, N>& shape) {
   int total = 1;
@@ -1370,7 +1379,11 @@ int lg_execute_at(const LevelsT& levels, std::size_t bytes, int team_size,
   const LevelsT ld = levels;
 
   const auto grid_shape = lg_grid_shape<LT>(levels, level_seq{});
-  const int  wk         = lg_league_size<GridTile>(grid_shape);
+  if (!lg_every_tile_whole<LT, GridModes>(grid_shape))
+    Kokkos::abort(
+        "level graph (Team): a gridded label's extent is not a multiple of its "
+        "tile; pad the extent, or use the CuTe backend");
+  const int wk = lg_league_size<GridTile>(grid_shape);
 
   Kokkos::TeamPolicy<ES> policy =
       team_size > 0 ? Kokkos::TeamPolicy<ES>(wk, team_size)

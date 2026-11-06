@@ -154,7 +154,7 @@ Breaking this is a caller error, mostly unchecked:
 | Mistake | What happens |
 | --- | --- |
 | A `LabelWhole` axis longer than its tile | Aborts in every build: `a label declared LabelWhole is longer than its tile`. |
-| A `LabelTile` extent that is not a multiple | No diagnostic in any build. The last tile reads past the data and the results are wrong. |
+| A `LabelTile` extent that is not a multiple | Aborts in every build: `a gridded label's extent is not a multiple of its tile`. The CuTe path accepts these extents and clips the last tile. |
 | A `LabelWhole` axis shorter than its tile | No diagnostic in a Release build. A Debug build asserts (`the tile overhangs the tensor`). |
 | An output view shaped in the operands' order instead of the declared order | No diagnostic in any build. With `c` as `(rows, cols)` the program runs and the results are wrong. |
 
