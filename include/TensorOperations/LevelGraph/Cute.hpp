@@ -736,10 +736,9 @@ __device__ auto lg_cute_outputs_tuple(const Outs& outs,
 }
 
 template <typename ES, int NumThreads, typename LevelsT, typename GridModes,
-          std::size_t RootR, std::size_t L, std::size_t M, typename Acc>
-__device__ auto lg_cute_stage_member(const LevelsT&                   levels,
-                                     const Kokkos::Array<int, RootR>& grid_idx,
-                                     const Acc&                       acc) {
+          std::size_t L, std::size_t M, typename Tile, typename Acc>
+__device__ auto lg_cute_stage_member(const LevelsT& levels, const Tile& tile,
+                                     const Acc& acc) {
   using Node = tuple_element_t<M, tuple_element_t<L, LevelsT>>;
   if constexpr (has_node_tag_v<GatherTag, typename Node::operand_type>) {
     using P = lg_cute_slot_producer<LevelsT, lg_member_base_v<LevelsT, L, M>,
@@ -757,16 +756,17 @@ __device__ auto lg_cute_stage_member(const LevelsT&                   levels,
     using Gather = gather_seq_t<typename Node::modes_seq, GridModes>;
     using Ext = std::conditional_t<lg_cute_global_input_v<Node>,
                                    lg_cute_input_ext_t<Node, GridModes>, void>;
-    const auto idx = node_index<Node::Rank, RootR>(grid_idx, Gather{});
-    auto       ev  = make_evaluator<CutePolicyTag<ES>>(
+    const auto idx    = tile.template node_index<Node::Rank>(Gather{});
+    const auto extent = tile.template node_extent<Node::Rank>(Gather{});
+    auto       ev     = make_evaluator<CutePolicyTag<ES>>(
         levels.template get<L>().template get<M>(),
         CuteStagedTag<typename S::tile_shape, typename S::part, Ext>{
             S::make()});
     if constexpr (Node::NumOut == 1) {
-      using R = DeviceTuple<decltype(ev(idx))>;
-      return R{ev(idx)};
+      using R = DeviceTuple<decltype(ev(idx, extent))>;
+      return R{ev(idx, extent)};
     } else {
-      const auto outs = ev(idx);
+      const auto outs = ev(idx, extent);
       return lg_cute_outputs_tuple(
           outs,
           std::make_index_sequence<static_cast<std::size_t>(Node::NumOut)>{});
@@ -864,17 +864,18 @@ inline constexpr bool lg_cute_scatter_aligned_v =
     lg_cute_scatter_aligned<IdxTV, SelfTV, CModes, IdxModes, TileShape>();
 
 template <typename V, typename ES, int NumThreads, typename LevelsT,
-          typename GridModes, std::size_t RootR, std::size_t L, std::size_t M,
+          typename GridModes, std::size_t L, std::size_t M, typename Tile,
           typename Acc, std::size_t... Ks, std::size_t... Os>
-__device__ auto lg_cute_combine_member(
-    const LevelsT& levels, const Kokkos::Array<int, RootR>& grid_idx,
-    const Acc& acc, V* base, std::index_sequence<Ks...>,
-    std::index_sequence<Os...>) {
-  using Node     = tuple_element_t<M, tuple_element_t<L, LevelsT>>;
-  using Plan     = lg_cute_combine_plan<LevelsT, L, M, NumThreads>;
-  using Gather   = gather_seq_t<typename Node::modes_seq, GridModes>;
-  using OutTile  = member_out_tile_t<Node>;
-  const auto idx = node_index<Node::Rank, RootR>(grid_idx, Gather{});
+__device__ auto lg_cute_combine_member(const LevelsT& levels, const Tile& tile,
+                                       const Acc& acc, V* base,
+                                       std::index_sequence<Ks...>,
+                                       std::index_sequence<Os...>) {
+  using Node        = tuple_element_t<M, tuple_element_t<L, LevelsT>>;
+  using Plan        = lg_cute_combine_plan<LevelsT, L, M, NumThreads>;
+  using Gather      = gather_seq_t<typename Node::modes_seq, GridModes>;
+  using OutTile     = member_out_tile_t<Node>;
+  const auto idx    = tile.template node_index<Node::Rank>(Gather{});
+  const auto extent = tile.template node_extent<Node::Rank>(Gather{});
   Kokkos::Array<int, Node::Rank> origin{};
   for (int d = 0; d < Node::Rank; ++d) origin[d] = idx[d] * OutTile::extent(d);
 
@@ -913,18 +914,19 @@ __device__ auto lg_cute_combine_member(
         node, ScatterAddFragFn<decltype(frag), typename Fn::dst_type>{
                   frag, node.fn.dst});
     make_evaluator<CutePolicyTag<ES>>(
-        bound, make_cute_combine_tag<TileShape>(Plan::make(levels), origin,
-                                                ops.template get<Ks>()...))();
+        bound,
+        make_cute_combine_tag<TileShape>(Plan::make(levels), origin,
+                                         ops.template get<Ks>()...))(extent);
     return DeviceTuple<>{};
   } else {
     const auto ev = make_evaluator<CutePolicyTag<ES>>(
         node, make_cute_combine_tag<typename Plan::tile_shape>(
                   Plan::make(levels), origin, ops.template get<Ks>()...));
     if constexpr (Node::NumOut == 0) {
-      ev();
+      ev(extent);
       return DeviceTuple<>{};
     } else {
-      return lg_cute_outputs_tuple(ev(), std::index_sequence<Os...>{});
+      return lg_cute_outputs_tuple(ev(extent), std::index_sequence<Os...>{});
     }
   }
 }
@@ -950,10 +952,9 @@ __device__ auto lg_cute_cat(const A& a, const B& b, const Rest&... rest) {
 }
 
 template <typename V, typename ES, int NumThreads, typename LevelsT,
-          typename GridModes, std::size_t RootR, std::size_t L, typename Acc,
+          typename GridModes, std::size_t L, typename Tile, typename Acc,
           std::size_t... Ss, std::size_t... Ms>
-__device__ auto lg_cute_run_level(const LevelsT&                   levels,
-                                  const Kokkos::Array<int, RootR>& grid_idx,
+__device__ auto lg_cute_run_level(const LevelsT& levels, const Tile& tile,
                                   const Acc& acc, V* base,
                                   std::index_sequence<Ss...>,
                                   std::index_sequence<Ms...>) {
@@ -961,8 +962,8 @@ __device__ auto lg_cute_run_level(const LevelsT&                   levels,
   if constexpr (lg_all_staged_v<LevelT>) {
     return lg_cute_cat(
         DeviceTuple<>{},
-        lg_cute_stage_member<ES, NumThreads, LevelsT, GridModes, RootR, L, Ms>(
-            levels, grid_idx, acc)...);
+        lg_cute_stage_member<ES, NumThreads, LevelsT, GridModes, L, Ms>(
+            levels, tile, acc)...);
   } else {
     if constexpr (lg_cute_reuses_at_v<LevelsT, NumThreads, L,
                                       std::index_sequence<Ss...>>)
@@ -978,22 +979,21 @@ __device__ auto lg_cute_run_level(const LevelsT&                   levels,
           lg_cute_contract_member<V, ES, NumThreads, LevelsT, L, Ms>(levels,
                                                                      base)...);
     } else {
-      return lg_cute_cat(DeviceTuple<>{},
-                         lg_cute_combine_member<V, ES, NumThreads, LevelsT,
-                                                GridModes, RootR, L, Ms>(
-                             levels, grid_idx, acc, base,
-                             std::make_index_sequence<static_cast<std::size_t>(
-                                 tuple_element_t<Ms, LevelT>::NumOps)>{},
-                             std::make_index_sequence<static_cast<std::size_t>(
-                                 tuple_element_t<Ms, LevelT>::NumOut)>{})...);
+      return lg_cute_cat(
+          DeviceTuple<>{},
+          lg_cute_combine_member<V, ES, NumThreads, LevelsT, GridModes, L, Ms>(
+              levels, tile, acc, base,
+              std::make_index_sequence<static_cast<std::size_t>(
+                  tuple_element_t<Ms, LevelT>::NumOps)>{},
+              std::make_index_sequence<static_cast<std::size_t>(
+                  tuple_element_t<Ms, LevelT>::NumOut)>{})...);
     }
   }
 }
 
 template <typename V, typename ES, int NumThreads, typename LevelsT,
-          typename GridModes, std::size_t RootR, std::size_t L, typename Acc>
-__device__ auto lg_cute_run_levels(const LevelsT&                   levels,
-                                   const Kokkos::Array<int, RootR>& grid_idx,
+          typename GridModes, std::size_t L, typename Tile, typename Acc>
+__device__ auto lg_cute_run_levels(const LevelsT& levels, const Tile& tile,
                                    const Acc& acc, V* base) {
   if constexpr (L == tuple_size_v<LevelsT>) {
     return acc;
@@ -1002,27 +1002,24 @@ __device__ auto lg_cute_run_levels(const LevelsT&                   levels,
     constexpr std::size_t NA = tuple_size_v<Acc>;
     static_assert(lg_member_base_v<LevelsT, L, 0> == NA,
                   "CuTe level graph: slots must be numbered in level order");
-    const auto lv =
-        lg_cute_run_level<V, ES, NumThreads, LevelsT, GridModes, RootR, L>(
-            levels, grid_idx, acc, base, std::make_index_sequence<NA>{},
-            std::make_index_sequence<NM>{});
-    return lg_cute_run_levels<V, ES, NumThreads, LevelsT, GridModes, RootR,
-                              L + 1>(levels, grid_idx, lg_cute_cat(acc, lv),
-                                     base);
+    const auto lv = lg_cute_run_level<V, ES, NumThreads, LevelsT, GridModes, L>(
+        levels, tile, acc, base, std::make_index_sequence<NA>{},
+        std::make_index_sequence<NM>{});
+    return lg_cute_run_levels<V, ES, NumThreads, LevelsT, GridModes, L + 1>(
+        levels, tile, lg_cute_cat(acc, lv), base);
   }
 }
 
 template <typename ES, int NumThreads, typename LevelsT, typename GridModes,
-          std::size_t RootR, std::size_t Rt, typename Slots, typename ViewT>
+          std::size_t Rt, typename Slots, typename Tile, typename ViewT>
 __device__ void lg_cute_store_root(const LevelsT& levels, const Slots& slots,
-                                   const Kokkos::Array<int, RootR>& grid_idx,
-                                   const ViewT&                     view) {
+                                   const Tile& tile, const ViewT& view) {
   using Node   = lg_cute_slot_node_t<LevelsT, Rt>;
   using P      = lg_cute_slot_producer<LevelsT, Rt, NumThreads>;
   using Gather = gather_seq_t<typename Node::modes_seq, GridModes>;
 
   const auto& f   = slots.template get<Rt>().node();
-  const auto  idx = node_index<Node::Rank, RootR>(grid_idx, Gather{});
+  const auto  idx = tile.template node_index<Node::Rank>(Gather{});
   const auto  node =
       make_cute_fragment_node<ES, Node::Rank, typename P::tile_shape>(
           f.frag_, f.coords_);
@@ -1032,19 +1029,18 @@ __device__ void lg_cute_store_root(const LevelsT& levels, const Slots& slots,
   const auto out  = make_handle_seq(view, DeclModes{});
   make_evaluator<CutePolicyTag<ES>>(
       node, CuteFragmentStoreTag<typename P::part>{P::make(levels)})(
-      idx, out, output_perm_seq<Node>(), Ext{});
+      idx, out, output_perm_seq<Node>(), Ext{},
+      tile.template node_extent<Node::Rank>(Gather{}));
 }
 
 template <typename ES, int NumThreads, typename LevelsT, typename GridModes,
-          std::size_t RootR, typename Slots, typename ViewArr,
-          std::size_t... Rts>
+          typename Slots, typename Tile, typename ViewArr, std::size_t... Rts>
 __device__ void lg_cute_store_roots(const LevelsT& levels, const Slots& slots,
-                                    const Kokkos::Array<int, RootR>& grid_idx,
-                                    const ViewArr&                   views,
+                                    const Tile& tile, const ViewArr& views,
                                     std::index_sequence<Rts...>) {
   int i = 0;
-  (lg_cute_store_root<ES, NumThreads, LevelsT, GridModes, RootR, Rts>(
-       levels, slots, grid_idx, views[i++]),
+  (lg_cute_store_root<ES, NumThreads, LevelsT, GridModes, Rts>(
+       levels, slots, tile, views[i++]),
    ...);
 }
 
@@ -1062,8 +1058,23 @@ __device__ void lg_cute_store_roots(const LevelsT& levels, const Slots& slots,
 #endif
 
 template <typename V, typename ES, int NumThreads, typename LevelsT,
+          typename GridModes, typename RootsSeq, typename Tile,
+          typename ViewArr>
+__forceinline__ __device__ void lg_cute_run_tile(const LevelsT& levels,
+                                                 const Tile&    tile,
+                                                 const ViewArr& views,
+                                                 V*             base) {
+  const auto slots =
+      lg_cute_run_levels<V, ES, NumThreads, LevelsT, GridModes, 0>(
+          levels, tile, DeviceTuple<>{}, base);
+  lg_cute_store_roots<ES, NumThreads, LevelsT, GridModes>(levels, slots, tile,
+                                                          views, RootsSeq{});
+}
+
+template <typename V, typename ES, int NumThreads, typename LevelsT,
           typename GridModes, typename GridTile, typename Scheduler,
-          typename RootsSeq, std::size_t RootR, typename ViewArr>
+          typename RootsSeq, std::size_t RootR, typename ViewArr,
+          bool EveryTileWhole>
 __global__ void lg_cute_kernel(LevelsT levels, Kokkos::Array<int, RootR> shape,
                                ViewArr views) {
 #if TENSOR_OPS_CHECK_CUTE_LAUNCH
@@ -1078,23 +1089,18 @@ __global__ void lg_cute_kernel(LevelsT levels, Kokkos::Array<int, RootR> shape,
   // the same constant and the debug check above traps on any other shape.
   __builtin_assume(threadIdx.x < static_cast<unsigned>(NumThreads));
   extern __shared__ __align__(16) unsigned char lg_cute_smem[];
-  V* const   base     = reinterpret_cast<V*>(lg_cute_smem);
-  const auto grid_idx = Scheduler::template tile_coord<RootR, GridTile>(shape);
-  const auto slots =
-      lg_cute_run_levels<V, ES, NumThreads, LevelsT, GridModes, RootR, 0>(
-          levels, grid_idx, DeviceTuple<>{}, base);
-  lg_cute_store_roots<ES, NumThreads, LevelsT, GridModes, RootR>(
-      levels, slots, grid_idx, views, RootsSeq{});
-}
-
-template <typename LT, typename GridModes, std::size_t N>
-void lg_cute_check_divisible(const Kokkos::Array<int, N>& shape) {
-  constexpr auto grid = seq_to_array(GridModes{});
-  for (std::size_t d = 0; d < N; ++d)
-    if (shape[d] % label_tile_of<LT>(grid[d]) != 0)
-      Kokkos::abort(
-          "level graph (CuTe): a gridded label's extent is not a multiple of "
-          "its tile; the CuTe backend requires tiles to divide the extents");
+  V* const   base  = reinterpret_cast<V*>(lg_cute_smem);
+  const auto index = Scheduler::template tile_coord<RootR, GridTile>(shape);
+  if constexpr (!EveryTileWhole) {
+    const auto clipped = clip_tile<GridTile>(shape, index);
+    if (!clipped.template is_whole<GridTile>()) {
+      lg_cute_run_tile<V, ES, NumThreads, LevelsT, GridModes, RootsSeq>(
+          levels, PlacedTile{index, clipped}, views, base);
+      return;
+    }
+  }
+  lg_cute_run_tile<V, ES, NumThreads, LevelsT, GridModes, RootsSeq>(
+      levels, PlacedTile{index, WholeTile{}}, views, base);
 }
 
 template <typename LT, typename Node>
@@ -1106,7 +1112,7 @@ void lg_cute_check_whole(const Node& n) {
         shape[d] != label_tile_of<LT>(modes[d]))
       Kokkos::abort(
           "level graph (CuTe): a LabelWhole label's extent differs from its "
-          "tile; the CuTe backend requires tiles to divide the extents");
+          "tile; the CuTe backend requires them to be equal");
 }
 
 template <typename LT, typename LevelsT, std::size_t... Ls>
@@ -1178,6 +1184,43 @@ std::size_t lg_cute_unpooled_smem_bytes() {
          sizeof(V);
 }
 
+template <typename V, typename ES, int NumThreads, typename LevelsT,
+          typename GridModes, typename GridTile, typename Scheduler,
+          typename RootsSeq, std::size_t RootR, bool EveryTileWhole,
+          typename ViewArr>
+void lg_cute_launch(const LevelsT&                   levels,
+                    const Kokkos::Array<int, RootR>& grid_shape,
+                    const ViewArr& varr, int wk) {
+  const std::size_t bytes = lg_cute_smem_bytes<V, ES, LevelsT>();
+
+  const auto kernel =
+      lg_cute_kernel<V, ES, NumThreads, LevelsT, GridModes, GridTile, Scheduler,
+                     RootsSeq, RootR, ViewArr, EveryTileWhole>;
+  if (bytes > lg_cute_default_smem_bytes &&
+      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                           static_cast<int>(bytes)) != cudaSuccess)
+    Kokkos::abort(
+        "level graph (CuTe): the graph's scratch exceeds the device's "
+        "shared memory per block");
+
+  // The kernel's own thread limit (registers included, not just the device's
+  // 1024). A launch above it would fail anyway; this says why.
+  cudaFuncAttributes attr{};
+  if (cudaFuncGetAttributes(&attr, kernel) != cudaSuccess)
+    Kokkos::abort("level graph (CuTe): cannot query the kernel's attributes");
+  if (NumThreads > attr.maxThreadsPerBlock)
+    Kokkos::abort(
+        "level graph (CuTe): the kernel's register use allows fewer threads "
+        "per block than the graph's contractions need; use a smaller tile");
+
+  // Exactly (NumThreads, 1, 1): the shape lg_cute_kernel assumes.
+  const dim3 block(static_cast<unsigned>(NumThreads), 1u, 1u);
+  kernel<<<Scheduler::grid(wk), block, bytes, ES{}.cuda_stream()>>>(
+      levels, grid_shape, varr);
+  if (cudaGetLastError() != cudaSuccess)
+    Kokkos::abort("level graph (CuTe): kernel launch failed");
+}
+
 template <typename V, typename ES, typename LT, typename LevelsT,
           typename RootsSeq, typename... ViewTs>
 int lg_execute_cute(const LevelsT& levels, RootsSeq, const ViewTs&... views) {
@@ -1202,7 +1245,6 @@ int lg_execute_cute(const LevelsT& levels, RootsSeq, const ViewTs&... views) {
 
   const auto grid_shape = lg_grid_shape<LT>(
       levels, std::make_index_sequence<tuple_size_v<LevelsT>>{});
-  lg_cute_check_divisible<LT, GridModes>(grid_shape);
   lg_cute_check_wholes<LT>(levels,
                            std::make_index_sequence<tuple_size_v<LevelsT>>{});
   lg_cute_check_global_inputs<GridModes>(
@@ -1211,34 +1253,12 @@ int lg_execute_cute(const LevelsT& levels, RootsSeq, const ViewTs&... views) {
   const auto varr = lg_view_array(views...);
   lg_cute_check_global_outputs<GridModes, NumThreads, LevelsT>(varr,
                                                                RootsSeq{});
-  const std::size_t bytes = lg_cute_smem_bytes<V, ES, LevelsT>();
-
-  const auto kernel =
-      lg_cute_kernel<V, ES, NumThreads, LevelsT, GridModes, GridTile, Scheduler,
-                     RootsSeq, RootR, std::decay_t<decltype(varr)>>;
-  if (bytes > lg_cute_default_smem_bytes &&
-      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                           static_cast<int>(bytes)) != cudaSuccess)
-    Kokkos::abort(
-        "level graph (CuTe): the graph's scratch exceeds the device's "
-        "shared memory per block");
-
-  // The kernel's own thread limit (registers included, not just the device's
-  // 1024). A launch above it would fail anyway; this says why.
-  cudaFuncAttributes attr{};
-  if (cudaFuncGetAttributes(&attr, kernel) != cudaSuccess)
-    Kokkos::abort("level graph (CuTe): cannot query the kernel's attributes");
-  if (NumThreads > attr.maxThreadsPerBlock)
-    Kokkos::abort(
-        "level graph (CuTe): the kernel's register use allows fewer threads "
-        "per block than the graph's contractions need; use a smaller tile");
-
-  // Exactly (NumThreads, 1, 1): the shape lg_cute_kernel assumes.
-  const dim3 block(static_cast<unsigned>(NumThreads), 1u, 1u);
-  kernel<<<Scheduler::grid(wk), block, bytes, ES{}.cuda_stream()>>>(
-      levels, grid_shape, varr);
-  if (cudaGetLastError() != cudaSuccess)
-    Kokkos::abort("level graph (CuTe): kernel launch failed");
+  if (lg_every_tile_whole<LT, GridModes>(grid_shape))
+    lg_cute_launch<V, ES, NumThreads, LevelsT, GridModes, GridTile, Scheduler,
+                   RootsSeq, RootR, true>(levels, grid_shape, varr, wk);
+  else
+    lg_cute_launch<V, ES, NumThreads, LevelsT, GridModes, GridTile, Scheduler,
+                   RootsSeq, RootR, false>(levels, grid_shape, varr, wk);
   return wk;
 }
 

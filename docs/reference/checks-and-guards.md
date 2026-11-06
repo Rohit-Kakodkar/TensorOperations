@@ -104,6 +104,6 @@ Worked example: {doc}`../howto/contract-with-a-level-graph`. Team path only.
 | Level rules (one kind and one iteration space per level) | Only when you instantiate `LevelPlan` for the graph; `add` does not check them | Compile time, on request |
 | A `LabelWhole` axis longer than its tile | `Kokkos::abort` | Yes |
 | Contracted extents differ between operands | `assert` | No: removed by `NDEBUG` |
-| A partial tile in a staged input | None | Not checked: wrong values |
+| A `LabelTile` extent that is not a multiple of its tile, on the Team path | `Kokkos::abort` | Yes |
 | A `LabelWhole` axis shorter than its tile | `assert` when a tile is staged or stored | No: removed by `NDEBUG` |
 | Output view axis order and extents matching the declared labels | None | Not checked: wrong values |
