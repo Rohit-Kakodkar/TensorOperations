@@ -61,7 +61,7 @@ int run() {
   const auto bytes  = lg_cute_smem_bytes<float, ES, LevelsT>();
   const auto kernel = lg_cute_kernel<float, ES, NT, LevelsT, GridModes,
                                      GridTile, LinearTileScheduler, RootsSeq,
-                                     RootR, std::decay_t<decltype(varr)>>;
+                                     RootR, std::decay_t<decltype(varr)>, true>;
   kernel<<<lg_league_size<GridTile>(shape), NT + 32, bytes>>>(lv, shape, varr);
 
   const cudaError_t e = cudaDeviceSynchronize();

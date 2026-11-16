@@ -2271,14 +2271,13 @@ TEST(CuteScatter, ViewFormMatchesTeamAndReference) {
 
 namespace {
 
-template <int TE, typename NT>
+template <int TE, typename NT, int E = 2 * TE>
 void expect_index_slot_scatter() {
-  using MX        = RowOfEMma<TE, ThrX, NT>;
-  using ME        = RowOfEMma<TE, ThrEta, NT>;
-  using MG        = RowOfEMma<TE, ThrGamma, NT>;
-  constexpr int E = 2 * TE;
-  OpView<5>     h("h", 5, 5);
-  IdxR          idx("idx", E, 5, 5, 5);
+  using MX = RowOfEMma<TE, ThrX, NT>;
+  using ME = RowOfEMma<TE, ThrEta, NT>;
+  using MG = RowOfEMma<TE, ThrGamma, NT>;
+  OpView<5> h("h", 5, 5);
+  IdxR      idx("idx", E, 5, 5, 5);
   fill(h, 0.5f);
   fill_gid(idx);
   const VecG src = make_gsrc();
@@ -2314,8 +2313,10 @@ void expect_index_slot_scatter() {
 
   build(cd).outputs().execute(CutePolicyTag<>{});
   ASSERT_TRUE(synced());
-  build(td).outputs().execute(TeamPolicyTag<ES>{});
-  ASSERT_TRUE(synced());
+  if constexpr (E % TE == 0) {
+    build(td).outputs().execute(TeamPolicyTag<ES>{});
+    ASSERT_TRUE(synced());
+  }
 
   auto hh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, h);
   auto uf = [](int e, int k, int j, int i) {
@@ -2338,10 +2339,39 @@ void expect_index_slot_scatter() {
         }
   const auto want = scatter_reference(E, val);
   EXPECT_LT(max_rel(cd, want), 1e-5);
-  EXPECT_LT(max_rel(td, want), 1e-5);
+  if constexpr (E % TE == 0) EXPECT_LT(max_rel(td, want), 1e-5);
 }
 
 }  // namespace
+
+TEST(CuteScatter, IndexSlotScatterSkipsMissingPoints) {
+  expect_index_slot_scatter<2, RowOfENTile<2>, 3>();
+}
+
+TEST(CuteScatter, ViewFormSkipsMissingPoints) {
+  constexpr int E = 7;
+  IdxR          idx("idx", E, N, N, N);
+  ViewR         u("u", E, N, N, N);
+  fill_gid(idx);
+  fill(u, 1.0f);
+  VecG dst("dst", kNG);
+
+  auto g0      = make_level_graph<float, ES>(Map4<2>{});
+  auto [g1, s] = g0.add(
+      make_stage_node(make_input_node(make_handle<'e', 'a', 'b', 'c'>(u))));
+  auto [g2, r] = g1.add(make_combine_node<'e', 'a', 'b', 'c'>(s, Twice{}));
+  auto g3      = g2.add(make_scatter_add_node<'e', 'a', 'b', 'c'>(idx, dst, r));
+  EXPECT_EQ(g3.outputs().execute(CutePolicyTag<>{}), 4);
+  ASSERT_TRUE(synced());
+
+  auto hu = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, u);
+  std::vector<double> val;
+  for (int e = 0; e < E; ++e)
+    for (int a = 0; a < N; ++a)
+      for (int b = 0; b < N; ++b)
+        for (int c = 0; c < N; ++c) val.push_back(2.0 * hu(e, a, b, c));
+  EXPECT_LT(max_rel(dst, scatter_reference(E, val)), 1e-6);
+}
 
 TEST(CuteScatter, IndexSlotScatterFromRowOfEGradients) {
   expect_index_slot_scatter<2, RowOfENTile<2>>();
