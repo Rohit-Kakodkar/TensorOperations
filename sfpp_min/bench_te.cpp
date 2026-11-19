@@ -38,6 +38,10 @@
 #include <kernel_new.hpp>
 #include <layout.hpp>
 #include <mesh.hpp>
+#include <stiffness_generic.hpp>
+#if defined(SFPP_MIN_BENCH_KERNEL) && SFPP_MIN_BENCH_KERNEL == 1
+#include <stiffness_simple.hpp>
+#endif
 
 #include <Kokkos_Core.hpp>
 
@@ -171,6 +175,80 @@ struct CuteBackend {
 };
 #endif
 
+// SFPP_MIN_BENCH_KERNEL picks the graph: 0 (default) kernel_new through the
+// backends above, 1 the hand-enumerated stiffness_simple (CuTe only), 2
+// stiffness_generic with SFPP_MIN_BENCH_PHYSICS (0 elastic, 1 acoustic) and
+// SFPP_MIN_BENCH_POINT_DATA (0 read in the integrand, 1 register nodes).
+#if defined(SFPP_MIN_BENCH_KERNEL) && SFPP_MIN_BENCH_KERNEL == 1
+struct SimpleBackend {
+  static constexpr const char* name =
+      "cute simple (hand-enumerated, metrics in registers)";
+  static constexpr bool team = false;
+
+  template <int TE, class Args>
+  static NewFootprint footprint(const Args& args, const GlobalHPrime& hw) {
+    const auto out = simple::build_graph<TE>(args, hw).outputs();
+    return {out.cute_smem_bytes(), out.cute_unpooled_smem_bytes(),
+            out.cute_num_threads()};
+  }
+  template <int TE, class Args>
+  static int launch(const Args& args, int, const GlobalHPrime& hw) {
+    return simple::stiffness<TE>(args, hw, TOps::CutePolicyTag<KernelES>{});
+  }
+};
+#elif defined(SFPP_MIN_BENCH_KERNEL) && SFPP_MIN_BENCH_KERNEL == 2
+#if defined(SFPP_MIN_BENCH_PHYSICS) && SFPP_MIN_BENCH_PHYSICS == 1
+#define SFPP_MIN_PHYSICS_NAME "acoustic"
+using BenchPhysics = generic::Acoustic;
+#else
+#define SFPP_MIN_PHYSICS_NAME "elastic"
+using BenchPhysics = generic::Elastic;
+#endif
+#if defined(SFPP_MIN_BENCH_POINT_DATA) && SFPP_MIN_BENCH_POINT_DATA == 1
+#define SFPP_MIN_POINT_DATA_NAME "point data in registers"
+inline constexpr generic::PointData BenchPointData =
+    generic::PointData::Registers;
+#else
+#define SFPP_MIN_POINT_DATA_NAME "point data read in the integrand"
+inline constexpr generic::PointData BenchPointData =
+    generic::PointData::Integrand;
+#endif
+
+struct GenericBackend {
+#if defined(SFPP_MIN_BENCH_TE_CUTE)
+  using Policy                      = TOps::CutePolicyTag<KernelES>;
+  static constexpr bool        team = false;
+  static constexpr const char* name =
+      "cute generic (" SFPP_MIN_PHYSICS_NAME ", " SFPP_MIN_POINT_DATA_NAME ")";
+#else
+  using Policy                      = TOps::TeamPolicyTag<KernelES>;
+  static constexpr bool        team = true;
+  static constexpr const char* name =
+      "team generic (" SFPP_MIN_PHYSICS_NAME ", " SFPP_MIN_POINT_DATA_NAME ")";
+#endif
+
+  template <int TE, class Args>
+  static NewFootprint footprint(const Args& args, const GlobalHPrime&) {
+    return generic::footprint<BenchPhysics, BenchPointData, TE>(args, Policy{});
+  }
+  template <int TE, class Args>
+  static int launch(const Args& args, int team_arg, const GlobalHPrime&) {
+    return generic::stiffness<BenchPhysics, BenchPointData, TE>(args, Policy{},
+                                                                team_arg);
+  }
+};
+#endif
+
+// Whether the backend runs the team policy, which takes a team size; the CuTe
+// block size comes from the graph's MMAs.
+template <class Backend>
+constexpr bool is_team_backend() {
+  if constexpr (requires { Backend::team; })
+    return Backend::team;
+  else
+    return std::is_same_v<Backend, TeamBackend>;
+}
+
 template <class Backend, int TE>
 int run_impl(int argc, char** argv) {
   const int  reps     = (argc > 1) ? std::atoi(argv[1]) : 5;
@@ -178,7 +256,7 @@ int run_impl(int argc, char** argv) {
   const int  team_arg = (argc > 3) ? std::atoi(argv[3]) : -1;
   const bool profile  = (argc > 4) && std::strlen(argv[4]) > 0;
 
-  if (!std::is_same_v<Backend, TeamBackend> && team_arg > 0) {
+  if (!is_team_backend<Backend>() && team_arg > 0) {
     std::printf(
         "the CuTe block size comes from the graph's MMAs; team size "
         "(argv[3]) must be -1\n");
@@ -267,7 +345,7 @@ int run_impl(int argc, char** argv) {
   }
   std::printf("teams       : %d (league) x %d elements = %d work items/team\n",
               league, TE, TE * kPointsPerElement);
-  if (std::is_same_v<Backend, TeamBackend>)
+  if (is_team_backend<Backend>())
     std::printf("team size   : %s\n", team_arg > 0
                                           ? std::to_string(team_arg).c_str()
                                           : "Kokkos::AUTO");
@@ -295,7 +373,7 @@ int run_impl(int argc, char** argv) {
 template <class Backend, int TE>
 int run_te(int argc, char** argv) {
   constexpr int threads = NGLL * NGLL * TE;
-  if constexpr (!std::is_same_v<Backend, TeamBackend> && threads > 1024) {
+  if constexpr (!is_team_backend<Backend>() && threads > 1024) {
     std::printf(
         "TE=%d needs %d threads per block at NGLL=%d; a CuTe block has at "
         "most 1024\n",
@@ -348,7 +426,11 @@ int dispatch_loads(int argc, char** argv, int te, const char* loads) {
 int run(int argc, char** argv) {
   const int   te    = (argc > 5) ? std::atoi(argv[5]) : kExecChunk;
   const char* loads = (argc > 6) ? argv[6] : "once";
-#if defined(SFPP_MIN_BENCH_TE_CUTE)
+#if defined(SFPP_MIN_BENCH_KERNEL) && SFPP_MIN_BENCH_KERNEL == 1
+  return dispatch_loads<SimpleBackend>(argc, argv, te, loads);
+#elif defined(SFPP_MIN_BENCH_KERNEL) && SFPP_MIN_BENCH_KERNEL == 2
+  return dispatch_loads<GenericBackend>(argc, argv, te, loads);
+#elif defined(SFPP_MIN_BENCH_TE_CUTE)
   return dispatch_loads<CuteBackend>(argc, argv, te, loads);
 #else
   return dispatch_loads<TeamBackend>(argc, argv, te, loads);

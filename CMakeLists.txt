@@ -607,6 +607,13 @@ add_executable(sfpp_min_kernel_new sfpp_min/tests/test_kernel_new.cpp)
 target_link_libraries(sfpp_min_kernel_new PRIVATE sfpp_min tensor GTest::gtest)
 gtest_discover_tests(sfpp_min_kernel_new TEST_PREFIX sfpp_min.)
 
+# The stiffness graph written once for any number of field components.
+add_executable(sfpp_min_stiffness_generic
+  sfpp_min/tests/test_stiffness_generic.cpp)
+target_link_libraries(sfpp_min_stiffness_generic
+  PRIVATE sfpp_min tensor GTest::gtest)
+gtest_discover_tests(sfpp_min_stiffness_generic TEST_PREFIX sfpp_min.)
+
 add_executable(sfpp_min_bench_new sfpp_min/bench_new.cpp)
 target_link_libraries(sfpp_min_bench_new PRIVATE sfpp_min tensor)
 
@@ -690,7 +697,51 @@ if(TENSOR_OPS_CUTLASS_DIR AND Kokkos_ENABLE_CUDA)
                                        SFPP_MIN_GATHER_MODE=${gather_mode}
                                        SFPP_MIN_SCATTER_MODE=${scatter_mode})
   endforeach()
+
+  # The hand-enumerated stiffness_simple graph and the component-agnostic
+  # stiffness_generic graph, one kernel per binary.
+  add_executable(sfpp_min_bench_te_cute_simple sfpp_min/bench_te.cpp)
+  target_link_libraries(sfpp_min_bench_te_cute_simple PRIVATE sfpp_min tensor)
+  target_compile_definitions(sfpp_min_bench_te_cute_simple
+                             PRIVATE SFPP_MIN_BENCH_TE_CUTE
+                                     SFPP_MIN_BENCH_ROW_OF_E
+                                     SFPP_MIN_BENCH_KERNEL=1)
+  foreach(physics elastic acoustic)
+    foreach(point_data integrand registers)
+      set(physics_id 0)
+      if(physics STREQUAL "acoustic")
+        set(physics_id 1)
+      endif()
+      set(point_data_id 0)
+      if(point_data STREQUAL "registers")
+        set(point_data_id 1)
+      endif()
+      set(target sfpp_min_bench_te_cute_generic_${physics}_${point_data})
+      add_executable(${target} sfpp_min/bench_te.cpp)
+      target_link_libraries(${target} PRIVATE sfpp_min tensor)
+      target_compile_definitions(${target}
+                                 PRIVATE SFPP_MIN_BENCH_TE_CUTE
+                                         SFPP_MIN_BENCH_ROW_OF_E
+                                         SFPP_MIN_BENCH_KERNEL=2
+                                         SFPP_MIN_BENCH_PHYSICS=${physics_id}
+                                         SFPP_MIN_BENCH_POINT_DATA=${point_data_id})
+    endforeach()
+  endforeach()
 endif()
+
+# The team policy's generic graph, against kernel_new's team binaries.
+foreach(point_data integrand registers)
+  set(point_data_id 0)
+  if(point_data STREQUAL "registers")
+    set(point_data_id 1)
+  endif()
+  add_executable(sfpp_min_bench_te_generic_${point_data} sfpp_min/bench_te.cpp)
+  target_link_libraries(sfpp_min_bench_te_generic_${point_data}
+                        PRIVATE sfpp_min tensor)
+  target_compile_definitions(sfpp_min_bench_te_generic_${point_data}
+                             PRIVATE SFPP_MIN_BENCH_KERNEL=2
+                                     SFPP_MIN_BENCH_POINT_DATA=${point_data_id})
+endforeach()
 
 # The same kernels at a higher polynomial order. NGLL is a compile-time
 # constant, so each order is its own set of binaries; the calibrated NGLL = 5

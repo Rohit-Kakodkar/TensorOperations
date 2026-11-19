@@ -166,4 +166,72 @@ ReferenceOutput reference_stiffness(const ElementSet&         set,
   return out;
 }
 
+// The acoustic operator, -div(grad(u) / rho), on the scalar field in column 0
+// of the displacement. The same loop as reference_stiffness with one
+// component and flux T_d = (du/dx_d) / rho. Returns one value per global
+// point.
+template <typename Offset, typename MapT>
+std::vector<double> reference_acoustic_stiffness(const ElementSet&         set,
+                                                 const Metrics<Offset>&    m,
+                                                 const Properties<Offset>& p,
+                                                 const MapT& g, const Fields& f,
+                                                 int nglob) {
+  std::vector<double> accel(static_cast<std::size_t>(nglob), 0.0);
+  const auto&         gm = g.h_map;
+  const auto&         uh = f.h_displacement;
+
+  for (int ispec = 0; ispec < set.nspec(); ++ispec) {
+    double u[NGLL][NGLL][NGLL];
+    for (int iz = 0; iz < NGLL; ++iz)
+      for (int iy = 0; iy < NGLL; ++iy)
+        for (int ix = 0; ix < NGLL; ++ix)
+          u[iz][iy][ix] = uh(gm(ispec, iz, iy, ix), 0);
+
+    double F[3][NGLL][NGLL][NGLL];
+    for (int iz = 0; iz < NGLL; ++iz)
+      for (int iy = 0; iy < NGLL; ++iy)
+        for (int ix = 0; ix < NGLL; ++ix) {
+          double dxi = 0, det = 0, dgm = 0;
+          for (int l = 0; l < NGLL; ++l) {
+            dxi += gll::hprime(ix, l) * u[iz][iy][l];
+            det += gll::hprime(iy, l) * u[iz][l][ix];
+            dgm += gll::hprime(iz, l) * u[l][iy][ix];
+          }
+          const double dr_dx[3][3] = {
+              {m.xix.host(ispec, iz, iy, ix), m.xiy.host(ispec, iz, iy, ix),
+               m.xiz.host(ispec, iz, iy, ix)},
+              {m.etax.host(ispec, iz, iy, ix), m.etay.host(ispec, iz, iy, ix),
+               m.etaz.host(ispec, iz, iy, ix)},
+              {m.gammax.host(ispec, iz, iy, ix),
+               m.gammay.host(ispec, iz, iy, ix),
+               m.gammaz.host(ispec, iz, iy, ix)}};
+          const double jac = m.jacobian.host(ispec, iz, iy, ix);
+          const double rho = p.rho.host(ispec, iz, iy, ix);
+          double       T[3];
+          for (int d = 0; d < 3; ++d)
+            T[d] = (dr_dx[0][d] * dxi + dr_dx[1][d] * det + dr_dx[2][d] * dgm) /
+                   rho;
+          for (int r = 0; r < 3; ++r)
+            F[r][iz][iy][ix] = jac * (T[0] * dr_dx[r][0] + T[1] * dr_dx[r][1] +
+                                      T[2] * dr_dx[r][2]);
+        }
+
+    for (int iz = 0; iz < NGLL; ++iz)
+      for (int iy = 0; iy < NGLL; ++iy)
+        for (int ix = 0; ix < NGLL; ++ix) {
+          double t1 = 0, t2 = 0, t3 = 0;
+          for (int l = 0; l < NGLL; ++l) {
+            t1 += F[0][iz][iy][l] * gll::hprime(l, ix) * gll::weight(l);
+            t2 += F[1][iz][l][ix] * gll::hprime(l, iy) * gll::weight(l);
+            t3 += F[2][l][iy][ix] * gll::hprime(l, iz) * gll::weight(l);
+          }
+          const double res = gll::weight(iz) * gll::weight(iy) * t1 +
+                             gll::weight(iz) * gll::weight(ix) * t2 +
+                             gll::weight(iy) * gll::weight(ix) * t3;
+          accel[gm(ispec, iz, iy, ix)] += -res;
+        }
+  }
+  return accel;
+}
+
 }  // namespace sfpp_min
