@@ -1,5 +1,9 @@
 #pragma once
 
+// The hand-enumerated CuTe control for stiffness_generic.hpp: its MMAs and
+// thread-value layouts are cute types, so it exists only in CuTe builds.
+#if defined(TENSOR_OPS_ENABLE_CUTE)
+
 #include <config.hpp>
 #include <data.hpp>
 #include <kernel_dummy.hpp>
@@ -108,9 +112,8 @@ struct Divergence {
   }
 };
 
-template <int TE, typename Args, typename Policy>
-int stiffness(const Args& a, GlobalHPrime hprimewgll, Policy policy,
-              int team_size = -1) {
+template <int TE, typename Args>
+auto build_graph(const Args& a, GlobalHPrime hprimewgll) {
   namespace TOps = TensorOperations;
   using Tiles =
       TOps::LabelTiles<TOps::LabelTile<'e', TE>, TOps::LabelWhole<'k', N>,
@@ -202,9 +205,18 @@ int stiffness(const Args& a, GlobalHPrime hprimewgll, Policy policy,
       sxi0, sxi1, sxi2, seta0, seta1, seta2, sgam0, sgam1, sgam2,
       Divergence<GlobalWeights>{a.weights}));
 
-  auto g8 = g7.add(scatter(0, r0), scatter(1, r1), scatter(2, r2));
+  return g7.add(scatter(0, r0), scatter(1, r1), scatter(2, r2));
+}
 
-  return g8.outputs().team_size(team_size).execute(policy);
+template <int TE, typename Args, typename Policy>
+int stiffness(const Args& a, GlobalHPrime hprimewgll, Policy policy,
+              int team_size = -1) {
+  return build_graph<TE>(a, hprimewgll)
+      .outputs()
+      .team_size(team_size)
+      .execute(policy);
 }
 
 }  // namespace sfpp_min::simple
+
+#endif  // TENSOR_OPS_ENABLE_CUTE
